@@ -424,6 +424,16 @@ Sandbox (OS-Level Isolation)
 - Agent → network (ต้องผ่าน Network Gateway + Destination Allowlist)
 - Agent → process spawn (ต้องผ่าน Process Executor ใน Trusted Path เท่านั้น)
 
+### 12.1.1 ขอบเขตการรันโปรแกรมและ subprocess
+
+การอนุญาต executable เพียงอย่างเดียว **ไม่เพียงพอ** ที่จะจำกัด process tree เพราะโปรแกรมอย่าง compiler, package manager และ test runner อาจเรียก subprocess, build script หรือ plugin ต่อได้
+
+- MVP ระยะแรกไม่มี shell หรือคำสั่ง `exec` ทั่วไป ให้ Agent ใช้เฉพาะ Tool ที่มี schema ชัดเจน เช่น filesystem read/write และ code search
+- Tool ที่รันโปรแกรมต้องระบุ executable ด้วย absolute path, รับเฉพาะ arguments ตาม schema, ไม่ผ่าน shell และไม่ต่อ string เป็น command
+- Process Executor ต้องเริ่ม process ใน sandbox เดียวกัน พร้อมจำกัด process tree ด้วย PID namespace และ `pids.max`; process ลูกต้องรับข้อจำกัด seccomp, filesystem, network และ resource เดียวกัน
+- การรัน compiler, package manager หรือ test runner ซึ่งอาจเรียก subprocess ให้ปิดไว้จนกว่าจะพิสูจน์การจำกัด process tree ได้ หากเปิดใช้ ต้องถือ subprocess ทุกตัวเป็น untrusted และบังคับ isolation ที่ OS ไม่พึ่งการตรวจ argument อย่างเดียว
+- `PATH`, environment, working directory, file descriptors และ executable ที่เข้าถึงได้ต้องกำหนดโดย Runtime; ห้ามรับค่าควบคุมเหล่านี้จาก Agent โดยตรง
+
 ### 12.2 Enforcement Guarantees
 
 1. **Canonicalization ก่อน Check**: ทุก Path จะถูก Resolve เป็น Canonical Realpath ก่อนตรวจสอบ Scope (ป้องกัน Symlink Traversal + TOCTOU Race)
@@ -1070,7 +1080,7 @@ Zeroize Immediately after Execution
 - **Cross-Check with Capability**: Request Scope ต้อง Match กับ Capability ที่ AI มีอยู่เท่านั้น (ไม่ขยาย Scope ได้)
 - **Audit All Requests**: ทุก Secret Request (Granted/Denied/Cancelled) ถูก Log พร้อม Metadata (ไม่รวม Secret)
 
-**MVP Recommendation**: เริ่มด้วย **Tool-Scoped + One-Time Lease + Structured Schema + HITL Default สำหรับ High-Risk Operations**
+**Future Recommendation**: เมื่อเพิ่ม secret support หลัง MVP ให้เริ่มจาก **Tool-Scoped + One-Time Lease + Structured Schema + HITL Default สำหรับ High-Risk Operations**; MVP-A ยังไม่รองรับ secrets
 
 \---
 
@@ -1078,7 +1088,7 @@ Zeroize Immediately after Execution
 
 AIVM แบ่ง Security Level ตามระดับ Isolation (Progressive Hardening)
 
-### Level 0 — Process Sandbox (MVP Target)
+### Level 0 — Process Sandbox (MVP-B Target)
 
 - Linux Namespaces (mnt, pid, net, ipc, uts)
 - cgroups v1/v2 (CPU, Memory, PIDs, I/O)
@@ -1087,7 +1097,7 @@ AIVM แบ่ง Security Level ตามระดับ Isolation (Progressive
 - Capability Dropping (Drop All Unnecessary Linux Caps)
 - No New Privileges
 
-**เหมาะสำหรับ**: Controlled Agents, Trusted Workloads, MVP Development
+**เหมาะสำหรับ**: Sandboxed tool execution หลัง MVP-A, Controlled Agents และ Trusted Workloads
 
 ---
 
@@ -1288,49 +1298,59 @@ aivm/
 
 MVP ไม่ควรเริ่มด้วย Hypervisor แต่เน้น **Hard Enforcement** ให้ได้ก่อน
 
+### MVP Scope
+
+MVP แบ่งเป็นสองขอบเขตเพื่อให้พิสูจน์ security boundary ได้ทีละขั้น:
+
+**MVP-A — Mediated workspace (เป้าหมายแรก)**
+
+- Agent ทำงานผ่าน Tool Gateway เท่านั้น: อ่าน/เขียนไฟล์ใน workspace และค้นหาโค้ด
+- ไม่มี shell, arbitrary process execution, network, secrets, deploy หรือ GPU
+- ใช้ state machine แบบเล็กและ policy แบบ allowlist/deny-by-default; ยังไม่ต้องมี Cube projection หรือ dynamic capability
+- ทุก Tool request และผล allow/deny ถูกส่งไปยัง audit writer นอก sandbox
+
+**MVP-B — Sandboxed process execution (หลัง MVP-A)**
+
+- เพิ่ม process tools เฉพาะเมื่อ process tree ทั้งหมดถูกจำกัดด้วย OS sandbox และ resource quotas
+- เริ่มจาก executable/tool ที่กำหนดชัดเจน; ปิด package hooks, plugins และ network โดยปริยาย
+- เปิด compiler/test runner ได้เมื่อ subprocess และ build scripts ไม่สามารถหลุดจากขอบเขตเดียวกันได้
+
 ### MVP Stack
 
 ```text
 Linux (Host Primitives)
  + Rust
- + Namespaces (mnt, pid, net, ipc, uts)
- + cgroups v2 (CPU, Memory, PIDs, I/O)
- + seccomp-BPF (Allowlist + KILL_PROCESS)
- + Landlock (FS/IPC) — Recommended
- + Capability Dropping (No Unnecessary Caps, No New Privileges)
- + Cube Engine (Projection-Based + Hard Cap)
- + Capability Engine (Time/Usage-Bounded)
- + Policy Engine (Deny-Overrides + Fail-Closed)
- + Tool Gateway (Canonicalization + TOCTOU)
- + Audit Writer (Append-Only + Outside Sandbox)
- + Secret Broker (Tool-Scoped, HITL-Gated) — Minimal Viable
+ + Filesystem Tool Gateway (workspace scope; read/write/search)
+ + Policy allowlist (deny-by-default; invalid config denies startup)
+ + Audit Writer outside the Agent execution boundary (record request and decision)
+ + MVP-B only: Linux sandbox for process tree, cgroups v2 limits, PID/mount/network namespaces, seccomp, no-new-privileges, capability dropping
 ```
 
 ### MVP Goal (Hard Acceptance Criteria)
 
-> «Run an AI coding agent that **cannot** access anything outside its declared workspace, **cannot** spawn arbitrary processes/shells, **cannot** make arbitrary syscalls, and **every** external action is mediated, authorized, auditable and deny-by-default.»
+> «Run an AI coding agent that can read, write and search only its declared workspace through mediated tools; has no shell, arbitrary process execution or direct host access; and whose every tool request is authorized, auditable and deny-by-default.»
 
 ### MVP Security Baseline
 
 - **Fail-Closed Everywhere**: Parse/Error/Eval → DENY
-- **Structural Enforcement**: Mount ro, seccomp allowlist, no CAP_SYS_ADMIN, boundary paths explicitly denied
-- **Adversarial-First**: มี Negative Test Suite (Must-Deny) ตั้งแต่ Phase 1
-- **Tamper-Evident Audit**: Append-Only (+a) + Outside Sandbox + Hash Chain (minimum)
+- **Structural Enforcement**: Agent ไม่มี direct filesystem/process/network access; workspace scope ถูกบังคับโดย trusted gateway และ OS boundary
+- **Adversarial-First**: มี must-deny cases สำหรับ path traversal, symlink escape, boundary writes และเรียก tool ที่ไม่มีสิทธิ์ ก่อนเพิ่ม process execution
+- **Audit**: บันทึก request, decision และ outcome นอก Agent boundary; hash chain และ immutable/WORM storage เป็น hardening ภายหลัง ไม่ใช่เงื่อนไขเริ่ม MVP
 
 \---
 
 33\. MVP Milestones
 
-Phase 1 — Sandbox
+Phase 1 — Mediated Workspace (MVP-A)
 
-\- Process isolation  
-\- Filesystem isolation  
-\- Resource limits  
-\- Process lifecycle
+\- Filesystem read/write/search ผ่าน Tool Gateway เท่านั้น
+\- Workspace scope และ deny-by-default
+\- Audit request และผลการตัดสินใจ
+\- Must-deny cases สำหรับ traversal, symlink และ boundary paths
 
 \---
 
-Phase 2 — Capability
+Phase 2 — Policy and Capabilities
 
 \- Capability model  
 \- Capability verification  
@@ -1340,27 +1360,22 @@ Phase 2 — Capability
 
 \---
 
-Phase 3 — Cube
+Phase 3 — Minimal State Machine
 
-\- Cube state  
-\- State transitions  
-\- Context state  
-\- Capability state  
-\- Confidence  
-\- Temporal state
+\- Explicit states และ valid transitions
+\- Context ขั้นต่ำที่ policy ต้องใช้
+\- ค่อยเพิ่ม Cube projection เมื่อมีข้อมูลและ use case ที่ต้องเก็บจริง
 
 \---
 
-Phase 4 — Tool Gateway
+Phase 4 — Sandboxed Process Tools (MVP-B)
 
-\- filesystem  
-\- process  
-\- git  
-\- compiler  
-\- test runner  
-\- network
+\- Process lifecycle และ resource limits
+\- Fixed executable + argument schema; no shell
+\- จำกัด subprocess tree ด้วย OS sandbox
+\- เพิ่ม compiler/test runner หลังพิสูจน์ build subprocess containment
 
-ทุก tool ต้องผ่าน capability verification
+ทุก tool ต้องผ่าน capability และ policy verification; network แยกเป็น milestone ภายหลัง
 
 \---
 
