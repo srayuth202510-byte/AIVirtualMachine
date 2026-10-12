@@ -472,6 +472,51 @@ unsafe fn enter_user_then_pid_ns() -> std::io::Result<()> {
     Ok(())
 }
 
+/// capset header (kernel struct, กำหนดเองเพรา่ libc crate ไม่ export)
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+/// capset data (kernel struct, กำหนดเองเพรา่ libc crate ไม่ export)
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// ลด capabilities ทั้งหมดใน userns (defense in depth)
+///
+/// หลังเข้า userns แล้ว process เป็น root (uid 0) ใน ns นั้น มี capabilities
+/// ทั้งหมดใน userns ตัวเอง แม้จะไม่มีผลกับ host แต่ควรลดเพื่อไม่ให้ tool
+/// ใช้ capabilities ใน userns ตัวเอง (เช่น CAP_SYS_ADMIN ใน userns)
+#[cfg(target_os = "linux")]
+unsafe fn drop_capabilities() -> std::io::Result<()> {
+    let hdr = CapHeader {
+        version: 0x20080522, // _LINUX_CAPABILITY_VERSION_3
+        pid: 0,
+    };
+    let data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    if libc::syscall(
+        libc::SYS_capset,
+        &hdr as *const _ as i64,
+        data.as_ptr() as i64,
+    ) != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// เข้า mount + network namespace (ทำหลัง userns จึงมี CAP_SYS_ADMIN)
 #[cfg(target_os = "linux")]
 unsafe fn enter_mount_and_net_ns() -> std::io::Result<()> {
@@ -522,6 +567,7 @@ struct IsolationStatus {
     mountns: bool,
     netns: bool,
     seccomp: bool,
+    capdrop: bool,
 }
 
 /// เครื่องนี้รองรับ namespace + isolation แบบใด (probe แล้ว cache)
@@ -537,6 +583,7 @@ fn probe_isolation() -> IsolationStatus {
             mountns: pr.userns,
             netns: pr.userns,
             seccomp: pr.seccomp_install,
+            capdrop: pr.userns,
         }
     })
 }
@@ -598,6 +645,9 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
             //    best-effort: เครื่องไหนไม่รองรับก็รันต่อแบบ degraded — gateway
             //    ยังเป็นประตูหลัก (รายงานผลจริงผ่าน applied/degraded)
             if enter_user_then_pid_ns().is_ok() {
+                // ลด capabilities ทั้งหมด (defense in depth)
+                let _ = drop_capabilities();
+
                 // mount + network namespace (ทำหลัง userns จึงมี CAP_SYS_ADMIN)
                 let _ = enter_mount_and_net_ns();
 
@@ -715,8 +765,12 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
         } else {
             degraded.push("network-namespace: not applied".into());
         }
-        // capability-drop ยังไม่ได้ทำ (tool เป็น root ใน userns ตัวเอง)
-        degraded.push("capability-drop: not applied".into());
+        // capability-drop: รองรับถ้า userns รองรับ (capset ทำได้ใน userns)
+        if iso.capdrop {
+            applied.push("capability-drop".into());
+        } else {
+            degraded.push("capability-drop: not applied".into());
+        }
         // seccomp denylist: รองรับถ้า probe ยืนยันว่า seccomp(2) ใช้ได้
         if iso.seccomp {
             applied.push("seccomp-filter".into());
@@ -1087,6 +1141,48 @@ mod tests {
         if out.applied.iter().any(|a| a == "user-namespace") {
             assert!(out.applied.iter().any(|a| a == "mount-namespace"));
             assert!(out.applied.iter().any(|a| a == "network-namespace"));
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn capability_drop_applied_when_supported() {
+        let ws = test_ws("capdrop");
+        let real = std::fs::canonicalize("/bin/true").unwrap();
+        let out = run_checked(
+            &spec("/bin/true", &ws),
+            &test_policy(&[&real.to_string_lossy()]),
+        )
+        .unwrap();
+        assert!(out.success());
+        // ถ้า userns รองรับ -> capability-drop ต้อง applied
+        if out.applied.iter().any(|a| a == "user-namespace") {
+            assert!(out.applied.iter().any(|a| a == "capability-drop"));
+            assert!(!out.degraded.iter().any(|d| d.starts_with("capability-drop")));
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+}
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn capability_drop_applied_when_supported() {
+        let ws = test_ws("capdrop");
+        let real = std::fs::canonicalize("/bin/true").unwrap();
+        let out = run_checked(
+            &spec("/bin/true", &ws),
+            &test_policy(&[&real.to_string_lossy()]),
+        )
+        .unwrap();
+        assert!(out.success());
+        // ถ้า userns รองรับ -> capability-drop ต้อง applied
+        if out.applied.iter().any(|a| a == "user-namespace") {
+            assert!(out.applied.iter().any(|a| a == "capability-drop"));
+            assert!(!out
+                .degraded
+                .iter()
+                .any(|d| d.starts_with("capability-drop")));
         }
         let _ = std::fs::remove_dir_all(&ws);
     }
