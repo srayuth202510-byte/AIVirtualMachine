@@ -382,6 +382,21 @@ fn i10_structural_enforcement() {
     for m in ["no-new-privs", "pdeathsig-sigkill", "env-scrub", "cwd-pin"] {
         assert!(out.applied.contains(&m.to_string()), "I-10: {m} missing");
     }
+    // honesty: mechanism ต้องไม่ถูกอ้างว่าทั้ง applied และ degraded พร้อมกัน
+    for a in &out.applied {
+        let name = a.split(['=', ':']).next().unwrap_or(a);
+        assert!(
+            !out.degraded.iter().any(|d| d.starts_with(name)),
+            "I-10: {name} claimed as both applied and degraded"
+        );
+    }
+    // namespace: ถ้าเครื่องรองรับ (probe) ต้องรายงาน applied จริง
+    if pr.userns && pr.pid_namespace {
+        assert!(
+            out.applied.contains(&"pid-namespace".to_string()),
+            "I-10: namespaces supported but not applied"
+        );
+    }
     // audit ไฟล์ล็อกเฉพาะเจ้าของ (structural ระดับ FS)
     let (mut gw, mut cube, dir) = gateway("i10b");
     gw.write(&mut cube, "src/a.rs", "x").unwrap();

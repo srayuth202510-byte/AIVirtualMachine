@@ -420,6 +420,103 @@ pub fn validate(spec: &ExecSpec, policy: &Policy) -> Result<PathBuf, SandboxErro
     Ok(canon)
 }
 
+// ---- Linux namespace helpers (syscall ล้วน: เรียกได้จาก pre_exec) ----
+
+/// เขียนไฟล์ด้วย open/write/close ไม่ allocate (pre_exec ห้ามแตะ allocator)
+#[cfg(target_os = "linux")]
+unsafe fn write_bytes(path: *const libc::c_char, data: &[u8]) -> std::io::Result<()> {
+    let fd = libc::open(path, libc::O_WRONLY | libc::O_CLOEXEC);
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut off = 0usize;
+    while off < data.len() {
+        let n = libc::write(
+            fd,
+            data[off..].as_ptr() as *const libc::c_void,
+            data.len() - off,
+        );
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+        off += n as usize;
+    }
+    libc::close(fd);
+    Ok(())
+}
+
+/// เขียนข้อความ uid/gid map รูปแบบ "0 <id> 1\n" ลงบัฟเฟอร์คงที่ (ไม่ allocate)
+/// คืนความยาวที่ใช้จริง — map inside-ns 0 <-> outside <id> (เราเป็น root ใน ns)
+#[cfg(target_os = "linux")]
+fn format_id_map(id: u32, buf: &mut [u8; 32]) -> usize {
+    let mut n = 0usize;
+    for b in *b"0 " {
+        buf[n] = b;
+        n += 1;
+    }
+    let mut tmp = [0u8; 10];
+    let mut t = 0usize;
+    let mut v = id;
+    if v == 0 {
+        tmp[t] = b'0';
+        t += 1;
+    }
+    while v > 0 {
+        tmp[t] = b'0' + (v % 10) as u8;
+        v /= 10;
+        t += 1;
+    }
+    while t > 0 {
+        t -= 1;
+        buf[n] = tmp[t];
+        n += 1;
+    }
+    for b in *b" 1\n" {
+        buf[n] = b;
+        n += 1;
+    }
+    n
+}
+
+/// เข้า user namespace แบบ unprivileged แล้ว map uid/gid ให้ตัวเองเป็น root
+/// ใน ns ใหม่ (ต้องเขียน setgroups=deny ก่อน gid_map) จากนั้นสร้าง PID
+/// namespace — ทำได้เพราะมี CAP_SYS_ADMIN ใน userns ที่เพิ่งสร้าง
+#[cfg(target_os = "linux")]
+unsafe fn enter_user_then_pid_ns() -> std::io::Result<()> {
+    // ต้องอ่าน uid/gid *ก่อน* unshare: หลังเข้า userns แล้ว getuid() จะเห็นค่า
+    // overflow (65534) เพราะยังไม่มี mapping — เคอร์เนลเทียบกับ kuid ตัวจริง
+    // (ผู้เขียนต้อง map uid ของตัวเองได้)
+    let uid = libc::getuid();
+    let gid = libc::getgid();
+    if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // ข้อกำหนด unprivileged: setgroups ต้องเป็น "deny" ก่อนเขียน gid_map
+    write_bytes(c"/proc/self/setgroups".as_ptr(), b"deny")?;
+    let mut buf = [0u8; 32];
+    let n = format_id_map(uid, &mut buf);
+    write_bytes(c"/proc/self/uid_map".as_ptr(), &buf[..n])?;
+    let n = format_id_map(gid, &mut buf);
+    write_bytes(c"/proc/self/gid_map".as_ptr(), &buf[..n])?;
+    if libc::unshare(libc::CLONE_NEWPID) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// เครื่องนี้รองรับ userns + PID namespace ไหม (probe แล้ว cache)
+/// ใช้ตัดสินว่า run_checked จะรายงาน namespace ว่า applied หรือ degraded
+#[cfg(target_os = "linux")]
+fn namespaces_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let pr = probe();
+        pr.userns && pr.pid_namespace
+    })
+}
+
 /// รันโปรแกรมตามสเปกที่ผ่านประตูแล้ว พร้อม hardening ใน pre_exec
 /// (Linux เท่านั้น ที่อื่นปฏิเสธแบบ fail-closed)
 pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, SandboxError> {
@@ -458,23 +555,9 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
                 return Err(std::io::Error::last_os_error());
             }
 
-            // 2. User namespace: needed for PID namespace without root
-            // Skip for now - requires root or complex setup
-            // if libc::unshare(libc::CLONE_NEWUSER) != 0 {
-            //     // User namespace not available
-            // } else {
-            //     let uid = libc::getuid();
-            //     let gid = libc::getgid();
-            //     let _ = std::fs::write("/proc/self/uid_map", format!("{} {} 1\n", uid, uid));
-            //     let _ = std::fs::write("/proc/self/gid_map", format!("{} {} 1\n", gid, gid));
-            //     let _ = std::fs::write("/proc/self/setgroups", "deny");
-            // }
-
-            // 3. PID namespace: isolate process tree (child ไม่เห็น parent processes)
-            // Skip for now - requires user namespace or root
-            // let _ = libc::unshare(libc::CLONE_NEWPID);
-
-            // 4. pdeathsig: parent ตาย child โดน SIGKILL ตาม (กัน process กำพร้า)
+            // 2. pdeathsig: parent ตาย child โดน SIGKILL ตาม (กัน process กำพร้า)
+            //    ตั้งก่อน fork เพื่อให้ทุกลำดับชั้นสืบทอด: ลูกที่ fork ทีหลัง
+            //    จะมี pdeathsig ชี้ไปตัวกลาง -> ตัวกลางตาย ลูกตาย
             if libc::prctl(
                 libc::PR_SET_PDEATHSIG,
                 libc::SIGKILL as libc::c_ulong,
@@ -486,33 +569,37 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
                 return Err(std::io::Error::last_os_error());
             }
 
-            // 5. seccomp: install syscall filter (allowlist per tool type)
-            // Disabled for now - tests pass without it
-            // let filter = vec![
-            //     libc::sock_filter { code: 0x20, jt: 0, jf: 0, k: 4 },
-            //     libc::sock_filter { code: 0x15, jt: 0, jf: 1, k: 0xc000003e },
-            //     libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: 0x00000000 },
-            //     libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: 0x7fff0000 },
-            // ];
-            // let mut filter = filter;
-            // let prog = libc::sock_fprog {
-            //     len: filter.len() as u16,
-            //     filter: filter.as_mut_ptr(),
-            // };
-            // if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-            //     return Err(std::io::Error::last_os_error());
-            // }
-            // let r = libc::syscall(
-            //     libc::SYS_seccomp,
-            //     1i64,
-            //     0i64,
-            //     &prog as *const _ as i64,
-            // );
-            // if r != 0 {
-            //     // seccomp failed, continue without it
-            // }
+            // 3. user + PID namespace แล้ว fork ให้ลูกเป็น PID 1 ใน ns ใหม่
+            //    (unshare(CLONE_NEWPID) มีผลกับลูกที่ fork ทีหลังเท่านั้น)
+            //    best-effort: เครื่องไหนไม่รองรับก็รันต่อแบบ degraded — gateway
+            //    ยังเป็นประตูหลัก (รายงานผลจริงผ่าน applied/degraded)
+            if enter_user_then_pid_ns().is_ok() {
+                let pid = libc::fork();
+                if pid < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if pid > 0 {
+                    // ตัวกลาง: รอลูกแล้วออกด้วยสถานะเดียวกัน (ไม่ exec)
+                    let mut status: libc::c_int = 0;
+                    while libc::waitpid(pid, &mut status, 0) < 0 {
+                        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                            break;
+                        }
+                    }
+                    let code = if libc::WIFEXITED(status) {
+                        libc::WEXITSTATUS(status)
+                    } else if libc::WIFSIGNALED(status) {
+                        128 + libc::WTERMSIG(status)
+                    } else {
+                        1
+                    };
+                    libc::_exit(code);
+                }
+                // ลูกเดินต่อ: ตอนนี้เป็น PID 1 ใน ns ใหม่
+            }
 
-            // 6. rlimits: เพดานทรัพยากรที่ลดได้อย่างเดียว (unprivileged ทำได้)
+            // 4. rlimits: เพดานทรัพยากรที่ลดได้อย่างเดียว (unprivileged ทำได้)
+            //    ตั้งหลัง fork เพื่อไม่ให้ RLIMIT_NPROC ไปบล็อก fork ภายใน
             let cap = |res: libc::__rlimit_resource_t, val: libc::rlim_t| {
                 let lim = libc::rlimit {
                     rlim_cur: val,
@@ -541,6 +628,9 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    let ns_ok = namespaces_supported();
+
     let mut child = cmd
         .spawn()
         .map_err(|e| SandboxError::Spawn(e.to_string()))?;
@@ -553,11 +643,40 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
     if let Some(h) = child.stderr.take() {
         let _ = h.take(MAX_OUTPUT + 1).read_to_string(&mut err_s);
     }
-    let mut degraded = vec![
-        // ยังไม่ได้ติดตั้งจริงในเครื่องนี้ — รายงานดัง ๆ ห้ามเงียบ (สเปก §12.1.1)
-        "pid-namespace: not enabled (needs unprivileged userns setup)".into(),
-        "seccomp-filter: not installed".into(),
+    #[allow(unused_mut)]
+    let mut applied: Vec<String> = vec![
+        "exe-allowlist".into(),
+        "arg-schema".into(),
+        "env-scrub".into(),
+        "cwd-pin".into(),
+        "stdin-null".into(),
+        "no-new-privs".into(),
+        "pdeathsig-sigkill".into(),
+        format!("rlimit-as={mem_bytes}"),
+        format!("rlimit-cpu={SANDBOX_CPU_SECS}s"),
+        format!("rlimit-fsize={SANDBOX_FS_MB}MiB"),
+        format!("rlimit-nproc={nproc}"),
     ];
+    #[allow(unused_mut)]
+    let mut degraded: Vec<String> = vec![];
+    // รายงานตามความจริงของเครื่องนี้ (สเปก §12.1.1): กลไกที่ใช้ไม่ได้ต้องดัง
+    #[cfg(target_os = "linux")]
+    {
+        if ns_ok {
+            applied.push("user-namespace".into());
+            applied.push("pid-namespace".into());
+        } else {
+            degraded.push("user-namespace: unavailable".into());
+            degraded.push("pid-namespace: unavailable (needs unprivileged userns)".into());
+        }
+        // ยังไม่ครบตาม MVP-B — รายงานตรง ๆ ไม่เงียบ (สเปก §12.1.1)
+        degraded.push("mount-namespace: not applied".into());
+        degraded.push("network-namespace: not applied".into());
+        degraded.push("capability-drop: not applied".into());
+        // seccomp allowlist ยังไม่ครอบ syscall ของไบนารีจริง (rseq, newfstatat, ...)
+        // เปิดตอนนี้จะ SIGSYS ฆ่า tool ปกติ -> คงปิดไว้และรายงานตรง ๆ
+        degraded.push("seccomp-filter: not installed".into());
+    }
     if out.len() as u64 > MAX_OUTPUT || err_s.len() as u64 > MAX_OUTPUT {
         out.truncate(MAX_OUTPUT as usize);
         err_s.truncate(MAX_OUTPUT as usize);
@@ -573,19 +692,7 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
         code,
         stdout: out,
         stderr: err_s,
-        applied: vec![
-            "exe-allowlist".into(),
-            "arg-schema".into(),
-            "env-scrub".into(),
-            "cwd-pin".into(),
-            "stdin-null".into(),
-            "no-new-privs".into(),
-            "pdeathsig-sigkill".into(),
-            format!("rlimit-as={mem_bytes}"),
-            format!("rlimit-cpu={SANDBOX_CPU_SECS}s"),
-            format!("rlimit-fsize={SANDBOX_FS_MB}MiB"),
-            format!("rlimit-nproc={nproc}"),
-        ],
+        applied,
         degraded,
     })
 }
@@ -623,13 +730,9 @@ fn probe_userns() -> std::io::Result<()> {
 }
 
 fn probe_pid_namespace() -> std::io::Result<()> {
-    // SAFETY: syscall เดียว ไม่มี allocate
-    unsafe {
-        if libc::unshare(libc::CLONE_NEWPID) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
+    // SAFETY: syscall ล้วน (userns + uid/gid map + pidns) ไม่ allocate
+    // ใช้ลำดับเดียวกับ run_checked จริง เพื่อ probe ให้ตรงกับที่ใช้จริง
+    unsafe { enter_user_then_pid_ns() }
 }
 
 fn probe_seccomp() -> std::io::Result<()> {
@@ -732,12 +835,32 @@ mod tests {
         .unwrap();
         assert!(out.success());
         assert!(out.applied.contains(&"no-new-privs".to_string()));
-        // ต้องไม่อ้างว่าติดตั้งสิ่งที่ยังไม่ติดตั้ง (honesty / I-10)
-        assert!(!out.applied.contains(&"pid-namespace".to_string()));
+        // seccomp ยังไม่ติดตั้ง -> ห้ามอ้างว่า applied และต้องรายงานใน degraded
         assert!(!out.applied.contains(&"seccomp-filter".to_string()));
-        // แต่ต้องรายงานดัง ๆ ใน degraded
-        assert!(out.degraded.iter().any(|d| d.starts_with("pid-namespace")));
         assert!(out.degraded.iter().any(|d| d.starts_with("seccomp-filter")));
+        // namespace แล้วแต่เครื่อง — รายงานต้องสอดคล้อง (applied XOR degraded)
+        if out.applied.contains(&"pid-namespace".to_string()) {
+            assert!(out.applied.contains(&"user-namespace".to_string()));
+            assert!(!out.degraded.iter().any(|d| d.starts_with("pid-namespace")));
+        } else {
+            assert!(out.degraded.iter().any(|d| d.starts_with("pid-namespace")));
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn exit_code_propagates_through_namespace_wrapper() {
+        // ถ้าใช้ namespace จะมีตัวกลาง fork รอลูกแล้ว exit ตามสถานะ —
+        // เทสต์นี้พิสูจน์ว่า exit code ยังส่งผ่านมาถึง runtime ถูกต้อง
+        let ws = test_ws("false");
+        let real = std::fs::canonicalize("/bin/false").unwrap();
+        let out = run_checked(
+            &spec("/bin/false", &ws),
+            &test_policy(&[&real.to_string_lossy()]),
+        )
+        .unwrap();
+        assert!(!out.success());
+        assert_eq!(out.code, Some(1));
         let _ = std::fs::remove_dir_all(&ws);
     }
 
