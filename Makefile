@@ -1,7 +1,7 @@
 # ทางลัดนักพัฒนา AIVM ดูรายการด้วย `make help`
 # ทุก target คือ cargo ธรรมดา ใช้ `rtk make <target>` ได้เหมือนกัน
 
-.PHONY: help build check test test-adv demo e2e clippy fmt fmt-check verify ci clean query path explain graph-update debug-test
+.PHONY: help build check test test-adv demo e2e llama-smoke clippy fmt fmt-check verify ci clean query path explain graph-update debug-test
 
 help: ## แสดงวิธีใช้นี้
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS=":.*?## "} {printf "  %-10s %s\n", $$1, $$2}'
@@ -23,6 +23,9 @@ demo: ## self-test เส้น enforcement ครั้งเดียว (ต�
 
 e2e: ## วงจร CLI ครบผ่าน scripts/smoke.sh (create/inspect/run/logs)
 	sh scripts/smoke.sh
+
+llama-smoke: ## ทดสอบโมเดล local จริง: make llama-smoke MODEL=/path/model.gguf [PROMPT='...']
+	sh scripts/llama-smoke.sh "$(MODEL)" "$(PROMPT)"
 
 clippy: ## ตรวจ lint เจอ warning คือตก
 	cargo clippy --workspace --all-targets -- -D warnings

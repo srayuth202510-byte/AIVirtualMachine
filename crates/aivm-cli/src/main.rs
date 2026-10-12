@@ -26,6 +26,9 @@ enum Cmd {
     /// รันหนึ่งก้าวแบบผ่านตัวกลาง
     Run {
         name: String,
+        /// context/พรอมป์ต์ที่ป้อนให้โมเดล (ค่าเริ่มต้น "init")
+        #[arg(long, default_value = "init")]
+        prompt: String,
     },
     /// แสดง state โมเดล ทรัพยากร และสิทธิ์
     Inspect {
@@ -89,13 +92,13 @@ fn main() -> Result<(), AnyErr> {
             sup.create(&name, cfg).map_err(err)?;
             println!("created vm '{name}'");
         }
-        Cmd::Run { name } => {
+        Cmd::Run { name, prompt } => {
             // `run` ต้อง `create` มาก่อน ถ้าไม่มีช่วยบอกให้ชัด
             if sup.status(&name).is_none() {
                 eprintln!("vm '{name}' not registered under this --root; `create` it first");
                 std::process::exit(2);
             }
-            let out = sup.run(&name).map_err(err)?;
+            let out = sup.run_with_prompt(&name, &prompt).map_err(err)?;
             println!("{out}");
         }
         Cmd::Inspect { name } => println!("{}", sup.inspect(&name).map_err(err)?),

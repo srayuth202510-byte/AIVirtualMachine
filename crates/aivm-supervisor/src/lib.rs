@@ -97,6 +97,11 @@ impl Supervisor {
     }
 
     pub fn run(&mut self, name: &str) -> Result<String, SupervisorError> {
+        self.run_with_prompt(name, "init")
+    }
+
+    /// เหมือน `run` แต่กำหนด context/พรอมป์ต์ได้ (ใช้ทดสอบโมเดล local)
+    pub fn run_with_prompt(&mut self, name: &str, prompt: &str) -> Result<String, SupervisorError> {
         let dir = self.resolve(name)?;
         let cfg = VmConfig::from_file(&dir.join("aivm.yaml"))
             .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
@@ -106,7 +111,7 @@ impl Supervisor {
             *st = VmStatus::Running;
         }
         let out = rt
-            .step("init")
+            .step(prompt)
             .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
         rt.persist()
             .map_err(|e| SupervisorError::Runtime(e.to_string()))?;

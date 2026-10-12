@@ -17,3 +17,7 @@ aivm-memory = { path = "../aivm-memory" }
 aivm-network = { path = "../aivm-network" }
 aivm-sandbox = { path = "../aivm-sandbox" }
 aivm-model = { path = "../aivm-model" }
+
+[features]
+# ส่งต่อฟีเจอร์แบ็กเอนด์ local (llama.cpp) ไปยัง aivm-model
+llama = ["aivm-model/llama"]
