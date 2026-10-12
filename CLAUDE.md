@@ -188,8 +188,13 @@ Never re-read whole files the graph already located.
 ## MVP-B status (sandboxed exec, spec Phase 4)
 
 - `Sandbox::run_checked` (fixed exe + arg schema, no shell) + `probe()` live in
-  `aivm-sandbox`; gateway `dispatch` ยังไม่รับ exec tools จนกว่าจะพิสูจน์
-  การกัก subprocess tree ได้ — ห้าม wire เองโดยไม่มี adversarial case.
+  `aivm-sandbox`; gateway รับ `process.exec` แล้วภายใต้เงื่อนไขครบ
+  (allowlist + execute cap + state grant + audit) พร้อม adversarial คุม
+  shell-literal/symlink/PATH/argv-shape — ห้ามเพิ่ม exec surface ใหม่
+  โดยไม่มี adversarial case.
+- Subprocess tree: hardening ตกทอดไป child (ยกเว้น pdeathsig) PID-namespace
+  ทั้งก้อนยังค้าง — เปิด compiler/test runner ได้เพราะประตูคุม ไม่ใช่
+  เพราะกัก tree สมบูรณ์แล้ว.
 - Audit: `rotate()` + `verify_sequence()` + `aivm audit <name>`; archive ถูกผนึก
   (+i เมื่อ FS รองรับ) ห้ามเขียนทับ.
 

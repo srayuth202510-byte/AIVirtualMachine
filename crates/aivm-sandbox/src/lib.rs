@@ -160,7 +160,9 @@ fn interpreter_basename(name: &str) -> bool {
 }
 
 /// ประตูตรวจสเปกก่อน spawn (fail-closed ทุกข้อ) คืน exe แบบ canonical
-fn validate(spec: &ExecSpec, policy: &Policy) -> Result<PathBuf, SandboxError> {
+/// เปิดเป็น pub เพื่อให้ gateway ใช้ประตูเดียวกับ `run_checked`
+/// (ไม่แยก logic กัน กัน TOCTOU เชิงนโยบาย)
+pub fn validate(spec: &ExecSpec, policy: &Policy) -> Result<PathBuf, SandboxError> {
     let bad = |m: &str| SandboxError::Invalid(m.to_string());
     // 1. exe ต้อง absolute + มีอยู่จริง + เป็นไฟล์รันได้
     if !spec.exe.is_absolute() {

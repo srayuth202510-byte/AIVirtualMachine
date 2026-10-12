@@ -215,7 +215,14 @@ impl Runtime {
                 ],
             },
             process: aivm_policy::ProcessPolicy {
-                allow: vec![],
+                // allowlist มาจาก tools.allow ใน config เท่านั้น (ชื่อล้วน
+                // ค้นใน /usr/bin:/bin แล้ว canonicalize ซ้ำ กัน PATH hijack)
+                allow: config
+                    .tools
+                    .allow
+                    .iter()
+                    .filter_map(|s| resolve_tool(s))
+                    .collect(),
                 deny: vec!["/bin/sh".into(), "/bin/bash".into()],
             },
             network: aivm_policy::NetworkPolicy {
@@ -329,7 +336,12 @@ impl Runtime {
         }
 
         let mut granted = 0;
-        for cap in state_grants(next, &self.workspace, &self.config.network.allow) {
+        for cap in state_grants(
+            next,
+            &self.workspace,
+            &self.config.network.allow,
+            &self.policy.process.allow,
+        ) {
             let label = format!("{}:{}", cap.action, cap.scope);
             if self.gateway.caps.grant(cap) {
                 granted += 1;
@@ -429,21 +441,34 @@ impl Runtime {
 /// สิทธิ์ที่ให้ตาม state (สเปก §14.2) lease ทุกใบมี scope ผูกกับ state
 /// (ออกจาก state แล้ว revoke อัตโนมัติ) และจำกัดเวลาถ้าสิทธิ์สูง (เน็ตเวิร์ก)
 /// สิทธิ์พื้นฐาน read/search จาก INIT ไม่มี condition จึงรอดเสมอ
-fn state_grants(next: AgentState, workspace: &Path, network_allow: &[String]) -> Vec<Capability> {
+fn state_grants(
+    next: AgentState,
+    workspace: &Path,
+    network_allow: &[String],
+    process_allow: &[String],
+) -> Vec<Capability> {
     let ws = workspace.to_string_lossy().to_string();
     let src = format!("{ws}/src");
     let mut out = vec![];
-    match next {
-        AgentState::Modify | AgentState::Validate => {
-            let mut write = Capability::new("write", "filesystem", &src);
-            write.condition = Some(Condition {
+    // สิทธิ์ write + execute เริ่มที่ MODIFY อยู่ต่อถึง VALIDATE (§14.2)
+    if matches!(next, AgentState::Modify | AgentState::Validate) {
+        let mut write = Capability::new("write", "filesystem", &src);
+        write.condition = Some(Condition {
+            protocol: None,
+            require_state: None,
+            valid_states: vec!["MODIFY".to_string(), "VALIDATE".to_string()],
+        });
+        out.push(write);
+        // execute ผูกกับ exe ที่ allowlist ทีละใบ (least privilege รายใบ)
+        for exe in process_allow {
+            let mut e = Capability::new("execute", "process", exe);
+            e.condition = Some(Condition {
                 protocol: None,
                 require_state: None,
                 valid_states: vec!["MODIFY".to_string(), "VALIDATE".to_string()],
             });
-            out.push(write);
+            out.push(e);
         }
-        _ => {}
     }
     if next == AgentState::Validate {
         for host in network_allow {
@@ -458,6 +483,28 @@ fn state_grants(next: AgentState, workspace: &Path, network_allow: &[String]) ->
         }
     }
     out
+}
+
+/// แปลงรายการ tools.allow ใน config เป็น absolute canonical path
+/// ชื่อล้วนค้นแค่ /usr/bin กับ /bin (PATH ที่ runtime คุม) อย่างอื่น
+/// ต้อง absolute เท่านั้น หาไม่เจอ/มี `/` ปน = ทิ้ง (fail-closed)
+fn resolve_tool(name: &str) -> Option<String> {
+    let cand = if Path::new(name).is_absolute() {
+        PathBuf::from(name)
+    } else {
+        if name.contains('/') || name.contains('\0') {
+            return None;
+        }
+        ["/usr/bin", "/bin"]
+            .iter()
+            .map(|d| Path::new(d).join(name))
+            .find(|p| p.is_file())?
+    };
+    let real = std::fs::canonicalize(&cand).ok()?;
+    if !real.is_file() {
+        return None;
+    }
+    Some(real.to_string_lossy().to_string())
 }
 
 fn absolutize(p: &Path) -> PathBuf {
@@ -578,13 +625,58 @@ capabilities:
     }
 
     #[test]
+    fn transition_grants_execute_for_allowlisted_tool() {
+        let base = std::env::temp_dir().join(format!(
+            "aivm-rt-exec-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = VmConfig::from_yaml(
+            "name: t\ntools:\n  allow: [/bin/true]\ncapabilities:\n  initial: [read:workspace, search:code]\n",
+        )
+        .unwrap();
+        // tools.allow แปลงเป็น process allowlist แบบ canonical
+        let real = std::fs::canonicalize("/bin/true").unwrap();
+        let mut rt = Runtime::init(cfg, base.clone()).unwrap();
+        assert!(rt
+            .policy
+            .process
+            .allow
+            .contains(&real.to_string_lossy().to_string()));
+        // INIT ไม่มี execute: MODIFY ให้ทีเดียว 2 ใบ (write + execute)
+        rt.transition_to(AgentState::Analyze, &TransitionGuards::default())
+            .unwrap();
+        let (granted, _) = rt
+            .transition_to(
+                AgentState::Modify,
+                &TransitionGuards {
+                    confidence: 0.95,
+                    confidence_threshold: CONFIDENCE_THRESHOLD,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(granted, 2);
+        let scope = real.to_string_lossy().to_string();
+        assert!(rt
+            .gateway
+            .caps
+            .authorize("execute", "process", &scope)
+            .is_ok());
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn transition_denied_leaves_state_untouched() {
         let (mut rt, base) = test_runtime("jump");
         let r = rt.transition_to(AgentState::Deploy, &TransitionGuards::default());
         assert!(r.is_err());
         assert_eq!(rt.cube.current_state(), AgentState::Init);
         assert!(rt.gateway.caps.caps.iter().all(|c| c.action != "write"));
-        aivm_audit::clear_flags(&base);
         aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);
     }

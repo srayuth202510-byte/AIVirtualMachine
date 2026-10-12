@@ -296,3 +296,135 @@ fn state_gate_holds_despite_capability() {
     assert!(gw.write(&mut cube, "src/a.rs", "x").is_ok());
     adv_clean(&dir);
 }
+
+/// gateway สำหรับเทสต์ exec: policy/caps ประกอบเองตามเคส
+fn exec_harness(
+    tag: &str,
+    allow: &[String],
+    deny: &[String],
+    with_execute_cap: bool,
+) -> (ToolGateway, Cube, std::path::PathBuf) {
+    let dir = adv_dir(&format!("exec-{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let allow_list = allow
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let deny_list = deny
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let policy = Policy::from_yaml(&format!(
+        "name: t\nprocess:\n  allow: [{allow_list}]\n  deny: [{deny_list}]\n"
+    ))
+    .unwrap();
+    let ws = dir.canonicalize().unwrap();
+    let mut caps = vec![Capability::new("read", "filesystem", &ws.to_string_lossy())];
+    if with_execute_cap {
+        for exe in allow {
+            caps.push(Capability::new("execute", "process", exe));
+        }
+    }
+    let audit = AuditWriter::open(dir.join("audit.jsonl")).unwrap();
+    let gw = ToolGateway::new(
+        dir.clone(),
+        policy,
+        CapabilitySet::new(caps),
+        audit,
+        "coder",
+        "s",
+    );
+    (gw, Cube::new("adv"), dir)
+}
+
+fn exec_req(exe: &str, args: &[&str]) -> aivm_tools::ToolRequest {
+    aivm_tools::ToolRequest {
+        tool: "process.exec".into(),
+        path: exe.into(),
+        content: Some(
+            serde_json::to_string(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap(),
+        ),
+    }
+}
+
+#[test]
+fn exec_shell_chars_stay_literal() {
+    // อาร์กิวเมนต์ต้องไม่ถูกตีความโดย shell: สตริงทั้งก้อนส่งตรงเป็น argv
+    let echo = std::fs::canonicalize("/bin/echo").unwrap();
+    let echo_s = echo.to_string_lossy().to_string();
+    let (mut gw, mut cube, dir) = exec_harness("lit", std::slice::from_ref(&echo_s), &[], true);
+    let planted = dir.join("pwned");
+    let arg = format!("a;touch {}", planted.display());
+    let r = gw.dispatch(&mut cube, &exec_req("/bin/echo", &[&arg]));
+    let out = r.unwrap();
+    // echo พิมพ์สตริงดิบออกมา แต่ไฟล์ต้องไม่ถูกสร้าง (ไม่มี shell มาต่อคำสั่ง)
+    assert!(out.output.contains(&arg));
+    assert!(!planted.exists());
+    adv_clean(&dir);
+}
+
+#[test]
+fn exec_symlink_to_shell_denied() {
+    // symlink ใน workspace ชี้ไป /bin/sh: canonicalize แล้วเจอ dash = interpreter
+    let dash = std::fs::canonicalize("/bin/sh").unwrap();
+    let dash_s = dash.to_string_lossy().to_string();
+    let (mut gw, mut cube, dir) = exec_harness("link", &[dash_s], &[], true);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/bin/sh", dir.join("src").join("sh")).unwrap();
+    let link = format!("{}/src/sh", dir.display());
+    // ต่อให้ policy/cap ครอบ canonical ปลายทาง ประตู interpreter ต้องปฏิเสธก่อน
+    assert!(gw.dispatch(&mut cube, &exec_req(&link, &[])).is_err());
+    adv_clean(&dir);
+}
+
+#[test]
+fn exec_relative_exe_denied() {
+    let (mut gw, mut cube, dir) = exec_harness("rel", &["/bin/true".to_string()], &[], true);
+    assert!(gw.dispatch(&mut cube, &exec_req("bin/true", &[])).is_err());
+    adv_clean(&dir);
+}
+
+#[test]
+fn exec_without_capability_denied() {
+    let real = std::fs::canonicalize("/bin/true")
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let (mut gw, mut cube, dir) = exec_harness("nocap", &[real], &[], false);
+    assert!(gw.dispatch(&mut cube, &exec_req("/bin/true", &[])).is_err());
+    adv_clean(&dir);
+}
+
+#[test]
+fn exec_policy_deny_wins() {
+    let real = std::fs::canonicalize("/bin/true")
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let real2 = real.clone();
+    let (mut gw, mut cube, dir) = exec_harness("deny", std::slice::from_ref(&real), &[real2], true);
+    assert!(gw.dispatch(&mut cube, &exec_req("/bin/true", &[])).is_err());
+    adv_clean(&dir);
+}
+
+#[test]
+fn exec_bad_argv_shape_denied() {
+    let real = std::fs::canonicalize("/bin/true")
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let (mut gw, mut cube, dir) = exec_harness("argv", &[real], &[], true);
+    let r = gw.dispatch(
+        &mut cube,
+        &aivm_tools::ToolRequest {
+            tool: "process.exec".into(),
+            path: "/bin/true".into(),
+            content: Some("not json".into()),
+        },
+    );
+    assert!(r.is_err());
+    adv_clean(&dir);
+}

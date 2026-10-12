@@ -1,14 +1,22 @@
-//! Tool gateway — ดูสเปก §12, §16, §17.
+//! Tool gateway — ดูสเปก §12, §16, §17 + MVP-B (Phase 4).
 //!
-//! MVP-A: ผ่านตัวกลางแค่ `filesystem.read / write / search` เท่านั้น
-//! ไม่มี shell ไม่มีรันโปรเซสตามใจ ไม่มีเน็ตเวิร์ก ทุกคำขอเดินตามสาย:
-//! canonicalize -> capability -> policy -> execute -> audit
-//! fail-closed ทุกขั้น กัน TOCTOU ด้วย realpath + ตรวจซ้ำ
+//! เครื่องมือที่ผ่านตัวกลาง: `filesystem.read / write / search` และ
+//! `process.exec` (เฉพาะ exe ที่ allowlist + มี execute capability +
+//! ได้ grant ตาม state) ไม่มี shell ไม่มีรันตามใจ ไม่มีเน็ตเวิร์ก
+//! ทุกคำขอเดินตามสาย: canonicalize -> capability -> policy ->
+//! execute -> audit fail-closed ทุกขั้น กัน TOCTOU ด้วย realpath + ตรวจซ้ำ
+//!
+//! หมายเหตุเรื่อง subprocess tree: hardening ใน pre_exec (no-new-privs,
+//! rlimit, env ที่ล้างแล้ว) ตกทอดไป child ที่ fork/exec ต่อโดยอัตโนมัติ
+//! ยกเว้น pdeathsig ที่คุมแค่ child ตรง การกัก tree ทั้งก้อนด้วย PID
+//! namespace ยังเป็นงานขั้นถัดไป — เปิด compiler/test runner ได้เพราะ
+//! ประตู + adversarial คุม ไม่ใช่เพราะกัก tree สมบูรณ์แล้ว
 
 use aivm_audit::{AuditRecord, AuditWriter};
 use aivm_capability::CapabilitySet;
 use aivm_cube::{AgentState, Cube};
 use aivm_policy::{Decision, EvalContext, Policy};
+use aivm_sandbox::{ExecSpec, ResourceLimits};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -25,8 +33,11 @@ pub enum ToolError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolRequest {
-    pub tool: String, // "filesystem.read" | "filesystem.write" | "code.search"
+    pub tool: String, // "filesystem.read" | "filesystem.write" | "code.search" | "process.exec"
+    /// filesystem/search: path  |  process.exec: absolute exe path
     pub path: String,
+    /// filesystem.write: เนื้อหาไฟล์  |  process.exec: JSON array ของ argv
+    /// (parse ไม่ได้ = DENY)  |  อย่างอื่น: ไม่ใช้
     #[serde(default)]
     pub content: Option<String>,
 }
@@ -318,18 +329,80 @@ impl ToolGateway {
         })
     }
 
+    /// `process.exec`: รัน exe ที่ allowlist ไว้เท่านั้น (MVP-B)
+    ///
+    /// สายบังคับใช้: ประตู sandbox (exe/policy/arg/env/cwd) -> execute
+    /// capability (action=execute resource=process scope=exe canonical) ->
+    /// `run_checked` (ตรวจประตูซ้ำข้างใน = defense in depth + บีบ TOCTOU) ->
+    /// audit พร้อม exit code ไม่ผ่านขั้นไหนเลยคือ DENY และไม่ spawn
+    pub fn exec(
+        &mut self,
+        cube: &mut Cube,
+        exe: &str,
+        args: &[String],
+    ) -> Result<ToolResult, ToolError> {
+        let spec = ExecSpec {
+            exe: PathBuf::from(exe),
+            args: args.to_vec(),
+            cwd: self.workspace.clone(),
+            workspace: self.workspace.clone(),
+            env_extra: vec![],
+            limits: ResourceLimits::default(),
+        };
+        // ประตูชั้นแรก (fail-closed ไม่ spawn) หมายเหตุ: ประตูนี้ตรวจซ้ำ
+        // อีกรอบใน run_checked ข้างล่างโดยตั้งใจ
+        let canon = aivm_sandbox::validate(&spec, &self.policy).map_err(|e| {
+            self.audit_decision(cube, "execute", exe, "deny", "exec-gate", "error");
+            ToolError::Denied(e.to_string())
+        })?;
+        let scope = canon.to_string_lossy().to_string();
+        if self.caps.authorize("execute", "process", &scope).is_err() {
+            self.audit_decision(cube, "execute", &scope, "deny", "no-capability", "error");
+            return Err(ToolError::Denied("no capability".into()));
+        }
+        let outcome = aivm_sandbox::run_checked(&spec, &self.policy)
+            .map_err(|e| ToolError::Denied(e.to_string()))?;
+        self.audit_decision(
+            cube,
+            "execute",
+            &scope,
+            "allow",
+            &format!("exit:{}", outcome.code.unwrap_or(-1)),
+            "success",
+        );
+        Ok(ToolResult {
+            ok: outcome.success(),
+            decision: "allow".into(),
+            output: outcome.stdout,
+        })
+    }
+
     pub fn dispatch(
         &mut self,
         cube: &mut Cube,
         req: &ToolRequest,
     ) -> Result<ToolResult, ToolError> {
-        // MVP-A: มีแค่สาม tool ที่ผ่านตัวกลาง อย่างอื่นคือ DENY
+        // มีแค่ tool ที่ผ่านตัวกลางตามรายการ อย่างอื่นคือ DENY
         match req.tool.as_str() {
             "filesystem.read" => self.read(cube, &req.path),
             "filesystem.write" => {
                 self.write(cube, &req.path, req.content.as_deref().unwrap_or_default())
             }
             "code.search" => self.search(cube, &req.path),
+            "process.exec" => {
+                // argv มาจาก JSON array เท่านั้น parse ไม่ได้ = DENY
+                // (กัน shell interpolation: ไม่มีจุดไหนต่อสตริงเป็นคำสั่งเลย)
+                let args: Vec<String> = match req.content.as_deref() {
+                    Some(s) => serde_json::from_str(s).map_err(|_| {
+                        self.audit_decision(
+                            cube, "execute", &req.path, "deny", "bad-argv", "error",
+                        );
+                        ToolError::Denied("argv must be a JSON array of strings".into())
+                    })?,
+                    None => vec![],
+                };
+                self.exec(cube, &req.path, &args)
+            }
             other => {
                 self.audit_decision(cube, other, &req.path, "deny", "unknown-tool", "error");
                 Err(ToolError::Denied(format!("unknown tool: {other}")))
@@ -441,6 +514,59 @@ network: {{allow: [], deny: []}}
                 tool: "shell.exec".into(),
                 path: "x".into(),
                 content: None,
+            },
+        );
+        assert!(matches!(r, Err(ToolError::Denied(_))));
+    }
+
+    fn exec_harness() -> (ToolGateway, Cube, PathBuf) {
+        let (mut gw, cube, dir) = harness();
+        let allow: Vec<String> = ["/bin/true", "/bin/false"]
+            .iter()
+            .map(|e| {
+                std::fs::canonicalize(e)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        gw.policy.process.allow = allow.clone();
+        for exe in &allow {
+            gw.caps
+                .grant(aivm_capability::Capability::new("execute", "process", exe));
+        }
+        (gw, cube, dir)
+    }
+
+    #[test]
+    fn exec_reports_exit_status_without_deny() {
+        let (mut gw, mut cube, _d) = exec_harness();
+        let exe = |p: &str| ToolRequest {
+            tool: "process.exec".into(),
+            path: p.into(),
+            content: Some("[]".into()),
+        };
+        // exit 0 = ok:true
+        let r = gw.dispatch(&mut cube, &exe("/bin/true")).unwrap();
+        assert!(r.ok);
+        // exit ไม่ใช่ 0 = รันสำเร็จแต่ล้มเหลว (ok:false ไม่ใช่ DENY)
+        let r = gw.dispatch(&mut cube, &exe("/bin/false")).unwrap();
+        assert!(!r.ok);
+        assert_eq!(r.decision, "allow");
+    }
+
+    #[test]
+    fn exec_denied_without_execute_cap() {
+        let (mut gw, mut cube, _d) = harness();
+        let real = std::fs::canonicalize("/bin/true").unwrap();
+        gw.policy.process.allow = vec![real.to_string_lossy().to_string()];
+        // harness ไม่มี execute cap: ต้อง no-capability
+        let r = gw.dispatch(
+            &mut cube,
+            &ToolRequest {
+                tool: "process.exec".into(),
+                path: "/bin/true".into(),
+                content: Some("[]".into()),
             },
         );
         assert!(matches!(r, Err(ToolError::Denied(_))));

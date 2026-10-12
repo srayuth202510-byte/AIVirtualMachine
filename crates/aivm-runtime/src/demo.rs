@@ -322,7 +322,59 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
         case(&mut cases, "dynamic grant + revoke (§14)", Expect::Allow, r);
     }
 
-    // 12. hash chain ของ audit ต้องตรวจผ่าน
+    // 12. process.exec แบบผ่านตัวกลาง (§12/Phase 4): ใน INIT ไม่มี
+    // execute lease พอถึง MODIFY รัน /bin/true ที่ allowlist ได้
+    {
+        let cfg = VmConfig::from_yaml(
+            "name: demo-exec\ntools:\n  allow: [/bin/true]\ncapabilities:\n  initial: [read:workspace, search:code]\n",
+        )
+        .map_err(|e| RuntimeError::Config(e.to_string()))?;
+        let mut rt =
+            Runtime::init(cfg, base.join("exec")).map_err(|e| RuntimeError::Io(e.to_string()))?;
+        let r: Result<String, String> = (|| {
+            let exec_req = ToolRequest {
+                tool: "process.exec".into(),
+                path: "/bin/true".into(),
+                content: Some("[]".into()),
+            };
+            // INIT: ไม่มี execute capability
+            if rt.gateway.dispatch(&mut rt.cube, &exec_req).is_ok() {
+                return Err("exec allowed in INIT".to_string());
+            }
+            // argv ไม่ใช่ JSON = DENY (กัน shell interpolation ตั้งแต่รูปคำขอ)
+            let bad_req = ToolRequest {
+                tool: "process.exec".into(),
+                path: "/bin/true".into(),
+                content: Some("not json".into()),
+            };
+            if rt.gateway.dispatch(&mut rt.cube, &bad_req).is_ok() {
+                return Err("bad argv allowed".to_string());
+            }
+            rt.transition_to(AgentState::Analyze, &TransitionGuards::default())
+                .map_err(|e| e.to_string())?;
+            rt.transition_to(
+                AgentState::Modify,
+                &TransitionGuards {
+                    confidence: 0.95,
+                    confidence_threshold: super::CONFIDENCE_THRESHOLD,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            rt.gateway
+                .dispatch(&mut rt.cube, &exec_req)
+                .map(|r| format!("exit-ok:{}", r.ok))
+                .map_err(|e| e.to_string())
+        })();
+        case(
+            &mut cases,
+            "process.exec mediated (Phase 4)",
+            Expect::Allow,
+            r,
+        );
+    }
+
+    // 13. hash chain ของ audit ต้องตรวจผ่าน
     let audit_entries =
         AuditWriter::verify(&audit_path).map_err(|e| RuntimeError::Io(e.to_string()))?;
     let audit_verified = audit_entries > 0;

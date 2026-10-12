@@ -143,7 +143,9 @@ dependencies = [
  "aivm-capability",
  "aivm-cube",
  "aivm-policy",
+ "aivm-sandbox",
  "serde",
+ "serde_json",
  "thiserror",
  "walkdir",
 ]
