@@ -50,6 +50,42 @@ pub struct Condition {
     pub valid_states: Vec<String>,
 }
 
+/// Constraints เพิ่มเติมสำหรับ Capability (Phase 1)
+/// รองรับการจำกัดขนาดข้อมูล จำนวนครั้ง และ timeout
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Constraints {
+    /// จำกัดขนาดข้อมูลสูงสุด (bytes) สำหรับ read/write
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    /// จำกัดจำนวนครั้งที่เรียกใช้งาน (แยกจาก max_uses ที่เป็น quota)
+    #[serde(default)]
+    pub max_calls: Option<u32>,
+    /// จำกัดเวลารอสูงสุด (milliseconds)
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+impl Constraints {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_max_bytes(mut self, bytes: u64) -> Self {
+        self.max_bytes = Some(bytes);
+        self
+    }
+
+    pub fn with_max_calls(mut self, calls: u32) -> Self {
+        self.max_calls = Some(calls);
+        self
+    }
+
+    pub fn with_timeout_ms(mut self, ms: u64) -> Self {
+        self.timeout_ms = Some(ms);
+        self
+    }
+}
+
 impl Condition {
     /// เช็กความสดแบบ fail-closed: lease ที่ผูกกับ state ไว้
     /// จะถือว่า stale ทันทีเมื่ออยู่ state อื่น
@@ -71,6 +107,9 @@ pub struct Capability {
     pub scope: String,
     #[serde(default)]
     pub condition: Option<Condition>,
+    /// Constraints เพิ่มเติม: max_bytes, max_calls, timeout_ms
+    #[serde(default)]
+    pub constraints: Constraints,
     /// timestamp แบบ Unix (วินาที) None = ไม่หมดอายุ
     #[serde(default)]
     pub expiration: Option<u64>,
@@ -87,10 +126,16 @@ impl Capability {
             resource: resource.to_string(),
             scope: scope.to_string(),
             condition: None,
+            constraints: Constraints::default(),
             expiration: None,
             max_uses: None,
             used_count: 0,
         }
+    }
+
+    pub fn with_constraints(mut self, constraints: Constraints) -> Self {
+        self.constraints = constraints;
+        self
     }
 
     pub fn with_expiration(mut self, secs_from_now: u64) -> Self {
@@ -127,6 +172,29 @@ impl Capability {
         Ok(())
     }
 
+    /// ตรวจสอบ constraints (max_bytes, max_calls, timeout_ms)
+    pub fn check_constraints(
+        &self,
+        request_bytes: Option<u64>,
+        call_count: Option<u32>,
+    ) -> Result<(), CapabilityError> {
+        if let Some(max_bytes) = self.constraints.max_bytes {
+            if let Some(bytes) = request_bytes {
+                if bytes > max_bytes {
+                    return Err(CapabilityError::BudgetExceeded(max_bytes));
+                }
+            }
+        }
+        if let Some(max_calls) = self.constraints.max_calls {
+            if let Some(count) = call_count {
+                if count > max_calls {
+                    return Err(CapabilityError::BudgetExceeded(max_calls as u64));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// capability นี้ครอบคลุม (action, resource, scope) ที่ขอมาหรือไม่?
     /// การเทียบ scope: เทียบ prefix ตรง ๆ บน canonical path หรือ
     /// แบบ glob ลงท้าย `/**` (ความหมายแบบ workspace)
@@ -151,6 +219,8 @@ impl Capability {
                 scope.to_string(),
             ));
         }
+        // ตรวจสอบ max_calls constraint
+        self.check_constraints(None, Some(self.used_count as u32 + 1))?;
         self.used_count += 1;
         Ok(())
     }
@@ -337,5 +407,52 @@ mod tests {
         assert!(set
             .authorize("write", "filesystem", "/workspace/src/a.rs")
             .is_ok());
+    }
+
+    #[test]
+    fn constraints_max_bytes_enforced() {
+        let cap = Capability::new("write", "filesystem", "/workspace/src")
+            .with_constraints(Constraints::new().with_max_bytes(100));
+        // ข้อมูลเล็กกว่าขีดจำกัด = OK
+        assert!(cap.check_constraints(Some(50), None).is_ok());
+        // ข้อมูลใหญ่กว่าขีดจำกัด = DENY
+        assert!(matches!(
+            cap.check_constraints(Some(200), None),
+            Err(CapabilityError::BudgetExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn constraints_max_calls_enforced() {
+        let cap = Capability::new("read", "filesystem", "/workspace")
+            .with_constraints(Constraints::new().with_max_calls(2));
+        // เรียกครั้งที่ 1 = OK
+        assert!(cap.check_constraints(None, Some(1)).is_ok());
+        // เรียกครั้งที่ 2 = OK
+        assert!(cap.check_constraints(None, Some(2)).is_ok());
+        // เรียกครั้งที่ 3 = DENY
+        assert!(matches!(
+            cap.check_constraints(None, Some(3)),
+            Err(CapabilityError::BudgetExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn authorize_respects_max_calls_constraint() {
+        let mut cap = Capability::new("read", "filesystem", "/workspace")
+            .with_constraints(Constraints::new().with_max_calls(2));
+        // ครั้งที่ 1
+        assert!(cap
+            .authorize("read", "filesystem", "/workspace/a.rs")
+            .is_ok());
+        // ครั้งที่ 2
+        assert!(cap
+            .authorize("read", "filesystem", "/workspace/b.rs")
+            .is_ok());
+        // ครั้งที่ 3 = DENY
+        assert!(matches!(
+            cap.authorize("read", "filesystem", "/workspace/c.rs"),
+            Err(CapabilityError::BudgetExceeded(_))
+        ));
     }
 }

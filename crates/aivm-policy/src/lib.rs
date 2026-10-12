@@ -378,6 +378,360 @@ fn eval_clause(c: &str, ctx: &EvalContext) -> bool {
     false
 }
 
+/// Policy Document ที่มี metadata สำหรับ versioning
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyDocument {
+    pub policy_id: String,
+    pub version: u32,
+    pub policy: Policy,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub description: String,
+}
+
+impl PolicyDocument {
+    pub fn new(policy_id: String, version: u32, policy: Policy) -> Self {
+        Self {
+            policy_id,
+            version,
+            policy,
+            created_at: now_secs(),
+            description: String::new(),
+        }
+    }
+
+    pub fn with_description(mut self, desc: String) -> Self {
+        self.description = desc;
+        self
+    }
+}
+
+/// Policy Manager: จัดการหลาย policy version และ validation
+/// MVP: in-memory, single active version per policy_id
+#[derive(Debug)]
+pub struct PolicyManager {
+    policies: HashMap<String, Vec<PolicyDocument>>, // policy_id -> versions
+    active: HashMap<String, u32>,                   // policy_id -> active version
+}
+
+impl PolicyManager {
+    pub fn new() -> Self {
+        Self {
+            policies: HashMap::new(),
+            active: HashMap::new(),
+        }
+    }
+
+    /// เพิ่ม policy ใหม่ (validate ก่อนเก็บ)
+    /// คืน error ถ้า validation fail
+    pub fn add_policy(&mut self, doc: PolicyDocument) -> Result<(), PolicyError> {
+        self.validate_policy(&doc.policy)?;
+        let versions = self.policies.entry(doc.policy_id.clone()).or_default();
+        // ตรวจสอบ version ซ้ำ
+        if versions.iter().any(|v| v.version == doc.version) {
+            return Err(PolicyError::Parse(format!(
+                "policy version {} already exists for {}",
+                doc.version, doc.policy_id
+            )));
+        }
+        versions.push(doc.clone());
+        versions.sort_by_key(|v| v.version);
+        // ถ้ายังไม่มี active version ให้ตั้งเป็น active
+        if !self.active.contains_key(&doc.policy_id) {
+            self.active.insert(doc.policy_id.clone(), doc.version);
+        }
+        Ok(())
+    }
+
+    /// ตั้ง active version (ต้องมี version นั้นอยู่แล้ว)
+    pub fn set_active(&mut self, policy_id: &str, version: u32) -> Result<(), PolicyError> {
+        let versions = self
+            .policies
+            .get(policy_id)
+            .ok_or_else(|| PolicyError::Parse(format!("policy {} not found", policy_id)))?;
+        if !versions.iter().any(|v| v.version == version) {
+            return Err(PolicyError::Parse(format!(
+                "version {} not found for policy {}",
+                version, policy_id
+            )));
+        }
+        self.active.insert(policy_id.to_string(), version);
+        Ok(())
+    }
+
+    /// ดึง active policy
+    pub fn get_active(&self, policy_id: &str) -> Option<&Policy> {
+        let version = self.active.get(policy_id)?;
+        self.policies
+            .get(policy_id)?
+            .iter()
+            .find(|v| v.version == *version)
+            .map(|v| &v.policy)
+    }
+
+    /// ดึง policy ตาม version ที่ระบุ
+    pub fn get_version(&self, policy_id: &str, version: u32) -> Option<&Policy> {
+        self.policies
+            .get(policy_id)?
+            .iter()
+            .find(|v| v.version == version)
+            .map(|v| &v.policy)
+    }
+
+    /// รายการ version ทั้งหมดของ policy
+    pub fn list_versions(&self, policy_id: &str) -> Option<Vec<u32>> {
+        self.policies
+            .get(policy_id)
+            .map(|vs| vs.iter().map(|v| v.version).collect())
+    }
+
+    /// Validate policy structure (fail-closed)
+    fn validate_policy(&self, policy: &Policy) -> Result<(), PolicyError> {
+        // ต้องมี name
+        if policy.name.is_empty() {
+            return Err(PolicyError::Parse("policy name is required".into()));
+        }
+        // deny_overrides ควรเป็น true (security best practice)
+        if !policy.deny_overrides {
+            return Err(PolicyError::Parse(
+                "deny_overrides must be true for security".into(),
+            ));
+        }
+        // ต้องมี deny list ขั้นต่ำสำหรับ filesystem (defense in depth)
+        if policy.filesystem.deny.is_empty() {
+            return Err(PolicyError::Parse(
+                "filesystem deny list must not be empty".into(),
+            ));
+        }
+        // process deny ต้องมี shell ขั้นต่ำ
+        let has_shell_deny = policy
+            .process
+            .deny
+            .iter()
+            .any(|d| d.contains("sh") || d.contains("bash"));
+        if !has_shell_deny {
+            return Err(PolicyError::Parse(
+                "process deny must include shell (/bin/sh or /bin/bash)".into(),
+            ));
+        }
+        // network deny ต้องมี private ranges
+        let has_private_deny =
+            policy.network.deny.iter().any(|d| {
+                d.starts_with("10.") || d.starts_with("192.168.") || d.starts_with("172.")
+            });
+        if !has_private_deny {
+            return Err(PolicyError::Parse(
+                "network deny must include private IP ranges".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// โหลด policy จาก YAML string พร้อม validate
+    pub fn load_from_yaml(
+        &mut self,
+        policy_id: &str,
+        version: u32,
+        yaml: &str,
+    ) -> Result<(), PolicyError> {
+        let policy = Policy::from_yaml(yaml)?;
+        let doc = PolicyDocument::new(policy_id.to_string(), version, policy);
+        self.add_policy(doc)
+    }
+}
+
+impl Default for PolicyManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn now_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+use std::collections::HashMap;
+
+/// Request struct สำหรับ PolicyEvaluator (แก้ clippy::too_many_arguments)
+#[derive(Debug, Clone)]
+pub struct EvalRequest<'a> {
+    pub agent_id: &'a str,
+    pub action: &'a str,
+    pub resource: &'a str,
+    pub scope: &'a str,
+    pub ctx: &'a EvalContext,
+    pub request_bytes: Option<u64>,
+}
+
+impl<'a> EvalRequest<'a> {
+    pub fn new(
+        agent_id: &'a str,
+        action: &'a str,
+        resource: &'a str,
+        scope: &'a str,
+        ctx: &'a EvalContext,
+    ) -> Self {
+        Self {
+            agent_id,
+            action,
+            resource,
+            scope,
+            ctx,
+            request_bytes: None,
+        }
+    }
+
+    pub fn with_request_bytes(mut self, bytes: u64) -> Self {
+        self.request_bytes = Some(bytes);
+        self
+    }
+}
+
+/// PolicyEvaluator: จุดตัดสินใจกลางสำหรับทุก Tool
+/// รวม: Identity -> Capability -> Policy -> Constraints -> Decision -> Audit
+#[derive(Debug)]
+pub struct PolicyEvaluator {
+    pub manager: PolicyManager,
+}
+
+impl PolicyEvaluator {
+    pub fn new(manager: PolicyManager) -> Self {
+        Self { manager }
+    }
+
+    /// ประเมินคำขอแบบเต็มรูปแบบ
+    /// คืน (Decision, reason, policy_version)
+    pub fn evaluate(
+        &self,
+        req: EvalRequest<'_>,
+        caps: &mut CapabilitySet,
+    ) -> (Decision, String, u32) {
+        // 1. ตรวจสอบตัวตนของ Agent (placeholder - ขยายได้ในอนาคต)
+        if req.agent_id.is_empty() {
+            return (Decision::Deny, "empty agent_id".into(), 0);
+        }
+
+        // 2. ดึง active policy
+        let policy = match self.manager.get_active("default") {
+            Some(p) => p,
+            None => {
+                // fallback: deny-all policy
+                return (Decision::Deny, "no active policy".into(), 0);
+            }
+        };
+        let policy_version = self.manager.active.get("default").copied().unwrap_or(0);
+
+        // 3. ตรวจสอบ Capability (fail-closed)
+        if caps.authorize(req.action, req.resource, req.scope).is_err() {
+            return (Decision::Deny, "no-capability".into(), policy_version);
+        }
+
+        // 4. ตรวจสอบ Constraints (max_bytes, max_calls)
+        // หา capability ที่ใช้อยู่
+        if let Ok(idx) = caps.authorize(req.action, req.resource, req.scope) {
+            if let Some(cap) = caps.caps.get(idx) {
+                if let Err(e) = cap.check_constraints(req.request_bytes, None) {
+                    return (
+                        Decision::Deny,
+                        format!("constraint-violation: {e}"),
+                        policy_version,
+                    );
+                }
+            }
+        }
+
+        // 5. ตรวจสอบ Policy (fail-closed)
+        let (decision, reason_opt) = match req.resource {
+            "filesystem" => policy.evaluate_fs(req.action, req.scope, req.ctx),
+            "network" => policy.evaluate_network(req.scope, req.ctx),
+            "process" => policy.evaluate_process(req.scope),
+            _ => (Decision::Deny, Some("unknown-resource".into())),
+        };
+
+        let reason = reason_opt.unwrap_or_else(|| "no-reason".into());
+        (decision, reason, policy_version)
+    }
+}
+
+/// ตรวจสอบ Path Traversal และ Symlink Escape
+/// คืน canonical path ถ้าผ่าน, Err ถ้าล้มเหลว
+pub fn validate_path_containment(
+    workspace: &std::path::Path,
+    requested: &str,
+) -> Result<std::path::PathBuf, String> {
+    use std::path::{Path, PathBuf};
+
+    let ws = std::fs::canonicalize(workspace)
+        .map_err(|e| format!("workspace canonicalize failed: {e}"))?;
+
+    let joined = if Path::new(requested).is_absolute() {
+        PathBuf::from(requested)
+    } else {
+        ws.join(requested)
+    };
+
+    // Lexical normalization ก่อน
+    let normalized = normalize_path(&joined);
+
+    // ตรวจสอบว่าไม่หลุดออกนอก workspace
+    if normalized != ws && !normalized.starts_with(&ws) {
+        return Err(format!("path traversal outside workspace: {requested}"));
+    }
+
+    // ตรวจสอบ symlink escape - canonicalize จริง
+    if let Ok(real) = std::fs::canonicalize(&normalized) {
+        let real_ws = std::fs::canonicalize(&ws)
+            .map_err(|e| format!("workspace canonicalize failed: {e}"))?;
+        if real != real_ws && !real.starts_with(&real_ws) {
+            return Err(format!("symlink escape outside workspace: {requested}"));
+        }
+        return Ok(real);
+    }
+
+    // Path ยังไม่มีอยู่ (write case) - ตรวจสอบ parent directories
+    let mut cur: Option<&Path> = Some(&normalized);
+    while let Some(p) = cur {
+        if p == ws || p == Path::new("") {
+            break;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(p) {
+            if meta.file_type().is_symlink() {
+                let real = std::fs::canonicalize(p)
+                    .map_err(|e| format!("symlink canonicalize failed: {e}"))?;
+                let real_ws = std::fs::canonicalize(&ws)
+                    .map_err(|e| format!("workspace canonicalize failed: {e}"))?;
+                if real != real_ws && !real.starts_with(&real_ws) {
+                    return Err(format!("symlink escape in parent: {requested}"));
+                }
+            }
+        }
+        cur = p.parent();
+    }
+
+    Ok(normalized)
+}
+
+/// Normalize path แบบ lexical (ตัด . และ ..)
+fn normalize_path(p: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,5 +885,163 @@ rules:
             p.evaluate_network("github.com", &validate).0,
             Decision::Allow
         );
+    }
+
+    #[test]
+    fn policy_manager_add_and_get_active() {
+        let mut mgr = PolicyManager::new();
+        let yaml = r#"
+name: test-policy
+deny_overrides: true
+filesystem:
+  read: [/workspace]
+  write: [/workspace/src]
+  deny: [/workspace/.git/config, "**/.env*", "**/secrets/**"]
+process:
+  allow: [/usr/bin/cargo]
+  deny: [/bin/sh, /bin/bash]
+network:
+  allow: [github.com]
+  deny: ["10.0.0.0/8", "192.168.0.0/16"]
+system:
+  allow: []
+"#;
+        mgr.load_from_yaml("test-policy", 1, yaml).unwrap();
+        let active = mgr.get_active("test-policy").unwrap();
+        assert_eq!(active.name, "test-policy");
+    }
+
+    #[test]
+    fn policy_manager_versioning() {
+        let mut mgr = PolicyManager::new();
+        let yaml_v1 = r#"
+name: versioned
+deny_overrides: true
+filesystem:
+  read: [/workspace]
+  write: [/workspace/src]
+  deny: [/workspace/.git/config, "**/.env*"]
+process:
+  allow: [/usr/bin/cargo]
+  deny: [/bin/sh]
+network:
+  allow: [github.com]
+  deny: ["10.0.0.0/8"]
+system:
+  allow: []
+"#;
+        let yaml_v2 = r#"
+name: versioned
+deny_overrides: true
+filesystem:
+  read: [/workspace]
+  write: [/workspace/src]
+  deny: [/workspace/.git/config, "**/.env*", "**/secrets/**"]
+process:
+  allow: [/usr/bin/cargo, /usr/bin/rustc]
+  deny: [/bin/sh, /bin/bash]
+network:
+  allow: [github.com, crates.io]
+  deny: ["10.0.0.0/8", "192.168.0.0/16"]
+system:
+  allow: []
+"#;
+        mgr.load_from_yaml("versioned", 1, yaml_v1).unwrap();
+        mgr.load_from_yaml("versioned", 2, yaml_v2).unwrap();
+
+        // version 1 should still be accessible
+        let v1 = mgr.get_version("versioned", 1).unwrap();
+        assert!(!v1.process.allow.contains(&"/usr/bin/rustc".to_string()));
+
+        // version 2 should have rustc
+        let v2 = mgr.get_version("versioned", 2).unwrap();
+        assert!(v2.process.allow.contains(&"/usr/bin/rustc".to_string()));
+
+        // active should be v1 (first loaded)
+        let active = mgr.get_active("versioned").unwrap();
+        assert!(!active.process.allow.contains(&"/usr/bin/rustc".to_string()));
+
+        // switch to v2
+        mgr.set_active("versioned", 2).unwrap();
+        let active = mgr.get_active("versioned").unwrap();
+        assert!(active.process.allow.contains(&"/usr/bin/rustc".to_string()));
+    }
+
+    #[test]
+    fn policy_manager_validation_rejects_weak_policy() {
+        let mut mgr = PolicyManager::new();
+        // missing filesystem deny
+        let bad_yaml = r#"
+name: bad
+deny_overrides: true
+filesystem:
+  read: [/workspace]
+  write: [/workspace/src]
+  deny: []
+process:
+  allow: [/usr/bin/cargo]
+  deny: [/bin/sh]
+network:
+  allow: [github.com]
+  deny: ["10.0.0.0/8"]
+system:
+  allow: []
+"#;
+        let result = mgr.load_from_yaml("bad", 1, bad_yaml);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("filesystem deny list must not be empty"));
+    }
+
+    #[test]
+    fn policy_manager_rejects_duplicate_version() {
+        let mut mgr = PolicyManager::new();
+        let yaml = r#"
+name: dup
+deny_overrides: true
+filesystem:
+  read: [/workspace]
+  write: [/workspace/src]
+  deny: [/workspace/.git/config]
+process:
+  allow: [/usr/bin/cargo]
+  deny: [/bin/sh]
+network:
+  allow: [github.com]
+  deny: ["10.0.0.0/8"]
+system:
+  allow: []
+"#;
+        mgr.load_from_yaml("dup", 1, yaml).unwrap();
+        let result = mgr.load_from_yaml("dup", 1, yaml);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn policy_manager_set_active_nonexistent() {
+        let mut mgr = PolicyManager::new();
+        let yaml = r#"
+name: test
+deny_overrides: true
+filesystem:
+  read: [/workspace]
+  write: [/workspace/src]
+  deny: [/workspace/.git/config]
+process:
+  allow: [/usr/bin/cargo]
+  deny: [/bin/sh]
+network:
+  allow: [github.com]
+  deny: ["10.0.0.0/8"]
+system:
+  allow: []
+"#;
+        mgr.load_from_yaml("test", 1, yaml).unwrap();
+        let result = mgr.set_active("test", 999);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
     }
 }

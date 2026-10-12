@@ -555,6 +555,131 @@ fn resolve_scope(base_dir: &Path, workspace: &Path, scope: &str) -> String {
     workspace.join(scope).to_string_lossy().to_string()
 }
 
+/// Config Loader และ Validator
+pub mod config {
+    use super::{resolve_tool, RuntimeError, VmConfig};
+    use aivm_policy::{Policy, PolicyManager};
+    use std::path::Path;
+
+    /// Validation result
+    #[derive(Debug, Clone)]
+    pub struct ValidationResult {
+        pub config: VmConfig,
+        pub warnings: Vec<String>,
+    }
+
+    /// โหลดและ validate config พร้อม policy versioning
+    pub fn load_and_validate(
+        config_path: &Path,
+        policy_manager: &mut PolicyManager,
+    ) -> Result<ValidationResult, RuntimeError> {
+        let config = VmConfig::from_file(config_path)?;
+        let mut warnings = Vec::new();
+
+        // Validate config structure
+        validate_config(&config, &mut warnings)?;
+
+        // Load default policy if not exists
+        if policy_manager.get_active("default").is_none() {
+            let default_policy = build_default_policy(&config);
+            let doc = aivm_policy::PolicyDocument::new("default".into(), 1, default_policy);
+            policy_manager
+                .add_policy(doc)
+                .map_err(|e| RuntimeError::Policy(e.to_string()))?;
+        }
+
+        Ok(ValidationResult { config, warnings })
+    }
+
+    fn validate_config(config: &VmConfig, warnings: &mut Vec<String>) -> Result<(), RuntimeError> {
+        // Name required
+        if config.name.is_empty() {
+            return Err(RuntimeError::Config("vm name is required".into()));
+        }
+
+        // Resources validation
+        if config.resources.cpu == 0 {
+            warnings.push("cpu not set, defaulting to 2".into());
+        }
+        if config.resources.memory.is_empty() {
+            warnings.push("memory not set, defaulting to 1GB".into());
+        }
+        if config.resources.storage.is_empty() {
+            warnings.push("storage not set, defaulting to 5GB".into());
+        }
+
+        // Filesystem validation
+        if config.filesystem.read.is_empty() {
+            warnings.push("filesystem.read is empty, will default to workspace".into());
+        }
+        if config.filesystem.write.is_empty() {
+            warnings.push("filesystem.write is empty, will default to workspace/src".into());
+        }
+
+        // Tools validation
+        if config.tools.allow.is_empty() {
+            warnings.push("tools.allow is empty, no process.exec will be allowed".into());
+        }
+
+        // Capabilities validation
+        if config.capabilities.initial.is_empty() {
+            warnings.push("capabilities.initial is empty, will default to read+search".into());
+        }
+
+        // Policy validation
+        if !config.policy.require_test_before_network {
+            warnings.push(
+                "require_test_before_network is false - network access allowed without tests"
+                    .into(),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn build_default_policy(config: &VmConfig) -> Policy {
+        let ws_str = format!("/workspace/{}", config.name);
+        Policy {
+            name: format!("{}-default", config.name),
+            deny_overrides: true,
+            filesystem: aivm_policy::FsPolicy {
+                read: vec![ws_str.clone()],
+                write: vec![format!("{}/src", ws_str)],
+                deny: vec![
+                    format!("{}/.git/config", ws_str),
+                    "**/.env*".into(),
+                    "**/secrets/**".into(),
+                    format!("{}/policies", ws_str),
+                    format!("{}/audit", ws_str),
+                ],
+            },
+            process: aivm_policy::ProcessPolicy {
+                allow: config
+                    .tools
+                    .allow
+                    .iter()
+                    .filter_map(|s| resolve_tool(s))
+                    .collect(),
+                deny: vec!["/bin/sh".into(), "/bin/bash".into()],
+            },
+            network: aivm_policy::NetworkPolicy {
+                allow: config.network.allow.clone(),
+                deny: vec![
+                    "10.0.0.0/8".into(),
+                    "192.168.0.0/16".into(),
+                    "172.16.0.0/12".into(),
+                    "127.0.0.1".into(),
+                    "::1".into(),
+                    "169.254.169.254".into(),
+                ],
+            },
+            system: Default::default(),
+            rules: vec![],
+            require_test_before_network: config.policy.require_test_before_network,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

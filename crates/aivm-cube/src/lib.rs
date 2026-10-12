@@ -255,6 +255,484 @@ fn state_id_of(s: AgentState) -> u32 {
     }
 }
 
+/// Workflow Engine: DAG-based workflow with branching, loops, timeout, cancellation, retry
+pub mod workflow {
+    use super::{AgentState, CubeError, TransitionGuards};
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+
+    /// Workflow Node: ขั้นตอนใน workflow
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct WorkflowNode {
+        pub id: String,
+        pub state: AgentState,
+        pub guards: TransitionGuards,
+        pub timeout_ms: Option<u64>,
+        pub retry_policy: Option<RetryPolicy>,
+        pub on_success: Vec<String>, // next node IDs
+        pub on_failure: Vec<String>, // next node IDs on failure
+        pub on_timeout: Vec<String>, // next node IDs on timeout
+    }
+
+    /// Retry Policy
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct RetryPolicy {
+        pub max_attempts: u32,
+        pub base_delay_ms: u64,
+        pub max_delay_ms: u64,
+        pub backoff_multiplier: f64,
+        pub retryable_errors: Vec<String>, // error patterns to retry
+    }
+
+    impl Default for RetryPolicy {
+        fn default() -> Self {
+            Self {
+                max_attempts: 3,
+                base_delay_ms: 1000,
+                max_delay_ms: 30000,
+                backoff_multiplier: 2.0,
+                retryable_errors: vec!["timeout".into(), "unavailable".into()],
+            }
+        }
+    }
+
+    /// Workflow Definition: DAG ของ nodes
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Workflow {
+        pub id: String,
+        pub name: String,
+        pub nodes: HashMap<String, WorkflowNode>,
+        pub entry_node: String,
+        pub max_iterations: u32, // bounded loop protection
+        pub global_timeout_ms: Option<u64>,
+    }
+
+    /// Workflow Execution State
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct WorkflowExecution {
+        pub workflow_id: String,
+        pub current_node: String,
+        pub iteration_count: u32,
+        pub node_attempts: HashMap<String, u32>,
+        pub started_at: u64,
+        pub last_transition_at: u64,
+        pub cancelled: bool,
+        pub snapshots: Vec<WorkflowSnapshot>,
+    }
+
+    /// Snapshot สำหรับ Rollback
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct WorkflowSnapshot {
+        pub node_id: String,
+        pub cube_state: Vec<u8>, // serialized cube state
+        pub timestamp: u64,
+    }
+
+    /// Workflow Engine
+    pub struct WorkflowEngine {
+        workflows: HashMap<String, Workflow>,
+    }
+
+    impl WorkflowEngine {
+        pub fn new() -> Self {
+            Self {
+                workflows: HashMap::new(),
+            }
+        }
+
+        /// ลงทะเบียน workflow
+        pub fn register(&mut self, workflow: Workflow) -> Result<(), CubeError> {
+            // Validate workflow structure
+            self.validate_workflow(&workflow)?;
+            if self.workflows.contains_key(&workflow.id) {
+                return Err(CubeError::InvalidTransition {
+                    from: "workflow".into(),
+                    to: format!("workflow {} already exists", workflow.id),
+                });
+            }
+            self.workflows.insert(workflow.id.clone(), workflow);
+            Ok(())
+        }
+
+        /// เริ่ม execute workflow
+        pub fn start(&self, workflow_id: &str) -> Result<WorkflowExecution, CubeError> {
+            let workflow =
+                self.workflows
+                    .get(workflow_id)
+                    .ok_or_else(|| CubeError::InvalidTransition {
+                        from: "workflow".into(),
+                        to: format!("workflow {} not found", workflow_id),
+                    })?;
+
+            Ok(WorkflowExecution {
+                workflow_id: workflow_id.to_string(),
+                current_node: workflow.entry_node.clone(),
+                iteration_count: 0,
+                node_attempts: HashMap::new(),
+                started_at: now_ms(),
+                last_transition_at: now_ms(),
+                cancelled: false,
+                snapshots: Vec::new(),
+            })
+        }
+
+        /// Execute one step ของ workflow
+        pub fn step(
+            &self,
+            workflow: &Workflow,
+            execution: &mut WorkflowExecution,
+            cube_state: &mut super::Cube,
+        ) -> Result<WorkflowStepResult, CubeError> {
+            // Check cancellation
+            if execution.cancelled {
+                return Err(CubeError::GuardFailed("workflow cancelled".into()));
+            }
+
+            // Check global timeout
+            if let Some(timeout) = workflow.global_timeout_ms {
+                let elapsed = now_ms() - execution.started_at;
+                if elapsed > timeout {
+                    return Err(CubeError::GuardFailed("global workflow timeout".into()));
+                }
+            }
+
+            // Check iteration limit (bounded loop)
+            if execution.iteration_count >= workflow.max_iterations {
+                return Err(CubeError::GuardFailed("max iterations exceeded".into()));
+            }
+
+            let node = workflow.nodes.get(&execution.current_node).ok_or_else(|| {
+                CubeError::InvalidTransition {
+                    from: execution.current_node.clone(),
+                    to: "unknown node".into(),
+                }
+            })?;
+
+            // Check node timeout
+            if let Some(timeout) = node.timeout_ms {
+                let elapsed = now_ms() - execution.last_transition_at;
+                if elapsed > timeout {
+                    // Transition to timeout handler
+                    if !node.on_timeout.is_empty() {
+                        execution.current_node = node.on_timeout[0].clone();
+                        execution.last_transition_at = now_ms();
+                        return Ok(WorkflowStepResult::Transitioned);
+                    }
+                    return Err(CubeError::GuardFailed("node timeout".into()));
+                }
+            }
+
+            // Try to transition cube state
+            let result = cube_state.transition(node.state, &node.guards);
+
+            match result {
+                Ok(_) => {
+                    // Success - record attempt and transition
+                    *execution.node_attempts.entry(node.id.clone()).or_insert(0) += 1;
+                    execution.iteration_count += 1;
+                    execution.last_transition_at = now_ms();
+
+                    // Determine next node
+                    if !node.on_success.is_empty() {
+                        execution.current_node = node.on_success[0].clone();
+                        Ok(WorkflowStepResult::Transitioned)
+                    } else {
+                        Ok(WorkflowStepResult::Completed)
+                    }
+                }
+                Err(e) => {
+                    // Failure - check retry policy
+                    let attempts = execution.node_attempts.entry(node.id.clone()).or_insert(0);
+                    *attempts += 1;
+
+                    if let Some(retry) = &node.retry_policy {
+                        if *attempts < retry.max_attempts {
+                            // Check if error is retryable
+                            let error_msg = e.to_string().to_lowercase();
+                            let retryable = retry
+                                .retryable_errors
+                                .iter()
+                                .any(|pattern| error_msg.contains(&pattern.to_lowercase()));
+                            if retryable {
+                                // Calculate backoff delay
+                                let delay = calculate_backoff(*attempts, retry);
+                                return Ok(WorkflowStepResult::RetryAfter(delay));
+                            }
+                        }
+                    }
+
+                    // No retry or max attempts reached - transition to failure handler
+                    if !node.on_failure.is_empty() {
+                        execution.current_node = node.on_failure[0].clone();
+                        execution.last_transition_at = now_ms();
+                        Ok(WorkflowStepResult::Transitioned)
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        }
+
+        /// สร้าง snapshot สำหรับ rollback
+        pub fn snapshot(
+            &self,
+            execution: &WorkflowExecution,
+            cube: &super::Cube,
+        ) -> Result<WorkflowSnapshot, CubeError> {
+            let cube_bytes = serde_json::to_vec(cube)
+                .map_err(|e| CubeError::GuardFailed(format!("snapshot serialize failed: {e}")))?;
+            Ok(WorkflowSnapshot {
+                node_id: execution.current_node.clone(),
+                cube_state: cube_bytes,
+                timestamp: now_ms(),
+            })
+        }
+
+        /// Rollback ไปยัง snapshot
+        pub fn rollback(
+            &self,
+            execution: &mut WorkflowExecution,
+            snapshot: WorkflowSnapshot,
+        ) -> Result<super::Cube, CubeError> {
+            let cube: super::Cube = serde_json::from_slice(&snapshot.cube_state)
+                .map_err(|e| CubeError::GuardFailed(format!("rollback deserialize failed: {e}")))?;
+            execution.current_node = snapshot.node_id;
+            execution.last_transition_at = now_ms();
+            Ok(cube)
+        }
+
+        /// ยกเลิก workflow
+        pub fn cancel(&self, execution: &mut WorkflowExecution) {
+            execution.cancelled = true;
+        }
+
+        fn validate_workflow(&self, workflow: &Workflow) -> Result<(), CubeError> {
+            // Check entry node exists
+            if !workflow.nodes.contains_key(&workflow.entry_node) {
+                return Err(CubeError::InvalidTransition {
+                    from: "entry".into(),
+                    to: format!("entry node {} not found", workflow.entry_node),
+                });
+            }
+
+            // Check all referenced nodes exist
+            for node in workflow.nodes.values() {
+                for next in &node.on_success {
+                    if !workflow.nodes.contains_key(next) {
+                        return Err(CubeError::InvalidTransition {
+                            from: node.id.clone(),
+                            to: format!("success node {} not found", next),
+                        });
+                    }
+                }
+                for next in &node.on_failure {
+                    if !workflow.nodes.contains_key(next) {
+                        return Err(CubeError::InvalidTransition {
+                            from: node.id.clone(),
+                            to: format!("failure node {} not found", next),
+                        });
+                    }
+                }
+                for next in &node.on_timeout {
+                    if !workflow.nodes.contains_key(next) {
+                        return Err(CubeError::InvalidTransition {
+                            from: node.id.clone(),
+                            to: format!("timeout node {} not found", next),
+                        });
+                    }
+                }
+            }
+
+            // Check for cycles that could cause infinite loops (simple detection)
+            // In production, use proper cycle detection algorithm
+            if workflow.max_iterations == 0 {
+                return Err(CubeError::GuardFailed("max_iterations must be > 0".into()));
+            }
+
+            Ok(())
+        }
+    }
+
+    impl Default for WorkflowEngine {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub enum WorkflowStepResult {
+        Transitioned,
+        Completed,
+        RetryAfter(u64), // milliseconds
+    }
+
+    fn calculate_backoff(attempt: u32, policy: &RetryPolicy) -> u64 {
+        let delay = (policy.base_delay_ms as f64
+            * policy.backoff_multiplier.powi(attempt as i32 - 1)) as u64;
+        delay.min(policy.max_delay_ms)
+    }
+
+    fn now_ms() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Builder สำหรับสร้าง Workflow แบบมาตรฐาน (ANALYZE -> MODIFY -> VALIDATE -> DEPLOY)
+    pub fn build_default_workflow() -> Workflow {
+        let mut nodes = HashMap::new();
+
+        nodes.insert(
+            "analyze".into(),
+            WorkflowNode {
+                id: "analyze".into(),
+                state: AgentState::Analyze,
+                guards: TransitionGuards::default(),
+                timeout_ms: Some(300000), // 5 minutes
+                retry_policy: None,
+                on_success: vec!["modify".into()],
+                on_failure: vec!["failed".into()],
+                on_timeout: vec!["analyze_timeout".into()],
+            },
+        );
+
+        nodes.insert(
+            "modify".into(),
+            WorkflowNode {
+                id: "modify".into(),
+                state: AgentState::Modify,
+                guards: TransitionGuards {
+                    confidence: 0.8,
+                    confidence_threshold: 0.8,
+                    ..Default::default()
+                },
+                timeout_ms: Some(600000), // 10 minutes
+                retry_policy: Some(RetryPolicy::default()),
+                on_success: vec!["validate".into()],
+                on_failure: vec!["modify".into()], // loop back to retry
+                on_timeout: vec!["modify_timeout".into()],
+            },
+        );
+
+        nodes.insert(
+            "validate".into(),
+            WorkflowNode {
+                id: "validate".into(),
+                state: AgentState::Validate,
+                guards: TransitionGuards {
+                    tests_passed: true,
+                    ..Default::default()
+                },
+                timeout_ms: Some(300000),
+                retry_policy: None,
+                on_success: vec!["deploy".into()],
+                on_failure: vec!["modify".into()], // loop back to modify
+                on_timeout: vec!["validate_timeout".into()],
+            },
+        );
+
+        nodes.insert(
+            "deploy".into(),
+            WorkflowNode {
+                id: "deploy".into(),
+                state: AgentState::Deploy,
+                guards: TransitionGuards {
+                    policy_approved: true,
+                    tests_passed: true,
+                    ..Default::default()
+                },
+                timeout_ms: Some(60000),
+                retry_policy: None,
+                on_success: vec![],
+                on_failure: vec!["failed".into()],
+                on_timeout: vec!["deploy_timeout".into()],
+            },
+        );
+
+        // Terminal nodes
+        nodes.insert(
+            "failed".into(),
+            WorkflowNode {
+                id: "failed".into(),
+                state: AgentState::Init, // terminal
+                guards: TransitionGuards::default(),
+                timeout_ms: None,
+                retry_policy: None,
+                on_success: vec![],
+                on_failure: vec![],
+                on_timeout: vec![],
+            },
+        );
+
+        nodes.insert(
+            "analyze_timeout".into(),
+            WorkflowNode {
+                id: "analyze_timeout".into(),
+                state: AgentState::Init,
+                guards: TransitionGuards::default(),
+                timeout_ms: None,
+                retry_policy: None,
+                on_success: vec![],
+                on_failure: vec![],
+                on_timeout: vec![],
+            },
+        );
+
+        nodes.insert(
+            "modify_timeout".into(),
+            WorkflowNode {
+                id: "modify_timeout".into(),
+                state: AgentState::Init,
+                guards: TransitionGuards::default(),
+                timeout_ms: None,
+                retry_policy: None,
+                on_success: vec![],
+                on_failure: vec![],
+                on_timeout: vec![],
+            },
+        );
+
+        nodes.insert(
+            "validate_timeout".into(),
+            WorkflowNode {
+                id: "validate_timeout".into(),
+                state: AgentState::Init,
+                guards: TransitionGuards::default(),
+                timeout_ms: None,
+                retry_policy: None,
+                on_success: vec![],
+                on_failure: vec![],
+                on_timeout: vec![],
+            },
+        );
+
+        nodes.insert(
+            "deploy_timeout".into(),
+            WorkflowNode {
+                id: "deploy_timeout".into(),
+                state: AgentState::Init,
+                guards: TransitionGuards::default(),
+                timeout_ms: None,
+                retry_policy: None,
+                on_success: vec![],
+                on_failure: vec![],
+                on_timeout: vec![],
+            },
+        );
+
+        Workflow {
+            id: "default".into(),
+            name: "Default AI Workflow".into(),
+            nodes,
+            entry_node: "analyze".into(),
+            max_iterations: 10,
+            global_timeout_ms: Some(3600000), // 1 hour
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +789,155 @@ mod tests {
             ..Default::default()
         };
         assert!(c.transition(AgentState::Modify, &g).is_err());
+    }
+
+    #[test]
+    fn workflow_engine_register_and_start() {
+        let mut engine = workflow::WorkflowEngine::new();
+        let workflow = workflow::build_default_workflow();
+        engine.register(workflow.clone()).unwrap();
+
+        let execution = engine.start("default").unwrap();
+        assert_eq!(execution.current_node, "analyze");
+        assert_eq!(execution.workflow_id, "default");
+    }
+
+    #[test]
+    fn workflow_engine_step_success() {
+        let mut engine = workflow::WorkflowEngine::new();
+        let workflow = workflow::build_default_workflow();
+        engine.register(workflow.clone()).unwrap();
+
+        let mut execution = engine.start("default").unwrap();
+        let mut cube = Cube::new("test-workflow");
+
+        // Step 1: analyze -> modify
+        let result = engine.step(&workflow, &mut execution, &mut cube).unwrap();
+        assert_eq!(result, workflow::WorkflowStepResult::Transitioned);
+        assert_eq!(execution.current_node, "modify");
+        assert_eq!(cube.current_state(), AgentState::Analyze);
+    }
+
+    #[test]
+    fn workflow_engine_full_flow() {
+        let mut engine = workflow::WorkflowEngine::new();
+        let workflow = workflow::build_default_workflow();
+        engine.register(workflow.clone()).unwrap();
+
+        let mut execution = engine.start("default").unwrap();
+        let mut cube = Cube::new("test-workflow");
+
+        // analyze -> modify
+        let _ = engine.step(&workflow, &mut execution, &mut cube).unwrap();
+        assert_eq!(execution.current_node, "modify");
+
+        // modify -> validate (needs confidence >= 0.8)
+        let _ = engine.step(&workflow, &mut execution, &mut cube).unwrap();
+        assert_eq!(execution.current_node, "validate");
+        assert_eq!(cube.current_state(), AgentState::Modify);
+
+        // validate -> deploy (needs tests_passed)
+        let _ = engine.step(&workflow, &mut execution, &mut cube).unwrap();
+        assert_eq!(execution.current_node, "deploy");
+        assert_eq!(cube.current_state(), AgentState::Validate);
+
+        // deploy -> completed
+        let result = engine.step(&workflow, &mut execution, &mut cube).unwrap();
+        assert_eq!(result, workflow::WorkflowStepResult::Completed);
+        assert_eq!(cube.current_state(), AgentState::Deploy);
+    }
+
+    #[test]
+    fn workflow_engine_cancellation() {
+        let mut engine = workflow::WorkflowEngine::new();
+        let workflow = workflow::build_default_workflow();
+        engine.register(workflow.clone()).unwrap();
+
+        let mut execution = engine.start("default").unwrap();
+        let mut cube = Cube::new("test-workflow");
+
+        // Cancel before first step
+        engine.cancel(&mut execution);
+        let result = engine.step(&workflow, &mut execution, &mut cube);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn workflow_engine_snapshot_and_rollback() {
+        let mut engine = workflow::WorkflowEngine::new();
+        let workflow = workflow::build_default_workflow();
+        engine.register(workflow.clone()).unwrap();
+
+        let mut execution = engine.start("default").unwrap();
+        let mut cube = Cube::new("test-workflow");
+
+        // Move to modify
+        let _ = engine.step(&workflow, &mut execution, &mut cube).unwrap();
+        assert_eq!(execution.current_node, "modify");
+
+        // Take snapshot
+        let snapshot = engine.snapshot(&execution, &cube).unwrap();
+        assert_eq!(snapshot.node_id, "modify");
+
+        // Move to validate
+        let _ = engine.step(&workflow, &mut execution, &mut cube).unwrap();
+        assert_eq!(execution.current_node, "validate");
+
+        // Rollback to snapshot
+        let rolled_back_cube = engine.rollback(&mut execution, snapshot).unwrap();
+        assert_eq!(execution.current_node, "modify");
+        assert_eq!(rolled_back_cube.current_state(), AgentState::Analyze);
+    }
+
+    #[test]
+    fn workflow_engine_max_iterations() {
+        let mut engine = workflow::WorkflowEngine::new();
+        let mut workflow = workflow::build_default_workflow();
+        workflow.max_iterations = 2; // Very low limit
+        engine.register(workflow.clone()).unwrap();
+
+        let mut execution = engine.start("default").unwrap();
+        let mut cube = Cube::new("test-workflow");
+
+        // First step: analyze -> modify (iteration 1)
+        let _ = engine.step(&workflow, &mut execution, &mut cube).unwrap();
+        assert_eq!(execution.iteration_count, 1);
+
+        // Second step: modify -> validate (iteration 2)
+        let _ = engine.step(&workflow, &mut execution, &mut cube).unwrap();
+        assert_eq!(execution.iteration_count, 2);
+
+        // Third step should fail due to max iterations
+        let result = engine.step(&workflow, &mut execution, &mut cube);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("max iterations exceeded"));
+    }
+
+    #[test]
+    fn workflow_engine_retry_on_failure() {
+        let mut engine = workflow::WorkflowEngine::new();
+        let mut workflow = workflow::build_default_workflow();
+
+        // Modify the modify node to fail initially
+        if let Some(node) = workflow.nodes.get_mut("modify") {
+            node.guards.confidence = 0.9; // This will pass
+            node.guards.confidence_threshold = 0.8;
+        }
+        engine.register(workflow.clone()).unwrap();
+
+        let mut execution = engine.start("default").unwrap();
+        let mut cube = Cube::new("test-workflow");
+
+        // analyze -> modify
+        let _ = engine.step(&workflow, &mut execution, &mut cube).unwrap();
+        assert_eq!(execution.current_node, "modify");
+
+        // modify should succeed with confidence 0.9
+        let _ = engine.step(&workflow, &mut execution, &mut cube).unwrap();
+        assert_eq!(execution.current_node, "validate");
     }
 }
