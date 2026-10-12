@@ -12,10 +12,42 @@
 //! (I-7) ไม่มีทางที่ข้อความจากโมเดลจะกลายเป็นการ execute โดยตรง
 
 use crate::RuntimeError;
+use aivm_cube::rag;
 use aivm_cube::Cube;
 use aivm_model::Model;
 use aivm_tools::{ToolGateway, ToolRequest};
 use serde::Serialize;
+use std::path::Path;
+
+/// อ่านไฟล์ทั้งหมดใน workspace (recursive) เป็น (path, content) pairs
+fn read_workspace_files(ws: &Path) -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    collect_files(ws, ws, &mut files);
+    files
+}
+
+fn collect_files(dir: &Path, ws: &Path, out: &mut Vec<(String, String)>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_files(&path, ws, out);
+            } else if path.is_file() {
+                // ตัด prefix workspace ออกจาก key
+                let rel = path.strip_prefix(ws).unwrap_or(&path);
+                let key = rel.to_string_lossy().to_string();
+                let content = std::fs::read_to_string(&path).unwrap_or_default();
+                out.push((key, content));
+            }
+        }
+    }
+}
+
+/// สร้าง RAG index จากไฟล์ใน workspace
+pub fn build_workspace_index(ws: &Path, current_state: u32) -> rag::RagIndex {
+    let files = read_workspace_files(ws);
+    rag::build_index(&files, current_state)
+}
 
 /// tool ที่ยอมรับในระดับ intent (deny-by-default: นอกลิสต์ = ปฏิเสธ)
 /// ต้องตรงกับ `ToolGateway::dispatch`
@@ -169,7 +201,7 @@ fn clip(s: &str, max: usize) -> String {
     out
 }
 
-fn build_prompt(task: &str, observations: &[String]) -> String {
+fn build_prompt(task: &str, observations: &[String], context_hint: Option<&str>) -> String {
     let mut p = String::new();
     p.push_str(SYSTEM_PROMPT);
     p.push_str("\n\nTask: ");
@@ -180,6 +212,10 @@ fn build_prompt(task: &str, observations: &[String]) -> String {
             p.push_str(&format!("{}. {}\n", i + 1, o));
         }
     }
+    if let Some(ctx) = context_hint {
+        p.push_str("\n\nRelevant context from workspace:\n");
+        p.push_str(ctx);
+    }
     p.push_str("\nNext action (single JSON object only):");
     p
 }
@@ -189,12 +225,15 @@ fn build_prompt(task: &str, observations: &[String]) -> String {
 /// - ทุก intent ถูก parse แบบเข้ม; parse ไม่ผ่าน = audit deny + ป้อนกลับ
 /// - tool ทุกตัววิ่งผ่าน `gateway.dispatch` เท่านั้น (capability + policy + audit)
 /// - หยุดเมื่อโมเดลส่ง `{"done":true}` หรือครบ `max_steps`
+/// - RAG: ก่อนเรียก model.reason() จะค้นหา context ที่เกี่ยวข้องจาก index
+///   แล้วผสมลงใน prompt (state-aware: ใช้ cube state ปัจจุบัน)
 pub fn run_loop(
     model: &dyn Model,
     gateway: &mut ToolGateway,
     cube: &mut Cube,
     task: &str,
     max_steps: usize,
+    rag_index: Option<&aivm_cube::rag::RagIndex>,
 ) -> Result<AgentRun, RuntimeError> {
     let mut steps: Vec<AgentStep> = Vec::new();
     let mut observations: Vec<String> = Vec::new();
@@ -202,7 +241,19 @@ pub fn run_loop(
     let mut stopped = "max-steps".to_string();
 
     for index in 0..max_steps {
-        let prompt = build_prompt(task, &observations);
+        // RAG: ค้นหา context ที่เกี่ยวข้องกับ task (ถ้ามี index)
+        let context_hint = if let Some(idx) = rag_index {
+            let hits = aivm_cube::rag::search(idx, task, 3, cube.current_state() as u32);
+            if hits.is_empty() {
+                None
+            } else {
+                Some(aivm_cube::rag::assemble_context(task, &hits, 2000))
+            }
+        } else {
+            None
+        };
+
+        let prompt = build_prompt(task, &observations, context_hint.as_deref());
         let raw = model
             .reason(&prompt)
             .map_err(|e| RuntimeError::Config(format!("model: {e}")))?;
@@ -351,7 +402,7 @@ mod tests {
             r#"{"tool":"filesystem.read","path":"src/seed.rs"}"#,
             r#"{"done":true,"summary":"read ok"}"#,
         ]);
-        let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "read seed", 8).unwrap();
+        let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "read seed", 8, None).unwrap();
         assert_eq!(run.stopped, "done");
         assert_eq!(run.summary.as_deref(), Some("read ok"));
         assert_eq!(run.steps.len(), 1);
@@ -367,7 +418,15 @@ mod tests {
     fn non_json_output_is_denied_and_audited() {
         let mut fx = fixture("nonjson");
         let model = ScriptedModel::new(&["I will just think about it"]);
-        let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "do something", 1).unwrap();
+        let run = run_loop(
+            &model,
+            &mut fx.gateway,
+            &mut fx.cube,
+            "do something",
+            1,
+            None,
+        )
+        .unwrap();
         assert_eq!(run.stopped, "max-steps");
         assert!(run.steps[0].outcome.starts_with("ERROR invalid intent"));
         assert!(
@@ -380,7 +439,7 @@ mod tests {
     fn unknown_tool_intent_is_denied_without_execution() {
         let mut fx = fixture("unknown");
         let model = ScriptedModel::new(&[r#"{"tool":"shell.exec","path":"rm -rf /"}"#]);
-        let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "escape", 1).unwrap();
+        let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "escape", 1, None).unwrap();
         assert!(run.steps[0].outcome.contains("unknown tool: shell.exec"));
         assert!(audit_contains(&fx, "invalid-intent"));
     }
@@ -390,7 +449,7 @@ mod tests {
         let mut fx = fixture("traversal");
         let model =
             ScriptedModel::new(&[r#"{"tool":"filesystem.read","path":"../../etc/passwd"}"#]);
-        let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "escape", 1).unwrap();
+        let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "escape", 1, None).unwrap();
         assert!(
             run.steps[0].outcome.starts_with("DENY filesystem.read"),
             "{:?}",
@@ -405,7 +464,7 @@ mod tests {
         let model = ScriptedModel::new(&[
             r#"{"tool":"filesystem.write","path":"README.md","content":"x"}"#,
         ]);
-        let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "write", 1).unwrap();
+        let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "write", 1, None).unwrap();
         assert!(
             run.steps[0].outcome.starts_with("DENY filesystem.write"),
             "{:?}",
@@ -417,7 +476,7 @@ mod tests {
     fn finish_intent_stops_without_tools() {
         let mut fx = fixture("finish");
         let model = ScriptedModel::new(&[r#"{"done":true,"summary":"all good"}"#]);
-        let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "nothing", 8).unwrap();
+        let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "nothing", 8, None).unwrap();
         assert_eq!(run.stopped, "done");
         assert_eq!(run.summary.as_deref(), Some("all good"));
         assert!(run.steps.is_empty());

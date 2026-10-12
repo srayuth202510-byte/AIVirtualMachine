@@ -120,7 +120,10 @@ fn main() -> Result<(), AnyErr> {
                 eprintln!("vm '{name}' not registered under this --root; `create` it first");
                 std::process::exit(2);
             }
-            let run = sup.run_agent(&name, &task, max_steps).map_err(err)?;
+            let ws = root.join(&name);
+            let run = sup
+                .run_agent(&name, &task, max_steps, Some(&ws))
+                .map_err(err)?;
             for s in &run.steps {
                 println!("#{} {} -> {}", s.index, s.action, s.outcome);
             }

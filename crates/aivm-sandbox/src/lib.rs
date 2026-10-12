@@ -1158,27 +1158,6 @@ mod tests {
         // ถ้า userns รองรับ -> capability-drop ต้อง applied
         if out.applied.iter().any(|a| a == "user-namespace") {
             assert!(out.applied.iter().any(|a| a == "capability-drop"));
-            assert!(!out.degraded.iter().any(|d| d.starts_with("capability-drop")));
-        }
-        let _ = std::fs::remove_dir_all(&ws);
-    }
-}
-        let _ = std::fs::remove_dir_all(&ws);
-    }
-
-    #[test]
-    fn capability_drop_applied_when_supported() {
-        let ws = test_ws("capdrop");
-        let real = std::fs::canonicalize("/bin/true").unwrap();
-        let out = run_checked(
-            &spec("/bin/true", &ws),
-            &test_policy(&[&real.to_string_lossy()]),
-        )
-        .unwrap();
-        assert!(out.success());
-        // ถ้า userns รองรับ -> capability-drop ต้อง applied
-        if out.applied.iter().any(|a| a == "user-namespace") {
-            assert!(out.applied.iter().any(|a| a == "capability-drop"));
             assert!(!out
                 .degraded
                 .iter()

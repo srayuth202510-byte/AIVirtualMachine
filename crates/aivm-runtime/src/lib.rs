@@ -443,17 +443,24 @@ impl Runtime {
     /// Agent loop เต็มรอบ (Phase 5): observe → reason → intent → execute → observe
     /// โมเดลต้องตอบเป็น JSON object เดียว (ดู `agent` module); ทุก intent
     /// วิ่งผ่าน gateway เท่านั้น คืนบันทึกการเดินทางของทั้งรอบ
+    ///
+    /// ถ้า `workspace` ให้มา จะสร้าง RAG index และผสม context ที่เกี่ยวข้อง
+    /// ลงใน prompt ก่อนเรียก model (Phase 6 CubeRAG, state-aware)
     pub fn run_agent(
         &mut self,
         task: &str,
         max_steps: usize,
+        workspace: Option<&std::path::Path>,
     ) -> Result<agent::AgentRun, RuntimeError> {
+        let rag_index =
+            workspace.map(|ws| agent::build_workspace_index(ws, self.cube.current_state() as u32));
         agent::run_loop(
             &*self.model,
             &mut self.gateway,
             &mut self.cube,
             task,
             max_steps,
+            rag_index.as_ref(),
         )
     }
 

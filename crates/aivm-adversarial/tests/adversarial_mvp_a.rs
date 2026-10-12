@@ -462,7 +462,7 @@ fn agent_loop_denies_non_json_model_output() {
     // provider เริ่มต้นคือ echo ซึ่งตอบข้อความธรรมดา (ไม่ใช่ JSON)
     let cfg = aivm_runtime::VmConfig::from_yaml("name: adv-agent\n").unwrap();
     let mut rt = aivm_runtime::Runtime::init(cfg, dir.clone()).unwrap();
-    let run = rt.run_agent("do whatever", 1).unwrap();
+    let run = rt.run_agent("do whatever", 1, None).unwrap();
     assert_eq!(run.stopped, "max-steps");
     assert_eq!(run.steps.len(), 1);
     assert!(

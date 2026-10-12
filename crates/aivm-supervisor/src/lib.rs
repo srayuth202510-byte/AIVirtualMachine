@@ -119,11 +119,13 @@ impl Supervisor {
     }
 
     /// Agent loop เต็มรอบ (Phase 5) — โมเดลคิดเป็น intent แล้วผ่าน gateway
+    /// ถ้า `workspace` ให้มา จะสร้าง RAG index และผสม context ลง prompt (Phase 6)
     pub fn run_agent(
         &mut self,
         name: &str,
         task: &str,
         max_steps: usize,
+        workspace: Option<&std::path::Path>,
     ) -> Result<aivm_runtime::agent::AgentRun, SupervisorError> {
         let dir = self.resolve(name)?;
         let cfg = VmConfig::from_file(&dir.join("aivm.yaml"))
@@ -134,7 +136,7 @@ impl Supervisor {
             *st = VmStatus::Running;
         }
         let run = rt
-            .run_agent(task, max_steps)
+            .run_agent(task, max_steps, workspace)
             .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
         rt.persist()
             .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
