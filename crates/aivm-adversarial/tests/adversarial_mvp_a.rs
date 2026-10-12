@@ -187,3 +187,90 @@ fn audit_chain_verifies() {
     .unwrap();
     assert_eq!(AuditWriter::verify(&p).unwrap(), 2);
 }
+
+fn dyn_runtime(tag: &str) -> (aivm_runtime::Runtime, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("aivm-adv-dyn-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = aivm_runtime::VmConfig::from_yaml(
+        "name: adv\nfilesystem:\n  read: [./workspace]\n  write: [./workspace/src]\nnetwork:\n  allow: [github.com]\ncapabilities:\n  initial: [read:workspace, search:code]\n",
+    )
+    .unwrap();
+    let rt = aivm_runtime::Runtime::init(cfg, dir.clone()).unwrap();
+    (rt, dir)
+}
+
+fn guards_modify() -> TransitionGuards {
+    TransitionGuards {
+        confidence: 0.95,
+        confidence_threshold: 0.8,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn write_before_grant_must_deny() {
+    let (mut rt, _dir) = dyn_runtime("pre");
+    // INIT holds read/search only: write denies even inside workspace/src.
+    assert!(rt.gateway.write(&mut rt.cube, "src/early.rs", "x").is_err());
+    // ANALYZE still holds no write lease.
+    rt.transition_to(AgentState::Analyze, &TransitionGuards::default())
+        .unwrap();
+    assert!(rt.gateway.write(&mut rt.cube, "src/early.rs", "x").is_err());
+}
+
+#[test]
+fn grant_opens_write_and_revoke_closes_it() {
+    let (mut rt, _dir) = dyn_runtime("cycle");
+    rt.transition_to(AgentState::Analyze, &TransitionGuards::default())
+        .unwrap();
+    let (granted, _) = rt
+        .transition_to(AgentState::Modify, &guards_modify())
+        .unwrap();
+    assert_eq!(granted, 1);
+    assert!(rt.gateway.write(&mut rt.cube, "src/ok.rs", "x").is_ok());
+    // Lease is bound to MODIFY/VALIDATE: outside them it must die.
+    assert_eq!(rt.gateway.caps.revoke_stale("ANALYZE"), 1);
+    assert!(rt.gateway.write(&mut rt.cube, "src/late.rs", "x").is_err());
+}
+
+#[test]
+fn failed_transition_grants_nothing() {
+    let (mut rt, _dir) = dyn_runtime("jump");
+    let before = rt.gateway.caps.caps.len();
+    assert!(rt
+        .transition_to(AgentState::Deploy, &TransitionGuards::default())
+        .is_err());
+    assert_eq!(rt.cube.current_state(), AgentState::Init);
+    assert_eq!(rt.gateway.caps.caps.len(), before);
+    assert!(rt.gateway.caps.caps.iter().all(|c| c.action != "write"));
+}
+
+#[test]
+fn state_gate_holds_despite_capability() {
+    // Even WITH a write capability, policy suspends the allow-list until
+    // a scoped allow-rule's `when` holds (spec §13.2 + §14).
+    let dir = std::env::temp_dir().join(format!("aivm-adv-gate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let ws = dir.canonicalize().unwrap();
+    let policy = Policy::from_yaml(&format!(
+        "name: gated\nfilesystem:\n  read: [{}]\n  write: [{}/src]\n  deny: []\nrules:\n  - id: allow_write_src\n    action: write\n    resource: filesystem\n    scope: {}/src/**\n    when: \"state in {{'MODIFY', 'VALIDATE'}} && confidence >= 0.8\"\n",
+        ws.display(), ws.display(), ws.display()
+    ))
+    .unwrap();
+    let caps = CapabilitySet::new(vec![
+        Capability::new("read", "filesystem", &ws.to_string_lossy()),
+        Capability::new("write", "filesystem", &format!("{}/src", ws.display())),
+    ]);
+    let audit = AuditWriter::open(dir.join("audit.jsonl")).unwrap();
+    let mut gw = ToolGateway::new(dir, policy, caps, audit, "coder", "sess-gate");
+    let mut cube = Cube::new("gate");
+    // INIT: capability present, gate shut.
+    assert!(gw.write(&mut cube, "src/a.rs", "x").is_err());
+    // After the guarded transition the same call is allowed.
+    cube.transition(AgentState::Analyze, &TransitionGuards::default())
+        .unwrap();
+    cube.transition(AgentState::Modify, &guards_modify())
+        .unwrap();
+    assert!(gw.write(&mut cube, "src/a.rs", "x").is_ok());
+}

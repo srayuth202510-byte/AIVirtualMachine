@@ -7,4 +7,5 @@ edition = "2021"
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
+aivm-cube = { path = "../aivm-cube" }
 aivm-runtime = { path = "../aivm-runtime" }

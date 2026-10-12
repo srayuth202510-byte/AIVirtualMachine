@@ -43,6 +43,23 @@ pub struct Condition {
     pub protocol: Option<String>,
     #[serde(default)]
     pub require_state: Option<String>,
+    /// States this capability is valid in (spec §14.3 re-evaluation).
+    /// Empty = valid in all states (base grants like read/search).
+    #[serde(default)]
+    pub valid_states: Vec<String>,
+}
+
+impl Condition {
+    /// Fail-closed freshness: a lease bound to states is stale anywhere else.
+    pub fn is_stale_in(&self, state: &str) -> bool {
+        if !self.valid_states.is_empty() && !self.valid_states.iter().any(|s| s == state) {
+            return true;
+        }
+        if let Some(req) = &self.require_state {
+            return req != state;
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,6 +221,29 @@ impl CapabilitySet {
         self.caps.retain(|c| !pred(c));
         before - self.caps.len()
     }
+
+    /// Drop every state-bound lease that is stale in `state`.
+    /// Base grants (no condition / empty valid_states) always survive.
+    pub fn revoke_stale(&mut self, state: &str) -> usize {
+        self.revoke_where(|c| match &c.condition {
+            Some(cond) => cond.is_stale_in(state),
+            None => false,
+        })
+    }
+
+    /// Idempotent grant: skip when a usable covering cap already exists.
+    /// Returns true when a new lease was added.
+    pub fn grant(&mut self, cap: Capability) -> bool {
+        let usable_exists = self
+            .caps
+            .iter()
+            .any(|c| c.check_usable().is_ok() && c.covers(&cap.action, &cap.resource, &cap.scope));
+        if usable_exists {
+            return false;
+        }
+        self.caps.push(cap);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -241,5 +281,59 @@ mod tests {
         assert!(scope_covers("/workspace", "/workspace/src/a.rs"));
         assert!(!scope_covers("/workspace", "/workspace2/evil"));
         assert!(!scope_covers("/workspace", "/etc/passwd"));
+    }
+
+    fn lease(action: &str, states: &[&str]) -> Capability {
+        let mut c = Capability::new(action, "filesystem", "/workspace/src");
+        c.condition = Some(Condition {
+            protocol: None,
+            require_state: None,
+            valid_states: states.iter().map(|s| s.to_string()).collect(),
+        });
+        c
+    }
+
+    #[test]
+    fn stale_lease_revoked_on_state_exit() {
+        let mut set = CapabilitySet::new(vec![
+            Capability::new("read", "filesystem", "/workspace"),
+            lease("write", &["MODIFY", "VALIDATE"]),
+        ]);
+        assert!(set
+            .authorize("write", "filesystem", "/workspace/src/a.rs")
+            .is_ok());
+        assert_eq!(set.revoke_stale("VALIDATE"), 0);
+        assert!(set
+            .authorize("write", "filesystem", "/workspace/src/a.rs")
+            .is_ok());
+        assert_eq!(set.revoke_stale("ANALYZE"), 1);
+        assert!(set
+            .authorize("write", "filesystem", "/workspace/src/a.rs")
+            .is_err());
+        // Base grant survives every transition.
+        assert!(set
+            .authorize("read", "filesystem", "/workspace/a.rs")
+            .is_ok());
+    }
+
+    #[test]
+    fn grant_is_idempotent() {
+        let mut set = CapabilitySet::default();
+        assert!(set.grant(lease("write", &["MODIFY"])));
+        assert!(!set.grant(lease("write", &["MODIFY"])));
+        assert_eq!(set.caps.len(), 1);
+    }
+
+    #[test]
+    fn expired_lease_is_not_regranted_as_usable() {
+        let mut set = CapabilitySet::default();
+        let mut c = lease("write", &["MODIFY"]);
+        c.expiration = Some(1); // long past
+        set.caps.push(c);
+        // An expired covering cap does not block a fresh grant.
+        assert!(set.grant(lease("write", &["MODIFY"])));
+        assert!(set
+            .authorize("write", "filesystem", "/workspace/src/a.rs")
+            .is_ok());
     }
 }

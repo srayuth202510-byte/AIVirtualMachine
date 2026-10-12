@@ -25,6 +25,13 @@ $BIN inspect coder | grep -q "AI VM: coder" || { echo "FAIL: inspect"; exit 1; }
 echo "== run =="
 $BIN run coder | grep -q "intent from context" || { echo "FAIL: run"; exit 1; }
 
+echo "== transition (dynamic grants) =="
+$BIN transition coder ANALYZE | grep -q "granted 0" || { echo "FAIL: ANALYZE grant"; exit 1; }
+$BIN transition coder MODIFY --confidence 0.95 | grep -q "granted 1" || { echo "FAIL: MODIFY grant"; exit 1; }
+$BIN inspect coder | grep -q "MODIFY" || { echo "FAIL: persisted state"; exit 1; }
+$BIN transition coder DEPLOY 2>/dev/null && { echo "FAIL: jump allowed"; exit 1; } || true
+test -f "$ROOT/coder/state.json" || { echo "FAIL: state.json missing"; exit 1; }
+
 echo "== pause/stop/kill =="
 $BIN pause coder
 $BIN stop coder

@@ -9,7 +9,7 @@
 //! This is the fastest debug loop for the security boundary:
 //! `cargo run -p aivm-cli -- demo`.
 
-use super::{absolutize, RuntimeError};
+use super::{absolutize, Runtime, RuntimeError, VmConfig};
 use aivm_audit::AuditWriter;
 use aivm_capability::{Capability, CapabilitySet};
 use aivm_cube::{AgentState, Cube, TransitionGuards};
@@ -276,7 +276,53 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
         );
     }
 
-    // 11. Audit chain must verify.
+    // 11. Dynamic grant: write denied in INIT, allowed after MODIFY.
+    {
+        let cfg = VmConfig::from_yaml(
+            "name: demo-dyn\nfilesystem:\n  read: [./workspace]\n  write: [./workspace/src]\nnetwork:\n  allow: [github.com]\ncapabilities:\n  initial: [read:workspace, search:code]\n",
+        )
+        .map_err(|e| RuntimeError::Config(e.to_string()))?;
+        let mut rt =
+            Runtime::init(cfg, base.join("dyn")).map_err(|e| RuntimeError::Io(e.to_string()))?;
+        let r: Result<String, String> = (|| {
+            // INIT holds no write lease.
+            if rt
+                .gateway
+                .write(&mut rt.cube, "src/dyn.rs", "fn dyn_() {}\n")
+                .is_ok()
+            {
+                return Err("write allowed in INIT".to_string());
+            }
+            rt.transition_to(AgentState::Analyze, &TransitionGuards::default())
+                .map_err(|e| e.to_string())?;
+            let (granted, _) = rt
+                .transition_to(
+                    AgentState::Modify,
+                    &TransitionGuards {
+                        confidence: 0.95,
+                        confidence_threshold: super::CONFIDENCE_THRESHOLD,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            if granted != 1 {
+                return Err(format!("expected 1 grant, got {granted}"));
+            }
+            rt.gateway
+                .write(&mut rt.cube, "src/dyn.rs", "fn dyn_() {}\n")
+                .map(|r| r.output)
+                .map_err(|e| e.to_string())?;
+            // Leaving the granting states revokes the lease: use-after-revoke denies.
+            rt.gateway.caps.revoke_stale("ANALYZE");
+            match rt.gateway.write(&mut rt.cube, "src/dyn2.rs", "x") {
+                Ok(_) => Err("write allowed after revoke".to_string()),
+                Err(_) => Ok("revoked".to_string()),
+            }
+        })();
+        case(&mut cases, "dynamic grant + revoke (§14)", Expect::Allow, r);
+    }
+
+    // 12. Audit chain must verify.
     let audit_entries =
         AuditWriter::verify(&audit_path).map_err(|e| RuntimeError::Io(e.to_string()))?;
     let audit_verified = audit_entries > 0;

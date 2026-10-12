@@ -52,6 +52,22 @@ enum Cmd {
     Kill {
         name: String,
     },
+    /// Validated state transition with dynamic grant/revoke (spec §14).
+    /// Guards are operator-supplied evidence, never agent claims.
+    Transition {
+        name: String,
+        /// INIT|ANALYZE|MODIFY|VALIDATE|DEPLOY
+        state: String,
+        /// Confidence for ANALYZE -> MODIFY (default 0).
+        #[arg(long, default_value_t = 0.0)]
+        confidence: f64,
+        /// Tests passed (for MODIFY -> VALIDATE).
+        #[arg(long, default_value_t = false)]
+        tests_passed: bool,
+        /// Policy approved (for VALIDATE -> DEPLOY).
+        #[arg(long, default_value_t = false)]
+        policy_approved: bool,
+    },
     /// Self-test the enforcement chain in a throwaway workspace.
     /// No --root needed; prints an ALLOW/DENY table and exits
     /// non-zero if any case misbehaves.
@@ -110,6 +126,24 @@ fn main() -> Result<(), AnyErr> {
         Cmd::Kill { name } => {
             sup.kill(&name).map_err(err)?;
             println!("killed '{name}'");
+        }
+        Cmd::Transition {
+            name,
+            state,
+            confidence,
+            tests_passed,
+            policy_approved,
+        } => {
+            use std::str::FromStr;
+            let next = aivm_cube::AgentState::from_str(&state).map_err(err)?;
+            let guards = aivm_cube::TransitionGuards {
+                confidence,
+                confidence_threshold: aivm_runtime::CONFIDENCE_THRESHOLD,
+                tests_passed,
+                policy_approved,
+            };
+            let (granted, revoked) = sup.transition(&name, next, &guards).map_err(err)?;
+            println!("{name}: -> {next} (granted {granted}, revoked {revoked})");
         }
         Cmd::Demo => {
             let rep = aivm_runtime::demo::mediated_demo().map_err(err)?;

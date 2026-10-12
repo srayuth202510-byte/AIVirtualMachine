@@ -4,6 +4,7 @@
 //! create/start/stop/pause/kill/inspect. The agent can never mutate it
 //! (invariant I-5).
 
+use aivm_cube::{AgentState, TransitionGuards};
 use aivm_runtime::{Runtime, VmConfig};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -105,8 +106,34 @@ impl Supervisor {
         if let Some((st, _)) = self.vms.get_mut(name) {
             *st = VmStatus::Running;
         }
-        rt.step("init")
-            .map_err(|e| SupervisorError::Runtime(e.to_string()))
+        let out = rt
+            .step("init")
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        rt.persist()
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        Ok(out)
+    }
+
+    /// Validated state advance with dynamic grant/revoke (§14).
+    /// Guards come from the operator (confidence, test + policy results),
+    /// never from the agent. Returns `(granted, revoked)`.
+    pub fn transition(
+        &mut self,
+        name: &str,
+        next: AgentState,
+        guards: &TransitionGuards,
+    ) -> Result<(usize, usize), SupervisorError> {
+        let dir = self.resolve(name)?;
+        let cfg = VmConfig::from_file(&dir.join("aivm.yaml"))
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        let mut rt =
+            Runtime::init(cfg, dir.clone()).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        let out = rt
+            .transition_to(next, guards)
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        rt.persist()
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        Ok(out)
     }
 
     pub fn pause(&mut self, name: &str) -> Result<(), SupervisorError> {

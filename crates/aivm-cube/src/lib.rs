@@ -16,6 +16,8 @@ pub enum CubeError {
     GuardFailed(String),
     #[error("cell budget exceeded (max_cells={0})")]
     BudgetExceeded(usize),
+    #[error("unknown state '{0}' (want INIT|ANALYZE|MODIFY|VALIDATE|DEPLOY)")]
+    UnknownState(String),
 }
 
 /// Agent lifecycle states (spec §15).
@@ -56,6 +58,21 @@ impl AgentState {
 impl std::fmt::Display for AgentState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AgentState {
+    type Err = CubeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "INIT" => Ok(AgentState::Init),
+            "ANALYZE" => Ok(AgentState::Analyze),
+            "MODIFY" => Ok(AgentState::Modify),
+            "VALIDATE" => Ok(AgentState::Validate),
+            "DEPLOY" => Ok(AgentState::Deploy),
+            other => Err(CubeError::UnknownState(other.to_string())),
+        }
     }
 }
 
@@ -118,7 +135,7 @@ pub struct TransitionGuards {
 }
 
 /// Minimal per-task Cube (spec §9.3.2: per-task instance, working set only).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cube {
     pub task_id: String,
     pub state: AgentState,

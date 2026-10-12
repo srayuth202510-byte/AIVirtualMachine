@@ -147,7 +147,9 @@ impl Policy {
                 return (Decision::Deny, Some(format!("rule:{}", rule.id)));
             }
         }
-        // 3. allow list
+        // 3. allow list — but a scoped allow-rule with `when` acts as a
+        // state gate: when one exists for this request it must match,
+        // otherwise the base allow is suspended (spec §13.2, §14).
         let allows = match action {
             "read" => &self.filesystem.read,
             "write" => &self.filesystem.write,
@@ -155,9 +157,10 @@ impl Policy {
         };
         for pat in allows {
             if match_pattern(pat, canonical_path) {
-                // 4. allow-rules with `when` must also match if a scoped
-                // allow-rule exists for this path; otherwise base allow stands.
-                return (Decision::Allow, Some(format!("allow-list:{pat}")));
+                if self.gated(action, "filesystem", canonical_path, ctx) {
+                    return (Decision::Allow, Some(format!("allow-list:{pat}")));
+                }
+                return (Decision::Deny, Some("state-gate".into()));
             }
         }
         // 5. conditional allow rules
@@ -199,15 +202,50 @@ impl Policy {
                 return (Decision::Deny, Some(format!("deny-list:{pat}")));
             }
         }
+        // Conditional deny rules (e.g. deny_network_during_analyze).
+        for rule in &self.rules {
+            if rule.effect.as_deref() == Some("deny")
+                && rule.action == "network"
+                && rule.resource == "network"
+                && match_pattern(&rule.scope, host)
+                && rule_matches(rule, ctx)
+            {
+                return (Decision::Deny, Some(format!("rule:{}", rule.id)));
+            }
+        }
         if self.require_test_before_network && !ctx.tests_passed {
             return (Decision::Deny, Some("require-test-before-network".into()));
         }
         for pat in &self.network.allow {
             if match_pattern(pat, host) {
-                return (Decision::Allow, Some(format!("allow-list:{pat}")));
+                if self.gated("network", "network", host, ctx) {
+                    return (Decision::Allow, Some(format!("allow-list:{pat}")));
+                }
+                return (Decision::Deny, Some("state-gate".into()));
             }
         }
         (Decision::Deny, Some("default-deny".into()))
+    }
+
+    /// True when no scoped allow-rule gates this request, or at least one
+    /// matching allow-rule's `when` holds. Fail-closed: unknown predicates
+    /// never match (see `eval_clause`).
+    fn gated(&self, action: &str, resource: &str, scope: &str, ctx: &EvalContext) -> bool {
+        let mut scoped = false;
+        for rule in &self.rules {
+            let effect = rule.effect.as_deref().unwrap_or("allow");
+            if effect == "allow"
+                && rule.action == action
+                && rule.resource == resource
+                && match_pattern(&rule.scope, scope)
+            {
+                scoped = true;
+                if rule_matches(rule, ctx) {
+                    return true;
+                }
+            }
+        }
+        !scoped
     }
 
     /// Full check: capability set + policy. Both must allow (I-2, I-3).
@@ -404,5 +442,92 @@ system:
     #[test]
     fn invalid_yaml_fail_closed() {
         assert!(Policy::from_yaml(":\t: bad: [").is_err());
+    }
+
+    fn gated_policy() -> Policy {
+        Policy::from_yaml(
+            r#"
+name: gated
+filesystem:
+  read: [/workspace]
+  write: [/workspace/src]
+  deny: []
+network:
+  allow: [github.com]
+  deny: []
+rules:
+  - id: allow_write_src
+    action: write
+    resource: filesystem
+    scope: /workspace/src/**
+    when: "state in {'MODIFY', 'VALIDATE'} && confidence >= 0.8"
+  - id: deny_network_during_analyze
+    action: network
+    resource: network
+    scope: "*"
+    when: "state == 'ANALYZE'"
+    effect: deny
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn write_suspended_until_modify_state() {
+        let p = gated_policy();
+        // Allow-listed path, but no allow-rule matches in ANALYZE.
+        let analyze = EvalContext {
+            state: "ANALYZE".into(),
+            confidence: 0.9,
+            ..Default::default()
+        };
+        let (d, rule) = p.evaluate_fs("write", "/workspace/src/a.rs", &analyze);
+        assert_eq!(d, Decision::Deny);
+        assert_eq!(rule.as_deref(), Some("state-gate"));
+        // Guarded transition satisfied: gate opens.
+        let modify = EvalContext {
+            state: "MODIFY".into(),
+            confidence: 0.9,
+            ..Default::default()
+        };
+        let (d, _) = p.evaluate_fs("write", "/workspace/src/a.rs", &modify);
+        assert_eq!(d, Decision::Allow);
+        // Low confidence keeps the gate shut even in MODIFY.
+        let unsure = EvalContext {
+            state: "MODIFY".into(),
+            confidence: 0.1,
+            ..Default::default()
+        };
+        assert_eq!(
+            p.evaluate_fs("write", "/workspace/src/a.rs", &unsure).0,
+            Decision::Deny
+        );
+        // Reads are ungated (no allow-rule scopes them).
+        assert_eq!(
+            p.evaluate_fs("read", "/workspace/a.rs", &analyze).0,
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn network_deny_rule_fires_during_analyze() {
+        let p = gated_policy();
+        let analyze = EvalContext {
+            state: "ANALYZE".into(),
+            tests_passed: true,
+            ..Default::default()
+        };
+        let (d, rule) = p.evaluate_network("github.com", &analyze);
+        assert_eq!(d, Decision::Deny);
+        assert_eq!(rule.as_deref(), Some("rule:deny_network_during_analyze"));
+        let validate = EvalContext {
+            state: "VALIDATE".into(),
+            tests_passed: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            p.evaluate_network("github.com", &validate).0,
+            Decision::Allow
+        );
     }
 }
