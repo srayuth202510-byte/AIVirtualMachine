@@ -6,6 +6,17 @@ runtime:
 model:
   provider: echo
   name: echo
+  # ตัวอย่างแบ็กเอนด์ local (GGUF) — ต้อง build ด้วย `--features llama`:
+  #   provider: local
+  #   name: my-gguf
+  #   local:
+  #     model_path: /models/model.gguf
+  #     ctx_size: 8192
+  #     gpu_layers: 0      # -1 = ยกทุกชั้นไป GPU
+  #     temperature: 0.7
+  #     top_p: 0.95
+  #     top_k: 40
+  #     max_tokens: 2048
 
 resources:
   cpu: 2

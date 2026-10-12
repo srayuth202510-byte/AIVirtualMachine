@@ -8,7 +8,7 @@ use aivm_audit::{AuditRecord, AuditWriter};
 use aivm_capability::{Capability, CapabilitySet, Condition};
 use aivm_cube::{AgentState, Cube, TransitionGuards};
 use aivm_memory::Memory;
-use aivm_model::{EchoModel, Model, ModelConfig};
+use aivm_model::{create_model, LocalModelConfig, Model, ModelConfig};
 use aivm_policy::Policy;
 use aivm_sandbox::{ResourceLimits, Sandbox, SandboxLevel};
 use aivm_tools::{ToolGateway, ToolRequest};
@@ -67,12 +67,27 @@ fn default_isolation() -> String {
     "sandbox".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelBlock {
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default = "default_model")]
     pub name: String,
+    /// การตั้งค่าแบ็กเอนด์ local (ใช้เมื่อ provider = "local")
+    #[serde(default)]
+    pub local: Option<LocalModelConfig>,
+}
+
+// default ต้องตรงกับ serde default (echo) ไม่ใช่ค่าว่าง เพื่อให้ผู้ที่สร้าง
+// ModelBlock::default() ตรง ๆ ยังได้ provider ที่ใช้ได้ (fail-closed ถ้าไม่รู้จัก)
+impl Default for ModelBlock {
+    fn default() -> Self {
+        Self {
+            provider: default_provider(),
+            name: default_model(),
+            local: None,
+        }
+    }
 }
 fn default_provider() -> String {
     "echo".into()
@@ -287,10 +302,11 @@ impl Runtime {
         let model_cfg = ModelConfig {
             provider: config.model.provider.clone(),
             name: config.model.name.clone(),
+            local: config.model.local.clone(),
         };
-        let model: Box<dyn Model> = Box::new(EchoModel {
-            name: model_cfg.name.clone(),
-        });
+        // สร้างโมเดลผ่าน factory — provider ที่ไม่รู้จัก/ไม่มีฟีเจอร์จะ fail-closed
+        let model: Box<dyn Model> =
+            create_model(&model_cfg).map_err(|e| RuntimeError::Config(e.to_string()))?;
 
         Ok(Self {
             cube,
