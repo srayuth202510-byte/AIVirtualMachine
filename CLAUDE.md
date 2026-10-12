@@ -180,6 +180,19 @@ Never re-read whole files the graph already located.
    concept): `make graph-update` (incremental, cached, headless, code-only;
    doc/spec changes need in-session `/graphify --update`).
 
+## Review gate (agent พลาดได้ — ให้ระบบจับ)
+
+ก่อน commit อ่าน `git diff` เองอีกรอบด้วย checklist นี้:
+
+- fail-closed ยังอยู่ครบ? (ทางออกใหม่ทุกทางต้อง DENY โดยปริยาย)
+- surface ใหม่ (tool/exec/policy branch) มี adversarial case คุม?
+- I-7: decision ใหม่ทุกอันมี audit record?
+- โค้ดใหม่มี comment ภาษาไทย?
+- ไฟล์ความเสี่ยงสูง (`sandbox` ส่วน unsafe/pre_exec, `policy::evaluate_*`,
+  `capability::authorize`, `audit::seal/verify`) ควรผ่านตาอีกรอบ —
+  ถ้าเปลี่ยน logic ตรงนี้ แนะนำให้แปะ diff ให้โมเดลอื่นรีวิวด้วย
+  (คนละโมเดล = คนละ blind spot — defense in depth กับคนทำด้วย)
+
 ## Crate map (dependency order)
 
 `capability` → `policy` → `cube`, `audit` → `tools` → `memory/network/sandbox/model`
