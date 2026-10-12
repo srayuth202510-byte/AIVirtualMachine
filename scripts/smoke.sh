@@ -25,7 +25,7 @@ $BIN inspect coder | grep -q "AI VM: coder" || { echo "FAIL: inspect"; exit 1; }
 echo "== run =="
 $BIN run coder | grep -q "intent from context" || { echo "FAIL: run"; exit 1; }
 
-echo "== agent loop (Phase 5): echo model emits non-JSON -> fail-closed =="
+echo "== agent loop (Phase 5): non-conforming output is denied, nothing runs =="
 $BIN agent coder "read the seed file" | grep -q "invalid intent" || { echo "FAIL: agent loop"; exit 1; }
 
 echo "== transition (dynamic grants) =="

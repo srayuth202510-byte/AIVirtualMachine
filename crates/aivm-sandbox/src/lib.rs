@@ -131,48 +131,19 @@ const SANDBOX_FS_MB: u64 = 512;
 /// PATH เดียวที่ child เห็น (runtime กำหนด agent เปลี่ยนไม่ได้)
 const SANDBOX_PATH: &str = "/usr/bin:/bin";
 
-/// Seccomp filter: allowlist syscalls สำหรับ tool ทั่วไป
-/// รองรับ: read, write, open, close, exit, futex, mmap, mprotect, brk, rt_sigaction, rt_sigprocmask, getpid, getuid, getgid, clock_gettime, nanosleep, sched_yield, arch_prctl, set_tid_address, set_robust_list, prlimit64, statx, ioctl, dup, dup2, pipe2, socket, connect, sendto, recvfrom, accept, bind, listen, getsockname, getpeername, setsockopt, getsockopt, epoll_create1, epoll_ctl, epoll_wait, eventfd2, timerfd_create, timerfd_settime, timerfd_gettime, signalfd4, memfd_create, pidfd_open, pidfd_send_signal, wait4, waitid, clone3, fork, vfork, execve, exit_group
-#[allow(dead_code)]
-fn seccomp_filter() -> Vec<libc::sock_filter> {
-    // BPF program allowing common syscalls, killing others
-    // Architecture: x86_64 (AUDIT_ARCH_X86_64 = 0xc000003e)
-    // We'll use a simple allowlist approach
-    vec![
-        // Load architecture
-        libc::sock_filter {
-            code: 0x20,
-            jt: 0,
-            jf: 0,
-            k: 0x00000004,
-        }, // BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, arch)
-        // Jump if not x86_64
-        libc::sock_filter {
-            code: 0x15,
-            jt: 0,
-            jf: 1,
-            k: 0xc000003e,
-        }, // BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64
-        libc::sock_filter {
-            code: 0x06,
-            jt: 0,
-            jf: 0,
-            k: 0x00000000,
-        }, // BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS (different arch)
-        // Load syscall number
-        libc::sock_filter {
-            code: 0x20,
-            jt: 0,
-            jf: 0,
-            k: 0x00000000,
-        }, // BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)
-           // Allowlist: check each allowed syscall
-           // For simplicity, we'll use a basic approach - allow specific syscalls
-           // In production, this would be a more complex BPF program
-    ]
-}
-
-/// Build seccomp filter for a given tool (allowlist based on tool type)
+/// สร้าง seccomp BPF allowlist สำหรับ tool หนึ่งชนิด
+///
+/// ยังไม่ถูกเรียกใช้ — รอ wiring ตอนเปิด namespace isolation จริง
+/// (ปัจจุบัน `run_checked` รายงาน seccomp ใน `degraded` อย่างตรงไปตรงมา)
+///
+/// โครงโปรแกรม:
+///   ld [4] (arch); jeq x86_64 else KILL; ld [0] (nr)
+///   สำหรับ syscall ที่อนุญาตแต่ละตัว: jeq nr -> ALLOW (ไม่ตรง -> เทียบตัวถัดไป)
+///   ตัวสุดท้าย: ไม่ตรง -> ข้ามไป KILL
+///   ret ALLOW; ret KILL
+///
+/// หมายเหตุ: `jt`/`jf` เป็น offset จาก *คำสั่งถัดไป* (i+1) ตาม ABI ของ BPF
+/// ต้องใส่ `jf` ให้ตัวสุดท้ายเท่านั้น ไม่งั้นทุกตัวที่ "ไม่ตรง" จะไหลไป ALLOW
 #[allow(dead_code)]
 fn build_seccomp_filter(tool_type: &str) -> Vec<libc::sock_filter> {
     // Base syscalls needed by all tools
@@ -280,59 +251,54 @@ fn build_seccomp_filter(tool_type: &str) -> Vec<libc::sock_filter> {
         ]);
     }
 
-    // Build BPF program
+    // กัน syscall ซ้ำ เพื่อให้ program สั้นและ jump offset ตรง
+    let mut seen = std::collections::HashSet::new();
+    allowed.retain(|nr| seen.insert(*nr));
+    let n = allowed.len();
+
+    let ret = |k: u32| libc::sock_filter {
+        code: 0x06, // BPF_RET | BPF_K
+        jt: 0,
+        jf: 0,
+        k,
+    };
+
+    // ld [4] (arch); jeq x86_64 (ข้าม KILL) else KILL; ld [0] (nr)
     let mut filter = vec![
-        // Load architecture
         libc::sock_filter {
             code: 0x20,
             jt: 0,
             jf: 0,
             k: 4,
-        }, // ldxb 4 (arch)
+        },
         libc::sock_filter {
             code: 0x15,
-            jt: 0,
-            jf: 1,
-            k: 0xc000003e,
-        }, // jeq x86_64
-        libc::sock_filter {
-            code: 0x06,
-            jt: 0,
+            jt: 1,
             jf: 0,
-            k: 0x00000000,
-        }, // ret kill (wrong arch)
+            k: 0xc000003e,
+        },
+        ret(0x00000000), // KILL (คนละสถาปัตยกรรม)
         libc::sock_filter {
             code: 0x20,
             jt: 0,
             jf: 0,
             k: 0,
-        }, // ldxb 0 (syscall nr)
+        },
     ];
 
-    // For each allowed syscall, add a jump to allow
-    for (i, &nr) in allowed.iter().enumerate() {
+    // เทียบทีละ syscall: "ตรง" -> กระโดดไป ret ALLOW ท้ายสุด
+    // "ไม่ตรง" -> เทียบตัวถัดไป (jf=0) ยกเว้นตัวสุดท้ายที่ข้ามไป KILL (jf=1)
+    for (k, &nr) in allowed.iter().enumerate() {
         filter.push(libc::sock_filter {
-            code: 0x15, // jeq
-            jt: 0,
-            jf: if i == allowed.len() - 1 { 1 } else { 0 },
+            code: 0x15, // BPF_JMP | BPF_JEQ | BPF_K
+            jt: (n - k - 1) as u8,
+            jf: if k == n - 1 { 1 } else { 0 },
             k: nr as u32,
         });
-        filter.push(libc::sock_filter {
-            code: 0x06,
-            jt: 0,
-            jf: 0,
-            k: 0x7fff0000,
-        }); // ret allow
     }
 
-    // Final kill
-    filter.push(libc::sock_filter {
-        code: 0x06,
-        jt: 0,
-        jf: 0,
-        k: 0x00000000,
-    }); // ret kill
-
+    filter.push(ret(0x7fff0000)); // ALLOW
+    filter.push(ret(0x00000000)); // KILL (default)
     filter
 }
 
@@ -587,7 +553,11 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
     if let Some(h) = child.stderr.take() {
         let _ = h.take(MAX_OUTPUT + 1).read_to_string(&mut err_s);
     }
-    let mut degraded = vec![];
+    let mut degraded = vec![
+        // ยังไม่ได้ติดตั้งจริงในเครื่องนี้ — รายงานดัง ๆ ห้ามเงียบ (สเปก §12.1.1)
+        "pid-namespace: not enabled (needs unprivileged userns setup)".into(),
+        "seccomp-filter: not installed".into(),
+    ];
     if out.len() as u64 > MAX_OUTPUT || err_s.len() as u64 > MAX_OUTPUT {
         out.truncate(MAX_OUTPUT as usize);
         err_s.truncate(MAX_OUTPUT as usize);
@@ -610,8 +580,6 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
             "cwd-pin".into(),
             "stdin-null".into(),
             "no-new-privs".into(),
-            "pid-namespace".into(),
-            "seccomp-filter".into(),
             "pdeathsig-sigkill".into(),
             format!("rlimit-as={mem_bytes}"),
             format!("rlimit-cpu={SANDBOX_CPU_SECS}s"),
@@ -764,7 +732,12 @@ mod tests {
         .unwrap();
         assert!(out.success());
         assert!(out.applied.contains(&"no-new-privs".to_string()));
-        assert!(out.degraded.is_empty());
+        // ต้องไม่อ้างว่าติดตั้งสิ่งที่ยังไม่ติดตั้ง (honesty / I-10)
+        assert!(!out.applied.contains(&"pid-namespace".to_string()));
+        assert!(!out.applied.contains(&"seccomp-filter".to_string()));
+        // แต่ต้องรายงานดัง ๆ ใน degraded
+        assert!(out.degraded.iter().any(|d| d.starts_with("pid-namespace")));
+        assert!(out.degraded.iter().any(|d| d.starts_with("seccomp-filter")));
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -835,5 +808,68 @@ mod tests {
         // รายงานอย่างเดียว ไม่ assert ค่า (แล้วแต่เครื่อง) แต่ต้องมีฟิลด์ครบ
         let text = serde_json::to_string(&pr).unwrap();
         assert!(text.contains("userns"));
+    }
+
+    /// ตีความ subset ของ BPF ที่ builder ใช้: ld [k], jeq(jt/jf), ret
+    /// คืนค่า k ของ ret สุดท้าย — ใช้พิสูจน์ว่า allow/deny ถูกต้องจริง
+    fn bpf_verdict(filter: &[libc::sock_filter], arch: u32, nr: u32) -> u32 {
+        let mut a: u32 = 0;
+        let mut pc = 0usize;
+        for _ in 0..4096 {
+            let ins = &filter[pc];
+            match ins.code {
+                0x20 => {
+                    a = if ins.k == 4 { arch } else { nr };
+                    pc += 1;
+                }
+                0x15 => {
+                    pc += 1 + if a == ins.k {
+                        ins.jt as usize
+                    } else {
+                        ins.jf as usize
+                    };
+                }
+                0x06 => return ins.k,
+                other => panic!("unexpected BPF insn 0x{other:x}"),
+            }
+            assert!(pc < filter.len(), "jump out of range");
+        }
+        panic!("no verdict (loop?)");
+    }
+
+    #[test]
+    fn seccomp_filter_allows_listed_and_kills_rest() {
+        let f = build_seccomp_filter("generic");
+        assert_eq!(
+            bpf_verdict(&f, 0xc000003e, libc::SYS_read as u32),
+            0x7fff0000
+        );
+        assert_eq!(
+            bpf_verdict(&f, 0xc000003e, libc::SYS_write as u32),
+            0x7fff0000
+        );
+        // นอก allowlist -> KILL (กันบั๊ก jf=0 ที่เคยทำให้ allow ทั้งหมด)
+        assert_eq!(
+            bpf_verdict(&f, 0xc000003e, libc::SYS_reboot as u32),
+            0x00000000
+        );
+        // สถาปัตยกรรมผิด -> KILL ทันที
+        assert_eq!(
+            bpf_verdict(&f, 0x40000003, libc::SYS_read as u32),
+            0x00000000
+        );
+    }
+
+    #[test]
+    fn seccomp_filter_network_profile_adds_socket_syscalls() {
+        let f = build_seccomp_filter("network");
+        assert_eq!(
+            bpf_verdict(&f, 0xc000003e, libc::SYS_socket as u32),
+            0x7fff0000
+        );
+        assert_eq!(
+            bpf_verdict(&f, 0xc000003e, libc::SYS_reboot as u32),
+            0x00000000
+        );
     }
 }
