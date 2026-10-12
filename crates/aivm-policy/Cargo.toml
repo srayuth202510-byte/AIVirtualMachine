@@ -1,0 +1,11 @@
+[package]
+name = "aivm-policy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+aivm-capability = { path = "../aivm-capability" }
+glob = { workspace = true }

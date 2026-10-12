@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/aivm-capability",
+    "crates/aivm-policy",
+    "crates/aivm-cube",
+    "crates/aivm-audit",
+    "crates/aivm-tools",
+    "crates/aivm-memory",
+    "crates/aivm-network",
+    "crates/aivm-sandbox",
+    "crates/aivm-model",
+    "crates/aivm-runtime",
+    "crates/aivm-supervisor",
+    "crates/aivm-cli",
+    "crates/aivm-adversarial",
+]
+resolver = "2"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+chrono = "0.4"
+glob = "0.3"
+walkdir = "2"

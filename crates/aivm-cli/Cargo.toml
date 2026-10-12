@@ -1,0 +1,15 @@
+[package]
+name = "aivm-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "aivm"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+aivm-runtime = { path = "../aivm-runtime" }
+aivm-supervisor = { path = "../aivm-supervisor" }

@@ -1,0 +1,10 @@
+[package]
+name = "aivm-supervisor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+aivm-runtime = { path = "../aivm-runtime" }

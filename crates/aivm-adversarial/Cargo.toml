@@ -1,0 +1,12 @@
+[package]
+name = "aivm-adversarial"
+version = "0.1.0"
+edition = "2021"
+
+[dev-dependencies]
+aivm-capability = { path = "../aivm-capability" }
+aivm-policy = { path = "../aivm-policy" }
+aivm-cube = { path = "../aivm-cube" }
+aivm-audit = { path = "../aivm-audit" }
+aivm-tools = { path = "../aivm-tools" }
+aivm-runtime = { path = "../aivm-runtime" }

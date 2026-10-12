@@ -1,0 +1,13 @@
+[package]
+name = "aivm-tools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+walkdir = { workspace = true }
+aivm-capability = { path = "../aivm-capability" }
+aivm-policy = { path = "../aivm-policy" }
+aivm-audit = { path = "../aivm-audit" }
+aivm-cube = { path = "../aivm-cube" }

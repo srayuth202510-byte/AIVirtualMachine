@@ -1,0 +1,59 @@
+name: coding-default
+deny_overrides: true
+
+filesystem:
+  read:
+    - /workspace
+  write:
+    - /workspace/src
+  deny:
+    - /workspace/.git/config
+    - "**/.env*"
+    - "**/secrets/**"
+
+process:
+  allow:
+    - /usr/bin/cargo
+    - /usr/bin/rustc
+    - /usr/bin/git
+  deny:
+    - /bin/sh
+    - /bin/bash
+    - /usr/bin/python3
+
+network:
+  allow:
+    - github.com
+    - crates.io
+  deny:
+    - "10.0.0.0/8"
+    - "192.168.0.0/16"
+    - "172.16.0.0/12"
+    - "127.0.0.1"
+    - "::1"
+    - "169.254.0.0/16"
+    - "169.254.169.254"
+
+system:
+  allow: []
+
+rules:
+  - id: allow_write_src
+    action: write
+    resource: filesystem
+    scope: /workspace/src/**
+    when: "state in {'MODIFY', 'VALIDATE'} && confidence >= 0.8"
+
+  - id: require_test_before_network
+    action: network
+    resource: network
+    scope: "*"
+    when: "state == 'VALIDATE' && tests_passed == true"
+    effect: allow
+
+  - id: deny_network_during_analyze
+    action: network
+    resource: network
+    scope: "*"
+    when: "state == 'ANALYZE'"
+    effect: deny

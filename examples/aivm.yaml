@@ -1,0 +1,38 @@
+name: coder
+
+runtime:
+  isolation: sandbox
+
+model:
+  provider: echo
+  name: echo
+
+resources:
+  cpu: 2
+  memory: 1GB
+  storage: 5GB
+
+filesystem:
+  read:
+    - ./workspace
+  write:
+    - ./workspace/src
+
+network:
+  allow:
+    - github.com
+    - crates.io
+
+tools:
+  allow:
+    - filesystem.read
+    - filesystem.write
+    - code.search
+
+capabilities:
+  initial:
+    - read:workspace
+    - search:code
+
+policy:
+  require_test_before_network: true

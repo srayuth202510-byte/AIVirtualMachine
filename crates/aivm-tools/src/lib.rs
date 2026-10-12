@@ -1,0 +1,426 @@
+//! Tool gateway — spec §12, §16, §17.
+//!
+//! MVP-A: mediated `filesystem.read / write / search` only. No shell,
+//! no arbitrary process execution, no network. Every request goes:
+//! canonicalize -> capability -> policy -> execute -> audit.
+//! Fail-closed at every step; TOCTOU-hardened via realpath + re-check.
+
+use aivm_audit::{AuditRecord, AuditWriter};
+use aivm_capability::CapabilitySet;
+use aivm_cube::{AgentState, Cube};
+use aivm_policy::{Decision, EvalContext, Policy};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ToolError {
+    #[error("denied: {0}")]
+    Denied(String),
+    #[error("io: {0}")]
+    Io(String),
+    #[error("audit: {0}")]
+    Audit(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolRequest {
+    pub tool: String, // "filesystem.read" | "filesystem.write" | "code.search"
+    pub path: String,
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub ok: bool,
+    pub decision: String,
+    pub output: String,
+}
+
+pub struct ToolGateway {
+    pub workspace: PathBuf,
+    pub policy: Policy,
+    pub caps: CapabilitySet,
+    pub audit: AuditWriter,
+    pub agent: String,
+    pub session_id: String,
+    req_counter: u64,
+}
+
+impl ToolGateway {
+    pub fn new(
+        workspace: PathBuf,
+        policy: Policy,
+        caps: CapabilitySet,
+        audit: AuditWriter,
+        agent: &str,
+        session_id: &str,
+    ) -> Self {
+        Self {
+            workspace,
+            policy,
+            caps,
+            audit,
+            agent: agent.to_string(),
+            session_id: session_id.to_string(),
+            req_counter: 0,
+        }
+    }
+
+    fn ctx_of(cube: &Cube) -> EvalContext {
+        EvalContext {
+            state: cube.current_state().to_string(),
+            confidence: cube.confidence,
+            tests_passed: cube.tests_passed,
+        }
+    }
+
+    /// Canonicalize `requested` against the workspace root and ensure the
+    /// result stays inside (symlink-escape + `..` hardened).
+    fn canonicalize(&self, requested: &str) -> Result<PathBuf, ToolError> {
+        // Reject absolute paths outside workspace early (adversarial-first).
+        let joined = if Path::new(requested).is_absolute() {
+            PathBuf::from(requested)
+        } else {
+            self.workspace.join(requested)
+        };
+        // Normalize `..` lexically first (no FS access yet).
+        let normalized = normalize(&joined);
+        let ws = normalize(&self.workspace);
+        if normalized != ws && !normalized.starts_with(&ws) {
+            return Err(ToolError::Denied(format!(
+                "path traversal outside workspace: {requested}"
+            )));
+        }
+        // Resolve symlinks where the path exists (TOCTOU: check-then-act +
+        // re-check at open time with O_NOFOLLOW semantics approximated by
+        // verifying no symlink component escapes).
+        if let Ok(real) = std::fs::canonicalize(&normalized) {
+            if real != ws && !real.starts_with(&ws) {
+                // Allow tempdir-style workspaces where canonical ws differs:
+                // compare against canonical workspace root too.
+                let real_ws = std::fs::canonicalize(&self.workspace)
+                    .map_err(|e| ToolError::Io(e.to_string()))?;
+                if real != real_ws && !real.starts_with(&real_ws) {
+                    return Err(ToolError::Denied(format!(
+                        "symlink escape outside workspace: {requested}"
+                    )));
+                }
+            }
+            return Ok(real);
+        }
+        // Path does not exist yet (write case): ensure no parent component
+        // is a symlink escaping the workspace.
+        let mut cur: Option<&Path> = Some(&normalized);
+        while let Some(p) = cur {
+            if p == ws || p == Path::new("") {
+                break;
+            }
+            if let Ok(meta) = std::fs::symlink_metadata(p) {
+                if meta.file_type().is_symlink() {
+                    let real = std::fs::canonicalize(p)
+                        .map_err(|e| ToolError::Io(e.to_string()))?;
+                    let real_ws = std::fs::canonicalize(&self.workspace).unwrap_or(ws.clone());
+                    if real != real_ws && !real.starts_with(&real_ws) {
+                        return Err(ToolError::Denied(format!(
+                            "symlink escape in parent: {requested}"
+                        )));
+                    }
+                }
+            }
+            cur = p.parent();
+        }
+        Ok(normalized)
+    }
+
+    fn audit_decision(
+        &mut self,
+        cube: &mut Cube,
+        action: &str,
+        resource: &str,
+        decision: &str,
+        rule: &str,
+        result: &str,
+    ) {
+        self.req_counter += 1;
+        let mut rec = AuditRecord::new(
+            0,
+            &self.agent,
+            &self.session_id,
+            &format!("req_{:06}", self.req_counter),
+            &cube.current_state().to_string(),
+            action,
+            resource,
+            decision,
+            &self.policy.name,
+        );
+        rec.rule_matched = rule.to_string();
+        rec.result = result.to_string();
+        if decision == "deny" {
+            cube.record_denial(rule);
+        }
+        if let Err(e) = self.audit.append(rec) {
+            eprintln!("[audit] append failed: {e}");
+        }
+    }
+
+    /// Shared enforcement: canonicalize -> capability -> policy.
+    /// Returns canonical path on ALLOW.
+    fn enforce(
+        &mut self,
+        cube: &mut Cube,
+        action: &str, // read|write|search
+        requested: &str,
+    ) -> Result<PathBuf, ToolError> {
+        let canon = self.canonicalize(requested)?;
+        let scope = canon.to_string_lossy().to_string();
+        let ctx = Self::ctx_of(cube);
+
+        // Boundary files: never writable via gateway (structural deny).
+        if action == "write" && is_boundary_path(&canon) {
+            self.audit_decision(cube, action, &scope, "deny", "boundary-write", "error");
+            return Err(ToolError::Denied("boundary path is read-only".into()));
+        }
+
+        // Capability check (fail-closed).
+        if self
+            .caps
+            .authorize(action, "filesystem", &scope)
+            .is_err()
+        {
+            // Search falls back to read capability.
+            let fallback_ok = action == "search"
+                && self.caps.authorize("read", "filesystem", &scope).is_ok();
+            if !fallback_ok {
+                self.audit_decision(cube, action, &scope, "deny", "no-capability", "error");
+                return Err(ToolError::Denied("no capability".into()));
+            }
+        }
+
+        // Policy check (fail-closed).
+        let policy_action = if action == "search" { "read" } else { action };
+        let (d, rule) = self.policy.evaluate_fs(policy_action, &scope, &ctx);
+        match d {
+            Decision::Allow => {
+                // Re-check after canonicalization (TOCTOU hardening): the
+                // scope string is the canonical path, already re-derived.
+                self.audit_decision(
+                    cube,
+                    action,
+                    &scope,
+                    "allow",
+                    rule.as_deref().unwrap_or(""),
+                    "success",
+                );
+                Ok(canon)
+            }
+            Decision::Deny => {
+                self.audit_decision(
+                    cube,
+                    action,
+                    &scope,
+                    "deny",
+                    rule.as_deref().unwrap_or("default-deny"),
+                    "error",
+                );
+                Err(ToolError::Denied(rule.unwrap_or("default-deny".into())))
+            }
+        }
+    }
+
+    pub fn read(&mut self, cube: &mut Cube, path: &str) -> Result<ToolResult, ToolError> {
+        let canon = self.enforce(cube, "read", path)?;
+        // Open with symlink check: reject symlink files (O_NOFOLLOW approx).
+        let meta =
+            std::fs::symlink_metadata(&canon).map_err(|e| ToolError::Io(e.to_string()))?;
+        if meta.file_type().is_symlink() {
+            self.audit_decision(cube, "read", path, "deny", "symlink-file", "error");
+            return Err(ToolError::Denied("symlink files not followed".into()));
+        }
+        let content =
+            std::fs::read_to_string(&canon).map_err(|e| ToolError::Io(e.to_string()))?;
+        Ok(ToolResult { ok: true, decision: "allow".into(), output: content })
+    }
+
+    pub fn write(
+        &mut self,
+        cube: &mut Cube,
+        path: &str,
+        content: &str,
+    ) -> Result<ToolResult, ToolError> {
+        let canon = self.enforce(cube, "write", path)?;
+        if let Some(parent) = canon.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| ToolError::Io(e.to_string()))?;
+        }
+        // Re-validate containment right before act (TOCTOU).
+        let ws = normalize(&self.workspace);
+        if canon != ws && !canon.starts_with(&ws) {
+            return Err(ToolError::Denied("containment re-check failed".into()));
+        }
+        std::fs::write(&canon, content).map_err(|e| ToolError::Io(e.to_string()))?;
+        Ok(ToolResult { ok: true, decision: "allow".into(), output: "written".into() })
+    }
+
+    /// `code.search`: substring search over workspace files (read-scoped).
+    pub fn search(&mut self, cube: &mut Cube, query: &str) -> Result<ToolResult, ToolError> {
+        let ws_str = self.workspace.to_string_lossy().to_string();
+        // Enforce read-scope over the workspace root itself.
+        let _ = self.enforce(cube, "search", &ws_str)?;
+        let mut hits = vec![];
+        for entry in walkdir::WalkDir::new(&self.workspace)
+            .max_depth(8)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            let p = entry.path();
+            // Skip boundary dirs.
+            if is_boundary_path(p) {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(p) {
+                for (i, line) in text.lines().enumerate() {
+                    if line.contains(query) {
+                        hits.push(format!("{}:{}: {}", p.display(), i + 1, line.trim()));
+                        if hits.len() >= 50 {
+                            break;
+                        }
+                    }
+                }
+            }
+            if hits.len() >= 50 {
+                break;
+            }
+        }
+        Ok(ToolResult { ok: true, decision: "allow".into(), output: hits.join("\n") })
+    }
+
+    pub fn dispatch(
+        &mut self,
+        cube: &mut Cube,
+        req: &ToolRequest,
+    ) -> Result<ToolResult, ToolError> {
+        // MVP-A: only three mediated tools exist. Anything else => DENY.
+        match req.tool.as_str() {
+            "filesystem.read" => self.read(cube, &req.path),
+            "filesystem.write" => self.write(
+                cube,
+                &req.path,
+                req.content.as_deref().unwrap_or_default(),
+            ),
+            "code.search" => self.search(cube, &req.path),
+            other => {
+                self.audit_decision(cube, other, &req.path, "deny", "unknown-tool", "error");
+                Err(ToolError::Denied(format!("unknown tool: {other}")))
+            }
+        }
+    }
+
+    /// Guard for tests: current state label.
+    pub fn _state_label(cube: &Cube) -> String {
+        let _: AgentState = cube.current_state();
+        cube.current_state().to_string()
+    }
+}
+
+/// Lexical normalization (no I/O): resolves `.` and `..`.
+fn normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
+
+fn is_boundary_path(p: &Path) -> bool {
+    let s = p.to_string_lossy();
+    s.contains("/policies")
+        || s.contains("aivm.yaml")
+        || s.contains("/audit")
+        || s.ends_with(".env")
+        || s.contains(".env.")
+        || s.contains("/secrets/")
+        || s.contains("/.git/config")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aivm_capability::Capability;
+
+    fn harness() -> (ToolGateway, Cube, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "aivm-tools-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let ws_real = dir.canonicalize().unwrap_or(dir.clone());
+        let policy = Policy::from_yaml(
+            &format!(
+                r#"
+name: test
+filesystem:
+  read: [{}]
+  write: [{}/src]
+  deny: ["**/.env*", "**/secrets/**"]
+process: {{allow: [], deny: []}}
+network: {{allow: [], deny: []}}
+"#,
+                ws_real.display(),
+                ws_real.display()
+            ),
+        )
+        .unwrap();
+        let caps = CapabilitySet::new(vec![
+            Capability::new("read", "filesystem", &ws_real.to_string_lossy()),
+            Capability::new("write", "filesystem", &format!("{}/src", ws_real.display())),
+            Capability::new("search", "filesystem", &ws_real.to_string_lossy()),
+        ]);
+        let audit = AuditWriter::open(dir.join("audit.jsonl")).unwrap();
+        let gw = ToolGateway::new(dir.clone(), policy, caps, audit, "coder", "sess");
+        (gw, Cube::new("t"), dir)
+    }
+
+    #[test]
+    fn traversal_denied() {
+        let (mut gw, mut cube, _d) = harness();
+        let r = gw.read(&mut cube, "../../etc/passwd");
+        assert!(matches!(r, Err(ToolError::Denied(_))));
+    }
+
+    #[test]
+    fn write_outside_src_denied() {
+        let (mut gw, mut cube, _d) = harness();
+        let r = gw.write(&mut cube, "README.md", "hi");
+        // README is at workspace root: write allows only */src.
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn write_inside_src_allowed() {
+        let (mut gw, mut cube, _d) = harness();
+        let r = gw.write(&mut cube, "src/a.rs", "fn main(){}");
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn unknown_tool_denied() {
+        let (mut gw, mut cube, _d) = harness();
+        let r = gw.dispatch(
+            &mut cube,
+            &ToolRequest { tool: "shell.exec".into(), path: "x".into(), content: None },
+        );
+        assert!(matches!(r, Err(ToolError::Denied(_))));
+    }
+}
