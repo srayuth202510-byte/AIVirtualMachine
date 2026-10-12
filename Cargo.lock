@@ -37,6 +37,7 @@ dependencies = [
 name = "aivm-cli"
 version = "0.1.0"
 dependencies = [
+ "aivm-audit",
  "aivm-cube",
  "aivm-runtime",
  "aivm-supervisor",
@@ -114,7 +115,10 @@ dependencies = [
 name = "aivm-sandbox"
 version = "0.1.0"
 dependencies = [
+ "aivm-policy",
+ "libc",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

@@ -14,3 +14,4 @@ thiserror = { workspace = true }
 aivm-runtime = { path = "../aivm-runtime" }
 aivm-supervisor = { path = "../aivm-supervisor" }
 aivm-cube = { path = "../aivm-cube" }
+aivm-audit = { path = "../aivm-audit" }

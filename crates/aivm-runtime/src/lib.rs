@@ -348,8 +348,18 @@ impl Runtime {
         };
         let text =
             serde_json::to_string_pretty(&saved).map_err(|e| RuntimeError::Io(e.to_string()))?;
-        std::fs::write(self.base_dir.join(STATE_FILE), text)
-            .map_err(|e| RuntimeError::Io(e.to_string()))?;
+        let path = self.base_dir.join(STATE_FILE);
+        std::fs::write(&path, text).map_err(|e| RuntimeError::Io(e.to_string()))?;
+        // lease ที่ persist มีความอ่อนไหวเหมือน audit: เจ้าของอ่านได้อย่างเดียว
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&path)
+                .map_err(|e| RuntimeError::Io(e.to_string()))?
+                .permissions();
+            perm.set_mode(0o600);
+            std::fs::set_permissions(&path, perm).map_err(|e| RuntimeError::Io(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -526,6 +536,7 @@ capabilities:
                 .unwrap()
                 .as_nanos()
         ));
+        aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);
         let rt = Runtime::init(test_config(), base.clone()).unwrap();
         (rt, base)
@@ -533,9 +544,12 @@ capabilities:
 
     #[test]
     fn write_denied_before_modify_grant() {
-        let (mut rt, _base) = test_runtime("deny");
+        let (mut rt, base) = test_runtime("deny");
         let r = rt.gateway.write(&mut rt.cube, "src/a.rs", "x");
         assert!(r.is_err(), "INIT must not hold write");
+        aivm_audit::clear_flags(&base);
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -559,16 +573,20 @@ capabilities:
         // บูตใหม่กู้ grant + state เดิม ไม่รีเซ็ตกลับ INIT
         let rt2 = Runtime::init(test_config(), base.clone()).unwrap();
         assert_eq!(rt2.cube.current_state(), AgentState::Modify);
+        aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn transition_denied_leaves_state_untouched() {
-        let (mut rt, _base) = test_runtime("jump");
+        let (mut rt, base) = test_runtime("jump");
         let r = rt.transition_to(AgentState::Deploy, &TransitionGuards::default());
         assert!(r.is_err());
         assert_eq!(rt.cube.current_state(), AgentState::Init);
         assert!(rt.gateway.caps.caps.iter().all(|c| c.action != "write"));
+        aivm_audit::clear_flags(&base);
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -580,6 +598,7 @@ capabilities:
         std::fs::write(base.join(STATE_FILE), "{not json").unwrap();
         let rt2 = Runtime::init(test_config(), base.clone()).unwrap();
         assert_eq!(rt2.cube.current_state(), AgentState::Init);
+        aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

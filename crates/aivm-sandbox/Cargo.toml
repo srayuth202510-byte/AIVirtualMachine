@@ -6,3 +6,8 @@ edition = "2021"
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
+aivm-policy = { path = "../aivm-policy" }
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = { workspace = true }

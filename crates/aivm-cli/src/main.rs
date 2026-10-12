@@ -43,6 +43,10 @@ enum Cmd {
     Logs {
         name: String,
     },
+    /// ตรวจ hash chain ของ audit รวมไฟล์ rotate แล้วสรุป
+    Audit {
+        name: String,
+    },
     Pause {
         name: String,
     },
@@ -113,6 +117,44 @@ fn main() -> Result<(), AnyErr> {
                     }
                 }
                 Err(e) => eprintln!("no audit log yet: {e}"),
+            }
+        }
+        Cmd::Audit { name } => {
+            // เก็บสายไฟล์: archive (audit.<suffix>.jsonl) เก่าไปใหม่
+            // แล้วปิดท้ายด้วยไฟล์ live
+            let dir = root.join(&name);
+            let mut archives: Vec<PathBuf> = vec![];
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for e in rd.filter_map(|e| e.ok()) {
+                    let p = e.path();
+                    if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
+                        // archive คือ audit.<suffix>.jsonl เท่านั้น
+                        // (ไฟล์ live ชื่อ audit.jsonl ตรง ๆ ต้องไม่นับซ้ำ)
+                        if n != "audit.jsonl" && n.starts_with("audit.") && n.ends_with(".jsonl") {
+                            archives.push(p);
+                        }
+                    }
+                }
+            }
+            archives.sort();
+            let live = dir.join("audit.jsonl");
+            if live.is_file() {
+                archives.push(live);
+            }
+            if archives.is_empty() {
+                eprintln!("no audit log yet for '{name}'");
+                std::process::exit(2);
+            }
+            match aivm_audit::verify_sequence(&archives) {
+                Ok(n) => println!(
+                    "audit {name}: {} file(s), {} entries, chain verified",
+                    archives.len(),
+                    n
+                ),
+                Err(e) => {
+                    eprintln!("audit {name}: CHAIN BROKEN: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Cmd::Pause { name } => {

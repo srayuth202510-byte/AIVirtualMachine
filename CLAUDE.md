@@ -185,6 +185,14 @@ Never re-read whole files the graph already located.
 `capability` → `policy` → `cube`, `audit` → `tools` → `memory/network/sandbox/model`
 → `runtime` (incl. `runtime::demo`) → `supervisor` → `cli`. No cycles; keep it so.
 
+## MVP-B status (sandboxed exec, spec Phase 4)
+
+- `Sandbox::run_checked` (fixed exe + arg schema, no shell) + `probe()` live in
+  `aivm-sandbox`; gateway `dispatch` ยังไม่รับ exec tools จนกว่าจะพิสูจน์
+  การกัก subprocess tree ได้ — ห้าม wire เองโดยไม่มี adversarial case.
+- Audit: `rotate()` + `verify_sequence()` + `aivm audit <name>`; archive ถูกผนึก
+  (+i เมื่อ FS รองรับ) ห้ามเขียนทับ.
+
 ## Rules while editing
 
 - **Fail-closed**: any parse/eval/context error → `DENY`. Never default to allow.

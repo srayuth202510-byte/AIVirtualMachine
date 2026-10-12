@@ -334,7 +334,8 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
         workspace: ws_str,
     };
 
-    // ลบแบบ best-effort ขยะ demo ต้องไม่เลอะ repo
+    // ลบแบบ best-effort ขยะ demo ต้องไม่เลอะ repo (ล้าง flag FS ก่อนลบ)
+    aivm_audit::clear_flags(&base);
     let _ = std::fs::remove_dir_all(&base);
 
     Ok(report)

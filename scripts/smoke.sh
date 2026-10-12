@@ -40,6 +40,9 @@ $BIN kill coder
 echo "== logs =="
 $BIN logs coder | grep -q '"decision"' || { echo "FAIL: logs (no audit entries)"; exit 1; }
 
+echo "== audit verify =="
+$BIN audit coder | grep -q "chain verified" || { echo "FAIL: audit chain"; exit 1; }
+
 echo "== demo =="
 cargo run -q -p aivm-cli -- demo
 

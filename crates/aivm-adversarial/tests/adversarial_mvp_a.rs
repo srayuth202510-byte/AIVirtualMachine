@@ -29,8 +29,21 @@ network:
     .unwrap()
 }
 
-fn harness(tag: &str) -> (ToolGateway, Cube) {
-    let dir = std::env::temp_dir().join(format!("aivm-adv-{tag}-{}", std::process::id()));
+fn adv_dir(tag: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("aivm-adv-{tag}-{nanos}"))
+}
+
+fn adv_clean(dir: &std::path::Path) {
+    aivm_audit::clear_flags(dir);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn harness(tag: &str) -> (ToolGateway, Cube, std::path::PathBuf) {
+    let dir = adv_dir(tag);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src").join("ok.rs"), "fn ok() {}").unwrap();
@@ -48,13 +61,13 @@ fn harness(tag: &str) -> (ToolGateway, Cube) {
         Capability::new("search", "filesystem", &ws.to_string_lossy()),
     ]);
     let audit = AuditWriter::open(dir.join("audit.jsonl")).unwrap();
-    let gw = ToolGateway::new(dir, policy, caps, audit, "coder", "sess-adv");
-    (gw, Cube::new("adv"))
+    let gw = ToolGateway::new(dir.clone(), policy, caps, audit, "coder", "sess-adv");
+    (gw, Cube::new("adv"), dir)
 }
 
 #[test]
 fn fs_escape_must_deny() {
-    let (mut gw, mut cube) = harness("fs");
+    let (mut gw, mut cube, dir) = harness("fs");
     for p in [
         "/etc/passwd",
         "../../etc/shadow",
@@ -64,19 +77,21 @@ fn fs_escape_must_deny() {
     }
     let (d, _) = test_policy().evaluate_fs("read", "/etc/passwd", &EvalContext::default());
     assert_eq!(d, Decision::Deny);
+    adv_clean(&dir);
 }
 
 #[test]
 fn dotenv_and_secrets_must_deny() {
-    let (mut gw, mut cube) = harness("env");
+    let (mut gw, mut cube, dir) = harness("env");
     assert!(gw.read(&mut cube, ".env").is_err());
     let (d, _) = test_policy().evaluate_fs("read", "/workspace/secrets/k", &EvalContext::default());
     assert_eq!(d, Decision::Deny);
+    adv_clean(&dir);
 }
 
 #[test]
 fn symlink_escape_must_deny() {
-    let dir = std::env::temp_dir().join(format!("aivm-adv-link-{}", std::process::id()));
+    let dir = adv_dir("link");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src")).unwrap();
     #[cfg(unix)]
@@ -94,14 +109,15 @@ fn symlink_escape_must_deny() {
         &ws.to_string_lossy(),
     )]);
     let audit = AuditWriter::open(dir.join("audit.jsonl")).unwrap();
-    let mut gw = ToolGateway::new(dir, policy, caps, audit, "coder", "s");
+    let mut gw = ToolGateway::new(dir.clone(), policy, caps, audit, "coder", "s");
     let mut cube = Cube::new("adv");
     assert!(gw.read(&mut cube, "src/evil/passwd").is_err());
+    adv_clean(&dir);
 }
 
 #[test]
 fn shell_and_unknown_tools_must_deny() {
-    let (mut gw, mut cube) = harness("proc");
+    let (mut gw, mut cube, dir) = harness("proc");
     let p = test_policy();
     assert_eq!(p.evaluate_process("/bin/sh").0, Decision::Deny);
     for tool in [
@@ -121,6 +137,7 @@ fn shell_and_unknown_tools_must_deny() {
         );
         assert!(r.is_err(), "must deny {tool}");
     }
+    adv_clean(&dir);
 }
 
 #[test]
@@ -172,7 +189,7 @@ fn invalid_config_must_fail_closed() {
 
 #[test]
 fn audit_chain_verifies() {
-    let dir = std::env::temp_dir().join(format!("aivm-adv-audit-{}", std::process::id()));
+    let dir = adv_dir("audit");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("a.jsonl");
@@ -186,10 +203,11 @@ fn audit_chain_verifies() {
     ))
     .unwrap();
     assert_eq!(AuditWriter::verify(&p).unwrap(), 2);
+    adv_clean(&dir);
 }
 
 fn dyn_runtime(tag: &str) -> (aivm_runtime::Runtime, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("aivm-adv-dyn-{tag}-{}", std::process::id()));
+    let dir = adv_dir(&format!("dyn-{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
     let cfg = aivm_runtime::VmConfig::from_yaml(
         "name: adv\nfilesystem:\n  read: [./workspace]\n  write: [./workspace/src]\nnetwork:\n  allow: [github.com]\ncapabilities:\n  initial: [read:workspace, search:code]\n",
@@ -209,18 +227,19 @@ fn guards_modify() -> TransitionGuards {
 
 #[test]
 fn write_before_grant_must_deny() {
-    let (mut rt, _dir) = dyn_runtime("pre");
+    let (mut rt, dir) = dyn_runtime("pre");
     // INIT มีแค่ read/search: เขียนไม่ได้แม้ใน workspace/src
     assert!(rt.gateway.write(&mut rt.cube, "src/early.rs", "x").is_err());
     // state ANALYZE ก็ยังไม่มี write lease
     rt.transition_to(AgentState::Analyze, &TransitionGuards::default())
         .unwrap();
     assert!(rt.gateway.write(&mut rt.cube, "src/early.rs", "x").is_err());
+    adv_clean(&dir);
 }
 
 #[test]
 fn grant_opens_write_and_revoke_closes_it() {
-    let (mut rt, _dir) = dyn_runtime("cycle");
+    let (mut rt, dir) = dyn_runtime("cycle");
     rt.transition_to(AgentState::Analyze, &TransitionGuards::default())
         .unwrap();
     let (granted, _) = rt
@@ -231,11 +250,12 @@ fn grant_opens_write_and_revoke_closes_it() {
     // lease ผูกกับ MODIFY/VALIDATE: นอกนั้นต้องตาย
     assert_eq!(rt.gateway.caps.revoke_stale("ANALYZE"), 1);
     assert!(rt.gateway.write(&mut rt.cube, "src/late.rs", "x").is_err());
+    adv_clean(&dir);
 }
 
 #[test]
 fn failed_transition_grants_nothing() {
-    let (mut rt, _dir) = dyn_runtime("jump");
+    let (mut rt, dir) = dyn_runtime("jump");
     let before = rt.gateway.caps.caps.len();
     assert!(rt
         .transition_to(AgentState::Deploy, &TransitionGuards::default())
@@ -243,13 +263,14 @@ fn failed_transition_grants_nothing() {
     assert_eq!(rt.cube.current_state(), AgentState::Init);
     assert_eq!(rt.gateway.caps.caps.len(), before);
     assert!(rt.gateway.caps.caps.iter().all(|c| c.action != "write"));
+    adv_clean(&dir);
 }
 
 #[test]
 fn state_gate_holds_despite_capability() {
     // ต่อให้มี write capability แต่ policy ระงับ allow-list ไว้จนกว่า
     // `when` ของ allow-rule ที่ระบุ scope จะเป็นจริง (สเปก §13.2 + §14)
-    let dir = std::env::temp_dir().join(format!("aivm-adv-gate-{}", std::process::id()));
+    let dir = adv_dir("gate");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src")).unwrap();
     let ws = dir.canonicalize().unwrap();
@@ -263,7 +284,7 @@ fn state_gate_holds_despite_capability() {
         Capability::new("write", "filesystem", &format!("{}/src", ws.display())),
     ]);
     let audit = AuditWriter::open(dir.join("audit.jsonl")).unwrap();
-    let mut gw = ToolGateway::new(dir, policy, caps, audit, "coder", "sess-gate");
+    let mut gw = ToolGateway::new(dir.clone(), policy, caps, audit, "coder", "sess-gate");
     let mut cube = Cube::new("gate");
     // ใน INIT: มี capability แต่ประตูปิด
     assert!(gw.write(&mut cube, "src/a.rs", "x").is_err());
@@ -273,4 +294,5 @@ fn state_gate_holds_despite_capability() {
     cube.transition(AgentState::Modify, &guards_modify())
         .unwrap();
     assert!(gw.write(&mut cube, "src/a.rs", "x").is_ok());
+    adv_clean(&dir);
 }
