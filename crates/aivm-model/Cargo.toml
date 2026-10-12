@@ -5,8 +5,10 @@ edition = "2021"
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 llama-cpp-2 = { version = "0.1.159", default-features = false, optional = true }
+ureq = { version = "2.9", features = ["json", "charset", "cookies", "tls"] }
 
 [features]
 default = []

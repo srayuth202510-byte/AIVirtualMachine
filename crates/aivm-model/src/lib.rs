@@ -10,6 +10,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod providers;
+
 #[cfg(feature = "llama")]
 use std::num::NonZeroU32;
 
@@ -43,6 +45,10 @@ pub struct ModelConfig {
     pub name: String,
     #[serde(default)]
     pub local: Option<LocalModelConfig>,
+    #[serde(default)]
+    pub openai: Option<providers::OpenAIConfig>,
+    #[serde(default)]
+    pub anthropic: Option<providers::AnthropicConfig>,
 }
 
 impl Default for ModelConfig {
@@ -51,6 +57,8 @@ impl Default for ModelConfig {
             provider: "echo".into(),
             name: "echo".into(),
             local: None,
+            openai: None,
+            anthropic: None,
         }
     }
 }
@@ -297,6 +305,12 @@ pub fn create_model(config: &ModelConfig) -> Result<Box<dyn Model>, ModelError> 
             name: config.name.clone(),
         })),
         "local" => create_local_model(config),
+        "openai" => Ok(Box::new(providers::OpenAIProvider::new(
+            config.openai.clone().unwrap_or_default(),
+        )?)),
+        "anthropic" => Ok(Box::new(providers::AnthropicProvider::new(
+            config.anthropic.clone().unwrap_or_default(),
+        )?)),
         other => Err(ModelError::Backend(format!("unknown provider: {other}"))),
     }
 }
@@ -340,17 +354,20 @@ mod tests {
             provider: "definitely-not-real".into(),
             name: "x".into(),
             local: None,
+            openai: None,
+            anthropic: None,
         };
         assert!(create_model(&cfg).is_err());
     }
 
-    // local ที่ไม่มี config ที่ถูกต้องต้อง error เสมอ (ทั้งกรณีมี/ไม่มีฟีเจอร์ llama)
     #[test]
     fn local_provider_without_valid_config_fails() {
         let cfg = ModelConfig {
             provider: "local".into(),
             name: "x".into(),
             local: None,
+            openai: None,
+            anthropic: None,
         };
         assert!(create_model(&cfg).is_err());
 
@@ -358,7 +375,35 @@ mod tests {
             provider: "local".into(),
             name: "x".into(),
             local: Some(LocalModelConfig::default()),
+            openai: None,
+            anthropic: None,
         };
         assert!(create_model(&cfg_empty_path).is_err());
+    }
+
+    #[test]
+    fn openai_provider_missing_key_fails_closed() {
+        std::env::remove_var("OPENAI_API_KEY");
+        let cfg = ModelConfig {
+            provider: "openai".into(),
+            name: "openai".into(),
+            local: None,
+            openai: Some(Default::default()),
+            anthropic: None,
+        };
+        assert!(create_model(&cfg).is_err());
+    }
+
+    #[test]
+    fn anthropic_provider_missing_key_fails_closed() {
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        let cfg = ModelConfig {
+            provider: "anthropic".into(),
+            name: "anthropic".into(),
+            local: None,
+            openai: None,
+            anthropic: Some(Default::default()),
+        };
+        assert!(create_model(&cfg).is_err());
     }
 }
