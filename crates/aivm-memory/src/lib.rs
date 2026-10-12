@@ -1,8 +1,8 @@
-//! Working/session/persistent memory — spec §20.
+//! หน่วยความจำแบบ working/session/persistent — ดูสเปก §20.
 //!
-//! MVP-A: file-backed session memory under `<workspace>/memory/`.
-//! Cube acts as the index layer; retrieval is deliberately simple
-//! (prefix scan) until CubeRAG (Phase 6).
+//! MVP-A: session memory เก็บเป็นไฟล์ใต้ `<workspace>/memory/`
+//! Cube ทำหน้าที่เป็นชั้น index ส่วนการค้นคืนตั้งใจให้ง่าย
+//! (กวาดแบบ prefix) ไปก่อนจนกว่าจะมี CubeRAG (Phase 6)
 
 use aivm_cube::Cube;
 use serde::{Deserialize, Serialize};
@@ -52,8 +52,8 @@ impl Memory {
         Ok(())
     }
 
-    /// Retrieve entries relevant to the cube's current state (MVP: all
-    /// entries tagged with current state + capped at 20).
+    /// ดึง entry ที่เกี่ยวกับ state ปัจจุบันของ cube (MVP: ทุก entry
+    /// ที่ติดป้าย state ปัจจุบัน + จำกัด 20 รายการ)
     pub fn retrieve(&self, cube: &Cube) -> Vec<MemoryEntry> {
         let want = cube.current_state().to_string();
         let mut out = vec![];

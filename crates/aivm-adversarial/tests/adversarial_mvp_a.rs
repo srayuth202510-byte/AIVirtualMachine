@@ -1,7 +1,7 @@
-//! Adversarial MVP-A suite — spec §38.
+//! ชุดเทสต์ adversarial สำหรับ MVP-A — ดูสเปก §38.
 //!
-//! Negative-testing-first: every case below MUST deny (or harden).
-//! Run: `cargo test -p aivm-adversarial` (integration) or `cargo test`.
+//! เน้น negative-testing-first: ทุกเคสด้านล่างต้อง DENY (หรือ harden)
+//! รันด้วย `cargo test -p aivm-adversarial` (integration) หรือ `cargo test`
 
 use aivm_audit::{AuditRecord, AuditWriter};
 use aivm_capability::{Capability, CapabilitySet};
@@ -210,9 +210,9 @@ fn guards_modify() -> TransitionGuards {
 #[test]
 fn write_before_grant_must_deny() {
     let (mut rt, _dir) = dyn_runtime("pre");
-    // INIT holds read/search only: write denies even inside workspace/src.
+    // INIT มีแค่ read/search: เขียนไม่ได้แม้ใน workspace/src
     assert!(rt.gateway.write(&mut rt.cube, "src/early.rs", "x").is_err());
-    // ANALYZE still holds no write lease.
+    // state ANALYZE ก็ยังไม่มี write lease
     rt.transition_to(AgentState::Analyze, &TransitionGuards::default())
         .unwrap();
     assert!(rt.gateway.write(&mut rt.cube, "src/early.rs", "x").is_err());
@@ -228,7 +228,7 @@ fn grant_opens_write_and_revoke_closes_it() {
         .unwrap();
     assert_eq!(granted, 1);
     assert!(rt.gateway.write(&mut rt.cube, "src/ok.rs", "x").is_ok());
-    // Lease is bound to MODIFY/VALIDATE: outside them it must die.
+    // lease ผูกกับ MODIFY/VALIDATE: นอกนั้นต้องตาย
     assert_eq!(rt.gateway.caps.revoke_stale("ANALYZE"), 1);
     assert!(rt.gateway.write(&mut rt.cube, "src/late.rs", "x").is_err());
 }
@@ -247,8 +247,8 @@ fn failed_transition_grants_nothing() {
 
 #[test]
 fn state_gate_holds_despite_capability() {
-    // Even WITH a write capability, policy suspends the allow-list until
-    // a scoped allow-rule's `when` holds (spec §13.2 + §14).
+    // ต่อให้มี write capability แต่ policy ระงับ allow-list ไว้จนกว่า
+    // `when` ของ allow-rule ที่ระบุ scope จะเป็นจริง (สเปก §13.2 + §14)
     let dir = std::env::temp_dir().join(format!("aivm-adv-gate-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -265,9 +265,9 @@ fn state_gate_holds_despite_capability() {
     let audit = AuditWriter::open(dir.join("audit.jsonl")).unwrap();
     let mut gw = ToolGateway::new(dir, policy, caps, audit, "coder", "sess-gate");
     let mut cube = Cube::new("gate");
-    // INIT: capability present, gate shut.
+    // ใน INIT: มี capability แต่ประตูปิด
     assert!(gw.write(&mut cube, "src/a.rs", "x").is_err());
-    // After the guarded transition the same call is allowed.
+    // หลัง transition แบบมี guard คำขอเดียวกันได้รับอนุญาต
     cube.transition(AgentState::Analyze, &TransitionGuards::default())
         .unwrap();
     cube.transition(AgentState::Modify, &guards_modify())

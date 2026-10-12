@@ -1,4 +1,4 @@
-//! `aivm` CLI — spec §29–§30.
+//! CLI ของ `aivm` — ดูสเปก §29-§30
 
 use aivm_runtime::VmConfig;
 use aivm_supervisor::Supervisor;
@@ -10,36 +10,36 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
-    /// Supervisor root dir (VM homes).
+    /// ไดเรกทอรี root ของ supervisor (บ้านของแต่ละ VM)
     #[arg(long, default_value = "./vms")]
     root: PathBuf,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a VM from an aivm.yaml config.
+    /// สร้าง VM จากไฟล์ config aivm.yaml
     Create {
         name: String,
         #[arg(long)]
         config: PathBuf,
     },
-    /// Run one mediated step.
+    /// รันหนึ่งก้าวแบบผ่านตัวกลาง
     Run {
         name: String,
     },
-    /// Show state, model, resources, capabilities.
+    /// แสดง state โมเดล ทรัพยากร และสิทธิ์
     Inspect {
         name: String,
     },
-    /// Show current agent state.
+    /// แสดง state ปัจจุบันของ agent
     State {
         name: String,
     },
-    /// List initial capabilities.
+    /// แสดงสิทธิ์ตั้งต้น
     Capabilities {
         name: String,
     },
-    /// Print audit log tail.
+    /// พิมพ์ท้ายล็อก audit
     Logs {
         name: String,
     },
@@ -52,25 +52,25 @@ enum Cmd {
     Kill {
         name: String,
     },
-    /// Validated state transition with dynamic grant/revoke (spec §14).
-    /// Guards are operator-supplied evidence, never agent claims.
+    /// เปลี่ยน state แบบ validate พร้อมให้/เพิกถอนสิทธิ์แบบ dynamic (สเปก §14)
+    /// guard คือหลักฐานจาก operator ไม่ใช่คำอ้างของ agent
     Transition {
         name: String,
         /// INIT|ANALYZE|MODIFY|VALIDATE|DEPLOY
         state: String,
-        /// Confidence for ANALYZE -> MODIFY (default 0).
+        /// ความเชื่อมั่นสำหรับ ANALYZE -> MODIFY (ค่าเริ่มต้น 0)
         #[arg(long, default_value_t = 0.0)]
         confidence: f64,
-        /// Tests passed (for MODIFY -> VALIDATE).
+        /// เทสต์ผ่านแล้ว (สำหรับ MODIFY -> VALIDATE)
         #[arg(long, default_value_t = false)]
         tests_passed: bool,
-        /// Policy approved (for VALIDATE -> DEPLOY).
+        /// policy อนุมัติแล้ว (สำหรับ VALIDATE -> DEPLOY)
         #[arg(long, default_value_t = false)]
         policy_approved: bool,
     },
-    /// Self-test the enforcement chain in a throwaway workspace.
-    /// No --root needed; prints an ALLOW/DENY table and exits
-    /// non-zero if any case misbehaves.
+    /// self-test เส้น enforcement ใน workspace ชั่วคราว
+    /// ไม่ต้องใช้ --root พิมพ์ตาราง ALLOW/DENY แล้วจบด้วย exit code
+    /// ไม่เป็นศูนย์ถ้ามีเคสไหนผิดปกติ
     Demo,
 }
 
@@ -81,12 +81,12 @@ fn main() -> Result<(), AnyErr> {
     match cli.cmd {
         Cmd::Create { name, config } => {
             let cfg = VmConfig::from_file(&config).map_err(err)?;
-            // Register into supervisor root manually (create validates boot).
+            // ลงทะเบียนเข้า root ของ supervisor เอง (create จะ validate การบูต)
             sup.create(&name, cfg).map_err(err)?;
             println!("created vm '{name}'");
         }
         Cmd::Run { name } => {
-            // `run` needs a prior `create`; be helpful if missing.
+            // `run` ต้อง `create` มาก่อน ถ้าไม่มีช่วยบอกให้ชัด
             if sup.status(&name).is_none() {
                 eprintln!("vm '{name}' not registered under this --root; `create` it first");
                 std::process::exit(2);

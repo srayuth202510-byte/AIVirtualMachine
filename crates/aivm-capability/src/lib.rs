@@ -1,8 +1,9 @@
-//! Capability model — spec §10.
+//! โมเดล Capability — ดูสเปก §10.
 //!
-//! Granular least-privilege permissions. Default deny: every action
-//! starts DENY, only an explicit, non-expired, within-budget capability
-//! allows it (invariants I-2, I-6, I-8).
+//! สิทธิ์แบบละเอียดยิบตามหลัก least-privilege โดยค่าเริ่มต้นคือปฏิเสธ
+//! ทุกอย่าง (default deny): ทุก action เริ่มจาก DENY มีเพียง capability
+//! ที่ระบุชัด ยังไม่หมดอายุ และใช้ไม่เกินโควต้าเท่านั้นจึงจะ ALLOW
+//! (invariants I-2, I-6, I-8).
 
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,7 +21,7 @@ pub enum CapabilityError {
     Mismatch,
 }
 
-/// Primitive actions from spec §10.1.
+/// action พื้นฐานตามสเปก §10.1
 pub mod actions {
     pub const READ: &str = "read";
     pub const WRITE: &str = "write";
@@ -38,19 +39,20 @@ pub mod actions {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Condition {
-    /// e.g. protocol == https, state == VALIDATE. MVP: opaque map.
+    /// ตัวอย่างเช่น protocol == https, state == VALIDATE (MVP: เก็บแบบ opaque)
     #[serde(default)]
     pub protocol: Option<String>,
     #[serde(default)]
     pub require_state: Option<String>,
-    /// States this capability is valid in (spec §14.3 re-evaluation).
-    /// Empty = valid in all states (base grants like read/search).
+    /// state ที่ capability นี้ยังใช้ได้ (ดูสเปก §14.3 เรื่อง re-evaluation)
+    /// ถ้าว่างเปล่า = ใช้ได้ทุก state (สิทธิ์พื้นฐานอย่าง read/search)
     #[serde(default)]
     pub valid_states: Vec<String>,
 }
 
 impl Condition {
-    /// Fail-closed freshness: a lease bound to states is stale anywhere else.
+    /// เช็กความสดแบบ fail-closed: lease ที่ผูกกับ state ไว้
+    /// จะถือว่า stale ทันทีเมื่ออยู่ state อื่น
     pub fn is_stale_in(&self, state: &str) -> bool {
         if !self.valid_states.is_empty() && !self.valid_states.iter().any(|s| s == state) {
             return true;
@@ -69,7 +71,7 @@ pub struct Capability {
     pub scope: String,
     #[serde(default)]
     pub condition: Option<Condition>,
-    /// Unix timestamp (secs). None = no expiry.
+    /// timestamp แบบ Unix (วินาที) None = ไม่หมดอายุ
     #[serde(default)]
     pub expiration: Option<u64>,
     #[serde(default)]
@@ -112,7 +114,7 @@ impl Capability {
         self.max_uses.map(|m| m.saturating_sub(self.used_count))
     }
 
-    /// Fail-closed check: expired or exhausted => Err (DENY).
+    /// เช็กแบบ fail-closed: หมดอายุหรือใช้เกินโควต้าแล้วจะได้ Err (DENY)
     pub fn check_usable(&self) -> Result<(), CapabilityError> {
         if self.is_expired() {
             return Err(CapabilityError::Expired);
@@ -125,9 +127,9 @@ impl Capability {
         Ok(())
     }
 
-    /// Does this capability cover (action, resource, scope)?
-    /// Scope matching: exact prefix match on canonical paths, or
-    /// glob-style `/**` suffix (workspace semantics).
+    /// capability นี้ครอบคลุม (action, resource, scope) ที่ขอมาหรือไม่?
+    /// การเทียบ scope: เทียบ prefix ตรง ๆ บน canonical path หรือ
+    /// แบบ glob ลงท้าย `/**` (ความหมายแบบ workspace)
     pub fn covers(&self, action: &str, resource: &str, scope: &str) -> bool {
         if self.action != action || self.resource != resource {
             return false;
@@ -135,7 +137,7 @@ impl Capability {
         scope_covers(&self.scope, scope)
     }
 
-    /// Authorize one use: verifies usability + coverage, then bumps counter.
+    /// อนุมัติการใช้งานหนึ่งครั้ง: ตรวจว่ายังใช้ได้ + ครอบคลุม แล้วเพิ่มตัวนับ
     pub fn authorize(
         &mut self,
         action: &str,
@@ -154,8 +156,8 @@ impl Capability {
     }
 }
 
-/// `/workspace` covers `/workspace/src/main.rs` but not `/workspace2` or `/etc`.
-/// A scope ending in `/**` or `/*` is treated as prefix; otherwise exact-or-prefix-dir.
+/// `/workspace` ครอบคลุม `/workspace/src/main.rs` แต่ไม่คลุม `/workspace2` หรือ `/etc`
+/// scope ที่ลงท้าย `/**` หรือ `/*` ถือเป็น prefix นอกนั้นต้องตรงกันพอดีหรือเป็น prefix แบบไดเรกทอรี
 pub fn scope_covers(cap_scope: &str, requested: &str) -> bool {
     let base = cap_scope
         .trim_end_matches("/**")
@@ -178,7 +180,7 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// A set of capabilities with deny-by-default resolution (spec §10.3, §14).
+/// ชุด capability ที่ตัดสินแบบ deny-by-default (สเปก §10.3, §14)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CapabilitySet {
     pub caps: Vec<Capability>,
@@ -189,15 +191,15 @@ impl CapabilitySet {
         Self { caps }
     }
 
-    /// Find a usable capability covering the request (mutable for use-count).
-    /// Returns index on success. Fail-closed: None means DENY.
+    /// หา capability ที่ยังใช้ได้และครอบคลุมคำขอ (mutable เพราะต้องนับการใช้)
+    /// สำเร็จคืน index ถ้าไม่เจอคือ DENY (fail-closed: None หมายถึง DENY)
     pub fn authorize(
         &mut self,
         action: &str,
         resource: &str,
         scope: &str,
     ) -> Result<usize, CapabilityError> {
-        // Try each cap; first usable+covering wins. Skip expired/exhausted.
+        // ลองทีละใบ ใบแรกที่ผ่านทั้ง usability + coverage ชนะ ข้ามใบที่หมดอายุ/หมดโควต้า
         let mut mismatch: Option<CapabilityError> = None;
         for (i, cap) in self.caps.iter_mut().enumerate() {
             if cap.check_usable().is_err() {
@@ -206,8 +208,8 @@ impl CapabilitySet {
             match cap.authorize(action, resource, scope) {
                 Ok(()) => return Ok(i),
                 Err(e) => {
-                    // Undo is not needed: authorize only bumps on success.
-                    // But note check_usable passed then covers failed.
+                    // ไม่ต้อง undo: authorize เพิ่มตัวนับเฉพาะตอนสำเร็จ
+                    // หมายเหตุ: ผ่าน check_usable แล้วแต่ covers ไม่ผ่าน
                     mismatch = Some(e);
                 }
             }
@@ -215,15 +217,15 @@ impl CapabilitySet {
         Err(mismatch.unwrap_or(CapabilityError::Mismatch))
     }
 
-    /// Revoke caps whose condition requires a state we no longer hold (§14.3).
+    /// เพิกถอนใบที่ condition ผูกกับ state ที่เราไม่ได้อยู่แล้ว (§14.3)
     pub fn revoke_where(&mut self, pred: impl Fn(&Capability) -> bool) -> usize {
         let before = self.caps.len();
         self.caps.retain(|c| !pred(c));
         before - self.caps.len()
     }
 
-    /// Drop every state-bound lease that is stale in `state`.
-    /// Base grants (no condition / empty valid_states) always survive.
+    /// ทิ้ง lease ที่ผูกกับ state ทุกใบที่ stale ใน `state`
+    /// สิทธิ์พื้นฐาน (ไม่มี condition / valid_states ว่าง) รอดเสมอ
     pub fn revoke_stale(&mut self, state: &str) -> usize {
         self.revoke_where(|c| match &c.condition {
             Some(cond) => cond.is_stale_in(state),
@@ -231,8 +233,8 @@ impl CapabilitySet {
         })
     }
 
-    /// Idempotent grant: skip when a usable covering cap already exists.
-    /// Returns true when a new lease was added.
+    /// ให้สิทธิ์แบบ idempotent: ข้ามถ้ามีใบที่ใช้ได้ครอบคลุมอยู่แล้ว
+    /// คืน true เมื่อเพิ่ม lease ใหม่จริง
     pub fn grant(&mut self, cap: Capability) -> bool {
         let usable_exists = self
             .caps
@@ -259,7 +261,7 @@ mod tests {
     #[test]
     fn expiry_is_deny() {
         let mut cap = Capability::new("read", "filesystem", "/workspace").with_expiration(0);
-        // force expiry
+        // บังคับให้หมดอายุ
         cap.expiration = Some(1);
         assert!(matches!(cap.check_usable(), Err(CapabilityError::Expired)));
     }
@@ -310,7 +312,7 @@ mod tests {
         assert!(set
             .authorize("write", "filesystem", "/workspace/src/a.rs")
             .is_err());
-        // Base grant survives every transition.
+        // สิทธิ์พื้นฐานรอดทุก transition
         assert!(set
             .authorize("read", "filesystem", "/workspace/a.rs")
             .is_ok());
@@ -328,9 +330,9 @@ mod tests {
     fn expired_lease_is_not_regranted_as_usable() {
         let mut set = CapabilitySet::default();
         let mut c = lease("write", &["MODIFY"]);
-        c.expiration = Some(1); // long past
+        c.expiration = Some(1); // หมดอายุไปนานแล้ว
         set.caps.push(c);
-        // An expired covering cap does not block a fresh grant.
+        // ใบที่หมดอายุไม่ขวางการให้สิทธิ์ใหม่
         assert!(set.grant(lease("write", &["MODIFY"])));
         assert!(set
             .authorize("write", "filesystem", "/workspace/src/a.rs")

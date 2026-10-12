@@ -1,58 +1,58 @@
-# AIVM developer shortcuts. `make help` lists targets.
-# Every target is plain cargo so `rtk make <target>` also works.
+# ทางลัดนักพัฒนา AIVM ดูรายการด้วย `make help`
+# ทุก target คือ cargo ธรรมดา ใช้ `rtk make <target>` ได้เหมือนกัน
 
 .PHONY: help build check test test-adv demo e2e clippy fmt fmt-check verify clean query path explain graph-update debug-test
 
-help: ## Show this help
+help: ## แสดงวิธีใช้นี้
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS=":.*?## "} {printf "  %-10s %s\n", $$1, $$2}'
 
-build: ## Compile the whole workspace
+build: ## คอมไพล์ทั้ง workspace
 	cargo build --workspace
 
-check: ## Fast type-check, no codegen
+check: ## ตรวจ type เร็ว ไม่สร้างโค้ด
 	cargo check --workspace --all-targets
 
-test: ## All unit + integration tests
+test: ## เทสต์ unit + integration ทั้งหมด
 	cargo test --workspace
 
-test-adv: ## Adversarial must-deny suite only (spec §38)
+test-adv: ## ชุด must-deny อย่างเดียว (สเปก §38)
 	cargo test -p aivm-adversarial
 
-demo: ## One-shot enforcement self-test (ALLOW/DENY table, temp dir)
+demo: ## self-test เส้น enforcement ครั้งเดียว (ตาราง ALLOW/DENY, temp dir)
 	cargo run -q -p aivm-cli -- demo
 
-e2e: ## Full CLI cycle via scripts/smoke.sh (create/inspect/run/logs)
+e2e: ## วงจร CLI ครบผ่าน scripts/smoke.sh (create/inspect/run/logs)
 	sh scripts/smoke.sh
 
-clippy: ## Lints; fails on warnings
+clippy: ## ตรวจ lint เจอ warning คือตก
 	cargo clippy --workspace --all-targets -- -D warnings
 
-fmt: ## Format all code
+fmt: ## จัดฟอร์แมตโค้ดทั้งหมด
 	cargo fmt --all
 
-fmt-check: ## Fail if formatting drifts
+fmt-check: ## ตกถ้าฟอร์แมตเพี้ยน
 	cargo fmt --all -- --check
 
-verify: fmt-check clippy test demo ## The full gate: format + lints + tests + self-test
+verify: fmt-check clippy test demo ## ด่านรวม: format + lint + test + self-test
 	@echo "verify: all green"
 
-clean: ## Remove build artifacts and demo VM homes
+clean: ## ลบ build artifact กับบ้าน VM เดโม
 	cargo clean
 	rm -rf ./vms
 
-# --- search: knowledge graph first, grep second (graph has file:line evidence) ---
-query: ## Graph search: make query Q="how does policy evaluation work?"
+# --- ค้นหา: ถามกราฟก่อน ค่อย grep (กราฟมีหลักฐาน file:line) ---
+query: ## ค้นกราฟ: make query Q="..."
 	graphify query "$(Q)" --budget 1200
 
-path: ## Concept path: make path A=ToolGateway B=AuditWriter
+path: ## ทางระหว่าง concept: make path A=... B=...
 	graphify path "$(A)" "$(B)"
 
-explain: ## Explain a node: make explain N=Policy
+explain: ## อธิบาย node: make explain N=...
 	graphify explain "$(N)"
 
-graph-update: ## Incremental graph refresh after structural changes (headless, cached)
+graph-update: ## รีเฟรชกราฟแบบเพิ่มทีละส่วนหลังแก้โครงสร้าง (headless, มี cache)
 	graphify update .
 
-# --- debug: single-test repro with backtrace + untruncated output ---
-debug-test: ## Repro one test: make debug-test F=traversal_denied [P=aivm-tools]
+# --- ดีบัก: จำลองเทสต์เดียวพร้อม backtrace + output เต็ม ---
+debug-test: ## จำลองเทสต์เดียว: make debug-test F=... [P=...]
 	RUST_BACKTRACE=1 cargo test $(if $(P),-p $(P),--workspace) $(F) -- --nocapture

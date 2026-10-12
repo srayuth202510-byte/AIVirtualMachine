@@ -1,10 +1,10 @@
 #!/bin/sh
-# Focused bug repro: run one test (or one package) with backtrace and
-# full output. Prefer this over `cargo test` when chasing a failure —
-# it skips capture so panics/asserts print in order.
-# Usage: sh scripts/debug-test.sh <name-filter> [package]
-#    ex: sh scripts/debug-test.sh traversal_denied
-#    ex: sh scripts/debug-test.sh tools aivm-tools
+# จำลองบั๊กแบบโฟกัส: รันเทสต์เดียว (หรือ crate เดียว) พร้อม backtrace
+# และ output เต็ม เหมาะกว่าตอนไล่ความล้มเหลว `cargo test`
+# เพราะไม่ซ่อน output panic/assert จะพิมพ์ตามลำดับจริง
+# วิธีใช้: sh scripts/debug-test.sh <name-filter> [package]
+#    ตัวอย่าง: sh scripts/debug-test.sh traversal_denied
+#    ตัวอย่าง: sh scripts/debug-test.sh tools aivm-tools
 set -eu
 
 F="${1:?usage: debug-test.sh <name-filter> [package]}"

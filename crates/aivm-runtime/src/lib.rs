@@ -1,8 +1,8 @@
-//! Runtime — spec §5, §22, §23, §28.
+//! Runtime — ดูสเปก §5, §22, §23, §28.
 //!
-//! Owns the agent loop: observe -> retrieve -> reason -> intent ->
-//! capability/policy -> execute -> observe. Wires Cube + Policy +
-//! ToolGateway + Memory + Audit from a single `aivm.yaml`.
+//! เจ้าของ agent loop: observe -> retrieve -> reason -> intent ->
+//! capability/policy -> execute -> observe เชื่อม Cube + Policy +
+//! ToolGateway + Memory + Audit จากไฟล์ `aivm.yaml` ไฟล์เดียว
 
 use aivm_audit::{AuditRecord, AuditWriter};
 use aivm_capability::{Capability, CapabilitySet, Condition};
@@ -18,11 +18,11 @@ use thiserror::Error;
 
 pub mod demo;
 
-/// Confidence gate for ANALYZE -> MODIFY (spec §15 example).
+/// เกณฑ์ confidence สำหรับ ANALYZE -> MODIFY (ตัวอย่างในสเปก §15)
 pub const CONFIDENCE_THRESHOLD: f64 = 0.8;
-/// Time-bounded lease for state-granted network access (spec §14.3, JIT).
+/// lease แบบจำกัดเวลาสำหรับสิทธิ์เน็ตเวิร์กที่ให้ตาม state (สเปก §14.3, แบบ JIT)
 pub const NETWORK_LEASE_SECS: u64 = 300;
-/// Persisted cube + capability set, so dynamic grants survive restarts.
+/// cube + ชุด capability ที่ persist ไว้ เพื่อให้สิทธิ์แบบ dynamic รอดข้าม restart
 const STATE_FILE: &str = "state.json";
 
 #[derive(Debug, Error)]
@@ -157,9 +157,9 @@ pub struct Runtime {
     op_seq: u64,
 }
 
-/// Persisted dynamic state: validated cube + live capability leases.
-/// Policy/config stay in `aivm.yaml` (ground truth); only the evolving
-/// part lives here so grants and use-counts survive restarts.
+/// state แบบ dynamic ที่ persist ไว้: cube ที่ผ่าน validate แล้ว + lease ที่ยังใช้ได้
+/// policy/config อยู่ใน `aivm.yaml` (ต้นฉบับความจริง) มีแค่ส่วนที่เปลี่ยน
+/// แปลงตามเวลาที่อยู่ไฟล์นี้ เพื่อให้ grant กับตัวนับการใช้รอดข้าม restart
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedState {
     cube: Cube,
@@ -167,17 +167,17 @@ struct PersistedState {
 }
 
 impl Runtime {
-    /// Fail-closed init: bad config/policy => Err, VM refuses to start.
+    /// init แบบ fail-closed: config/policy เสียได้ Err VM ปฏิเสธสตาร์ต
     pub fn init(config: VmConfig, base_dir: PathBuf) -> Result<Self, RuntimeError> {
         let workspace = base_dir.join("workspace");
         std::fs::create_dir_all(&workspace).map_err(|e| RuntimeError::Io(e.to_string()))?;
-        // Absolutize so capability scopes and canonicalized request paths
-        // compare in the same domain (relative base_dirs would otherwise
-        // double-join inside the gateway and deny everything).
+        // ทำ workspace ให้เป็น absolute เพื่อให้ scope ของ capability
+        // กับ path คำขอที่ canonicalize แล้วเทียบกันในโดเมนเดียวกัน
+        // (base_dir แบบ relative จะ join ซ้ำใน gateway แล้ว deny หมด)
         let workspace = absolutize(&workspace);
         let base_dir = absolutize(&base_dir);
 
-        // Resolve workspace-relative scopes to absolute canonical strings.
+        // แปลง scope ที่อิง workspace ให้เป็นสตริง absolute แบบ canonical
         let ws_str = workspace.to_string_lossy().to_string();
         let read_scopes: Vec<String> = if config.filesystem.read.is_empty() {
             vec![ws_str.clone()]
@@ -234,7 +234,7 @@ impl Runtime {
             require_test_before_network: true,
         };
 
-        // Initial capabilities (§14.2 INIT state).
+        // สิทธิ์เริ่มต้น (state INIT ตาม §14.2)
         let mut caps = vec![];
         for c in &config.capabilities.initial {
             match c.as_str() {
@@ -265,9 +265,9 @@ impl Runtime {
             &format!("sess_{}", config.name),
         );
         let mut cube = Cube::new(&format!("task_{}", config.name));
-        // Resume dynamic state (validated transitions + live leases).
-        // Corrupt/foreign state files are ignored fail-closed: the VM
-        // restarts with minimal INIT grants, never with extra privilege.
+        // กู้ state แบบ dynamic (transition ที่ validate แล้ว + lease ที่ยังใช้ได้)
+        // ไฟล์ state ที่เสีย/แปลกปลอมจะถูกเมินแบบ fail-closed: VM จะ
+        // เริ่มใหม่ด้วยสิทธิ์ INIT ขั้นต่ำ ไม่เคยได้สิทธิ์เกิน
         let state_path = base_dir.join(STATE_FILE);
         if let Ok(text) = std::fs::read_to_string(&state_path) {
             if let Ok(saved) = serde_json::from_str::<PersistedState>(&text) {
@@ -300,14 +300,14 @@ impl Runtime {
         })
     }
 
-    /// Validated state advance with dynamic capability management (§14).
+    /// เดิน state ไปข้างหน้าแบบ validate พร้อมจัดการ capability แบบ dynamic (§14)
     ///
-    /// 1. `Cube::transition` validates edge + guards (fail-closed).
-    /// 2. State-bound leases that lapsed are revoked (§14.3).
-    /// 3. Grants for the new state are issued idempotently (JIT, §14.2).
-    /// 4. Every grant/revoke is audited; denial leaves state untouched.
+    /// 1. `Cube::transition` ตรวจ edge + guard (fail-closed)
+    /// 2. lease ที่ผูกกับ state และหมดความหมายแล้วถูก revoke (§14.3)
+    /// 3. สิทธิ์ของ state ใหม่ออกแบบ idempotent (ให้เมื่อจำเป็น JIT, §14.2)
+    /// 4. ทุก grant/revoke ถูก audit ถ้าปฏิเสธ state จะไม่ขยับ
     ///
-    /// Returns `(granted, revoked)`.
+    /// คืน `(granted, revoked)`
     pub fn transition_to(
         &mut self,
         next: AgentState,
@@ -339,8 +339,8 @@ impl Runtime {
         Ok((granted, revoked))
     }
 
-    /// Persist validated cube + live leases so `transition_to` survives
-    /// restarts. Called by the supervisor after run/transition/create.
+    /// persist cube ที่ validate แล้ว + lease ที่ยังใช้ได้ เพื่อให้
+    /// `transition_to` รอดข้าม restart supervisor เรียกหลัง run/transition/create
     pub fn persist(&self) -> Result<(), RuntimeError> {
         let saved = PersistedState {
             cube: self.cube.clone(),
@@ -381,15 +381,15 @@ impl Runtime {
         Ok(())
     }
 
-    /// One mediated step of the main loop (§23): reason via model, then
-    /// execute a filesystem read through the gateway. Returns model text.
+    /// หนึ่งก้าวของ main loop แบบผ่านตัวกลาง (§23): ให้โมเดลคิดจาก context
+    /// แล้วรัน filesystem read ผ่าน gateway คืนข้อความของโมเดล
     pub fn step(&mut self, context: &str) -> Result<String, RuntimeError> {
         let _mem = self.memory.retrieve(&self.cube);
         let intent = self
             .model
             .reason(context)
             .map_err(|e| RuntimeError::Config(e.to_string()))?;
-        // Demonstrate mediation: list workspace via search (always audited).
+        // สาธิตการผ่านตัวกลาง: ค้น workspace ด้วย search (ถูก audit ทุกครั้ง)
         let req = ToolRequest {
             tool: "code.search".into(),
             path: intent.clone(),
@@ -416,10 +416,9 @@ impl Runtime {
     }
 }
 
-/// State-gated capability grants (spec §14.2). Leases are scoped,
-/// state-bound (auto-revoked on exit), and time-bounded where the
-/// privilege is high (network). Base read/search grants from INIT
-/// carry no condition and always survive.
+/// สิทธิ์ที่ให้ตาม state (สเปก §14.2) lease ทุกใบมี scope ผูกกับ state
+/// (ออกจาก state แล้ว revoke อัตโนมัติ) และจำกัดเวลาถ้าสิทธิ์สูง (เน็ตเวิร์ก)
+/// สิทธิ์พื้นฐาน read/search จาก INIT ไม่มี condition จึงรอดเสมอ
 fn state_grants(next: AgentState, workspace: &Path, network_allow: &[String]) -> Vec<Capability> {
     let ws = workspace.to_string_lossy().to_string();
     let src = format!("{ws}/src");
@@ -465,8 +464,8 @@ fn absolutize(p: &Path) -> PathBuf {
 
 fn resolve_scope(base_dir: &Path, workspace: &Path, scope: &str) -> String {
     if scope.starts_with("./") {
-        // Relative to the VM home (where aivm.yaml lives): ./workspace/src
-        // means <base>/workspace/src.
+        // เทียบกับ VM home (ที่อยู่ของ aivm.yaml): ./workspace/src
+        // หมายถึง <base>/workspace/src
         let rel = scope.trim_start_matches("./");
         if rel == "workspace" {
             return workspace.to_string_lossy().to_string();
@@ -477,7 +476,7 @@ fn resolve_scope(base_dir: &Path, workspace: &Path, scope: &str) -> String {
         return base_dir.join(rel).to_string_lossy().to_string();
     }
     if scope.starts_with("/workspace") {
-        // Map the spec's virtual /workspace onto the real dir.
+        // แปลง /workspace แบบ virtual ในสเปกให้เป็นไดเรกทอรีจริง
         let rel = scope
             .trim_start_matches("/workspace")
             .trim_start_matches('/');
@@ -489,12 +488,12 @@ fn resolve_scope(base_dir: &Path, workspace: &Path, scope: &str) -> String {
     if Path::new(scope).is_absolute() {
         return scope.to_string();
     }
-    // Bare hostnames (network) pass through untouched.
+    // hostname ล้วน (เน็ตเวิร์ก) ผ่านไปตรง ๆ ไม่แตะ
     if !scope.contains('/') && !scope.contains('.') {
         return scope.to_string();
     }
     if !scope.contains('/') {
-        return scope.to_string(); // hostname like github.com
+        return scope.to_string(); // hostname อย่าง github.com
     }
     workspace.join(scope).to_string_lossy().to_string()
 }
@@ -557,7 +556,7 @@ capabilities:
         assert_eq!(g, 1);
         assert!(rt.gateway.write(&mut rt.cube, "src/a.rs", "x").is_ok());
         rt.persist().unwrap();
-        // Fresh boot resumes grants + state instead of resetting to INIT.
+        // บูตใหม่กู้ grant + state เดิม ไม่รีเซ็ตกลับ INIT
         let rt2 = Runtime::init(test_config(), base.clone()).unwrap();
         assert_eq!(rt2.cube.current_state(), AgentState::Modify);
         let _ = std::fs::remove_dir_all(&base);

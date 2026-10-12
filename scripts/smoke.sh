@@ -1,7 +1,7 @@
 #!/bin/sh
-# End-to-end CLI smoke test: exercises the real `aivm` binary through a
-# full VM lifecycle in an isolated temp root. Fails on first error.
-# Usage: sh scripts/smoke.sh  (or: make e2e)
+# สโมกเทสต์ CLI แบบ end-to-end: ใช้ไบนารี `aivm` ตัวจริงวิ่งตลอด
+# วงจรชีวิต VM ใน root ชั่วคราวที่แยกจากกัน เจอข้อผิดพลาดแรกล้มทันที
+# วิธีใช้: sh scripts/smoke.sh (หรือ: make e2e)
 set -eu
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/aivm-smoke-XXXXXX")"

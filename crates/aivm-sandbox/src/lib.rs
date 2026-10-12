@@ -1,8 +1,8 @@
-//! Sandbox layer — spec §27.
+//! ชั้น Sandbox — ดูสเปก §27.
 //!
-//! MVP-A: mediated workspace only (no process spawn). MVP-B will add
-//! namespaces/cgroups/seccomp via this crate's interface. Until then,
-//! `Sandbox::spawn` always fails closed.
+//! MVP-A: มีแค่ workspace แบบผ่านตัวกลาง (ห้าม spawn process)
+//! MVP-B จะเติม namespaces/cgroups/seccomp ผ่าน interface ของ crate นี้
+//! จนกว่าจะถึงตอนนั้น `Sandbox::spawn` ปฏิเสธแบบ fail-closed เสมอ
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -48,7 +48,7 @@ impl Sandbox {
         Self { level, limits }
     }
 
-    /// MVP-A: always denied. MVP-B implements real isolation here.
+    /// MVP-A: ปฏิเสธเสมอ ของจริงที่ isolate ระดับ OS มาใน MVP-B
     pub fn spawn(&self, _exe: &str, _args: &[String]) -> Result<(), SandboxError> {
         Err(SandboxError::Disabled(
             "arbitrary process execution is disabled in MVP-A; use mediated tools".into(),

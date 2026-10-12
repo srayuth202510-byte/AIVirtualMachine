@@ -1,13 +1,13 @@
-//! One-shot mediated self-test (`aivm demo`).
+//! self-test แบบผ่านตัวกลางในครั้งเดียว (`aivm demo`)
 //!
-//! Spins up a throwaway workspace in the temp dir, drives the full
-//! enforcement chain (capability + policy + gateway + state machine +
-//! audit) through representative allow AND deny cases, verifies the
-//! audit hash chain, and cleans up. Fails closed: any unexpected
-//! decision is reported, never silently ignored.
+//! สร้าง workspace ชั่วคราวใน temp dir แล้วขับ enforcement chain ทั้งเส้น
+//! (capability + policy + gateway + state machine + audit) ผ่านเคส
+//! ตัวอย่างทั้ง ALLOW และ DENY จากนั้นตรวจ hash chain ของ audit แล้ว
+//! ทำความสะอาด fail-closed: การตัดสินที่ผิดคาดจะถูกรายงาน
+//! ไม่มีเงียบหาย
 //!
-//! This is the fastest debug loop for the security boundary:
-//! `cargo run -p aivm-cli -- demo`.
+//! นี่คือ loop ดีบักที่เร็วที่สุดของเส้นขอบเขตความปลอดภัย:
+//! `cargo run -p aivm-cli -- demo`
 
 use super::{absolutize, Runtime, RuntimeError, VmConfig};
 use aivm_audit::AuditWriter;
@@ -35,7 +35,7 @@ impl Expect {
 pub struct DemoCase {
     pub name: String,
     pub expected: Expect,
-    /// What actually happened: "allow…" on allow, "deny:<reason>" on deny.
+    /// เกิดอะไรขึ้นจริง: "allow:..." ตอนอนุญาต "deny:<เหตุผล>" ตอนปฏิเสธ
     pub got: String,
     pub pass: bool,
 }
@@ -109,7 +109,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
     let mut cube = Cube::new("demo");
     let mut cases: Vec<DemoCase> = vec![];
 
-    // 1. Happy-path write inside src.
+    // 1. ทางสุข: เขียนใน src ได้
     case(
         &mut cases,
         "write src/new.rs",
@@ -119,7 +119,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
             .map_err(|e| e.to_string()),
     );
 
-    // 2. Read back what was written (content must round-trip).
+    // 2. อ่านสิ่งที่เขียนกลับมา (เนื้อหาต้องตรงกัน)
     case(
         &mut cases,
         "read src/new.rs",
@@ -142,7 +142,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
             }),
     );
 
-    // 3. Path traversal must deny.
+    // 3. path traversal ต้องถูกปฏิเสธ
     case(
         &mut cases,
         "read ../../etc/passwd (traversal)",
@@ -152,7 +152,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
             .map_err(|e| e.to_string()),
     );
 
-    // 4. Absolute escape must deny.
+    // 4. หลุดออกนอกด้วย absolute path ต้องถูกปฏิเสธ
     case(
         &mut cases,
         "read /etc/passwd (escape)",
@@ -162,7 +162,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
             .map_err(|e| e.to_string()),
     );
 
-    // 5. Dotenv must deny (policy deny-list).
+    // 5. ไฟล์ dotenv ต้องถูกปฏิเสธ (deny-list ของ policy)
     case(
         &mut cases,
         "read .env (deny-list)",
@@ -172,7 +172,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
             .map_err(|e| e.to_string()),
     );
 
-    // 6. Write outside src must deny (capability scope).
+    // 6. เขียนนอก src ต้องถูกปฏิเสธ (scope ของ capability)
     case(
         &mut cases,
         "write README.md (out of scope)",
@@ -182,7 +182,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
             .map_err(|e| e.to_string()),
     );
 
-    // 7. Unknown tool must deny.
+    // 7. tool ที่ไม่รู้จักต้องถูกปฏิเสธ
     case(
         &mut cases,
         "dispatch shell.exec (unknown tool)",
@@ -199,7 +199,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
         .map_err(|e| e.to_string()),
     );
 
-    // 8. Symlink escape must deny (unix only; skipped elsewhere).
+    // 8. symlink escape ต้องถูกปฏิเสธ (เฉพาะ unix ที่อื่นข้าม)
     #[cfg(unix)]
     case(
         &mut cases,
@@ -221,7 +221,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
         pass: true,
     });
 
-    // 9. State jump INIT -> DEPLOY must deny.
+    // 9. กระโดด state จาก INIT -> DEPLOY ต้องถูกปฏิเสธ
     {
         let mut c = Cube::new("demo-jump");
         let r = c.transition(AgentState::Deploy, &TransitionGuards::default());
@@ -234,7 +234,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
         );
     }
 
-    // 10. Validated guarded transitions must allow.
+    // 10. transition แบบมี guard ที่ถูกต้องทั้งหมดต้องผ่าน
     {
         let mut c = Cube::new("demo-path");
         let r: Result<String, String> = (|| {
@@ -276,7 +276,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
         );
     }
 
-    // 11. Dynamic grant: write denied in INIT, allowed after MODIFY.
+    // 11. สิทธิ์แบบ dynamic: ใน INIT เขียนไม่ได้ พอถึง MODIFY เขียนได้
     {
         let cfg = VmConfig::from_yaml(
             "name: demo-dyn\nfilesystem:\n  read: [./workspace]\n  write: [./workspace/src]\nnetwork:\n  allow: [github.com]\ncapabilities:\n  initial: [read:workspace, search:code]\n",
@@ -285,7 +285,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
         let mut rt =
             Runtime::init(cfg, base.join("dyn")).map_err(|e| RuntimeError::Io(e.to_string()))?;
         let r: Result<String, String> = (|| {
-            // INIT holds no write lease.
+            // ใน INIT ไม่มี write lease
             if rt
                 .gateway
                 .write(&mut rt.cube, "src/dyn.rs", "fn dyn_() {}\n")
@@ -312,7 +312,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
                 .write(&mut rt.cube, "src/dyn.rs", "fn dyn_() {}\n")
                 .map(|r| r.output)
                 .map_err(|e| e.to_string())?;
-            // Leaving the granting states revokes the lease: use-after-revoke denies.
+            // ออกจาก state ที่ให้สิทธิ์ lease ถูก revoke: ใช้หลัง revoke ต้องถูกปฏิเสธ
             rt.gateway.caps.revoke_stale("ANALYZE");
             match rt.gateway.write(&mut rt.cube, "src/dyn2.rs", "x") {
                 Ok(_) => Err("write allowed after revoke".to_string()),
@@ -322,7 +322,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
         case(&mut cases, "dynamic grant + revoke (§14)", Expect::Allow, r);
     }
 
-    // 12. Audit chain must verify.
+    // 12. hash chain ของ audit ต้องตรวจผ่าน
     let audit_entries =
         AuditWriter::verify(&audit_path).map_err(|e| RuntimeError::Io(e.to_string()))?;
     let audit_verified = audit_entries > 0;
@@ -334,7 +334,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
         workspace: ws_str,
     };
 
-    // Best-effort cleanup; demo artifacts must not pollute the repo.
+    // ลบแบบ best-effort ขยะ demo ต้องไม่เลอะ repo
     let _ = std::fs::remove_dir_all(&base);
 
     Ok(report)

@@ -1,8 +1,8 @@
-//! Network gateway — spec §18.
+//! Network gateway — ดูสเปก §18.
 //!
-//! MVP-A: **no network**. This crate exists so the deny path is explicit
-//! and testable: every request is denied until a later milestone adds an
-//! allowlisted egress gateway. Fail-closed by construction.
+//! MVP-A: **ไม่มีเน็ตเวิร์ก** crate นี้มีไว้เพื่อให้ทางปฏิเสธชัดแจ้ง
+//! และเทสต์ได้: ทุกคำขอถูกปฏิเสธจนกว่า milestone หลังจะเพิ่ม
+//! egress gateway แบบ allowlist fail-closed โดยโครงสร้าง
 
 use aivm_policy::{EvalContext, Policy};
 use serde::{Deserialize, Serialize};
@@ -30,8 +30,8 @@ impl NetworkGateway {
         Self { policy }
     }
 
-    /// MVP-A always denies (no egress). Still evaluates policy so denials
-    /// carry the correct rule label for audit.
+    /// MVP-A ปฏิเสธเสมอ (ไม่มี egress) แต่ยังประเมิน policy เพื่อให้
+    /// เหตุผลปฏิเสธมีป้าย rule ที่ถูกต้องสำหรับ audit
     pub fn request(&self, req: &NetworkRequest, ctx: &EvalContext) -> Result<(), NetworkError> {
         if req.protocol != "https" {
             return Err(NetworkError::Denied("protocol-not-https".into()));

@@ -1,9 +1,9 @@
-//! Tool gateway — spec §12, §16, §17.
+//! Tool gateway — ดูสเปก §12, §16, §17.
 //!
-//! MVP-A: mediated `filesystem.read / write / search` only. No shell,
-//! no arbitrary process execution, no network. Every request goes:
-//! canonicalize -> capability -> policy -> execute -> audit.
-//! Fail-closed at every step; TOCTOU-hardened via realpath + re-check.
+//! MVP-A: ผ่านตัวกลางแค่ `filesystem.read / write / search` เท่านั้น
+//! ไม่มี shell ไม่มีรันโปรเซสตามใจ ไม่มีเน็ตเวิร์ก ทุกคำขอเดินตามสาย:
+//! canonicalize -> capability -> policy -> execute -> audit
+//! fail-closed ทุกขั้น กัน TOCTOU ด้วย realpath + ตรวจซ้ำ
 
 use aivm_audit::{AuditRecord, AuditWriter};
 use aivm_capability::CapabilitySet;
@@ -76,16 +76,16 @@ impl ToolGateway {
         }
     }
 
-    /// Canonicalize `requested` against the workspace root and ensure the
-    /// result stays inside (symlink-escape + `..` hardened).
+    /// ทำ path ที่ขอมาให้เป็น canonical เทียบกับ workspace root และ
+    /// รับรองว่าผลลัพธ์ยังอยู่ข้างใน (กัน symlink-escape + `..`)
     fn canonicalize(&self, requested: &str) -> Result<PathBuf, ToolError> {
-        // Reject absolute paths outside workspace early (adversarial-first).
+        // ปฏิเสธ absolute path ที่อยู่นอก workspace ตั้งแต่เนิ่น ๆ (คิดแบบ adversarial ก่อน)
         let joined = if Path::new(requested).is_absolute() {
             PathBuf::from(requested)
         } else {
             self.workspace.join(requested)
         };
-        // Normalize `..` lexically first (no FS access yet).
+        // ตัด `..` แบบ lexical ก่อน (ยังไม่แตะ FS)
         let normalized = normalize(&joined);
         let ws = normalize(&self.workspace);
         if normalized != ws && !normalized.starts_with(&ws) {
@@ -93,13 +93,13 @@ impl ToolGateway {
                 "path traversal outside workspace: {requested}"
             )));
         }
-        // Resolve symlinks where the path exists (TOCTOU: check-then-act +
-        // re-check at open time with O_NOFOLLOW semantics approximated by
-        // verifying no symlink component escapes).
+        // คลี่ symlink ตรง path ที่มีอยู่จริง (กัน TOCTOU แบบ check-then-act +
+        // ตรวจซ้ำตอนเปิด ใช้ความหมายใกล้ O_NOFOLLOW โดยยืนยันว่า
+        // ไม่มีส่วนไหนของ symlink หลุดออกนอก)
         if let Ok(real) = std::fs::canonicalize(&normalized) {
             if real != ws && !real.starts_with(&ws) {
-                // Allow tempdir-style workspaces where canonical ws differs:
-                // compare against canonical workspace root too.
+                // เผื่อ workspace สไตล์ tempdir ที่ canonical ไม่ตรงกัน:
+                // เทียบกับ workspace root แบบ canonical ด้วย
                 let real_ws = std::fs::canonicalize(&self.workspace)
                     .map_err(|e| ToolError::Io(e.to_string()))?;
                 if real != real_ws && !real.starts_with(&real_ws) {
@@ -110,8 +110,8 @@ impl ToolGateway {
             }
             return Ok(real);
         }
-        // Path does not exist yet (write case): ensure no parent component
-        // is a symlink escaping the workspace.
+        // path ยังไม่มีอยู่จริง (เคส write): ต้องแน่ใจว่าไม่มี parent ส่วนไหน
+        // เป็น symlink ที่หลุดออกนอก workspace
         let mut cur: Option<&Path> = Some(&normalized);
         while let Some(p) = cur {
             if p == ws || p == Path::new("") {
@@ -165,8 +165,8 @@ impl ToolGateway {
         }
     }
 
-    /// Shared enforcement: canonicalize -> capability -> policy.
-    /// Returns canonical path on ALLOW.
+    /// บังคับใช้ร่วมกัน: canonicalize -> capability -> policy
+    /// คืน canonical path เมื่อ ALLOW
     fn enforce(
         &mut self,
         cube: &mut Cube,
@@ -177,15 +177,15 @@ impl ToolGateway {
         let scope = canon.to_string_lossy().to_string();
         let ctx = Self::ctx_of(cube);
 
-        // Boundary files: never writable via gateway (structural deny).
+        // ไฟล์ขอบเขต: ห้ามเขียนผ่าน gateway เด็ดขาด (deny เชิงโครงสร้าง)
         if action == "write" && is_boundary_path(&canon) {
             self.audit_decision(cube, action, &scope, "deny", "boundary-write", "error");
             return Err(ToolError::Denied("boundary path is read-only".into()));
         }
 
-        // Capability check (fail-closed).
+        // เช็ก capability (fail-closed)
         if self.caps.authorize(action, "filesystem", &scope).is_err() {
-            // Search falls back to read capability.
+            // search ใช้สิทธิ์ read แทนได้ถ้าไม่มี search
             let fallback_ok =
                 action == "search" && self.caps.authorize("read", "filesystem", &scope).is_ok();
             if !fallback_ok {
@@ -194,13 +194,13 @@ impl ToolGateway {
             }
         }
 
-        // Policy check (fail-closed).
+        // เช็ก policy (fail-closed)
         let policy_action = if action == "search" { "read" } else { action };
         let (d, rule) = self.policy.evaluate_fs(policy_action, &scope, &ctx);
         match d {
             Decision::Allow => {
-                // Re-check after canonicalization (TOCTOU hardening): the
-                // scope string is the canonical path, already re-derived.
+                // ตรวจซ้ำหลัง canonicalize (กัน TOCTOU): สตริง scope
+                // คือ canonical path ที่ได้มาใหม่แล้ว
                 self.audit_decision(
                     cube,
                     action,
@@ -227,7 +227,7 @@ impl ToolGateway {
 
     pub fn read(&mut self, cube: &mut Cube, path: &str) -> Result<ToolResult, ToolError> {
         let canon = self.enforce(cube, "read", path)?;
-        // Open with symlink check: reject symlink files (O_NOFOLLOW approx).
+        // เปิดพร้อมเช็ก symlink: ปฏิเสธไฟล์ symlink (ใกล้เคียง O_NOFOLLOW)
         let meta = std::fs::symlink_metadata(&canon).map_err(|e| ToolError::Io(e.to_string()))?;
         if meta.file_type().is_symlink() {
             self.audit_decision(cube, "read", path, "deny", "symlink-file", "error");
@@ -251,7 +251,7 @@ impl ToolGateway {
         if let Some(parent) = canon.parent() {
             std::fs::create_dir_all(parent).map_err(|e| ToolError::Io(e.to_string()))?;
         }
-        // Re-validate containment right before act (TOCTOU).
+        // ยืนยัน containment อีกครั้งก่อนลงมือ (กัน TOCTOU)
         let ws = normalize(&self.workspace);
         if canon != ws && !canon.starts_with(&ws) {
             return Err(ToolError::Denied("containment re-check failed".into()));
@@ -264,10 +264,10 @@ impl ToolGateway {
         })
     }
 
-    /// `code.search`: substring search over workspace files (read-scoped).
+    /// `code.search`: ค้น substring ในไฟล์ workspace (ใช้ scope แบบ read)
     pub fn search(&mut self, cube: &mut Cube, query: &str) -> Result<ToolResult, ToolError> {
         let ws_str = self.workspace.to_string_lossy().to_string();
-        // Enforce read-scope over the workspace root itself.
+        // บังคับ scope แบบ read บน workspace root เองก่อน
         let _ = self.enforce(cube, "search", &ws_str)?;
         let mut hits = vec![];
         for entry in walkdir::WalkDir::new(&self.workspace)
@@ -277,7 +277,7 @@ impl ToolGateway {
             .filter(|e| e.file_type().is_file())
         {
             let p = entry.path();
-            // Skip boundary dirs.
+            // ข้ามไดเรกทอรีขอบเขต
             if is_boundary_path(p) {
                 continue;
             }
@@ -307,7 +307,7 @@ impl ToolGateway {
         cube: &mut Cube,
         req: &ToolRequest,
     ) -> Result<ToolResult, ToolError> {
-        // MVP-A: only three mediated tools exist. Anything else => DENY.
+        // MVP-A: มีแค่สาม tool ที่ผ่านตัวกลาง อย่างอื่นคือ DENY
         match req.tool.as_str() {
             "filesystem.read" => self.read(cube, &req.path),
             "filesystem.write" => {
@@ -321,14 +321,14 @@ impl ToolGateway {
         }
     }
 
-    /// Guard for tests: current state label.
+    /// ตัวช่วยเทสต์: ป้ายชื่อ state ปัจจุบัน
     pub fn _state_label(cube: &Cube) -> String {
         let _: AgentState = cube.current_state();
         cube.current_state().to_string()
     }
 }
 
-/// Lexical normalization (no I/O): resolves `.` and `..`.
+/// normalize แบบ lexical (ไม่แตะ I/O): ตัด `.` กับ `..` ออก
 fn normalize(p: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
@@ -405,7 +405,7 @@ network: {{allow: [], deny: []}}
     fn write_outside_src_denied() {
         let (mut gw, mut cube, _d) = harness();
         let r = gw.write(&mut cube, "README.md", "hi");
-        // README is at workspace root: write allows only */src.
+        // README อยู่ root ของ workspace: write อนุญาตแค่ */src
         assert!(r.is_err());
     }
 

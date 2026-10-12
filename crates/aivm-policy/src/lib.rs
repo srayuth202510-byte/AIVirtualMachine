@@ -1,7 +1,8 @@
-//! Policy engine — spec §13.
+//! Policy engine — กฎหมายของ AI VM (ดูสเปก §13)
 //!
-//! Deny-overrides, order-independent, fail-closed, deterministic,
-//! state-aware. MVP: YAML allowlist + explicit deny list.
+//! หลักการ: deny ชนะเสมอ (deny-overrides) ไม่ขึ้นกับลำดับ rule
+//! fail-closed ทุกจุด ตัดสินแบบ deterministic และรับรู้ state
+//! MVP: allowlist ใน YAML + deny list ที่ระบุชัดเจน
 
 use aivm_capability::CapabilitySet;
 use serde::{Deserialize, Serialize};
@@ -54,10 +55,10 @@ pub struct SystemPolicy {
     pub allow: Vec<String>,
 }
 
-/// Conditional rule (advanced, spec §13.2). MVP evaluates a tiny subset:
-/// `when` supports `state == 'X'`, `state in {'A','B'}`, `confidence >= N`
-/// combined with `&&`. Anything unparsable => rule does not match
-/// (fail-closed at rule level, deny-by-default overall).
+/// rule แบบมีเงื่อนไข (ขั้นสูง ดูสเปก §13.2) MVP ประเมินแค่ชุดย่อย:
+/// `when` รองรับ `state == 'X'`, `state in {'A','B'}`, `confidence >= N`
+/// เชื่อมด้วย `&&` ถ้า parse ไม่ได้ rule นั้นจะไม่ match
+/// (fail-closed ระดับ rule และ deny-by-default ทั้งระบบ)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     pub id: String,
@@ -67,7 +68,7 @@ pub struct Rule {
     #[serde(default)]
     pub when: Option<String>,
     #[serde(default)]
-    pub effect: Option<String>, // "allow" | "deny", default allow
+    pub effect: Option<String>, // "allow" | "deny" ค่าเริ่มต้นคือ allow
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,27 +117,27 @@ pub struct EvalContext {
 }
 
 impl Policy {
-    /// Fail-closed load: invalid YAML => Err, caller must refuse startup.
+    /// โหลดแบบ fail-closed: YAML เสียได้ Err ผู้เรียกต้องปฏิเสธการสตาร์ต
     pub fn from_yaml(text: &str) -> Result<Self, PolicyError> {
         serde_yaml::from_str(text).map_err(|e| PolicyError::Parse(e.to_string()))
     }
 
-    /// Evaluate a filesystem action against the policy.
-    /// Order: explicit deny (glob) first (deny-overrides), then allow list,
-    /// then conditional rules. No match => Deny.
+    /// ประเมิน action บน filesystem เทียบกับ policy
+    /// ลำดับ: deny ที่ระบุชัด (glob) มาก่อนเสมอ (deny-overrides) แล้วค่อยดู
+    /// allow list แล้วค่อย rule แบบมีเงื่อนไข ไม่ตรงอะไรเลยคือ Deny
     pub fn evaluate_fs(
         &self,
         action: &str, // "read" | "write"
         canonical_path: &str,
         ctx: &EvalContext,
     ) -> (Decision, Option<String>) {
-        // 1. deny list always wins
+        // 1. deny list ชนะเสมอ
         for pat in &self.filesystem.deny {
             if match_pattern(pat, canonical_path) {
                 return (Decision::Deny, Some(format!("deny-list:{pat}")));
             }
         }
-        // 2. conditional rules with effect: deny also win over allows
+        // 2. rule แบบมีเงื่อนไขที่ effect: deny ก็ชนะ allow เหมือนกัน
         for rule in &self.rules {
             if rule.effect.as_deref() == Some("deny")
                 && rule.action == action
@@ -147,9 +148,10 @@ impl Policy {
                 return (Decision::Deny, Some(format!("rule:{}", rule.id)));
             }
         }
-        // 3. allow list — but a scoped allow-rule with `when` acts as a
-        // state gate: when one exists for this request it must match,
-        // otherwise the base allow is suspended (spec §13.2, §14).
+        // 3. allow list — แต่ allow-rule ที่ระบุ scope พร้อม `when`
+        // จะทำหน้าที่เป็น state gate: ถ้ามี rule แบบนี้ตรงกับคำขอ
+        // ต้องมีอย่างน้อยหนึ่ง rule ที่ match ไม่เช่นนั้นสิทธิ์ allow
+        // พื้นฐานจะถูกระงับ (สเปก §13.2, §14)
         let allows = match action {
             "read" => &self.filesystem.read,
             "write" => &self.filesystem.write,
@@ -163,7 +165,7 @@ impl Policy {
                 return (Decision::Deny, Some("state-gate".into()));
             }
         }
-        // 5. conditional allow rules
+        // 5. allow-rule แบบมีเงื่อนไข
         for rule in &self.rules {
             let effect = rule.effect.as_deref().unwrap_or("allow");
             if effect == "allow"
@@ -193,7 +195,7 @@ impl Policy {
     }
 
     pub fn evaluate_network(&self, host: &str, ctx: &EvalContext) -> (Decision, Option<String>) {
-        // Private/loopback/metadata always denied (defense in depth, §18).
+        // เครือข่ายส่วนตัว/loopback/metadata ปฏิเสธเสมอ (defense in depth §18)
         if is_blocked_network(host) {
             return (Decision::Deny, Some("blocked-range".into()));
         }
@@ -202,7 +204,7 @@ impl Policy {
                 return (Decision::Deny, Some(format!("deny-list:{pat}")));
             }
         }
-        // Conditional deny rules (e.g. deny_network_during_analyze).
+        // deny-rule แบบมีเงื่อนไข (เช่น deny_network_during_analyze)
         for rule in &self.rules {
             if rule.effect.as_deref() == Some("deny")
                 && rule.action == "network"
@@ -227,9 +229,9 @@ impl Policy {
         (Decision::Deny, Some("default-deny".into()))
     }
 
-    /// True when no scoped allow-rule gates this request, or at least one
-    /// matching allow-rule's `when` holds. Fail-closed: unknown predicates
-    /// never match (see `eval_clause`).
+    /// จริงเมื่อไม่มี allow-rule ที่ระบุ scope มากั้นคำขอนี้ หรือมีอย่างน้อย
+    /// หนึ่ง rule ที่ `when` เป็นจริง หลัก fail-closed: predicate ที่ไม่รู้จัก
+    /// จะไม่มีวัน match (ดู `eval_clause`)
     fn gated(&self, action: &str, resource: &str, scope: &str, ctx: &EvalContext) -> bool {
         let mut scoped = false;
         for rule in &self.rules {
@@ -248,7 +250,7 @@ impl Policy {
         !scoped
     }
 
-    /// Full check: capability set + policy. Both must allow (I-2, I-3).
+    /// เช็กครบทั้งสองชั้น: ต้องมี capability และ policy ต้องอนุญาต (I-2, I-3)
     pub fn authorize_with_capability(
         &self,
         caps: &mut CapabilitySet,
@@ -269,21 +271,21 @@ impl Policy {
     }
 }
 
-/// Glob-ish matching for MVP: supports `*`, `**`, exact, and prefix.
-/// `**/.env*` should match any path containing `/.env`.
+/// การเทียบแบบ glob สำหรับ MVP: รองรับ `*`, `**`, ตรงกันพอดี และ prefix
+/// `**/.env*` จะ match ทุก path ที่มี `/.env`
 pub fn match_pattern(pattern: &str, value: &str) -> bool {
     if pattern == "*" || pattern == "**" {
         return true;
     }
-    // Use the `glob` crate semantics on the full string; fall back to
-    // substring/prefix checks for workspace-style scopes.
+    // ใช้ความหมายแบบ `glob` crate กับทั้งสตริง ถ้าไม่ได้ผลค่อยถอยมา
+    // เช็กแบบ substring/prefix สำหรับ scope สไตล์ workspace
     if pattern.contains('*') {
         if let Ok(pat) = glob::Pattern::new(pattern) {
             if pat.matches(value) {
                 return true;
             }
         }
-        // `**/x` also matches bare `x` segments anywhere.
+        // `**/x` match ส่วน `x` ที่อยู่ตรงไหนก็ได้ด้วย
         let stripped: String = pattern
             .trim_start_matches("**/")
             .trim_start_matches("*/")
@@ -295,7 +297,7 @@ pub fn match_pattern(pattern: &str, value: &str) -> bool {
         }
         return false;
     }
-    // Plain path: exact or dir-prefix.
+    // path ธรรมดา: ต้องตรงกันพอดีหรือเป็น prefix แบบไดเรกทอรี
     if value == pattern {
         return true;
     }
@@ -330,7 +332,7 @@ fn rule_matches(rule: &Rule, ctx: &EvalContext) -> bool {
     }
 }
 
-/// Tiny `&&`-only evaluator for MVP (full CEL later).
+/// ตัวประเมิน `&&` อย่างง่ายสำหรับ MVP (อนาคตใช้ CEL เต็ม)
 fn eval_when(when: &str, ctx: &EvalContext) -> bool {
     for clause in when.split("&&") {
         let c = clause.trim();
@@ -366,13 +368,13 @@ fn eval_clause(c: &str, ctx: &EvalContext) -> bool {
         if let Ok(v) = rest.trim().parse::<f64>() {
             return ctx.confidence >= v;
         }
-        return false; // fail-closed
+        return false; // fail-closed: parse ไม่ได้คือไม่ผ่าน
     }
     if let Some(rest) = c.strip_prefix("tests_passed ==") {
         let want = rest.trim() == "true";
         return ctx.tests_passed == want;
     }
-    // Unknown predicate => fail-closed (rule does not match).
+    // predicate ที่ไม่รู้จัก = fail-closed (rule นี้ไม่ match)
     false
 }
 
@@ -475,7 +477,7 @@ rules:
     #[test]
     fn write_suspended_until_modify_state() {
         let p = gated_policy();
-        // Allow-listed path, but no allow-rule matches in ANALYZE.
+        // path อยู่ใน allow-list แต่ไม่มี allow-rule ไหน match ใน state ANALYZE
         let analyze = EvalContext {
             state: "ANALYZE".into(),
             confidence: 0.9,
@@ -484,7 +486,7 @@ rules:
         let (d, rule) = p.evaluate_fs("write", "/workspace/src/a.rs", &analyze);
         assert_eq!(d, Decision::Deny);
         assert_eq!(rule.as_deref(), Some("state-gate"));
-        // Guarded transition satisfied: gate opens.
+        // ผ่านเงื่อนไข transition แบบมี guard: ประตูเปิด
         let modify = EvalContext {
             state: "MODIFY".into(),
             confidence: 0.9,
@@ -492,7 +494,7 @@ rules:
         };
         let (d, _) = p.evaluate_fs("write", "/workspace/src/a.rs", &modify);
         assert_eq!(d, Decision::Allow);
-        // Low confidence keeps the gate shut even in MODIFY.
+        // confidence ต่ำ ประตูก็ยังปิดแม้อยู่ใน state MODIFY
         let unsure = EvalContext {
             state: "MODIFY".into(),
             confidence: 0.1,
@@ -502,7 +504,7 @@ rules:
             p.evaluate_fs("write", "/workspace/src/a.rs", &unsure).0,
             Decision::Deny
         );
-        // Reads are ungated (no allow-rule scopes them).
+        // read ไม่ถูก gate (ไม่มี allow-rule ไหนครอบคลุม)
         assert_eq!(
             p.evaluate_fs("read", "/workspace/a.rs", &analyze).0,
             Decision::Allow

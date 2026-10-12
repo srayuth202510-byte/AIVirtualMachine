@@ -1,8 +1,8 @@
-//! Cube engine — spec §8–§9.
+//! Cube engine — ดูสเปก §8-§9.
 //!
-//! CubeCell is the security context of the AI in a given state.
-//! MVP-A keeps an explicit validated state machine; full projection /
-//! event-sourcing compaction arrives with later milestones.
+//! CubeCell คือ security context ของ AI ใน state นั้น ๆ
+//! MVP-A ใช้ state machine ที่ผ่านการ validate แล้ว
+//! ส่วน projection / event-sourcing แบบเต็มมาใน milestone หลัง
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -20,7 +20,7 @@ pub enum CubeError {
     UnknownState(String),
 }
 
-/// Agent lifecycle states (spec §15).
+/// state ในวงจรชีวิต agent (สเปก §15)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum AgentState {
@@ -43,7 +43,7 @@ impl AgentState {
         }
     }
 
-    /// Valid edges of the state machine. INIT->DEPLOY jumps are denied.
+    /// เส้นทางที่ถูกต้องของ state machine ห้ามกระโดด INIT->DEPLOY ตรง ๆ
     pub fn can_transition_to(&self, next: AgentState) -> bool {
         matches!(
             (*self, next),
@@ -76,7 +76,7 @@ impl std::str::FromStr for AgentState {
     }
 }
 
-/// Exact struct from spec §9.2.
+/// struct ตรงตามสเปก §9.2 ทุกฟิลด์
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CubeCell {
     pub status_flags: u8,
@@ -121,7 +121,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Guards required per transition (spec §15).
+/// เงื่อนไข guard ที่แต่ละ transition ต้องผ่าน (สเปก §15)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TransitionGuards {
     #[serde(default)]
@@ -134,7 +134,7 @@ pub struct TransitionGuards {
     pub policy_approved: bool,
 }
 
-/// Minimal per-task Cube (spec §9.3.2: per-task instance, working set only).
+/// Cube ขนาดเล็กแยกตาม task (สเปก §9.3.2: แยก instance ต่อ task เก็บเฉพาะ working set)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cube {
     pub task_id: String,
@@ -167,7 +167,7 @@ impl Cube {
         self.state
     }
 
-    /// Validated transition. Fail-closed: invalid edge or unmet guard => Err.
+    /// transition ที่ผ่านการ validate ถ้าเส้นผิดหรือ guard ไม่ผ่านจะได้ Err (fail-closed)
     pub fn transition(
         &mut self,
         next: AgentState,
@@ -209,8 +209,8 @@ impl Cube {
         Ok(())
     }
 
-    /// Insert or update a cell. Fail-closed on eviction: never evict cells
-    /// for the current state; evict LRU otherwise (§9.3.2–§9.3.3).
+    /// เพิ่มหรืออัปเดต cell ตอน evict ใช้แบบ fail-closed: ห้ามทิ้ง cell
+    /// ของ current state เด็ดขาด นอกนั้นทิ้งแบบ LRU (§9.3.2-§9.3.3)
     pub fn upsert_cell(&mut self, cell: CubeCell) -> Result<(), CubeError> {
         use std::collections::hash_map::Entry;
         let key = (cell.domain_id, cell.concept_id);
@@ -222,7 +222,7 @@ impl Cube {
             Entry::Vacant(_) => {}
         }
         if self.cells.len() >= self.max_cells {
-            // LRU victim excluding current-state cells.
+            // เลือกเหยื่อแบบ LRU โดยเว้น cell ของ current state ไว้
             let victim = self
                 .cells
                 .iter()

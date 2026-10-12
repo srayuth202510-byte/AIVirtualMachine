@@ -1,8 +1,8 @@
-//! Audit system — spec §25.
+//! ระบบ Audit — ดูสเปก §25.
 //!
-//! Every decision is recorded outside the agent boundary as an
-//! append-only JSONL log with hash chaining (tamper-evident).
-//! Secrets are redacted by default.
+//! ทุกการตัดสินถูกบันทึกไว้นอกขอบเขต agent เป็นล็อก JSONL แบบ
+//! append-only ที่มี hash chaining (ตรวจจับการแก้ไขย้อนหลังได้)
+//! ความลับทุกอย่างถูก redact เป็นค่าเริ่มต้น
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -106,7 +106,7 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Redact anything that looks like a secret value.
+/// แทนค่าอะไรก็ตามที่ดูเหมือนความลับด้วย [REDACTED]
 pub fn redact(s: &str) -> String {
     let lower = s.to_lowercase();
     if lower.contains("token")
@@ -129,7 +129,7 @@ pub struct AuditWriter {
 impl AuditWriter {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditError> {
         let path = path.as_ref().to_path_buf();
-        // Recover chain tip so rotation/restart keeps continuity.
+        // กู้ปลาย chain เดิม เพื่อให้ rotate/restart แล้วต่อเนื่องกัน
         let (seq, prev_hash) = read_tip(&path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -159,7 +159,7 @@ impl AuditWriter {
         Ok(rec)
     }
 
-    /// Offline integrity verification: hash chain + monotonic seq.
+    /// ตรวจความถูกต้องแบบออฟไลน์: hash chain + seq ที่เพิ่มทีละหนึ่ง
     pub fn verify(path: impl AsRef<Path>) -> Result<u64, AuditError> {
         let text =
             std::fs::read_to_string(path.as_ref()).map_err(|e| AuditError::Io(e.to_string()))?;

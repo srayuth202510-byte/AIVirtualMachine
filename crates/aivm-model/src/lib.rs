@@ -1,7 +1,7 @@
-//! Model abstraction — spec §28 (`model:` block).
+//! นามธรรมโมเดล — ดูสเปก §28 (บล็อก `model:`)
 //!
-//! Supports local and remote LLMs behind one trait. MVP ships a
-//! deterministic echo model for tests/offline runs.
+//! รองรับทั้ง LLM แบบ local และ remote หลัง trait เดียวกัน
+//! MVP แถม echo model แบบ deterministic ไว้รันเทสต์/ออฟไลน์
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -31,7 +31,7 @@ pub trait Model: Send + Sync {
     fn reason(&self, context: &str) -> Result<String, ModelError>;
 }
 
-/// Deterministic offline model (tests, CI, MVP demos).
+/// โมเดลออฟไลน์แบบ deterministic (ไว้ใช้ในเทสต์ CI และเดโม MVP)
 pub struct EchoModel {
     pub name: String,
 }

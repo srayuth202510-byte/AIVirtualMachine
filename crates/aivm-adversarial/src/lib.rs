@@ -1,1 +1,1 @@
-//! Marker crate: adversarial integration suite lives in `tests/`.
+//! crate ป้ายชื่อ: ชุดเทสต์ adversarial แบบ integration อยู่ใน `tests/`

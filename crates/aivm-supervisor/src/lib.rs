@@ -1,8 +1,7 @@
-//! Supervisor — spec §7.
+//! Supervisor — ดูสเปก §7.
 //!
-//! Trusted component OUTSIDE the AI sandbox. Owns VM lifecycle:
-//! create/start/stop/pause/kill/inspect. The agent can never mutate it
-//! (invariant I-5).
+//! องค์ประกอบที่ไว้ใจได้ อยู่นอก AI sandbox เป็นเจ้าของวงจรชีวิต VM:
+//! create/start/stop/pause/kill/inspect agent แตะต้องไม่ได้ (invariant I-5)
 
 use aivm_cube::{AgentState, TransitionGuards};
 use aivm_runtime::{Runtime, VmConfig};
@@ -44,8 +43,8 @@ impl Supervisor {
         s
     }
 
-    /// Pick up VMs created by previous CLI invocations (crash-safe,
-    /// restart-safe: ground truth is `vms/<name>/aivm.yaml` on disk).
+    /// เก็บ VM ที่คำสั่ง CLI ครั้งก่อนสร้างไว้ (ทน crash/restart ได้
+    /// ต้นฉบับความจริงคือ `vms/<name>/aivm.yaml` บนดิสก์)
     fn discover(&mut self) {
         let Ok(rd) = std::fs::read_dir(&self.root) else {
             return;
@@ -62,7 +61,7 @@ impl Supervisor {
         }
     }
 
-    /// Resolve a VM dir, falling back to disk if the in-memory map missed it.
+    /// หาไดเรกทอรี VM ถ้าแผนที่ในหน่วยความจำตกหล่นก็ถอยไปดูดิสก์
     fn resolve(&mut self, name: &str) -> Result<PathBuf, SupervisorError> {
         if let Some((_, dir)) = self.vms.get(name) {
             return Ok(dir.clone());
@@ -91,7 +90,7 @@ impl Supervisor {
             serde_yaml::to_string(&config).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
         std::fs::write(dir.join("aivm.yaml"), yaml)
             .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
-        // Validate runtime boots fail-closed before registering.
+        // ตรวจว่า runtime บูตแบบ fail-closed ได้ก่อนค่อยลงทะเบียน
         Runtime::init(config, dir.clone()).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
         self.vms.insert(name.to_string(), (VmStatus::Created, dir));
         Ok(())
@@ -114,9 +113,9 @@ impl Supervisor {
         Ok(out)
     }
 
-    /// Validated state advance with dynamic grant/revoke (§14).
-    /// Guards come from the operator (confidence, test + policy results),
-    /// never from the agent. Returns `(granted, revoked)`.
+    /// เดิน state ไปข้างหน้าแบบ validate พร้อมให้/เพิกถอนสิทธิ์แบบ dynamic (§14)
+    /// guard มาจาก operator (confidence ผลเทสต์ ผล policy)
+    /// ไม่รับจาก agent คืน `(granted, revoked)`
     pub fn transition(
         &mut self,
         name: &str,
