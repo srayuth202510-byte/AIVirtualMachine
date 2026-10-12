@@ -11,7 +11,9 @@ dependencies = [
  "aivm-cube",
  "aivm-policy",
  "aivm-runtime",
+ "aivm-sandbox",
  "aivm-tools",
+ "serde_json",
 ]
 
 [[package]]

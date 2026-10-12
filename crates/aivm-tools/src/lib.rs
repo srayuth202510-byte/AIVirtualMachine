@@ -173,7 +173,22 @@ impl ToolGateway {
         action: &str, // read|write|search
         requested: &str,
     ) -> Result<PathBuf, ToolError> {
-        let canon = self.canonicalize(requested)?;
+        // I-7: แม้ deny ตั้งแต่ขั้น canonicalize ก็ต้องมี audit record
+        // (complete mediation นับ denied attempts ด้วย)
+        let canon = match self.canonicalize(requested) {
+            Ok(c) => c,
+            Err(e) => {
+                let label = match &e {
+                    ToolError::Denied(m) if m.contains("traversal") => "path-traversal".to_string(),
+                    ToolError::Denied(m) if m.contains("symlink") => "symlink-escape".to_string(),
+                    ToolError::Denied(m) => m.clone(),
+                    ToolError::Io(m) => format!("canonicalize-io:{m}"),
+                    ToolError::Audit(m) => format!("audit:{m}"),
+                };
+                self.audit_decision(cube, action, requested, "deny", &label, "error");
+                return Err(e);
+            }
+        };
         let scope = canon.to_string_lossy().to_string();
         let ctx = Self::ctx_of(cube);
 
@@ -251,9 +266,10 @@ impl ToolGateway {
         if let Some(parent) = canon.parent() {
             std::fs::create_dir_all(parent).map_err(|e| ToolError::Io(e.to_string()))?;
         }
-        // ยืนยัน containment อีกครั้งก่อนลงมือ (กัน TOCTOU)
+        // ยืนยัน containment อีกครั้งก่อนลงมือ (กัน TOCTOU) ตกก็ audit
         let ws = normalize(&self.workspace);
         if canon != ws && !canon.starts_with(&ws) {
+            self.audit_decision(cube, "write", path, "deny", "containment-recheck", "error");
             return Err(ToolError::Denied("containment re-check failed".into()));
         }
         std::fs::write(&canon, content).map_err(|e| ToolError::Io(e.to_string()))?;

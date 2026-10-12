@@ -10,3 +10,5 @@ aivm-cube = { path = "../aivm-cube" }
 aivm-audit = { path = "../aivm-audit" }
 aivm-tools = { path = "../aivm-tools" }
 aivm-runtime = { path = "../aivm-runtime" }
+aivm-sandbox = { path = "../aivm-sandbox" }
+serde_json = { workspace = true }
