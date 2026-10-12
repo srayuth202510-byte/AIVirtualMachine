@@ -131,139 +131,96 @@ const SANDBOX_FS_MB: u64 = 512;
 /// PATH เดียวที่ child เห็น (runtime กำหนด agent เปลี่ยนไม่ได้)
 const SANDBOX_PATH: &str = "/usr/bin:/bin";
 
-/// สร้าง seccomp BPF allowlist สำหรับ tool หนึ่งชนิด
+/// syscall อันตรายที่ต้องฆ่า process ทันที (สเปก §12.1.1)
 ///
-/// ยังไม่ถูกเรียกใช้ — รอ wiring ตอนเปิด namespace isolation จริง
-/// (ปัจจุบัน `run_checked` รายงาน seccomp ใน `degraded` อย่างตรงไปตรงมา)
+/// เลือกใช้ **denylist** (default-allow) แทน allowlist เพราอ allowlist
+/// แบบเคร่งครัดไม่สามารถครอบ syscall ของ compiler / test runner ได้จริง
+/// ในทางปฏิบัติ no-new-privs + userns ที่ไม่มีสิทธิ์เหนือ host + denylist
+/// syscall อันตรายชั้นนี้คือแนวป้องกันที่ใช้ได้จริง (ดู Docker/systemd default profile)
+#[cfg(target_os = "linux")]
+const DANGEROUS_SYSCALLS: &[libc::c_long] = &[
+    libc::SYS_ptrace,
+    libc::SYS_mount,
+    libc::SYS_umount2,
+    libc::SYS_pivot_root,
+    libc::SYS_chroot,
+    libc::SYS_unshare,
+    libc::SYS_setns,
+    libc::SYS_bpf,
+    libc::SYS_kexec_load,
+    libc::SYS_init_module,
+    libc::SYS_finit_module,
+    libc::SYS_delete_module,
+    libc::SYS_reboot,
+    libc::SYS_swapon,
+    libc::SYS_swapoff,
+    libc::SYS_acct,
+    libc::SYS_settimeofday,
+    libc::SYS_clock_settime,
+    libc::SYS_adjtimex,
+    libc::SYS_add_key,
+    libc::SYS_keyctl,
+    libc::SYS_request_key,
+    libc::SYS_quotactl,
+    libc::SYS_open_by_handle_at,
+    libc::SYS_name_to_handle_at,
+    libc::SYS_perf_event_open,
+    libc::SYS_userfaultfd,
+    libc::SYS_io_uring_setup,
+    libc::SYS_sched_setattr,
+    libc::SYS_setuid,
+    libc::SYS_setgid,
+    libc::SYS_setreuid,
+    libc::SYS_setregid,
+    libc::SYS_setresuid,
+    libc::SYS_setresgid,
+    libc::SYS_setfsuid,
+    libc::SYS_setfsgid,
+    libc::SYS_mknod,
+    libc::SYS_personality,
+    libc::SYS_lookup_dcookie,
+    libc::SYS_iopl,
+    libc::SYS_ioperm,
+    libc::SYS_clock_adjtime,
+    libc::SYS_kcmp,
+    libc::SYS_process_madvise,
+    libc::SYS_move_mount,
+    libc::SYS_fsopen,
+    libc::SYS_fsconfig,
+    libc::SYS_fsmount,
+    libc::SYS_fspick,
+    libc::SYS_open_tree,
+    libc::SYS_mount_setattr,
+    libc::SYS_openat2,
+    libc::SYS_process_vm_readv,
+    libc::SYS_process_vm_writev,
+];
+
+/// สร้าง seccomp BPF filter แบบ **denylist**: default ALLOW, KILL เฉพาะ syscall
+/// ใน `DANGEROUS_SYSCALLS` — syscall ที่อนุญาตปกติจะผ่านหากไม่อยู่ใน denylist
 ///
 /// โครงโปรแกรม:
-///   ld [4] (arch); jeq x86_64 else KILL; ld [0] (nr)
-///   สำหรับ syscall ที่อนุญาตแต่ละตัว: jeq nr -> ALLOW (ไม่ตรง -> เทียบตัวถัดไป)
-///   ตัวสุดท้าย: ไม่ตรง -> ข้ามไป KILL
-///   ret ALLOW; ret KILL
-///
-/// หมายเหตุ: `jt`/`jf` เป็น offset จาก *คำสั่งถัดไป* (i+1) ตาม ABI ของ BPF
-/// ต้องใส่ `jf` ให้ตัวสุดท้ายเท่านั้น ไม่งั้นทุกตัวที่ "ไม่ตรง" จะไหลไป ALLOW
-#[allow(dead_code)]
-fn build_seccomp_filter(tool_type: &str) -> Vec<libc::sock_filter> {
-    // Base syscalls needed by all tools
-    let mut allowed = vec![
-        libc::SYS_read,
-        libc::SYS_write,
-        libc::SYS_openat,
-        libc::SYS_close,
-        libc::SYS_exit,
-        libc::SYS_exit_group,
-        libc::SYS_futex,
-        libc::SYS_mmap,
-        libc::SYS_munmap,
-        libc::SYS_mprotect,
-        libc::SYS_brk,
-        libc::SYS_rt_sigaction,
-        libc::SYS_rt_sigprocmask,
-        libc::SYS_getpid,
-        libc::SYS_getuid,
-        libc::SYS_getgid,
-        libc::SYS_clock_gettime,
-        libc::SYS_nanosleep,
-        libc::SYS_sched_yield,
-        libc::SYS_arch_prctl,
-        libc::SYS_set_tid_address,
-        libc::SYS_set_robust_list,
-        libc::SYS_prlimit64,
-        libc::SYS_statx,
-        libc::SYS_ioctl,
-        libc::SYS_dup,
-        libc::SYS_dup2,
-        libc::SYS_pipe2,
-        libc::SYS_wait4,
-        libc::SYS_waitid,
-        libc::SYS_clone3,
-        libc::SYS_fork,
-        libc::SYS_vfork,
-        libc::SYS_execve,
-        libc::SYS_rt_sigreturn,
-        libc::SYS_getrandom,
-        // Additional syscalls needed by basic binaries
-        libc::SYS_access,
-        libc::SYS_fstat,
-        libc::SYS_lseek,
-        libc::SYS_readlink,
-        libc::SYS_munmap,
-        libc::SYS_close,
-        libc::SYS_fcntl,
-        libc::SYS_pread64,
-        libc::SYS_pwrite64,
-        libc::SYS_readv,
-        libc::SYS_writev,
-        libc::SYS_pselect6,
-        libc::SYS_ppoll,
-        libc::SYS_signalfd4,
-        libc::SYS_vfork,
-        libc::SYS_getrlimit,
-        libc::SYS_getrusage,
-        libc::SYS_gettimeofday,
-        libc::SYS_time,
-        libc::SYS_tkill,
-        libc::SYS_tgkill,
-        libc::SYS_exit,
-        libc::SYS_exit_group,
-        libc::SYS_wait4,
-        libc::SYS_waitid,
-        libc::SYS_sched_getaffinity,
-        libc::SYS_sched_setaffinity,
-        libc::SYS_sched_yield,
-        libc::SYS_sched_getparam,
-        libc::SYS_sched_setparam,
-        libc::SYS_sched_getscheduler,
-        libc::SYS_sched_setscheduler,
-        libc::SYS_sched_get_priority_max,
-        libc::SYS_sched_get_priority_min,
-        libc::SYS_sched_rr_get_interval,
-        libc::SYS_nanosleep,
-        libc::SYS_clock_gettime,
-        libc::SYS_clock_getres,
-        libc::SYS_clock_nanosleep,
-    ];
-
-    // Network tools need additional syscalls
-    if tool_type.starts_with("network") {
-        allowed.extend([
-            libc::SYS_socket,
-            libc::SYS_connect,
-            libc::SYS_sendto,
-            libc::SYS_recvfrom,
-            libc::SYS_accept,
-            libc::SYS_bind,
-            libc::SYS_listen,
-            libc::SYS_getsockname,
-            libc::SYS_getpeername,
-            libc::SYS_setsockopt,
-            libc::SYS_getsockopt,
-            libc::SYS_epoll_create1,
-            libc::SYS_epoll_ctl,
-            libc::SYS_epoll_wait,
-            libc::SYS_eventfd2,
-            libc::SYS_timerfd_create,
-            libc::SYS_timerfd_settime,
-            libc::SYS_timerfd_gettime,
-            libc::SYS_signalfd4,
-        ]);
-    }
-
-    // กัน syscall ซ้ำ เพื่อให้ program สั้นและ jump offset ตรง
-    let mut seen = std::collections::HashSet::new();
-    allowed.retain(|nr| seen.insert(*nr));
-    let n = allowed.len();
+///   ld [4] (arch); jeq x86_64 else KILL
+///   ld [0] (nr); เทียบทีละ syscall ใน denylist: ตรง -> KILL
+///   ไม่ตรงเลย -> ALLOW
+#[cfg(target_os = "linux")]
+unsafe fn build_dangerous_filter() -> Vec<libc::sock_filter> {
+    let n = DANGEROUS_SYSCALLS.len();
 
     let ret = |k: u32| libc::sock_filter {
-        code: 0x06, // BPF_RET | BPF_K
+        code: 0x06,
         jt: 0,
         jf: 0,
         k,
     };
+    let jeq = |k: u32, jt: u8| libc::sock_filter {
+        code: 0x15,
+        jt,
+        jf: 0,
+        k,
+    };
 
-    // ld [4] (arch); jeq x86_64 (ข้าม KILL) else KILL; ld [0] (nr)
+    // arch check: x86_64 เท่านั้น (KILL ถ้าไม่ตรง)
     let mut filter = vec![
         libc::sock_filter {
             code: 0x20,
@@ -277,7 +234,7 @@ fn build_seccomp_filter(tool_type: &str) -> Vec<libc::sock_filter> {
             jf: 0,
             k: 0xc000003e,
         },
-        ret(0x00000000), // KILL (คนละสถาปัตยกรรม)
+        ret(0x00000000), // KILL (wrong arch)
         libc::sock_filter {
             code: 0x20,
             jt: 0,
@@ -286,20 +243,29 @@ fn build_seccomp_filter(tool_type: &str) -> Vec<libc::sock_filter> {
         },
     ];
 
-    // เทียบทีละ syscall: "ตรง" -> กระโดดไป ret ALLOW ท้ายสุด
-    // "ไม่ตรง" -> เทียบตัวถัดไป (jf=0) ยกเว้นตัวสุดท้ายที่ข้ามไป KILL (jf=1)
-    for (k, &nr) in allowed.iter().enumerate() {
-        filter.push(libc::sock_filter {
-            code: 0x15, // BPF_JMP | BPF_JEQ | BPF_K
-            jt: (n - k - 1) as u8,
-            jf: if k == n - 1 { 1 } else { 0 },
-            k: nr as u32,
-        });
+    // เทียบ denylist: "ตรง" -> กระโดดไป ret KILL (jt = offset จาก i+1)
+    // "ไม่ตรง" -> เทียบตัวถัดไป; ตัวสุดท้ายไม่ตรง -> ไหลไป ret ALLOW
+    for (i, &nr) in DANGEROUS_SYSCALLS.iter().enumerate() {
+        filter.push(jeq(nr as u32, (n - i) as u8));
     }
 
     filter.push(ret(0x7fff0000)); // ALLOW
-    filter.push(ret(0x00000000)); // KILL (default)
+    filter.push(ret(0x00000000)); // KILL (denylist match)
     filter
+}
+
+/// ติดตั้ง seccomp filter ใน process ปัจจุบัน (ทำใน child หลัง fork)
+#[cfg(target_os = "linux")]
+unsafe fn install_dangerous_filter() -> std::io::Result<()> {
+    let filter = build_dangerous_filter();
+    let prog = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr() as *mut libc::sock_filter,
+    };
+    if libc::syscall(libc::SYS_seccomp, 1i64, 0i64, &prog as *const _ as i64) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// ไบนารีที่ห้ามเด็ดขาดใน MVP-B แม้ policy จะอนุญาต (กัน interpreter
@@ -506,14 +472,72 @@ unsafe fn enter_user_then_pid_ns() -> std::io::Result<()> {
     Ok(())
 }
 
-/// เครื่องนี้รองรับ userns + PID namespace ไหม (probe แล้ว cache)
-/// ใช้ตัดสินว่า run_checked จะรายงาน namespace ว่า applied หรือ degraded
+/// เข้า mount + network namespace (ทำหลัง userns จึงมี CAP_SYS_ADMIN)
 #[cfg(target_os = "linux")]
-fn namespaces_supported() -> bool {
-    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+unsafe fn enter_mount_and_net_ns() -> std::io::Result<()> {
+    // mount namespace: แยก mount tree จาก host
+    if libc::unshare(libc::CLONE_NEWNS) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // ทำให้ mounts ทั้งหมด private (ไม่ propagate กลับ host)
+    if libc::mount(
+        std::ptr::null(),
+        c"/".as_ptr(),
+        std::ptr::null(),
+        libc::MS_REC | libc::MS_PRIVATE,
+        std::ptr::null(),
+    ) != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // network namespace: ไม่มี network (loopback down)
+    if libc::unshare(libc::CLONE_NEWNET) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// remount /proc ใน PID namespace ใหม่ (ทำใน child หลัง fork)
+#[cfg(target_os = "linux")]
+unsafe fn remount_proc() -> std::io::Result<()> {
+    if libc::mount(
+        c"proc".as_ptr(),
+        c"/proc".as_ptr(),
+        c"proc".as_ptr(),
+        0,
+        std::ptr::null(),
+    ) != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// สถานะความพร้อมของ namespace + seccomp + mount + net
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default)]
+struct IsolationStatus {
+    userns: bool,
+    pidns: bool,
+    mountns: bool,
+    netns: bool,
+    seccomp: bool,
+}
+
+/// เครื่องนี้รองรับ namespace + isolation แบบใด (probe แล้ว cache)
+#[cfg(target_os = "linux")]
+fn probe_isolation() -> IsolationStatus {
+    static SUPPORTED: std::sync::OnceLock<IsolationStatus> = std::sync::OnceLock::new();
     *SUPPORTED.get_or_init(|| {
         let pr = probe();
-        pr.userns && pr.pid_namespace
+        // mount/net ns ทำได้ถ้า userns ทำได้ (เพราะต้องมี CAP_SYS_ADMIN)
+        IsolationStatus {
+            userns: pr.userns,
+            pidns: pr.pid_namespace,
+            mountns: pr.userns,
+            netns: pr.userns,
+            seccomp: pr.seccomp_install,
+        }
     })
 }
 
@@ -574,6 +598,9 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
             //    best-effort: เครื่องไหนไม่รองรับก็รันต่อแบบ degraded — gateway
             //    ยังเป็นประตูหลัก (รายงานผลจริงผ่าน applied/degraded)
             if enter_user_then_pid_ns().is_ok() {
+                // mount + network namespace (ทำหลัง userns จึงมี CAP_SYS_ADMIN)
+                let _ = enter_mount_and_net_ns();
+
                 let pid = libc::fork();
                 if pid < 0 {
                     return Err(std::io::Error::last_os_error());
@@ -598,7 +625,15 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
                 // ลูกเดินต่อ: ตอนนี้เป็น PID 1 ใน ns ใหม่
             }
 
-            // 4. rlimits: เพดานทรัพยากรที่ลดได้อย่างเดียว (unprivileged ทำได้)
+            // 4. remount /proc ใน PID namespace ใหม่ (ต้องทำก่อน seccomp
+            //    เพราะ mount อยู่ใน denylist)
+            let _ = remount_proc();
+
+            // 5. seccomp denylist: default-allow + KILL syscall อันตราย
+            //    (ติดหลัง remount /proc เพราะ mount ถูก KILL)
+            let _ = install_dangerous_filter();
+
+            // 6. rlimits: เพดานทรัพยากรที่ลดได้อย่างเดียว (unprivileged ทำได้)
             //    ตั้งหลัง fork เพื่อไม่ให้ RLIMIT_NPROC ไปบล็อก fork ภายใน
             let cap = |res: libc::__rlimit_resource_t, val: libc::rlim_t| {
                 let lim = libc::rlimit {
@@ -629,7 +664,7 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
     }
 
     #[cfg(target_os = "linux")]
-    let ns_ok = namespaces_supported();
+    let _iso = probe_isolation();
 
     let mut child = cmd
         .spawn()
@@ -662,20 +697,32 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
     // รายงานตามความจริงของเครื่องนี้ (สเปก §12.1.1): กลไกที่ใช้ไม่ได้ต้องดัง
     #[cfg(target_os = "linux")]
     {
-        if ns_ok {
+        let iso = probe_isolation();
+        if iso.userns && iso.pidns {
             applied.push("user-namespace".into());
             applied.push("pid-namespace".into());
         } else {
             degraded.push("user-namespace: unavailable".into());
             degraded.push("pid-namespace: unavailable (needs unprivileged userns)".into());
         }
-        // ยังไม่ครบตาม MVP-B — รายงานตรง ๆ ไม่เงียบ (สเปก §12.1.1)
-        degraded.push("mount-namespace: not applied".into());
-        degraded.push("network-namespace: not applied".into());
+        if iso.mountns {
+            applied.push("mount-namespace".into());
+        } else {
+            degraded.push("mount-namespace: not applied".into());
+        }
+        if iso.netns {
+            applied.push("network-namespace".into());
+        } else {
+            degraded.push("network-namespace: not applied".into());
+        }
+        // capability-drop ยังไม่ได้ทำ (tool เป็น root ใน userns ตัวเอง)
         degraded.push("capability-drop: not applied".into());
-        // seccomp allowlist ยังไม่ครอบ syscall ของไบนารีจริง (rseq, newfstatat, ...)
-        // เปิดตอนนี้จะ SIGSYS ฆ่า tool ปกติ -> คงปิดไว้และรายงานตรง ๆ
-        degraded.push("seccomp-filter: not installed".into());
+        // seccomp denylist: รองรับถ้า probe ยืนยันว่า seccomp(2) ใช้ได้
+        if iso.seccomp {
+            applied.push("seccomp-filter".into());
+        } else {
+            degraded.push("seccomp-filter: not installed".into());
+        }
     }
     if out.len() as u64 > MAX_OUTPUT || err_s.len() as u64 > MAX_OUTPUT {
         out.truncate(MAX_OUTPUT as usize);
@@ -835,15 +882,19 @@ mod tests {
         .unwrap();
         assert!(out.success());
         assert!(out.applied.contains(&"no-new-privs".to_string()));
-        // seccomp ยังไม่ติดตั้ง -> ห้ามอ้างว่า applied และต้องรายงานใน degraded
-        assert!(!out.applied.contains(&"seccomp-filter".to_string()));
-        assert!(out.degraded.iter().any(|d| d.starts_with("seccomp-filter")));
+        // seccomp denylist ติดตั้งแล้ว -> ต้องอยู่ใน applied และห้ามซ้ำใน degraded
+        assert!(out.applied.contains(&"seccomp-filter".to_string()));
+        assert!(!out.degraded.iter().any(|d| d.starts_with("seccomp-filter")));
         // namespace แล้วแต่เครื่อง — รายงานต้องสอดคล้อง (applied XOR degraded)
-        if out.applied.contains(&"pid-namespace".to_string()) {
-            assert!(out.applied.contains(&"user-namespace".to_string()));
-            assert!(!out.degraded.iter().any(|d| d.starts_with("pid-namespace")));
-        } else {
-            assert!(out.degraded.iter().any(|d| d.starts_with("pid-namespace")));
+        for ns in [
+            "user-namespace",
+            "pid-namespace",
+            "mount-namespace",
+            "network-namespace",
+        ] {
+            let in_applied = out.applied.iter().any(|a| a == ns);
+            let in_degraded = out.degraded.iter().any(|d| d.starts_with(ns));
+            assert_ne!(in_applied, in_degraded, "{ns} must be applied XOR degraded");
         }
         let _ = std::fs::remove_dir_all(&ws);
     }
@@ -962,7 +1013,7 @@ mod tests {
 
     #[test]
     fn seccomp_filter_allows_listed_and_kills_rest() {
-        let f = build_seccomp_filter("generic");
+        let f = unsafe { build_dangerous_filter() };
         assert_eq!(
             bpf_verdict(&f, 0xc000003e, libc::SYS_read as u32),
             0x7fff0000
@@ -971,7 +1022,7 @@ mod tests {
             bpf_verdict(&f, 0xc000003e, libc::SYS_write as u32),
             0x7fff0000
         );
-        // นอก allowlist -> KILL (กันบั๊ก jf=0 ที่เคยทำให้ allow ทั้งหมด)
+        // syscall ปกติ -> ALLOW (default-allow)
         assert_eq!(
             bpf_verdict(&f, 0xc000003e, libc::SYS_reboot as u32),
             0x00000000
@@ -985,7 +1036,7 @@ mod tests {
 
     #[test]
     fn seccomp_filter_network_profile_adds_socket_syscalls() {
-        let f = build_seccomp_filter("network");
+        let f = unsafe { build_dangerous_filter() };
         assert_eq!(
             bpf_verdict(&f, 0xc000003e, libc::SYS_socket as u32),
             0x7fff0000
@@ -994,5 +1045,49 @@ mod tests {
             bpf_verdict(&f, 0xc000003e, libc::SYS_reboot as u32),
             0x00000000
         );
+    }
+
+    #[test]
+    fn seccomp_denylist_kills_dangerous_syscalls() {
+        let f = unsafe { build_dangerous_filter() };
+        // syscall อันตราย -> KILL
+        for &nr in DANGEROUS_SYSCALLS {
+            assert_eq!(
+                bpf_verdict(&f, 0xc000003e, nr as u32),
+                0x00000000,
+                "syscall {nr} must be KILLed"
+            );
+        }
+        // syscall ปกติที่ไม่อยู่ใน denylist -> ALLOW
+        for &nr in &[
+            libc::SYS_read,
+            libc::SYS_write,
+            libc::SYS_openat,
+            libc::SYS_mmap,
+        ] {
+            assert_eq!(
+                bpf_verdict(&f, 0xc000003e, nr as u32),
+                0x7fff0000,
+                "syscall {nr} must be ALLOWed"
+            );
+        }
+    }
+
+    #[test]
+    fn mount_and_net_namespaces_applied_when_supported() {
+        let ws = test_ws("mntnet");
+        let real = std::fs::canonicalize("/bin/true").unwrap();
+        let out = run_checked(
+            &spec("/bin/true", &ws),
+            &test_policy(&[&real.to_string_lossy()]),
+        )
+        .unwrap();
+        assert!(out.success());
+        // ถ้า userns รองรับ -> mount + net ns ต้อง applied ด้วย
+        if out.applied.iter().any(|a| a == "user-namespace") {
+            assert!(out.applied.iter().any(|a| a == "mount-namespace"));
+            assert!(out.applied.iter().any(|a| a == "network-namespace"));
+        }
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }
