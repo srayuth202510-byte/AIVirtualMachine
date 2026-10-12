@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+pub mod agent;
 pub mod demo;
 
 /// เกณฑ์ confidence สำหรับ ANALYZE -> MODIFY (ตัวอย่างในสเปก §15)
@@ -437,6 +438,23 @@ impl Runtime {
             Ok(_) => Ok(intent),
             Err(e) => Ok(format!("{intent} [tool denied: {e}]")),
         }
+    }
+
+    /// Agent loop เต็มรอบ (Phase 5): observe → reason → intent → execute → observe
+    /// โมเดลต้องตอบเป็น JSON object เดียว (ดู `agent` module); ทุก intent
+    /// วิ่งผ่าน gateway เท่านั้น คืนบันทึกการเดินทางของทั้งรอบ
+    pub fn run_agent(
+        &mut self,
+        task: &str,
+        max_steps: usize,
+    ) -> Result<agent::AgentRun, RuntimeError> {
+        agent::run_loop(
+            &*self.model,
+            &mut self.gateway,
+            &mut self.cube,
+            task,
+            max_steps,
+        )
     }
 
     pub fn inspect(&self) -> String {

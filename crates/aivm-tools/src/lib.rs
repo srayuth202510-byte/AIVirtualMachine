@@ -684,6 +684,13 @@ impl ToolGateway {
         let _: AgentState = cube.current_state();
         cube.current_state().to_string()
     }
+
+    /// บันทึกการปฏิเสธที่ระดับ intent (parse ไม่ผ่าน หรืออ้าง tool ที่ไม่รู้จัก)
+    /// I-7: ทุก decision ต้องมี audit แม้ยังไม่ถึงขั้น dispatch (complete mediation)
+    /// `raw` คือข้อความดิบจากโมเดล — ผู้เรียกควรตัดให้สั้นก่อนส่งเข้ามา
+    pub fn audit_intent_deny(&mut self, cube: &mut Cube, reason: &str, raw: &str) {
+        self.audit_decision(cube, "intent", raw, "deny", "invalid-intent", reason);
+    }
 }
 
 /// normalize แบบ lexical (ไม่แตะ I/O): ตัด `.` กับ `..` ออก

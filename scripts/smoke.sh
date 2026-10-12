@@ -25,6 +25,9 @@ $BIN inspect coder | grep -q "AI VM: coder" || { echo "FAIL: inspect"; exit 1; }
 echo "== run =="
 $BIN run coder | grep -q "intent from context" || { echo "FAIL: run"; exit 1; }
 
+echo "== agent loop (Phase 5): echo model emits non-JSON -> fail-closed =="
+$BIN agent coder "read the seed file" | grep -q "invalid intent" || { echo "FAIL: agent loop"; exit 1; }
+
 echo "== transition (dynamic grants) =="
 $BIN transition coder ANALYZE | grep -q "granted 0" || { echo "FAIL: ANALYZE grant"; exit 1; }
 $BIN transition coder MODIFY --confidence 0.95 | grep -q "granted 1" || { echo "FAIL: MODIFY grant"; exit 1; }

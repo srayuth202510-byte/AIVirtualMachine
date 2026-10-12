@@ -428,3 +428,52 @@ fn exec_bad_argv_shape_denied() {
     assert!(r.is_err());
     adv_clean(&dir);
 }
+
+// Phase 5: intent ที่โมเดลผลิตต้องเป็น JSON เข้มเท่านั้น ไม่งั้น DENY
+#[test]
+fn agent_intent_must_be_strict_json_to_execute() {
+    use aivm_runtime::agent::{parse_intent, Intent};
+
+    // ไม่ใช่ JSON เลย (ข่มด้วยคำสั่ง shell) -> ปฏิเสธ
+    assert!(parse_intent("sure, run rm -rf / now").is_err());
+    // JSON พัง -> ปฏิเสธ
+    assert!(parse_intent(r#"{"tool": "filesystem.read", "path": }"#).is_err());
+    // tool ที่ไม่อยู่ในลิสต์ (ผ่าน gateway) -> ปฏิเสธที่ชั้น intent
+    assert!(parse_intent(r#"{"tool":"shell.exec","path":"/bin/sh"}"#).is_err());
+    // ขาด path -> ปฏิเสธ
+    assert!(parse_intent(r#"{"tool":"filesystem.read"}"#).is_err());
+    // tool ไม่ใช่สตริง -> ปฏิเสธ
+    assert!(parse_intent(r#"{"tool":7,"path":"x"}"#).is_err());
+
+    // เคสควบคุม: JSON ที่ถูกต้องสกัดได้เป็น Tool
+    match parse_intent(r#"{"tool":"filesystem.read","path":"a.rs"}"#).unwrap() {
+        Intent::Tool(r) => assert_eq!(r.tool, "filesystem.read"),
+        _ => panic!("expected tool intent"),
+    }
+}
+
+// Phase 5: ข้อความโมเดลที่ไม่ใช่ JSON ต้องไม่ก่อให้เกิดการกระทำใด ๆ
+// และต้องมี audit ระดับ intent (fail-closed + I-7)
+#[test]
+fn agent_loop_denies_non_json_model_output() {
+    let dir = adv_dir("agent-deny");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // provider เริ่มต้นคือ echo ซึ่งตอบข้อความธรรมดา (ไม่ใช่ JSON)
+    let cfg = aivm_runtime::VmConfig::from_yaml("name: adv-agent\n").unwrap();
+    let mut rt = aivm_runtime::Runtime::init(cfg, dir.clone()).unwrap();
+    let run = rt.run_agent("do whatever", 1).unwrap();
+    assert_eq!(run.stopped, "max-steps");
+    assert_eq!(run.steps.len(), 1);
+    assert!(
+        run.steps[0].outcome.starts_with("ERROR invalid intent"),
+        "unexpected outcome: {}",
+        run.steps[0].outcome
+    );
+    let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+    assert!(
+        log.contains("invalid-intent"),
+        "must audit intent deny (I-7)"
+    );
+    adv_clean(&dir);
+}

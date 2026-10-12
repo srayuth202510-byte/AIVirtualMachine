@@ -118,6 +118,29 @@ impl Supervisor {
         Ok(out)
     }
 
+    /// Agent loop เต็มรอบ (Phase 5) — โมเดลคิดเป็น intent แล้วผ่าน gateway
+    pub fn run_agent(
+        &mut self,
+        name: &str,
+        task: &str,
+        max_steps: usize,
+    ) -> Result<aivm_runtime::agent::AgentRun, SupervisorError> {
+        let dir = self.resolve(name)?;
+        let cfg = VmConfig::from_file(&dir.join("aivm.yaml"))
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        let mut rt =
+            Runtime::init(cfg, dir.clone()).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        if let Some((st, _)) = self.vms.get_mut(name) {
+            *st = VmStatus::Running;
+        }
+        let run = rt
+            .run_agent(task, max_steps)
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        rt.persist()
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        Ok(run)
+    }
+
     /// เดิน state ไปข้างหน้าแบบ validate พร้อมให้/เพิกถอนสิทธิ์แบบ dynamic (§14)
     /// guard มาจาก operator (confidence ผลเทสต์ ผล policy)
     /// ไม่รับจาก agent คืน `(granted, revoked)`

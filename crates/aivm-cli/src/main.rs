@@ -30,6 +30,16 @@ enum Cmd {
         #[arg(long, default_value = "init")]
         prompt: String,
     },
+    /// รัน agent loop เต็มรอบ (Phase 5): observe -> reason -> intent -> execute
+    /// โมเดลต้องตอบเป็น JSON object เดียว; ทุก intent ผ่าน gateway
+    Agent {
+        name: String,
+        /// งานที่มอบหมายให้ agent
+        task: String,
+        /// จำนวนก้าวสูงสุด
+        #[arg(long, default_value_t = aivm_runtime::agent::DEFAULT_MAX_STEPS)]
+        max_steps: usize,
+    },
     /// แสดง state โมเดล ทรัพยากร และสิทธิ์
     Inspect {
         name: String,
@@ -100,6 +110,24 @@ fn main() -> Result<(), AnyErr> {
             }
             let out = sup.run_with_prompt(&name, &prompt).map_err(err)?;
             println!("{out}");
+        }
+        Cmd::Agent {
+            name,
+            task,
+            max_steps,
+        } => {
+            if sup.status(&name).is_none() {
+                eprintln!("vm '{name}' not registered under this --root; `create` it first");
+                std::process::exit(2);
+            }
+            let run = sup.run_agent(&name, &task, max_steps).map_err(err)?;
+            for s in &run.steps {
+                println!("#{} {} -> {}", s.index, s.action, s.outcome);
+            }
+            match &run.summary {
+                Some(s) => println!("summary: {s}"),
+                None => println!("(stopped: {})", run.stopped),
+            }
         }
         Cmd::Inspect { name } => println!("{}", sup.inspect(&name).map_err(err)?),
         Cmd::State { name } => println!("{}", sup.inspect(&name).map_err(err)?),
