@@ -5,6 +5,41 @@ use aivm_supervisor::Supervisor;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+fn collect_rag_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<(String, String)>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.') || matches!(name, "target" | "node_modules") {
+                continue;
+            }
+            collect_rag_files(root, &path, out);
+        } else if meta.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, content));
+            }
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "aivm", about = "AI Virtual Machine — isolate AI agency")]
 struct Cli {
@@ -39,6 +74,25 @@ enum Cmd {
         /// จำนวนก้าวสูงสุด
         #[arg(long, default_value_t = aivm_runtime::agent::DEFAULT_MAX_STEPS)]
         max_steps: usize,
+    },
+    /// สร้าง inverted index สำหรับ workspace
+    Index {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, default_value = ".aivm/rag-index.json")]
+        output: PathBuf,
+        #[arg(long, default_value = "INIT")]
+        state: String,
+    },
+    /// ค้นหาใน RAG index
+    Search {
+        query: String,
+        #[arg(long, default_value = ".aivm/rag-index.json")]
+        index: PathBuf,
+        #[arg(long, default_value_t = 5)]
+        top_k: usize,
+        #[arg(long, default_value = "INIT")]
+        state: String,
     },
     /// แสดง state โมเดล ทรัพยากร และสิทธิ์
     Inspect {
@@ -130,6 +184,46 @@ fn main() -> Result<(), AnyErr> {
             match &run.summary {
                 Some(s) => println!("summary: {s}"),
                 None => println!("(stopped: {})", run.stopped),
+            }
+        }
+        Cmd::Index {
+            path,
+            output,
+            state,
+        } => {
+            use std::str::FromStr;
+            let state = aivm_cube::AgentState::from_str(&state).map_err(err)?;
+            let root_path = std::fs::canonicalize(&path)?;
+            let mut files = Vec::new();
+            collect_rag_files(&root_path, &root_path, &mut files);
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+            let index = aivm_cube::rag::build_index(&files, state as u32);
+            index.save(&output)?;
+            println!(
+                "indexed {} files into {} chunks at {}",
+                files.len(),
+                index.total_chunks,
+                output.display()
+            );
+        }
+        Cmd::Search {
+            query,
+            index,
+            top_k,
+            state,
+        } => {
+            use std::str::FromStr;
+            let state = aivm_cube::AgentState::from_str(&state)? as u32;
+            let index_data = aivm_cube::rag::RagIndex::load(index)?;
+            let retriever = aivm_cube::rag::Retriever {
+                top_k,
+                current_state: state,
+            };
+            for hit in retriever.retrieve(&index_data, &query) {
+                println!(
+                    "{}:{}-{} score={:.3}\n{}\n",
+                    hit.file_path, hit.line_start, hit.line_end, hit.score, hit.content
+                );
             }
         }
         Cmd::Inspect { name } => println!("{}", sup.inspect(&name).map_err(err)?),

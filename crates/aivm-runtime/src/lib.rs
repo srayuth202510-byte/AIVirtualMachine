@@ -304,6 +304,7 @@ impl Runtime {
             provider: config.model.provider.clone(),
             name: config.model.name.clone(),
             local: config.model.local.clone(),
+            ..ModelConfig::default()
         };
         // สร้างโมเดลผ่าน factory — provider ที่ไม่รู้จัก/ไม่มีฟีเจอร์จะ fail-closed
         let model: Box<dyn Model> =

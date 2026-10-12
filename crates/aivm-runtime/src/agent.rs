@@ -30,9 +30,25 @@ fn collect_files(dir: &Path, ws: &Path, out: &mut Vec<(String, String)>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
+            if std::fs::symlink_metadata(&path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(true)
+            {
+                continue;
+            }
             if path.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with('.') || matches!(name, "target" | "node_modules") {
+                    continue;
+                }
                 collect_files(&path, ws, out);
-            } else if path.is_file() {
+            } else if path.is_file()
+                && !path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .starts_with('.')
+            {
                 // ตัด prefix workspace ออกจาก key
                 let rel = path.strip_prefix(ws).unwrap_or(&path);
                 let key = rel.to_string_lossy().to_string();
@@ -243,7 +259,11 @@ pub fn run_loop(
     for index in 0..max_steps {
         // RAG: ค้นหา context ที่เกี่ยวข้องกับ task (ถ้ามี index)
         let context_hint = if let Some(idx) = rag_index {
-            let hits = aivm_cube::rag::search(idx, task, 3, cube.current_state() as u32);
+            let retriever = rag::Retriever {
+                top_k: 3,
+                current_state: cube.current_state() as u32,
+            };
+            let hits = retriever.retrieve(idx, task);
             if hits.is_empty() {
                 None
             } else {

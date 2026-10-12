@@ -10,6 +10,16 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum RagError {
+    #[error("RAG index I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("RAG index serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+}
 
 /// chunk เดียวของไฟล์
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +59,34 @@ pub struct SearchHit {
     pub line_end: usize,
 }
 
+/// Retrieval options used by both the CLI and agent runtime.
+#[derive(Debug, Clone, Copy)]
+pub struct Retriever {
+    pub top_k: usize,
+    pub current_state: u32,
+}
+
+impl Retriever {
+    pub fn retrieve(&self, index: &RagIndex, query: &str) -> Vec<SearchHit> {
+        search(index, query, self.top_k, self.current_state)
+    }
+}
+
+impl RagIndex {
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), RagError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_vec(self)?)?;
+        Ok(())
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, RagError> {
+        Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    }
+}
+
 /// ตัวแบบ chunking
 pub const CHUNK_SIZE: usize = 40; // บรรทัด
 pub const CHUNK_OVERLAP: usize = 5; // บรรทัล overlap
@@ -59,6 +97,8 @@ pub fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<(String,
     if lines.is_empty() {
         return vec![];
     }
+    let chunk_size = chunk_size.max(1);
+    let overlap = overlap.min(chunk_size - 1);
     let mut chunks = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -134,17 +174,24 @@ pub fn build_index(
 
 /// คะแนน chunk จาก query (TF-based + recency + state boost)
 fn score_chunk(chunk: &Chunk, query_terms: &[String], index: &RagIndex, current_state: u32) -> f64 {
+    // BM25-style lexical ranking, with query coverage for multi-term matches.
+    let n = index.total_chunks.max(1) as f64;
     let mut score = 0.0;
-
-    // 1. term frequency score
+    let mut matched = HashSet::new();
+    let length = tokenize(&chunk.content).len().max(1) as f64;
     for term in query_terms {
         if let Some(postings) = index.postings.get(term) {
-            for (cid, tf) in postings {
-                if *cid == chunk.id {
-                    score += *tf as f64;
-                }
+            if let Some((_, tf)) = postings.iter().find(|(cid, _)| *cid == chunk.id) {
+                matched.insert(term);
+                let df = postings.len() as f64;
+                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                let tf = *tf as f64;
+                score += idf * (tf * 2.2) / (tf + 1.2 * (0.25 + 0.75 * length / 200.0));
             }
         }
+    }
+    if !query_terms.is_empty() {
+        score *= 1.0 + matched.len() as f64 / query_terms.len() as f64;
     }
 
     // 2. state boost: chunk ที่อยู่ใน state ปัจจุบันหรือ state ใกล้เคียง ได้คะแนนเพิ่ม
@@ -190,7 +237,11 @@ pub fn search(index: &RagIndex, query: &str, top_k: usize, current_state: u32) -
             })
         })
         .collect();
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     // เอา top-K
     scored
@@ -337,5 +388,44 @@ mod tests {
         let index = build_index(&files, 0);
         let hits = search(&index, "", 5, 0);
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn retriever_ranks_multi_term_matches_and_roundtrips_index() {
+        let files = vec![
+            ("one.rs".to_string(), "database connection pool".to_string()),
+            ("two.rs".to_string(), "database only".to_string()),
+        ];
+        let index = build_index(&files, 2);
+        let hits = Retriever {
+            top_k: 2,
+            current_state: 2,
+        }
+        .retrieve(&index, "database connection");
+        assert_eq!(hits[0].file_path, "one.rs");
+
+        let path = std::env::temp_dir().join(format!("aivm-rag-{}.json", now_ms()));
+        index.save(&path).unwrap();
+        let restored = RagIndex::load(&path).unwrap();
+        let restored_hits = search(&restored, "database connection", 2, 2);
+        assert_eq!(restored_hits[0].file_path, "one.rs");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ranking_is_deterministic_for_equal_scores() {
+        let mut index = build_index(
+            &[
+                ("z".into(), "common word".into()),
+                ("a".into(), "common word".into()),
+            ],
+            0,
+        );
+        for chunk in index.chunks.values_mut() {
+            chunk.timestamp = 1;
+        }
+        let hits = search(&index, "common", 2, 0);
+        assert_eq!(hits[0].chunk_id, 0);
+        assert_eq!(hits[1].chunk_id, 1);
     }
 }
