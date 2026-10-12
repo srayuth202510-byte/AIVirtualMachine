@@ -27,6 +27,9 @@ pub mod actions {
     pub const WRITE: &str = "write";
     pub const EXECUTE: &str = "execute";
     pub const NETWORK: &str = "network";
+    pub const NETWORK_CONNECT: &str = "network:connect";
+    pub const NETWORK_FETCH: &str = "network:fetch";
+    pub const NETWORK_LISTEN: &str = "network:listen";
     pub const SPAWN: &str = "spawn";
     pub const GPU: &str = "gpu";
     pub const SECRET: &str = "secret";
@@ -63,6 +66,18 @@ pub struct Constraints {
     /// จำกัดเวลารอสูงสุด (milliseconds)
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Network-specific: allowed protocols (http, https)
+    #[serde(default)]
+    pub allowed_protocols: Vec<String>,
+    /// Network-specific: allowed ports
+    #[serde(default)]
+    pub allowed_ports: Vec<u16>,
+    /// Network-specific: max response size
+    #[serde(default)]
+    pub max_response_bytes: Option<u64>,
+    /// Network-specific: require TLS
+    #[serde(default)]
+    pub require_tls: bool,
 }
 
 impl Constraints {
@@ -82,6 +97,27 @@ impl Constraints {
 
     pub fn with_timeout_ms(mut self, ms: u64) -> Self {
         self.timeout_ms = Some(ms);
+        self
+    }
+
+    /// Network constraint builders
+    pub fn with_allowed_protocols(mut self, protocols: Vec<String>) -> Self {
+        self.allowed_protocols = protocols;
+        self
+    }
+
+    pub fn with_allowed_ports(mut self, ports: Vec<u16>) -> Self {
+        self.allowed_ports = ports;
+        self
+    }
+
+    pub fn with_max_response_bytes(mut self, bytes: u64) -> Self {
+        self.max_response_bytes = Some(bytes);
+        self
+    }
+
+    pub fn with_require_tls(mut self, require: bool) -> Self {
+        self.require_tls = require;
         self
     }
 }
@@ -172,11 +208,14 @@ impl Capability {
         Ok(())
     }
 
-    /// ตรวจสอบ constraints (max_bytes, max_calls, timeout_ms)
+    /// ตรวจสอบ constraints (max_bytes, max_calls, timeout_ms, network constraints)
     pub fn check_constraints(
         &self,
         request_bytes: Option<u64>,
         call_count: Option<u32>,
+        protocol: Option<&str>,
+        port: Option<u16>,
+        response_bytes: Option<u64>,
     ) -> Result<(), CapabilityError> {
         if let Some(max_bytes) = self.constraints.max_bytes {
             if let Some(bytes) = request_bytes {
@@ -189,6 +228,64 @@ impl Capability {
             if let Some(count) = call_count {
                 if count > max_calls {
                     return Err(CapabilityError::BudgetExceeded(max_calls as u64));
+                }
+            }
+        }
+        // Network constraints
+        if !self.constraints.allowed_protocols.is_empty() {
+            if let Some(proto) = protocol {
+                if !self
+                    .constraints
+                    .allowed_protocols
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(proto))
+                {
+                    return Err(CapabilityError::ScopeMismatch(
+                        format!("protocol not allowed: {}", proto),
+                        "protocol".into(),
+                    ));
+                }
+            } else {
+                return Err(CapabilityError::ScopeMismatch(
+                    "protocol required but not provided".into(),
+                    "protocol".into(),
+                ));
+            }
+        }
+        if !self.constraints.allowed_ports.is_empty() {
+            if let Some(p) = port {
+                if !self.constraints.allowed_ports.contains(&p) {
+                    return Err(CapabilityError::ScopeMismatch(
+                        format!("port not allowed: {}", p),
+                        "port".into(),
+                    ));
+                }
+            } else {
+                return Err(CapabilityError::ScopeMismatch(
+                    "port required but not provided".into(),
+                    "port".into(),
+                ));
+            }
+        }
+        if self.constraints.require_tls {
+            if let Some(proto) = protocol {
+                if !proto.eq_ignore_ascii_case("https") {
+                    return Err(CapabilityError::ScopeMismatch(
+                        "TLS required but protocol is not https".into(),
+                        "protocol".into(),
+                    ));
+                }
+            } else {
+                return Err(CapabilityError::ScopeMismatch(
+                    "TLS required but protocol not specified".into(),
+                    "protocol".into(),
+                ));
+            }
+        }
+        if let Some(max_resp) = self.constraints.max_response_bytes {
+            if let Some(resp_bytes) = response_bytes {
+                if resp_bytes > max_resp {
+                    return Err(CapabilityError::BudgetExceeded(max_resp));
                 }
             }
         }
@@ -219,8 +316,8 @@ impl Capability {
                 scope.to_string(),
             ));
         }
-        // ตรวจสอบ max_calls constraint
-        self.check_constraints(None, Some(self.used_count as u32 + 1))?;
+        // ตรวจสอบ max_calls constraint (network params not available here, checked in PolicyEvaluator)
+        self.check_constraints(None, Some(self.used_count as u32 + 1), None, None, None)?;
         self.used_count += 1;
         Ok(())
     }
@@ -414,10 +511,12 @@ mod tests {
         let cap = Capability::new("write", "filesystem", "/workspace/src")
             .with_constraints(Constraints::new().with_max_bytes(100));
         // ข้อมูลเล็กกว่าขีดจำกัด = OK
-        assert!(cap.check_constraints(Some(50), None).is_ok());
+        assert!(cap
+            .check_constraints(Some(50), None, None, None, None)
+            .is_ok());
         // ข้อมูลใหญ่กว่าขีดจำกัด = DENY
         assert!(matches!(
-            cap.check_constraints(Some(200), None),
+            cap.check_constraints(Some(200), None, None, None, None),
             Err(CapabilityError::BudgetExceeded(_))
         ));
     }
@@ -427,12 +526,16 @@ mod tests {
         let cap = Capability::new("read", "filesystem", "/workspace")
             .with_constraints(Constraints::new().with_max_calls(2));
         // เรียกครั้งที่ 1 = OK
-        assert!(cap.check_constraints(None, Some(1)).is_ok());
+        assert!(cap
+            .check_constraints(None, Some(1), None, None, None)
+            .is_ok());
         // เรียกครั้งที่ 2 = OK
-        assert!(cap.check_constraints(None, Some(2)).is_ok());
+        assert!(cap
+            .check_constraints(None, Some(2), None, None, None)
+            .is_ok());
         // เรียกครั้งที่ 3 = DENY
         assert!(matches!(
-            cap.check_constraints(None, Some(3)),
+            cap.check_constraints(None, Some(3), None, None, None),
             Err(CapabilityError::BudgetExceeded(_))
         ));
     }

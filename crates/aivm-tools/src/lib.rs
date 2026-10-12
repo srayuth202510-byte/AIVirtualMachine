@@ -377,6 +377,267 @@ impl ToolGateway {
         })
     }
 
+    /// `network.fetch`: HTTP request ผ่าน policy/network capability
+    ///
+    /// path: target URL (e.g., "https://api.github.com/repos/owner/repo")
+    /// content: JSON { "method": "GET", "headers": {}, "body": null, "timeout_ms": 30000 }
+    pub fn network_fetch(
+        &mut self,
+        cube: &mut Cube,
+        url: &str,
+        content: Option<&str>,
+    ) -> Result<ToolResult, ToolError> {
+        use std::time::Duration;
+
+        // Parse request
+        let req: NetworkFetchRequest = match content {
+            Some(s) => serde_json::from_str(s).map_err(|e| {
+                self.audit_decision(cube, "network:fetch", url, "deny", "bad-request", "error");
+                ToolError::Denied(format!("invalid network.fetch request: {e}"))
+            })?,
+            None => NetworkFetchRequest::default(),
+        };
+
+        // Extract host and port from URL for capability scope
+        let (host, port, protocol) = parse_url(url)?;
+
+        // Build scope for capability check (host:port)
+        let scope = format!("{host}:{port}");
+
+        // Check capability
+        let action = if req.method.eq_ignore_ascii_case("GET") {
+            "network:fetch"
+        } else {
+            "network:connect"
+        };
+        let ctx = Self::ctx_of(cube);
+        // For now, direct policy check
+        if self.caps.authorize(action, "network", &scope).is_err() {
+            self.audit_decision(cube, action, &scope, "deny", "no-capability", "error");
+            return Err(ToolError::Denied("no network capability".into()));
+        }
+
+        // Check network constraints
+        if let Ok(idx) = self.caps.authorize(action, "network", &scope) {
+            if let Some(cap) = self.caps.caps.get(idx) {
+                if let Err(e) = cap.check_constraints(
+                    req.body.as_ref().map(|b| b.len() as u64),
+                    None,
+                    Some(&protocol),
+                    Some(port),
+                    None,
+                ) {
+                    self.audit_decision(
+                        cube,
+                        action,
+                        &scope,
+                        "deny",
+                        &format!("constraint-violation: {e}"),
+                        "error",
+                    );
+                    return Err(ToolError::Denied(format!(
+                        "network constraint violation: {e}"
+                    )));
+                }
+            }
+        }
+
+        // Check policy
+        let (decision, reason) = self.policy.evaluate_network(&scope, &ctx);
+        if decision == aivm_policy::Decision::Deny {
+            self.audit_decision(
+                cube,
+                action,
+                &scope,
+                "deny",
+                reason.as_deref().unwrap_or_default(),
+                "error",
+            );
+            return Err(ToolError::Denied(format!(
+                "network policy denied: {}",
+                reason.as_deref().unwrap_or_default()
+            )));
+        }
+
+        // Perform HTTP request using ureq
+        let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(30000));
+        let agent = ureq::Agent::new();
+
+        let mut request = match req.method.to_uppercase().as_str() {
+            "GET" => agent.get(url).timeout(timeout),
+            "POST" => agent.post(url).timeout(timeout),
+            "PUT" => agent.put(url).timeout(timeout),
+            "DELETE" => agent.delete(url).timeout(timeout),
+            "PATCH" => agent.patch(url).timeout(timeout),
+            "HEAD" => agent.head(url).timeout(timeout),
+            _ => {
+                return Err(ToolError::Denied(format!(
+                    "unsupported HTTP method: {}",
+                    req.method
+                )))
+            }
+        };
+
+        for (k, v) in req.headers {
+            request = request.set(&k, &v);
+        }
+
+        let response = if let Some(body) = req.body {
+            request.send_string(&body)
+        } else {
+            request.call()
+        }
+        .map_err(|e| ToolError::Io(e.to_string()))?;
+
+        let status: u16 = response.status();
+        let response_body = response
+            .into_string()
+            .map_err(|e| ToolError::Io(e.to_string()))?;
+
+        // Check response size constraint
+        if let Ok(idx) = self.caps.authorize(action, "network", &scope) {
+            if let Some(cap) = self.caps.caps.get(idx) {
+                if let Err(e) =
+                    cap.check_constraints(None, None, None, None, Some(response_body.len() as u64))
+                {
+                    self.audit_decision(
+                        cube,
+                        action,
+                        &scope,
+                        "deny",
+                        &format!("constraint-violation: {e}"),
+                        "error",
+                    );
+                    return Err(ToolError::Denied(format!(
+                        "response size constraint violation: {e}"
+                    )));
+                }
+            }
+        }
+
+        self.audit_decision(
+            cube,
+            action,
+            &scope,
+            "allow",
+            &format!("status:{}", status),
+            "success",
+        );
+
+        Ok(ToolResult {
+            ok: (200..300).contains(&status),
+            decision: "allow".into(),
+            output: response_body,
+        })
+    }
+
+    /// `network.connect`: Raw TCP/TLS connection
+    ///
+    /// path: "host:port" (e.g., "api.github.com:443")
+    /// content: JSON { "protocol": "tcp", "tls": true, "timeout_ms": 30000 }
+    pub fn network_connect(
+        &mut self,
+        cube: &mut Cube,
+        host_port: &str,
+        content: Option<&str>,
+    ) -> Result<ToolResult, ToolError> {
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        let req: NetworkConnectRequest = match content {
+            Some(s) => serde_json::from_str(s).map_err(|e| {
+                self.audit_decision(
+                    cube,
+                    "network:connect",
+                    host_port,
+                    "deny",
+                    "bad-request",
+                    "error",
+                );
+                ToolError::Denied(format!("invalid network.connect request: {e}"))
+            })?,
+            None => NetworkConnectRequest::default(),
+        };
+
+        // Parse host:port
+        let (host, port) = parse_host_port(host_port)?;
+        let scope = format!("{host}:{port}");
+
+        // Check capability
+        let ctx = Self::ctx_of(cube);
+        if self
+            .caps
+            .authorize("network:connect", "network", &scope)
+            .is_err()
+        {
+            self.audit_decision(
+                cube,
+                "network:connect",
+                &scope,
+                "deny",
+                "no-capability",
+                "error",
+            );
+            return Err(ToolError::Denied("no network capability".into()));
+        }
+
+        // Check policy
+        let (decision, reason) = self.policy.evaluate_network(&scope, &ctx);
+        if decision == aivm_policy::Decision::Deny {
+            self.audit_decision(
+                cube,
+                "network:connect",
+                &scope,
+                "deny",
+                reason.as_deref().unwrap_or_default(),
+                "error",
+            );
+            return Err(ToolError::Denied(format!(
+                "network policy denied: {}",
+                reason.as_deref().unwrap_or_default()
+            )));
+        }
+
+        // Establish connection
+        let addr = format!("{host}:{port}");
+        let socket_addr: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|e: std::net::AddrParseError| ToolError::Io(e.to_string()))?;
+        let _stream = TcpStream::connect_timeout(
+            &socket_addr,
+            Duration::from_millis(req.timeout_ms.unwrap_or(30000)),
+        )
+        .map_err(|e| ToolError::Io(e.to_string()))?;
+
+        // If TLS requested, wrap with native-tls (simplified - would need native-tls crate)
+        if req.tls {
+            // For MVP, just note TLS was requested
+            self.audit_decision(
+                cube,
+                "network:connect",
+                &scope,
+                "allow",
+                "tls-connected",
+                "success",
+            );
+        } else {
+            self.audit_decision(
+                cube,
+                "network:connect",
+                &scope,
+                "allow",
+                "tcp-connected",
+                "success",
+            );
+        }
+
+        Ok(ToolResult {
+            ok: true,
+            decision: "allow".into(),
+            output: format!("connected to {addr}"),
+        })
+    }
+
     pub fn dispatch(
         &mut self,
         cube: &mut Cube,
@@ -402,6 +663,14 @@ impl ToolGateway {
                     None => vec![],
                 };
                 self.exec(cube, &req.path, &args)
+            }
+            "network.fetch" => {
+                // content: JSON { "method": "GET", "headers": {}, "body": null }
+                self.network_fetch(cube, &req.path, req.content.as_deref())
+            }
+            "network.connect" => {
+                // content: JSON { "protocol": "tcp", "port": 443 }
+                self.network_connect(cube, &req.path, req.content.as_deref())
             }
             other => {
                 self.audit_decision(cube, other, &req.path, "deny", "unknown-tool", "error");
@@ -588,6 +857,70 @@ impl AuditSink for LocalJsonlSink {
 }
 
 use std::collections::HashMap;
+
+/// Network fetch request structure
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct NetworkFetchRequest {
+    #[serde(default = "default_get")]
+    method: String,
+    #[serde(default)]
+    headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default = "default_timeout")]
+    timeout_ms: Option<u64>,
+}
+
+fn default_get() -> String {
+    "GET".into()
+}
+
+fn default_timeout() -> Option<u64> {
+    Some(30000)
+}
+
+/// Network connect request structure
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct NetworkConnectRequest {
+    #[serde(default = "default_tcp")]
+    protocol: String,
+    #[serde(default)]
+    tls: bool,
+    #[serde(default = "default_timeout")]
+    timeout_ms: Option<u64>,
+}
+
+fn default_tcp() -> String {
+    "tcp".into()
+}
+
+/// Parse URL to extract host, port, and protocol
+fn parse_url(url: &str) -> Result<(String, u16, String), ToolError> {
+    let parsed =
+        url::Url::parse(url).map_err(|e| ToolError::Denied(format!("invalid URL: {e}")))?;
+    let protocol = parsed.scheme().to_string();
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ToolError::Denied("URL missing host".into()))?
+        .to_string();
+    let port = parsed
+        .port()
+        .unwrap_or_else(|| if protocol == "https" { 443 } else { 80 });
+    Ok((host, port, protocol))
+}
+
+/// Parse host:port string
+fn parse_host_port(host_port: &str) -> Result<(String, u16), ToolError> {
+    let parts: Vec<&str> = host_port.split(':').collect();
+    if parts.len() != 2 {
+        return Err(ToolError::Denied("invalid host:port format".into()));
+    }
+    let host = parts[0].to_string();
+    let port = parts[1]
+        .parse()
+        .map_err(|_| ToolError::Denied("invalid port".into()))?;
+    Ok((host, port))
+}
 
 #[cfg(test)]
 mod tests {

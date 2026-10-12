@@ -566,6 +566,9 @@ pub struct EvalRequest<'a> {
     pub scope: &'a str,
     pub ctx: &'a EvalContext,
     pub request_bytes: Option<u64>,
+    pub protocol: Option<&'a str>,
+    pub port: Option<u16>,
+    pub response_bytes: Option<u64>,
 }
 
 impl<'a> EvalRequest<'a> {
@@ -583,11 +586,29 @@ impl<'a> EvalRequest<'a> {
             scope,
             ctx,
             request_bytes: None,
+            protocol: None,
+            port: None,
+            response_bytes: None,
         }
     }
 
     pub fn with_request_bytes(mut self, bytes: u64) -> Self {
         self.request_bytes = Some(bytes);
+        self
+    }
+
+    pub fn with_protocol(mut self, proto: &'a str) -> Self {
+        self.protocol = Some(proto);
+        self
+    }
+
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = Some(port);
+        self
+    }
+
+    pub fn with_response_bytes(mut self, bytes: u64) -> Self {
+        self.response_bytes = Some(bytes);
         self
     }
 }
@@ -631,11 +652,17 @@ impl PolicyEvaluator {
             return (Decision::Deny, "no-capability".into(), policy_version);
         }
 
-        // 4. ตรวจสอบ Constraints (max_bytes, max_calls)
+        // 4. ตรวจสอบ Constraints (max_bytes, max_calls, network constraints)
         // หา capability ที่ใช้อยู่
         if let Ok(idx) = caps.authorize(req.action, req.resource, req.scope) {
             if let Some(cap) = caps.caps.get(idx) {
-                if let Err(e) = cap.check_constraints(req.request_bytes, None) {
+                if let Err(e) = cap.check_constraints(
+                    req.request_bytes,
+                    None,
+                    req.protocol,
+                    req.port,
+                    req.response_bytes,
+                ) {
                     return (
                         Decision::Deny,
                         format!("constraint-violation: {e}"),
