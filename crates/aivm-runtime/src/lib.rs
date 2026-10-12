@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+pub mod demo;
+
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error("config: {0}")]
@@ -161,12 +163,22 @@ impl Runtime {
         let read_scopes: Vec<String> = if config.filesystem.read.is_empty() {
             vec![ws_str.clone()]
         } else {
-            config.filesystem.read.iter().map(|s| resolve_scope(&base_dir, &workspace, s)).collect()
+            config
+                .filesystem
+                .read
+                .iter()
+                .map(|s| resolve_scope(&base_dir, &workspace, s))
+                .collect()
         };
         let write_scopes: Vec<String> = if config.filesystem.write.is_empty() {
             vec![format!("{ws_str}/src")]
         } else {
-            config.filesystem.write.iter().map(|s| resolve_scope(&base_dir, &workspace, s)).collect()
+            config
+                .filesystem
+                .write
+                .iter()
+                .map(|s| resolve_scope(&base_dir, &workspace, s))
+                .collect()
         };
 
         let policy = Policy {
@@ -239,7 +251,9 @@ impl Runtime {
             provider: config.model.provider.clone(),
             name: config.model.name.clone(),
         };
-        let model: Box<dyn Model> = Box::new(EchoModel { name: model_cfg.name.clone() });
+        let model: Box<dyn Model> = Box::new(EchoModel {
+            name: model_cfg.name.clone(),
+        });
 
         Ok(Self {
             cube: Cube::new(&format!("task_{}", config.name)),
@@ -297,7 +311,9 @@ fn absolutize(p: &Path) -> PathBuf {
     if p.is_absolute() {
         return p.to_path_buf();
     }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(p)
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(p)
 }
 
 fn resolve_scope(base_dir: &Path, workspace: &Path, scope: &str) -> String {
@@ -315,7 +331,9 @@ fn resolve_scope(base_dir: &Path, workspace: &Path, scope: &str) -> String {
     }
     if scope.starts_with("/workspace") {
         // Map the spec's virtual /workspace onto the real dir.
-        let rel = scope.trim_start_matches("/workspace").trim_start_matches('/');
+        let rel = scope
+            .trim_start_matches("/workspace")
+            .trim_start_matches('/');
         if rel.is_empty() {
             return workspace.to_string_lossy().to_string();
         }

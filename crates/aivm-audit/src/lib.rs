@@ -133,11 +133,14 @@ impl AuditWriter {
         let (seq, prev_hash) = read_tip(&path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| AuditError::Io(e.to_string()))?;
+                std::fs::create_dir_all(parent).map_err(|e| AuditError::Io(e.to_string()))?;
             }
         }
-        Ok(Self { path, seq, prev_hash })
+        Ok(Self {
+            path,
+            seq,
+            prev_hash,
+        })
     }
 
     pub fn append(&mut self, mut rec: AuditRecord) -> Result<AuditRecord, AuditError> {
@@ -176,7 +179,10 @@ impl AuditWriter {
                 )));
             }
             if rec.hash_prev != prev {
-                return Err(AuditError::Ser(format!("hash chain broken at seq {}", rec.seq)));
+                return Err(AuditError::Ser(format!(
+                    "hash chain broken at seq {}",
+                    rec.seq
+                )));
             }
             let mut check = rec.clone();
             let claimed = rec.hash_entry.clone();

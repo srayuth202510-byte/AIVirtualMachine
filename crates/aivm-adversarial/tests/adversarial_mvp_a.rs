@@ -55,7 +55,11 @@ fn harness(tag: &str) -> (ToolGateway, Cube) {
 #[test]
 fn fs_escape_must_deny() {
     let (mut gw, mut cube) = harness("fs");
-    for p in ["/etc/passwd", "../../etc/shadow", "/workspace/../../etc/passwd"] {
+    for p in [
+        "/etc/passwd",
+        "../../etc/shadow",
+        "/workspace/../../etc/passwd",
+    ] {
         assert!(gw.read(&mut cube, p).is_err(), "must deny {p}");
     }
     let (d, _) = test_policy().evaluate_fs("read", "/etc/passwd", &EvalContext::default());
@@ -84,7 +88,11 @@ fn symlink_escape_must_deny() {
         ws.display()
     ))
     .unwrap();
-    let caps = CapabilitySet::new(vec![Capability::new("read", "filesystem", &ws.to_string_lossy())]);
+    let caps = CapabilitySet::new(vec![Capability::new(
+        "read",
+        "filesystem",
+        &ws.to_string_lossy(),
+    )]);
     let audit = AuditWriter::open(dir.join("audit.jsonl")).unwrap();
     let mut gw = ToolGateway::new(dir, policy, caps, audit, "coder", "s");
     let mut cube = Cube::new("adv");
@@ -96,10 +104,20 @@ fn shell_and_unknown_tools_must_deny() {
     let (mut gw, mut cube) = harness("proc");
     let p = test_policy();
     assert_eq!(p.evaluate_process("/bin/sh").0, Decision::Deny);
-    for tool in ["shell.exec", "process.spawn", "network.fetch", "secret.get", "deploy.run"] {
+    for tool in [
+        "shell.exec",
+        "process.spawn",
+        "network.fetch",
+        "secret.get",
+        "deploy.run",
+    ] {
         let r = gw.dispatch(
             &mut cube,
-            &aivm_tools::ToolRequest { tool: tool.into(), path: "x".into(), content: None },
+            &aivm_tools::ToolRequest {
+                tool: tool.into(),
+                path: "x".into(),
+                content: None,
+            },
         );
         assert!(r.is_err(), "must deny {tool}");
     }
@@ -108,9 +126,23 @@ fn shell_and_unknown_tools_must_deny() {
 #[test]
 fn network_must_deny() {
     let p = test_policy();
-    let ctx = EvalContext { state: "ANALYZE".into(), tests_passed: true, ..Default::default() };
-    for h in ["10.1.2.3", "192.168.1.1", "127.0.0.1", "169.254.169.254", "evil.example.com"] {
-        assert_eq!(p.evaluate_network(h, &ctx).0, Decision::Deny, "must deny {h}");
+    let ctx = EvalContext {
+        state: "ANALYZE".into(),
+        tests_passed: true,
+        ..Default::default()
+    };
+    for h in [
+        "10.1.2.3",
+        "192.168.1.1",
+        "127.0.0.1",
+        "169.254.169.254",
+        "evil.example.com",
+    ] {
+        assert_eq!(
+            p.evaluate_network(h, &ctx).0,
+            Decision::Deny,
+            "must deny {h}"
+        );
     }
 }
 
@@ -127,7 +159,9 @@ fn expired_and_exhausted_capability_must_deny() {
 #[test]
 fn state_jump_must_deny() {
     let mut c = Cube::new("t");
-    assert!(c.transition(AgentState::Deploy, &TransitionGuards::default()).is_err());
+    assert!(c
+        .transition(AgentState::Deploy, &TransitionGuards::default())
+        .is_err());
 }
 
 #[test]
@@ -143,7 +177,13 @@ fn audit_chain_verifies() {
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("a.jsonl");
     let mut w = AuditWriter::open(&p).unwrap();
-    w.append(AuditRecord::new(0, "coder", "s", "r1", "ANALYZE", "read", "/w/a", "deny", "p")).unwrap();
-    w.append(AuditRecord::new(0, "coder", "s", "r2", "ANALYZE", "write", "/w/b", "deny", "p")).unwrap();
+    w.append(AuditRecord::new(
+        0, "coder", "s", "r1", "ANALYZE", "read", "/w/a", "deny", "p",
+    ))
+    .unwrap();
+    w.append(AuditRecord::new(
+        0, "coder", "s", "r2", "ANALYZE", "write", "/w/b", "deny", "p",
+    ))
+    .unwrap();
     assert_eq!(AuditWriter::verify(&p).unwrap(), 2);
 }

@@ -278,7 +278,11 @@ fn is_blocked_network(host: &str) -> bool {
         || h.starts_with("172.17.")
         || h.starts_with("172.18.")
         || (h.starts_with("172.")
-            && h.split('.').nth(1).and_then(|s| s.parse::<u8>().ok()).map(|n| (16..=31).contains(&n)).unwrap_or(false))
+            && h.split('.')
+                .nth(1)
+                .and_then(|s| s.parse::<u8>().ok())
+                .map(|n| (16..=31).contains(&n))
+                .unwrap_or(false))
 }
 
 fn rule_matches(rule: &Rule, ctx: &EvalContext) -> bool {
@@ -390,7 +394,10 @@ system:
             tests_passed: true,
             ..Default::default()
         };
-        assert_eq!(p.evaluate_network("169.254.169.254", &ctx).0, Decision::Deny);
+        assert_eq!(
+            p.evaluate_network("169.254.169.254", &ctx).0,
+            Decision::Deny
+        );
         assert_eq!(p.evaluate_network("127.0.0.1", &ctx).0, Decision::Deny);
     }
 

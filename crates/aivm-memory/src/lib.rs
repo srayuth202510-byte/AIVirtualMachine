@@ -36,10 +36,19 @@ impl Memory {
         let safe: String = entry
             .key
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
-        std::fs::write(self.dir.join(format!("{safe}.json")), serde_json::to_string(entry).unwrap())
-            .map_err(|e| MemoryError::Io(e.to_string()))?;
+        std::fs::write(
+            self.dir.join(format!("{safe}.json")),
+            serde_json::to_string(entry).unwrap(),
+        )
+        .map_err(|e| MemoryError::Io(e.to_string()))?;
         Ok(())
     }
 

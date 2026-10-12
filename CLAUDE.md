@@ -136,3 +136,36 @@ rtk init --global       # Add RTK to ~/.claude/CLAUDE.md
 
 Overall average: **60-90% token reduction** on common development operations.
 <!-- /rtk-instructions -->
+
+<!-- aivm-agent-workflow -->
+# AIVM Agent Workflow
+
+Rust workspace implementing the spec in `AI Virtual Machine.md` (MVP-A: mediated
+`filesystem.read/write` + `code.search` only; no shell/process/network).
+
+## Fast loops (prefer these)
+
+```bash
+make verify        # full gate: fmt-check + clippy(-D warnings) + tests + demo
+make test-adv      # adversarial must-deny suite only (spec §38)
+make demo          # 10-case ALLOW/DENY self-test, throwaway temp dir (~1s)
+cargo adv          # alias for the adversarial suite
+cargo lint         # alias for strict clippy
+```
+
+`make demo` is the fastest way to debug the enforcement chain — it prints the
+exact decision/reason per case. For the full CLI cycle: `make e2e`.
+
+## Crate map (dependency order)
+
+`capability` → `policy` → `cube`, `audit` → `tools` → `memory/network/sandbox/model`
+→ `runtime` (incl. `runtime::demo`) → `supervisor` → `cli`. No cycles; keep it so.
+
+## Rules while editing
+
+- **Fail-closed**: any parse/eval/context error → `DENY`. Never default to allow.
+- New tools must be added to `ToolGateway::dispatch` deny-by-default + covered by
+  a `demo` case in `crates/aivm-runtime/src/demo.rs` and the adversarial suite.
+- Security invariants `I-1`–`I-10` live in spec §35; adversarial categories in §38.
+- `cargo fmt` before finishing; `make verify` must stay green.
+<!-- /aivm-agent-workflow -->

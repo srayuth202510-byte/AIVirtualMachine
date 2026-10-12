@@ -35,7 +35,10 @@ pub struct Supervisor {
 
 impl Supervisor {
     pub fn new(root: PathBuf) -> Self {
-        let mut s = Self { root, vms: HashMap::new() };
+        let mut s = Self {
+            root,
+            vms: HashMap::new(),
+        };
         s.discover();
         s
     }
@@ -65,7 +68,8 @@ impl Supervisor {
         }
         let dir = self.vm_dir(name);
         if dir.join("aivm.yaml").is_file() {
-            self.vms.insert(name.to_string(), (VmStatus::Stopped, dir.clone()));
+            self.vms
+                .insert(name.to_string(), (VmStatus::Stopped, dir.clone()));
             return Ok(dir);
         }
         Err(SupervisorError::NotFound(name.into()))
@@ -82,7 +86,8 @@ impl Supervisor {
         let dir = self.vm_dir(name);
         std::fs::create_dir_all(dir.join("workspace/src"))
             .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
-        let yaml = serde_yaml::to_string(&config).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        let yaml =
+            serde_yaml::to_string(&config).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
         std::fs::write(dir.join("aivm.yaml"), yaml)
             .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
         // Validate runtime boots fail-closed before registering.
@@ -93,17 +98,23 @@ impl Supervisor {
 
     pub fn run(&mut self, name: &str) -> Result<String, SupervisorError> {
         let dir = self.resolve(name)?;
-        let cfg = VmConfig::from_file(&dir.join("aivm.yaml")).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
-        let mut rt = Runtime::init(cfg, dir.clone()).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        let cfg = VmConfig::from_file(&dir.join("aivm.yaml"))
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        let mut rt =
+            Runtime::init(cfg, dir.clone()).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
         if let Some((st, _)) = self.vms.get_mut(name) {
             *st = VmStatus::Running;
         }
-        rt.step("init").map_err(|e| SupervisorError::Runtime(e.to_string()))
+        rt.step("init")
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))
     }
 
     pub fn pause(&mut self, name: &str) -> Result<(), SupervisorError> {
         let dir = self.resolve(name)?;
-        let (st, _) = self.vms.get_mut(name).ok_or_else(|| SupervisorError::NotFound(name.into()))?;
+        let (st, _) = self
+            .vms
+            .get_mut(name)
+            .ok_or_else(|| SupervisorError::NotFound(name.into()))?;
         *st = VmStatus::Paused;
         let _ = dir;
         Ok(())
@@ -111,7 +122,10 @@ impl Supervisor {
 
     pub fn stop(&mut self, name: &str) -> Result<(), SupervisorError> {
         let dir = self.resolve(name)?;
-        let (st, _) = self.vms.get_mut(name).ok_or_else(|| SupervisorError::NotFound(name.into()))?;
+        let (st, _) = self
+            .vms
+            .get_mut(name)
+            .ok_or_else(|| SupervisorError::NotFound(name.into()))?;
         *st = VmStatus::Stopped;
         let _ = dir;
         Ok(())
@@ -119,7 +133,10 @@ impl Supervisor {
 
     pub fn kill(&mut self, name: &str) -> Result<(), SupervisorError> {
         let dir = self.resolve(name)?;
-        let (st, _) = self.vms.get_mut(name).ok_or_else(|| SupervisorError::NotFound(name.into()))?;
+        let (st, _) = self
+            .vms
+            .get_mut(name)
+            .ok_or_else(|| SupervisorError::NotFound(name.into()))?;
         *st = VmStatus::Killed;
         let _ = dir;
         Ok(())
@@ -134,9 +151,15 @@ impl Supervisor {
         if !dir.join("aivm.yaml").is_file() {
             return Err(SupervisorError::NotFound(name.into()));
         }
-        let st = self.vms.get(name).map(|(s, _)| s.clone()).unwrap_or(VmStatus::Stopped);
-        let cfg = VmConfig::from_file(&dir.join("aivm.yaml")).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
-        let rt = Runtime::init(cfg, dir.clone()).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        let st = self
+            .vms
+            .get(name)
+            .map(|(s, _)| s.clone())
+            .unwrap_or(VmStatus::Stopped);
+        let cfg = VmConfig::from_file(&dir.join("aivm.yaml"))
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        let rt =
+            Runtime::init(cfg, dir.clone()).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
         Ok(format!("{:?}\n{}", st, rt.inspect()))
     }
 

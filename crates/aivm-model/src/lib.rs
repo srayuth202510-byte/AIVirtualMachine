@@ -20,7 +20,10 @@ pub struct ModelConfig {
 
 impl Default for ModelConfig {
     fn default() -> Self {
-        Self { provider: "echo".into(), name: "echo".into() }
+        Self {
+            provider: "echo".into(),
+            name: "echo".into(),
+        }
     }
 }
 
@@ -35,6 +38,10 @@ pub struct EchoModel {
 
 impl Model for EchoModel {
     fn reason(&self, context: &str) -> Result<String, ModelError> {
-        Ok(format!("[{}] intent from context: {}", self.name, context.lines().next().unwrap_or(""))) 
+        Ok(format!(
+            "[{}] intent from context: {}",
+            self.name,
+            context.lines().next().unwrap_or("")
+        ))
     }
 }

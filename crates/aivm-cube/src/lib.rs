@@ -151,7 +151,11 @@ impl Cube {
     }
 
     /// Validated transition. Fail-closed: invalid edge or unmet guard => Err.
-    pub fn transition(&mut self, next: AgentState, guards: &TransitionGuards) -> Result<(), CubeError> {
+    pub fn transition(
+        &mut self,
+        next: AgentState,
+        guards: &TransitionGuards,
+    ) -> Result<(), CubeError> {
         if !self.state.can_transition_to(next) {
             return Err(CubeError::InvalidTransition {
                 from: self.state.to_string(),
@@ -248,20 +252,32 @@ mod tests {
     #[test]
     fn happy_path() {
         let mut c = Cube::new("t");
-        c.transition(AgentState::Analyze, &TransitionGuards::default()).unwrap();
+        c.transition(AgentState::Analyze, &TransitionGuards::default())
+            .unwrap();
         c.transition(
             AgentState::Modify,
-            &TransitionGuards { confidence: 0.95, confidence_threshold: 0.8, ..Default::default() },
+            &TransitionGuards {
+                confidence: 0.95,
+                confidence_threshold: 0.8,
+                ..Default::default()
+            },
         )
         .unwrap();
         c.transition(
             AgentState::Validate,
-            &TransitionGuards { tests_passed: true, ..Default::default() },
+            &TransitionGuards {
+                tests_passed: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         c.transition(
             AgentState::Deploy,
-            &TransitionGuards { policy_approved: true, tests_passed: true, ..Default::default() },
+            &TransitionGuards {
+                policy_approved: true,
+                tests_passed: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(c.current_state(), AgentState::Deploy);
@@ -270,8 +286,13 @@ mod tests {
     #[test]
     fn low_confidence_blocks() {
         let mut c = Cube::new("t");
-        c.transition(AgentState::Analyze, &TransitionGuards::default()).unwrap();
-        let g = TransitionGuards { confidence: 0.1, confidence_threshold: 0.8, ..Default::default() };
+        c.transition(AgentState::Analyze, &TransitionGuards::default())
+            .unwrap();
+        let g = TransitionGuards {
+            confidence: 0.1,
+            confidence_threshold: 0.8,
+            ..Default::default()
+        };
         assert!(c.transition(AgentState::Modify, &g).is_err());
     }
 }

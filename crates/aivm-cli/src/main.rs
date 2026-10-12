@@ -18,24 +18,49 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Create a VM from an aivm.yaml config.
-    Create { name: String, #[arg(long)] config: PathBuf },
+    Create {
+        name: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Run one mediated step.
-    Run { name: String },
+    Run {
+        name: String,
+    },
     /// Show state, model, resources, capabilities.
-    Inspect { name: String },
+    Inspect {
+        name: String,
+    },
     /// Show current agent state.
-    State { name: String },
+    State {
+        name: String,
+    },
     /// List initial capabilities.
-    Capabilities { name: String },
+    Capabilities {
+        name: String,
+    },
     /// Print audit log tail.
-    Logs { name: String },
-    Pause { name: String },
-    Stop { name: String },
-    Kill { name: String },
+    Logs {
+        name: String,
+    },
+    Pause {
+        name: String,
+    },
+    Stop {
+        name: String,
+    },
+    Kill {
+        name: String,
+    },
+    /// Self-test the enforcement chain in a throwaway workspace.
+    /// No --root needed; prints an ALLOW/DENY table and exits
+    /// non-zero if any case misbehaves.
+    Demo,
 }
 
 fn main() -> Result<(), AnyErr> {
     let cli = Cli::parse();
+    let root = cli.root.clone();
     let mut sup = Supervisor::new(cli.root);
     match cli.cmd {
         Cmd::Create { name, config } => {
@@ -57,10 +82,17 @@ fn main() -> Result<(), AnyErr> {
         Cmd::State { name } => println!("{}", sup.inspect(&name).map_err(err)?),
         Cmd::Capabilities { name } => println!("{}", sup.inspect(&name).map_err(err)?),
         Cmd::Logs { name } => {
-            let p = PathBuf::from("./vms").join(&name).join("audit.jsonl");
+            let p = root.join(&name).join("audit.jsonl");
             match std::fs::read_to_string(&p) {
                 Ok(t) => {
-                    for line in t.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev() {
+                    for line in t
+                        .lines()
+                        .rev()
+                        .take(20)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                    {
                         println!("{line}");
                     }
                 }
@@ -78,6 +110,36 @@ fn main() -> Result<(), AnyErr> {
         Cmd::Kill { name } => {
             sup.kill(&name).map_err(err)?;
             println!("killed '{name}'");
+        }
+        Cmd::Demo => {
+            let rep = aivm_runtime::demo::mediated_demo().map_err(err)?;
+            for c in &rep.cases {
+                let mark = if c.pass { "ok  " } else { "FAIL" };
+                println!(
+                    "{mark} expect {:5} {:45} -> {}",
+                    c.expected.label(),
+                    c.name,
+                    c.got
+                );
+            }
+            println!(
+                "audit: {} entries, chain {}",
+                rep.audit_entries,
+                if rep.audit_verified {
+                    "verified"
+                } else {
+                    "BROKEN"
+                }
+            );
+            println!(
+                "demo: {}/{} pass{}",
+                rep.passed(),
+                rep.cases.len(),
+                if rep.ok() { "" } else { " — FAILED" }
+            );
+            if !rep.ok() {
+                std::process::exit(1);
+            }
         }
     }
     Ok(())

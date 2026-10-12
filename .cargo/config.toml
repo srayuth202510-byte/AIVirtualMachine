@@ -1,0 +1,5 @@
+[alias]
+# Shortcuts for the inner loop; see `make help` for the full set.
+adv = "test -p aivm-adversarial"
+lint = "clippy --workspace --all-targets -- -D warnings"
+t = "test --workspace"

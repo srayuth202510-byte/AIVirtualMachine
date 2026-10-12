@@ -218,8 +218,7 @@ mod tests {
 
     #[test]
     fn expiry_is_deny() {
-        let mut cap = Capability::new("read", "filesystem", "/workspace")
-            .with_expiration(0);
+        let mut cap = Capability::new("read", "filesystem", "/workspace").with_expiration(0);
         // force expiry
         cap.expiration = Some(1);
         assert!(matches!(cap.check_usable(), Err(CapabilityError::Expired)));
@@ -227,9 +226,10 @@ mod tests {
 
     #[test]
     fn max_uses_enforced() {
-        let mut cap =
-            Capability::new("secret", "github_token", "repo:write").with_max_uses(1);
-        assert!(cap.authorize("secret", "github_token", "repo:write").is_ok());
+        let mut cap = Capability::new("secret", "github_token", "repo:write").with_max_uses(1);
+        assert!(cap
+            .authorize("secret", "github_token", "repo:write")
+            .is_ok());
         assert!(matches!(
             cap.authorize("secret", "github_token", "repo:write"),
             Err(CapabilityError::BudgetExceeded(_))

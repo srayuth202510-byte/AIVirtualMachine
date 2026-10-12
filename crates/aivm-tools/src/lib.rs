@@ -119,8 +119,8 @@ impl ToolGateway {
             }
             if let Ok(meta) = std::fs::symlink_metadata(p) {
                 if meta.file_type().is_symlink() {
-                    let real = std::fs::canonicalize(p)
-                        .map_err(|e| ToolError::Io(e.to_string()))?;
+                    let real =
+                        std::fs::canonicalize(p).map_err(|e| ToolError::Io(e.to_string()))?;
                     let real_ws = std::fs::canonicalize(&self.workspace).unwrap_or(ws.clone());
                     if real != real_ws && !real.starts_with(&real_ws) {
                         return Err(ToolError::Denied(format!(
@@ -184,14 +184,10 @@ impl ToolGateway {
         }
 
         // Capability check (fail-closed).
-        if self
-            .caps
-            .authorize(action, "filesystem", &scope)
-            .is_err()
-        {
+        if self.caps.authorize(action, "filesystem", &scope).is_err() {
             // Search falls back to read capability.
-            let fallback_ok = action == "search"
-                && self.caps.authorize("read", "filesystem", &scope).is_ok();
+            let fallback_ok =
+                action == "search" && self.caps.authorize("read", "filesystem", &scope).is_ok();
             if !fallback_ok {
                 self.audit_decision(cube, action, &scope, "deny", "no-capability", "error");
                 return Err(ToolError::Denied("no capability".into()));
@@ -232,15 +228,17 @@ impl ToolGateway {
     pub fn read(&mut self, cube: &mut Cube, path: &str) -> Result<ToolResult, ToolError> {
         let canon = self.enforce(cube, "read", path)?;
         // Open with symlink check: reject symlink files (O_NOFOLLOW approx).
-        let meta =
-            std::fs::symlink_metadata(&canon).map_err(|e| ToolError::Io(e.to_string()))?;
+        let meta = std::fs::symlink_metadata(&canon).map_err(|e| ToolError::Io(e.to_string()))?;
         if meta.file_type().is_symlink() {
             self.audit_decision(cube, "read", path, "deny", "symlink-file", "error");
             return Err(ToolError::Denied("symlink files not followed".into()));
         }
-        let content =
-            std::fs::read_to_string(&canon).map_err(|e| ToolError::Io(e.to_string()))?;
-        Ok(ToolResult { ok: true, decision: "allow".into(), output: content })
+        let content = std::fs::read_to_string(&canon).map_err(|e| ToolError::Io(e.to_string()))?;
+        Ok(ToolResult {
+            ok: true,
+            decision: "allow".into(),
+            output: content,
+        })
     }
 
     pub fn write(
@@ -259,7 +257,11 @@ impl ToolGateway {
             return Err(ToolError::Denied("containment re-check failed".into()));
         }
         std::fs::write(&canon, content).map_err(|e| ToolError::Io(e.to_string()))?;
-        Ok(ToolResult { ok: true, decision: "allow".into(), output: "written".into() })
+        Ok(ToolResult {
+            ok: true,
+            decision: "allow".into(),
+            output: "written".into(),
+        })
     }
 
     /// `code.search`: substring search over workspace files (read-scoped).
@@ -293,7 +295,11 @@ impl ToolGateway {
                 break;
             }
         }
-        Ok(ToolResult { ok: true, decision: "allow".into(), output: hits.join("\n") })
+        Ok(ToolResult {
+            ok: true,
+            decision: "allow".into(),
+            output: hits.join("\n"),
+        })
     }
 
     pub fn dispatch(
@@ -304,11 +310,9 @@ impl ToolGateway {
         // MVP-A: only three mediated tools exist. Anything else => DENY.
         match req.tool.as_str() {
             "filesystem.read" => self.read(cube, &req.path),
-            "filesystem.write" => self.write(
-                cube,
-                &req.path,
-                req.content.as_deref().unwrap_or_default(),
-            ),
+            "filesystem.write" => {
+                self.write(cube, &req.path, req.content.as_deref().unwrap_or_default())
+            }
             "code.search" => self.search(cube, &req.path),
             other => {
                 self.audit_decision(cube, other, &req.path, "deny", "unknown-tool", "error");
@@ -366,9 +370,8 @@ mod tests {
         ));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         let ws_real = dir.canonicalize().unwrap_or(dir.clone());
-        let policy = Policy::from_yaml(
-            &format!(
-                r#"
+        let policy = Policy::from_yaml(&format!(
+            r#"
 name: test
 filesystem:
   read: [{}]
@@ -377,10 +380,9 @@ filesystem:
 process: {{allow: [], deny: []}}
 network: {{allow: [], deny: []}}
 "#,
-                ws_real.display(),
-                ws_real.display()
-            ),
-        )
+            ws_real.display(),
+            ws_real.display()
+        ))
         .unwrap();
         let caps = CapabilitySet::new(vec![
             Capability::new("read", "filesystem", &ws_real.to_string_lossy()),
@@ -419,7 +421,11 @@ network: {{allow: [], deny: []}}
         let (mut gw, mut cube, _d) = harness();
         let r = gw.dispatch(
             &mut cube,
-            &ToolRequest { tool: "shell.exec".into(), path: "x".into(), content: None },
+            &ToolRequest {
+                tool: "shell.exec".into(),
+                path: "x".into(),
+                content: None,
+            },
         );
         assert!(matches!(r, Err(ToolError::Denied(_))));
     }

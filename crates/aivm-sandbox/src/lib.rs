@@ -22,7 +22,11 @@ pub struct ResourceLimits {
 
 impl Default for ResourceLimits {
     fn default() -> Self {
-        Self { cpu: 2, memory_mb: 1024, pids_max: 64 }
+        Self {
+            cpu: 2,
+            memory_mb: 1024,
+            pids_max: 64,
+        }
     }
 }
 
