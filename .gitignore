@@ -2,3 +2,4 @@
 *.log
 audit.log*
 /vms/
+/graphify-out/

@@ -156,6 +156,29 @@ cargo lint         # alias for strict clippy
 `make demo` is the fastest way to debug the enforcement chain — it prints the
 exact decision/reason per case. For the full CLI cycle: `make e2e`.
 
+## Search first (cheapest context wins)
+
+```bash
+make query Q="..."        # knowledge graph: concept-level, file:line evidence
+make path A=... B=...     # shortest path between two concepts
+make explain N=...        # what a node is + its connections
+rtk grep <pattern>        # text search only when the graph has no answer
+```
+
+Order: `query` → `path`/`explain` → `grep` → read the cited `file:line`.
+Never re-read whole files the graph already located.
+
+## Bugfix loop
+
+1. **Repro first**: `make debug-test F=<name> [P=<crate>]` (backtrace + `--nocapture`),
+   or add a `demo` case if it's an enforcement decision.
+2. **Fix** at the cited location; keep the fail-closed rule below.
+3. **Close the loop**: `make verify`. New regression test or `demo` case required —
+   a fix without a test is not done.
+4. **Refresh the map** after structural changes (new crate, moved module, new
+   concept): `make graph-update` (incremental, cached, headless, code-only;
+   doc/spec changes need in-session `/graphify --update`).
+
 ## Crate map (dependency order)
 
 `capability` → `policy` → `cube`, `audit` → `tools` → `memory/network/sandbox/model`
