@@ -147,6 +147,7 @@ Rust workspace implementing the spec in `AI Virtual Machine.md` (MVP-A: mediated
 
 ```bash
 make verify        # full gate: fmt-check + clippy(-D warnings) + tests + demo
+make ci            # เหมือน CI บน GitHub ทุกอย่าง (= verify + e2e)
 make test-adv      # adversarial must-deny suite only (spec §38)
 make demo          # 10-case ALLOW/DENY self-test, throwaway temp dir (~1s)
 cargo adv          # alias for the adversarial suite

@@ -1,0 +1,37 @@
+# CI ของ AIVM: ล็อกเกตคุณภาพทุก push/PR ห้าม main พังเงียบ
+# งานตรงกับ `make ci` ในเครื่อง (verify + e2e) ใช้ ubuntu ตัวเดียว
+# เพราะ milestone ถัดไป (sandbox) พึ่งพา Linux อยู่แล้ว
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ติดตั้ง Rust stable + clippy + rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: แคช cargo (ให้รอบถัดไปเร็ว)
+        uses: Swatinem/rust-cache@v2
+
+      - name: ฟอร์แมตต้องไม่เพี้ยน
+        run: cargo fmt --all -- --check
+
+      - name: lint แบบ strict (เจอ warning คือตก)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: เทสต์ทั้ง workspace (รวม adversarial)
+        run: cargo test --workspace
+
+      - name: self-test เส้น enforcement (11 เคส ALLOW/DENY)
+        run: cargo run -q -p aivm-cli -- demo
+
+      - name: วงจร CLI ครบ (create/transition/inspect/run/logs)
+        run: sh scripts/smoke.sh

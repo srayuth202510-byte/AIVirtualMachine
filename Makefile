@@ -1,7 +1,7 @@
 # ทางลัดนักพัฒนา AIVM ดูรายการด้วย `make help`
 # ทุก target คือ cargo ธรรมดา ใช้ `rtk make <target>` ได้เหมือนกัน
 
-.PHONY: help build check test test-adv demo e2e clippy fmt fmt-check verify clean query path explain graph-update debug-test
+.PHONY: help build check test test-adv demo e2e clippy fmt fmt-check verify ci clean query path explain graph-update debug-test
 
 help: ## แสดงวิธีใช้นี้
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS=":.*?## "} {printf "  %-10s %s\n", $$1, $$2}'
@@ -35,6 +35,8 @@ fmt-check: ## ตกถ้าฟอร์แมตเพี้ยน
 
 verify: fmt-check clippy test demo ## ด่านรวม: format + lint + test + self-test
 	@echo "verify: all green"
+
+ci: verify e2e ## เหมือน CI บน GitHub: verify + วงจร CLI ครบ
 
 clean: ## ลบ build artifact กับบ้าน VM เดโม
 	cargo clean
