@@ -19,6 +19,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use thiserror::Error;
 
+/// MicroVM backend (Phase 7) — เปิดด้วยฟีเจอร์ `microvm` เท่านั้น
+/// ตอนนี้เป็น skeleton (ประตู fail-closed ยังไม่มีการ boot จริง) เพื่อให้
+/// `make verify` เบาและไม่พึ่ง KVM/Firecracker ใน CI (แบบเดียวกับ `llama`)
+#[cfg(feature = "microvm")]
+pub mod microvm;
+
 #[derive(Debug, Error)]
 pub enum SandboxError {
     #[error("mvp-a: process execution disabled: {0}")]
@@ -514,9 +520,12 @@ pub fn revalidate_exe(canon: &Path, policy: &Policy) -> Result<(), SandboxError>
 /// จุดแยก backend ตาม `SandboxLevel` (seam ของ Phase 7)
 ///
 /// - `Process` = พฤติกรรม MVP-B เดิม (`run_checked`) ไม่เปลี่ยน
-/// - `Container`/`MicroVm`/`Hardware` = ยังไม่มี backend ในขั้นเตรียมการ
-///   คืน `Disabled` แบบ fail-closed เสมอ (แม้เปิดฟีเจอร์ `microvm` แล้วก็ตาม
-///   จนกว่า milestone backend จะส่งมอบ) gateway ชั้นบนจึงไม่ต้องแยกเคสเอง
+/// - `MicroVm` = เปิดฟีเจอร์ `microvm` แล้วเดินประตู skeleton
+///   (spec → shape → supply chain → host readiness → `Disabled` จนกว่า
+///   milestone boot/exec จะส่งมอบ) ไม่เปิดฟีเจอร์คือ `Disabled` ทันที
+/// - `Container`/`Hardware` = ยังไม่มี backend คืน `Disabled` เสมอ
+///
+/// gateway ชั้นบนจึงไม่ต้องแยกเคสเอง
 pub fn run_checked_with_level(
     spec: &ExecSpec,
     policy: &Policy,
@@ -527,6 +536,9 @@ pub fn run_checked_with_level(
         SandboxLevel::Container => Err(SandboxError::Disabled(
             "container backend not implemented; use Process level".into(),
         )),
+        #[cfg(feature = "microvm")]
+        SandboxLevel::MicroVm => microvm::run_in_microvm(spec, policy, &microvm::MicroVmConfig::default()),
+        #[cfg(not(feature = "microvm"))]
         SandboxLevel::MicroVm => Err(SandboxError::Disabled(
             "microvm backend not implemented (needs KVM + firecracker + verified image); use Process level".into(),
         )),
@@ -991,12 +1003,23 @@ pub fn probe() -> SandboxProbe {
 /// `/dev/kvm` มีอยู่และเปิดอ่านได้ (ไม่ต้องมีสิทธิ์ใช้จริง)
 /// แค่บอกว่าเครื่องนี้มีโอกาสรัน MicroVM ได้ ต้องตรวจเวอร์ชันอีกทีตอน boot
 fn probe_kvm() -> bool {
+    kvm_available()
+}
+
+/// `/dev/kvm` เปิดอ่านได้หรือไม่ (side-effect free)
+pub(crate) fn kvm_available() -> bool {
     std::fs::File::open("/dev/kvm").is_ok()
 }
 
 /// หาไบนารี `firecracker` ใน PATH (ไม่รัน ไม่ spawn)
 /// คืน true ถ้าเจอไฟล์รันได้ชื่อตรงใน PATH เท่านั้น
 fn probe_firecracker() -> bool {
+    find_firecracker().is_some()
+}
+
+/// หา path ของไบนารี `firecracker` ใน PATH (ไม่รัน ไม่ spawn)
+/// คืน `None` ถ้าไม่เจอไฟล์รันได้ชื่อตรง — ผู้เรียกต้อง fail-closed
+pub(crate) fn find_firecracker() -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&path) {
         let cand = dir.join("firecracker");
@@ -1006,17 +1029,17 @@ fn probe_firecracker() -> bool {
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(md) = std::fs::metadata(&cand) {
                     if md.permissions().mode() & 0o111 != 0 {
-                        return true;
+                        return Some(cand);
                     }
                 }
             }
             #[cfg(not(unix))]
             {
-                return true;
+                return Some(cand);
             }
         }
     }
-    false
+    None
 }
 
 /// probe ย่อยต้องเป็น fn ธรรมดา (ห้าม closure ที่ allocate) เพราะถูกเรียก
@@ -1468,23 +1491,32 @@ mod tests {
 
     #[test]
     fn non_process_levels_fail_closed() {
-        // Level ที่ยังไม่มี backend ต้อง Disabled เสมอ (fail-closed)
+        // Level ที่ยังไม่มี backend ต้อง fail-closed เสมอ (fail-closed)
         // gateway จึงไม่ต้องแยกเคสเอง และ CI ที่ไม่มี KVM ยังเขียว
+        // หมายเหตุ: เปิดฟีเจอร์ `microvm` แล้ว MicroVm จะเดินประตู skeleton
+        // ด้วย config ว่าง (artifact หาย) จึงเป็น Invalid แทน Disabled —
+        // deny เหมือนกันทั้งคู่ ไม่มีทางรัน
         let ws = test_ws("levels");
         let real = std::fs::canonicalize("/bin/true").unwrap();
         let pol = test_policy(&[&real.to_string_lossy()]);
         let s = spec("/bin/true", &ws);
-        for level in [
-            SandboxLevel::Container,
-            SandboxLevel::MicroVm,
-            SandboxLevel::Hardware,
-        ] {
+        for level in [SandboxLevel::Container, SandboxLevel::Hardware] {
             let r = run_checked_with_level(&s, &pol, level);
             assert!(
                 matches!(r, Err(SandboxError::Disabled(_))),
                 "level {level:?} ต้อง Disabled"
             );
         }
+        #[cfg(not(feature = "microvm"))]
+        {
+            let r = run_checked_with_level(&s, &pol, SandboxLevel::MicroVm);
+            assert!(matches!(r, Err(SandboxError::Disabled(_))));
+        }
+        #[cfg(feature = "microvm")]
+        assert!(
+            run_checked_with_level(&s, &pol, SandboxLevel::MicroVm).is_err(),
+            "MicroVm skeleton ต้อง deny (Invalid/Disabled ก็ได้ ห้ามรัน)"
+        );
         // Process ยังรันได้ปกติ (ไม่ถดถอย)
         assert!(run_checked_with_level(&s, &pol, SandboxLevel::Process).is_ok());
         let _ = std::fs::remove_dir_all(&ws);
