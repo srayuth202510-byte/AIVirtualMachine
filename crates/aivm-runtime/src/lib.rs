@@ -972,4 +972,80 @@ microvm:
         aivm_audit::clear_flags(&base2);
         let _ = std::fs::remove_dir_all(&base2);
     }
+
+    // Phase 7 (ฟีเจอร์ microvm): e2e ระดับ Runtime — yaml `isolation:
+    // microvm` + บล็อก pins จริง → `process.exec` ผ่าน gateway ต้อง ALLOW
+    // (สาย config → gateway → boot ครบ ไม่ใช่แค่ unit ระดับล่าง: level เป็น
+    // MicroVm แล้ว arm Process จะไปไม่ถึงโดย construction)
+    // ข้ามอย่างซื่อสัตย์เมื่อไม่มี AIVM_MICROVM_PINS / KVM / firecracker
+    #[cfg(feature = "microvm")]
+    #[test]
+    fn microvm_real_boot_allow_through_gateway() {
+        let pins_path = std::env::var("AIVM_MICROVM_PINS").unwrap_or_default();
+        if pins_path.is_empty() {
+            eprintln!("skip: ตั้ง AIVM_MICROVM_PINS เพื่อทดสอบ e2e จริง");
+            return;
+        }
+        let has_fc = std::env::var_os("PATH")
+            .map(|p| {
+                std::env::split_paths(&p)
+                    .any(|d| d.join("firecracker").is_file() || d.join("firecracker.exe").is_file())
+            })
+            .unwrap_or(false);
+        if !std::path::Path::new("/dev/kvm").exists() || !has_fc {
+            eprintln!("skip: เครื่องนี้ไม่มี KVM/firecracker");
+            return;
+        }
+        let text = std::fs::read_to_string(&pins_path).expect("อ่าน pins.json ได้");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("pins.json เป็น JSON");
+        let str_of = |ptr: &str| v.pointer(ptr).and_then(|x| x.as_str()).unwrap_or("");
+        let cfg = VmConfig::from_yaml(&format!(
+            r#"
+name: uvm-e2e
+runtime:
+  isolation: microvm
+microvm:
+  kernel_path: {kp}
+  kernel_sha256: "{ks}"
+  rootfs_path: {rp}
+  rootfs_sha256: "{rs}"
+  fc_sha256: "{fs}"
+"#,
+            kp = str_of("/kernel/path"),
+            ks = str_of("/kernel/sha256"),
+            rp = str_of("/rootfs/path"),
+            rs = str_of("/rootfs/sha256"),
+            fs = str_of("/binary/sha256"),
+        ))
+        .unwrap();
+        let base = std::env::temp_dir().join(format!(
+            "aivm-rt-uvm-e2e-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut rt = Runtime::init(cfg, base.clone()).unwrap();
+        assert_eq!(rt.gateway.level, SandboxLevel::MicroVm);
+        // อนุญาต exe + ให้ execute cap (แบบเดียวกับ exec_harness ฝั่ง tools)
+        for exe in ["/bin/true", "/bin/false"] {
+            let real = std::fs::canonicalize(exe)
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            rt.gateway.policy.process.allow.push(real.clone());
+            rt.gateway.caps.grant(aivm_capability::Capability::new(
+                "execute", "process", &real,
+            ));
+        }
+        // exit 0 = ok:true, exit 1 = ok:false แต่ decision ต้อง allow ทั้งคู่
+        let r = rt.gateway.exec(&mut rt.cube, "/bin/true", &[]).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.decision, "allow");
+        let r = rt.gateway.exec(&mut rt.cube, "/bin/false", &[]).unwrap();
+        assert!(!r.ok);
+        assert_eq!(r.decision, "allow");
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
