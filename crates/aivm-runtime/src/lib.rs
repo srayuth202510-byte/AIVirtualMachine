@@ -14,6 +14,7 @@ use aivm_sandbox::{ResourceLimits, Sandbox, SandboxLevel};
 use aivm_tools::{ToolGateway, ToolRequest};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use thiserror::Error;
 
 pub mod agent;
@@ -59,10 +60,20 @@ pub struct VmConfig {
     pub policy: PolicyExtra,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeBlock {
     #[serde(default = "default_isolation")]
     pub isolation: String,
+}
+// ค่าเริ่มต้นต้องเป็น "sandbox" ไม่ใช่ "" (derive Default ให้ String ว่าง
+// ซึ่ง from_str จะปฏิเสธแบบ fail-closed — config ที่ไม่ระบุ isolation
+// ต้องบูตได้ด้วยพฤติกรรม MVP-B เดิม)
+impl Default for RuntimeBlock {
+    fn default() -> Self {
+        Self {
+            isolation: default_isolation(),
+        }
+    }
 }
 fn default_isolation() -> String {
     "sandbox".into()
@@ -299,7 +310,13 @@ impl Runtime {
             }
         }
         let memory = Memory::new(base_dir.join("memory"));
-        let sandbox = Sandbox::new(SandboxLevel::Process, ResourceLimits::default());
+        // ผูกระดับ isolation จาก config (Phase 7): ค่าแปลก = บูตไม่ขึ้น
+        // (fail-closed ไม่เงียบไปใช้ Process) ระดับที่ยังไม่มี backend จะ
+        // DENY ทุก process.exec ที่ gateway พร้อม audit อยู่ดี
+        let level = SandboxLevel::from_str(&config.runtime.isolation)
+            .map_err(|e| RuntimeError::Config(e.to_string()))?;
+        gateway.level = level;
+        let sandbox = Sandbox::new(level, ResourceLimits::default());
         let model_cfg = ModelConfig {
             provider: config.model.provider.clone(),
             name: config.model.name.clone(),
@@ -857,6 +874,46 @@ capabilities:
         std::fs::write(base.join(STATE_FILE), "{not json").unwrap();
         let rt2 = Runtime::init(test_config(), base.clone()).unwrap();
         assert_eq!(rt2.cube.current_state(), AgentState::Init);
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Phase 7: `runtime.isolation` แปลกต้องบูตไม่ขึ้น (fail-closed ไม่เงียบ
+    // ไปใช้ Process) ค่าเริ่มต้นต้องเป็น Process เหมือนเดิม
+    #[test]
+    fn unknown_isolation_fails_boot() {
+        let base = std::env::temp_dir().join(format!(
+            "aivm-rt-iso-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut cfg = test_config();
+        cfg.runtime.isolation = "docker".into();
+        assert!(Runtime::init(cfg, base.clone()).is_err());
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn isolation_selects_gateway_level() {
+        let base = std::env::temp_dir().join(format!(
+            "aivm-rt-lvl-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // ค่าเริ่มต้น (sandbox) = Process
+        let (rt, _) = test_runtime("lvl-default");
+        assert_eq!(rt.gateway.level, SandboxLevel::Process);
+        // microvm ผูกถึง gateway (exec จะ DENY แบบมี audit)
+        let mut cfg = test_config();
+        cfg.runtime.isolation = "microvm".into();
+        let rt = Runtime::init(cfg, base.clone()).unwrap();
+        assert_eq!(rt.gateway.level, SandboxLevel::MicroVm);
+        assert_eq!(rt.sandbox.level, SandboxLevel::MicroVm);
         aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);
     }

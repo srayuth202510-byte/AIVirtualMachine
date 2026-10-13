@@ -57,9 +57,11 @@ dependencies = [
  "aivm-audit",
  "aivm-cube",
  "aivm-runtime",
+ "aivm-sandbox",
  "aivm-supervisor",
  "clap",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 

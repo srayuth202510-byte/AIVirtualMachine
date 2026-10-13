@@ -139,6 +139,9 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         policy_approved: bool,
     },
+    /// ตรวจความพร้อม isolation ของเครื่องนี้ (userns/pidns/seccomp/KVM/firecracker)
+    /// ใช้วางแผน Phase 7: ไม่มี KVM ก็รายงาน false อย่างซื่อสัตย์ ไม่ error
+    Probe,
     /// self-test เส้น enforcement ใน workspace ชั่วคราว
     /// ไม่ต้องใช้ --root พิมพ์ตาราง ALLOW/DENY แล้วจบด้วย exit code
     /// ไม่เป็นศูนย์ถ้ามีเคสไหนผิดปกติ
@@ -314,6 +317,10 @@ fn main() -> Result<(), AnyErr> {
             };
             let (granted, revoked) = sup.transition(&name, next, &guards).map_err(err)?;
             println!("{name}: -> {next} (granted {granted}, revoked {revoked})");
+        }
+        Cmd::Probe => {
+            let pr = aivm_sandbox::probe();
+            println!("{}", serde_json::to_string_pretty(&pr).map_err(err)?);
         }
         Cmd::Demo => {
             let rep = aivm_runtime::demo::mediated_demo().map_err(err)?;

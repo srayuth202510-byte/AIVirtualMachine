@@ -18,7 +18,7 @@ use aivm_audit::{AuditRecord, AuditWriter};
 use aivm_capability::CapabilitySet;
 use aivm_cube::{AgentState, Cube};
 use aivm_policy::{Decision, EvalContext, Policy};
-use aivm_sandbox::{ExecSpec, ResourceLimits};
+use aivm_sandbox::{ExecSpec, ResourceLimits, SandboxLevel};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -58,6 +58,10 @@ pub struct ToolGateway {
     pub audit: AuditWriter,
     pub agent: String,
     pub session_id: String,
+    /// ระดับ isolation ของ VM นี้ (Phase 7: มาจาก `runtime.isolation` ใน config)
+    /// `Process` = พฤติกรรม MVP-B เดิม ระดับอื่นที่ยังไม่มี backend จะ DENY
+    /// แบบ fail-closed ตั้งแต่ gateway (I-7: มี audit ทุกครั้ง)
+    pub level: SandboxLevel,
     req_counter: u64,
 }
 
@@ -77,8 +81,16 @@ impl ToolGateway {
             audit,
             agent: agent.to_string(),
             session_id: session_id.to_string(),
+            // ค่าเริ่มต้นคงพฤติกรรม MVP-B เดิม; Runtime จะเขียนทับจาก config
+            level: SandboxLevel::Process,
             req_counter: 0,
         }
+    }
+
+    /// ตั้งระดับ isolation แบบ builder (ใช้ในเทสต์/อนาคตที่ backend พร้อม)
+    pub fn with_level(mut self, level: SandboxLevel) -> Self {
+        self.level = level;
+        self
     }
 
     fn ctx_of(cube: &Cube) -> EvalContext {
@@ -362,8 +374,15 @@ impl ToolGateway {
             self.audit_decision(cube, "execute", &scope, "deny", "no-capability", "error");
             return Err(ToolError::Denied("no capability".into()));
         }
-        let outcome = aivm_sandbox::run_checked(&spec, &self.policy)
-            .map_err(|e| ToolError::Denied(e.to_string()))?;
+        let outcome = match aivm_sandbox::run_checked_with_level(&spec, &self.policy, self.level) {
+            Ok(o) => o,
+            // ระดับที่ยังไม่มี backend ต้อง DENY พร้อม audit (I-7) ไม่ใช่เงียบหาย
+            Err(aivm_sandbox::SandboxError::Disabled(msg)) => {
+                self.audit_decision(cube, "execute", &scope, "deny", "level-disabled", "error");
+                return Err(ToolError::Denied(msg));
+            }
+            Err(e) => return Err(ToolError::Denied(e.to_string())),
+        };
         self.audit_decision(
             cube,
             "execute",
@@ -1057,5 +1076,29 @@ network: {{allow: [], deny: []}}
             },
         );
         assert!(matches!(r, Err(ToolError::Denied(_))));
+    }
+
+    // Phase 7: ระดับที่ยังไม่มี backend ต้อง DENY พร้อม audit (I-7)
+    // แม้ policy + capability จะอนุญาตครบ (ประตู level มาก่อน execute)
+    #[test]
+    fn exec_denied_on_unimplemented_level_with_audit() {
+        let (mut gw, mut cube, dir) = exec_harness();
+        gw.level = SandboxLevel::MicroVm;
+        let r = gw.dispatch(
+            &mut cube,
+            &ToolRequest {
+                tool: "process.exec".into(),
+                path: "/bin/true".into(),
+                content: Some("[]".into()),
+            },
+        );
+        assert!(matches!(r, Err(ToolError::Denied(_))));
+        // ต้องมี audit decision ที่ deny ด้วยเหตุ level-disabled
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(
+            log.contains("level-disabled"),
+            "ต้อง audit การ deny ระดับ level"
+        );
+        assert!(log.contains("\"decision\":\"deny\""));
     }
 }

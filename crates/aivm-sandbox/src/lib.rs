@@ -55,6 +55,27 @@ pub enum SandboxLevel {
     Hardware,
 }
 
+impl std::str::FromStr for SandboxLevel {
+    type Err = SandboxError;
+
+    /// แปลงค่า `runtime.isolation` ใน `aivm.yaml` เป็น level (fail-closed)
+    ///
+    /// รับ `"sandbox"`/`"process"` (เดิม), `"container"`, `"microvm"`,
+    /// `"hardware"` (case-insensitive, ตัด whitespace หัวท้าย) นอกนั้นคืน
+    /// `Invalid` — config แปลกห้ามเงียบไปใช้ค่าเริ่มต้น ต้องบูตไม่ขึ้น
+    fn from_str(s: &str) -> Result<Self, SandboxError> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "sandbox" | "process" => Ok(SandboxLevel::Process),
+            "container" => Ok(SandboxLevel::Container),
+            "microvm" | "micro-vm" | "firecracker" => Ok(SandboxLevel::MicroVm),
+            "hardware" => Ok(SandboxLevel::Hardware),
+            _ => Err(SandboxError::Invalid(format!(
+                "unknown isolation level: {s}"
+            ))),
+        }
+    }
+}
+
 pub struct Sandbox {
     pub level: SandboxLevel,
     pub limits: ResourceLimits,
@@ -1071,6 +1092,7 @@ fn can_true_with(pre: fn() -> std::io::Result<()>) -> bool {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::str::FromStr;
 
     fn test_policy(allow: &[&str]) -> Policy {
         let allow_list = allow
@@ -1414,6 +1436,34 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // `runtime.isolation` ใน config แปลงเป็น level แบบ fail-closed:
+    // ค่าแปลกห้ามเงียบไปใช้ค่าเริ่มต้น ต้องบูตไม่ขึ้น
+    #[test]
+    fn isolation_level_parses_and_rejects_unknown() {
+        assert_eq!(
+            SandboxLevel::from_str("sandbox").unwrap(),
+            SandboxLevel::Process
+        );
+        assert_eq!(
+            SandboxLevel::from_str("process").unwrap(),
+            SandboxLevel::Process
+        );
+        assert_eq!(
+            SandboxLevel::from_str("  MicroVM ").unwrap(),
+            SandboxLevel::MicroVm
+        );
+        assert_eq!(
+            SandboxLevel::from_str("container").unwrap(),
+            SandboxLevel::Container
+        );
+        assert_eq!(
+            SandboxLevel::from_str("hardware").unwrap(),
+            SandboxLevel::Hardware
+        );
+        assert!(SandboxLevel::from_str("docker").is_err());
+        assert!(SandboxLevel::from_str("").is_err());
     }
 
     #[test]

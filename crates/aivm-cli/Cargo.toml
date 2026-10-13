@@ -10,11 +10,13 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 aivm-runtime = { path = "../aivm-runtime" }
 aivm-supervisor = { path = "../aivm-supervisor" }
 aivm-cube = { path = "../aivm-cube" }
 aivm-audit = { path = "../aivm-audit" }
+aivm-sandbox = { path = "../aivm-sandbox" }
 
 [features]
 # เปิดแบ็กเอนด์ local (GGUF ผ่าน llama.cpp) ทั้งสาย cli -> supervisor -> runtime -> model
