@@ -13,10 +13,12 @@
 use super::{ExecOutcome, ExecSpec, MicroVmConfig};
 use crate::{verify_artifact, SandboxError};
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use which;
 
 // หมายเหตุ: เส้นตายรวมตั้งแต่ spawn จนจับ marker ได้ถูกกำหนดต่อครั้ง
 // ผ่าน `cfg.boot_timeout_secs` (validate ช่วง 5..=600 ตั้งแต่ประตู shape)
@@ -435,21 +437,19 @@ fn boot_and_run_inner(
     )?;
 
     // 5. spawn firecracker (serial → ไฟล์, ไม่มีเน็ตเวิร์กเลย)
+// รองรับ Jailer (optional, requires root) — จะ wrap firecracker ด้วย isolation เพิ่มเติม
+    let use_jailer = cfg.jailer.is_some();
     let sock = scratch.join("api.sock");
     let serial_log = scratch.join("serial.log");
     let serial_file = std::fs::File::create(&serial_log).map_err(|e| spawn_err("serial log", e))?;
     let err_log = scratch.join("stderr.log");
     let err_file = std::fs::File::create(&err_log).map_err(|e| spawn_err("stderr log", e))?;
     let mut guard = KillOnDrop(Some(
-        Command::new(fc_bin)
-            .arg("--api-sock")
-            .arg(&sock)
-            .stdin(Stdio::null())
-            .stdout(serial_file)
-            .stderr(err_file)
-            .env_clear()
-            .spawn()
-            .map_err(|e| spawn_err("firecracker spawn", e))?,
+        if use_jailer {
+            spawn_jailer(cfg, fc_bin, &sock, serial_file, err_file, &scratch)?
+        } else {
+            spawn_firecracker_direct(fc_bin, &sock, serial_file, err_file)?
+        }
     ));
     let child = guard.0.as_mut().expect("guard holds child");
 
@@ -606,6 +606,107 @@ fn parse_exit(log: &str, mark: &str) -> Result<i32, SandboxError> {
     let rest = log[pos + mark.len()..].lines().next().unwrap_or("").trim();
     rest.parse::<i32>()
         .map_err(|_| SandboxError::Spawn("microvm exit code unparsable".into()))
+}
+
+/// จุดเข้าสำหรับการ spawn firecracker โดยตรง (ไม่ใช้ jailer)
+fn spawn_firecracker_direct(
+    fc_bin: &Path,
+    sock: &Path,
+    serial_file: std::fs::File,
+    err_file: std::fs::File,
+) -> Result<Child, SandboxError> {
+    Command::new(fc_bin)
+        .arg("--api-sock")
+        .arg(sock)
+        .stdin(Stdio::null())
+        .stdout(serial_file)
+        .stderr(err_file)
+        .env_clear()
+        .spawn()
+        .map_err(|e| SandboxError::Spawn(format!("firecracker spawn failed: {e}")))
+}
+
+/// Spawn firecracker through Jailer for additional isolation (requires root)
+fn spawn_jailer(
+    cfg: &MicroVmConfig,
+    fc_bin: &Path,
+    sock: &Path,
+    serial_file: std::fs::File,
+    err_file: std::fs::File,
+    scratch: &Path,
+) -> Result<Child, SandboxError> {
+    let jailer_cfg = cfg.jailer.as_ref().expect("use_jailer guard");
+    
+    // Find jailer binary
+    let jailer_bin = if jailer_cfg.jailer_path.as_os_str().is_empty() {
+        which::which("jailer").map_err(|_| SandboxError::Spawn(
+            "jailer binary not found in PATH (install jailer or set jailer_path)".into()
+        ))?
+    } else {
+        jailer_cfg.jailer_path.clone()
+    };
+    
+    let jailer_id = if jailer_cfg.jailer_id.is_empty() {
+        format!("aivm-{}", std::process::id())
+    } else {
+        jailer_cfg.jailer_id.clone()
+    };
+    
+    // Create chroot directory for jailer
+    let chroot_base = std::env::temp_dir().join(format!("aivm-jailer-{}-chroot", jailer_id));
+    std::fs::create_dir_all(&chroot_base).map_err(|e| SandboxError::Spawn(format!("jailer chroot dir create failed: {e}")))?;
+    
+    // Copy firecracker binary into chroot
+    let fc_in_chroot = chroot_base.join("firecracker");
+    std::fs::copy(fc_bin, &fc_in_chroot).map_err(|e| SandboxError::Spawn(format!("jailer fc copy failed: {e}")))?;
+    
+    // Make it executable
+    let mut perms = std::fs::metadata(&fc_in_chroot)
+        .map_err(|e| SandboxError::Spawn(format!("jailer fc stat failed: {e}")))?
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fc_in_chroot, perms).map_err(|e| SandboxError::Spawn(format!("jailer fc chmod failed: {e}")))?;
+    
+    // Build jailer command
+    let mut cmd = Command::new(&jailer_bin);
+    cmd.arg("--id").arg(&jailer_id)
+       .arg("--firecracker-binary").arg("/firecracker")
+       .arg("--chroot-base-dir").arg(&chroot_base)
+       .arg("--api-sock").arg(sock);
+    
+    if jailer_cfg.chroot {
+        cmd.arg("--chroot");
+    }
+    if jailer_cfg.cgroup {
+        cmd.arg("--cgroup");
+    }
+    if jailer_cfg.namespace {
+        cmd.arg("--namespace");
+    }
+    if jailer_cfg.drop_caps {
+        cmd.arg("--drop-caps");
+    }
+    if jailer_cfg.no_new_privs {
+        cmd.arg("--no-new-privs");
+    }
+    
+    // Copy images to chroot for jailer
+    let rootfs_in_chroot = chroot_base.join("root.img");
+    std::fs::copy(&scratch.join("root.img"), &rootfs_in_chroot).map_err(|e| SandboxError::Spawn(format!("jailer rootfs copy failed: {e}")))?;
+    
+    let data_in_chroot = chroot_base.join("data.img");
+    std::fs::copy(&scratch.join("data.img"), &data_in_chroot).map_err(|e| SandboxError::Spawn(format!("jailer data copy failed: {e}")))?;
+    
+    // Copy kernel to chroot
+    let kernel_in_chroot = chroot_base.join("vmlinux.bin");
+    std::fs::copy(&scratch.join("vmlinux.bin"), &kernel_in_chroot).map_err(|e| SandboxError::Spawn(format!("jailer kernel copy failed: {e}")))?;
+    
+    cmd.stdin(Stdio::null())
+       .stdout(serial_file)
+       .stderr(err_file)
+       .env_clear();
+    
+    cmd.spawn().map_err(|e| SandboxError::Spawn(format!("jailer spawn failed: {e}")))
 }
 
 #[cfg(test)]

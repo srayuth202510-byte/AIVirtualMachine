@@ -10,6 +10,7 @@ thiserror = { workspace = true }
 aivm-policy = { path = "../aivm-policy" }
 libc = "0.2"
 sha2 = { workspace = true }
+which = "5"
 
 [features]
 default = []

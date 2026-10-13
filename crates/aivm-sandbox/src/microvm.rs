@@ -66,6 +66,11 @@ pub struct MicroVmConfig {
     /// เส้นตายบูต+รันต่อครั้ง หน่วยวินาที (5..=600)
     #[serde(default = "default_boot_timeout")]
     pub boot_timeout_secs: u64,
+    /// Optional Jailer configuration (requires root)
+    /// เมื่อตั้งค่า จะใช้ jailer รวม firecracker แทนการเรียก firecracker ตรง ๆ
+    /// เพิ่ม isolation: chroot, cgroups, namespaces, no-new-privs, drop caps
+    #[serde(default)]
+    pub jailer: Option<JailerConfig>,
 }
 
 fn default_vcpu() -> u8 {
@@ -81,6 +86,36 @@ fn default_boot_timeout() -> u64 {
     BOOT_TIMEOUT_DEFAULT_SECS
 }
 
+/// Jailer configuration for additional isolation (requires root)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct JailerConfig {
+    /// Path to jailer binary (default: "jailer" in PATH)
+    #[serde(default)]
+    pub jailer_path: PathBuf,
+    /// Jailer ID (unique identifier for the microVM instance)
+    #[serde(default)]
+    pub jailer_id: String,
+    /// Enable chroot isolation
+    #[serde(default = "default_true")]
+    pub chroot: bool,
+    /// Enable cgroup v2 isolation
+    #[serde(default = "default_true")]
+    pub cgroup: bool,
+    /// Enable namespace isolation (pid, net, mnt, ipc, uts)
+    #[serde(default = "default_true")]
+    pub namespace: bool,
+    /// Drop all capabilities
+    #[serde(default = "default_true")]
+    pub drop_caps: bool,
+    /// No new privileges
+    #[serde(default = "default_true")]
+    pub no_new_privs: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 impl Default for MicroVmConfig {
     fn default() -> Self {
         Self {
@@ -93,6 +128,7 @@ impl Default for MicroVmConfig {
             max_artifact_bytes: default_max_bytes(),
             fc_sha256: String::new(),
             boot_timeout_secs: default_boot_timeout(),
+            jailer: None,
         }
     }
 }
