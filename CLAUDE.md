@@ -149,7 +149,7 @@ Rust workspace implementing the spec in `AI Virtual Machine.md` (MVP-A: mediated
 make verify        # full gate: fmt-check + clippy(-D warnings) + tests + demo
 make ci            # เหมือน CI บน GitHub ทุกอย่าง (= verify + e2e)
 make test-adv      # adversarial must-deny suite only (spec §38)
-make demo          # 10-case ALLOW/DENY self-test, throwaway temp dir (~1s)
+make demo          # 12-case ALLOW/DENY self-test, throwaway temp dir (~1s)
 cargo adv          # alias for the adversarial suite
 cargo lint         # alias for strict clippy
 ```
@@ -205,9 +205,10 @@ Never re-read whole files the graph already located.
   (allowlist + execute cap + state grant + audit) พร้อม adversarial คุม
   shell-literal/symlink/PATH/argv-shape — ห้ามเพิ่ม exec surface ใหม่
   โดยไม่มี adversarial case.
-- Subprocess tree: hardening ตกทอดไป child (ยกเว้น pdeathsig) PID-namespace
-  ทั้งก้อนยังค้าง — เปิด compiler/test runner ได้เพราะประตูคุม ไม่ใช่
-  เพราะกัก tree สมบูรณ์แล้ว.
+- Subprocess tree: hardening ตกทอดไป child (no-new-privs/rlimit/env/seccomp)
+  + pdeathsig ตั้งซ้ำในหลาน PID 1 (กันค่าถูกล้างตอน fork) + PID/mount/net
+  namespace แบบ best-effort พร้อมรายงาน degraded — เปิด compiler/test runner
+  ได้เพราะประตูคุม ไม่ใช่เพราะกัก tree สมบูรณ์แล้ว.
 - Audit: `rotate()` + `verify_sequence()` + `aivm audit <name>`; archive ถูกผนึก
   (+i เมื่อ FS รองรับ) ห้ามเขียนทับ.
 

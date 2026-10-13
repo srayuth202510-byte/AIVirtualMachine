@@ -383,12 +383,17 @@ mod tests {
 
     #[test]
     fn openai_provider_missing_key_fails_closed() {
-        std::env::remove_var("OPENAI_API_KEY");
+        // ชื่อ env เฉพาะเทสต์ กัน race กับเทสต์ providers ที่รันขนานกัน
+        let env = "AIVM_TEST_MISSING_OPENAI_KEY_LIB";
+        std::env::remove_var(env);
         let cfg = ModelConfig {
             provider: "openai".into(),
             name: "openai".into(),
             local: None,
-            openai: Some(Default::default()),
+            openai: Some(providers::OpenAIConfig {
+                api_key_env: env.into(),
+                model: "gpt-4o-mini".into(),
+            }),
             anthropic: None,
         };
         assert!(create_model(&cfg).is_err());
@@ -396,13 +401,17 @@ mod tests {
 
     #[test]
     fn anthropic_provider_missing_key_fails_closed() {
-        std::env::remove_var("ANTHROPIC_API_KEY");
+        let env = "AIVM_TEST_MISSING_ANTHROPIC_KEY_LIB";
+        std::env::remove_var(env);
         let cfg = ModelConfig {
             provider: "anthropic".into(),
             name: "anthropic".into(),
             local: None,
             openai: None,
-            anthropic: Some(Default::default()),
+            anthropic: Some(providers::AnthropicConfig {
+                api_key_env: env.into(),
+                model: "claude-sonnet-4-20250514".into(),
+            }),
         };
         assert!(create_model(&cfg).is_err());
     }

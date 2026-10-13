@@ -627,8 +627,8 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
             }
 
             // 2. pdeathsig: parent ตาย child โดน SIGKILL ตาม (กัน process กำพร้า)
-            //    ตั้งก่อน fork เพื่อให้ทุกลำดับชั้นสืบทอด: ลูกที่ fork ทีหลัง
-            //    จะมี pdeathsig ชี้ไปตัวกลาง -> ตัวกลางตาย ลูกตาย
+            //    ค่าถูกล้างในลูกที่ fork ใหม่ (man prctl) จึงต้องตั้งซ้ำในหลาน
+            //    ที่เป็น PID 1 อีกครั้ง (ดูขั้น 3) ไม่ใช่สืบทอดอัตโนมัติ
             if libc::prctl(
                 libc::PR_SET_PDEATHSIG,
                 libc::SIGKILL as libc::c_ulong,
@@ -673,6 +673,20 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
                     libc::_exit(code);
                 }
                 // ลูกเดินต่อ: ตอนนี้เป็น PID 1 ใน ns ใหม่
+                // pdeathsig ถูกล้างตอน fork ต้องตั้งใหม่ให้ชี้ไปตัวกลาง:
+                // ตัวกลางตาย (เช่น parent หลักตายแล้วตัวกลางโดน SIGKILL) หลานตายตาม
+                // กัน race ที่ตัวกลางตายก่อนตั้ง: ถ้า ppid กลายเป็น 1 (init host)
+                // แสดงว่ากำพร้าแล้ว ให้ตายทันทีแบบ fail-closed
+                let _ = libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                );
+                if libc::getppid() == 1 {
+                    libc::_exit(1);
+                }
             }
 
             // 4. remount /proc ใน PID namespace ใหม่ (ต้องทำก่อน seccomp

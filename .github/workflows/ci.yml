@@ -30,7 +30,7 @@ jobs:
       - name: เทสต์ทั้ง workspace (รวม adversarial)
         run: cargo test --workspace
 
-      - name: self-test เส้น enforcement (11 เคส ALLOW/DENY)
+      - name: self-test เส้น enforcement (12 เคส ALLOW/DENY)
         run: cargo run -q -p aivm-cli -- demo
 
       - name: วงจร CLI ครบ (create/transition/inspect/run/logs)

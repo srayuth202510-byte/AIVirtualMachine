@@ -7,10 +7,12 @@
 //! execute -> audit fail-closed ทุกขั้น กัน TOCTOU ด้วย realpath + ตรวจซ้ำ
 //!
 //! หมายเหตุเรื่อง subprocess tree: hardening ใน pre_exec (no-new-privs,
-//! rlimit, env ที่ล้างแล้ว) ตกทอดไป child ที่ fork/exec ต่อโดยอัตโนมัติ
-//! ยกเว้น pdeathsig ที่คุมแค่ child ตรง การกัก tree ทั้งก้อนด้วย PID
-//! namespace ยังเป็นงานขั้นถัดไป — เปิด compiler/test runner ได้เพราะ
-//! ประตู + adversarial คุม ไม่ใช่เพราะกัก tree สมบูรณ์แล้ว
+//! rlimit, env ที่ล้างแล้ว, seccomp denylist) ตกทอดไป child ที่ fork/exec ต่อ
+//! โดยอัตโนมัติ; pdeathsig ตั้งที่ child ตรงแล้วตั้งซ้ำในหลานที่เป็น PID 1
+//! (ค่าถูกล้างตอน fork) การกัก tree ด้วย PID/mount/net namespace ทำแบบ
+//! best-effort พร้อมรายงาน applied/degraded อย่างซื่อสัตย์ — เปิด
+//! compiler/test runner ได้เพราะประตู + adversarial คุม ไม่ใช่เพราะกัก
+//! tree สมบูรณ์แล้ว
 
 use aivm_audit::{AuditRecord, AuditWriter};
 use aivm_capability::CapabilitySet;
