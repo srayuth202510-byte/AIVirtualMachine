@@ -8,6 +8,13 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 aivm-policy = { path = "../aivm-policy" }
 libc = "0.2"
+sha2 = { workspace = true }
+
+[features]
+default = []
+# Backend MicroVM (Firecracker) — ยังไม่มี dependency จริงในขั้นเตรียมการ
+# เปิดไว้เป็น seam ให้ milestone ถัดไปเติม backend โดยไม่แตะ exec path เดิม
+microvm = []
 
 [dev-dependencies]
 serde_json = { workspace = true }

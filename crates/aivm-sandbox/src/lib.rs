@@ -11,10 +11,11 @@
 
 use aivm_policy::{Decision, Policy};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use thiserror::Error;
 
@@ -118,6 +119,12 @@ pub struct SandboxProbe {
     pub seccomp_install: bool,
     pub pid_namespace: bool,
     pub chattr: bool,
+    /// `/dev/kvm` เปิดได้ (เงื่อนไขตั้งต้นของ MicroVM Level 2)
+    #[serde(default)]
+    pub kvm: bool,
+    /// ไบนารี `firecracker` อยู่ใน PATH (ยังไม่การันตีเวอร์ชัน)
+    #[serde(default)]
+    pub firecracker: bool,
 }
 
 // ขีดจำกัดกันบัฟเฟอร์บวม/คำสั่งประหลาด (fail-closed)
@@ -384,6 +391,128 @@ pub fn validate(spec: &ExecSpec, policy: &Policy) -> Result<PathBuf, SandboxErro
         return Err(bad("cwd escapes workspace"));
     }
     Ok(canon)
+}
+
+/// ตรวจ artifact (kernel/rootfs/image สำหรับ Phase 7) ด้วย sha256 ที่ pin ไว้
+/// (supply chain, fail-closed)
+///
+/// อ่านไฟล์แบบมีเพดาน `max_bytes` คำนวณ sha256 แล้วเทียบกับค่า hex ที่คาดหวัง
+/// แบบเทียบทุกไบต์ก่อนคืน (กัน timing oracle แบบง่าย) คืนขนาดไฟล์เมื่อตรง;
+/// ทุกความผิดพลาด (ไม่มีไฟล์/อ่านไม่ได้/ใหญ่เกิน/hex ผิด/hash ไม่ตรง)
+/// คืน `SandboxError::Invalid` — ห้าม boot เด็ดขาด
+pub fn verify_artifact(
+    path: &Path,
+    expected_sha256_hex: &str,
+    max_bytes: u64,
+) -> Result<u64, SandboxError> {
+    let bad = |m: &str| SandboxError::Invalid(m.to_string());
+    // hex ต้องยาว 64 ตัว (32 ไบต์) และเป็น [0-9a-fA-F] เท่านั้น
+    if expected_sha256_hex.len() != 64
+        || !expected_sha256_hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(bad("bad expected hash (must be 64 hex chars)"));
+    }
+    let mut expected = [0u8; 32];
+    for (i, chunk) in expected_sha256_hex.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| bad("bad hex"))?;
+        let lo = (chunk[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| bad("bad hex"))?;
+        expected[i] = ((hi << 4) | lo) as u8;
+    }
+    let meta = std::fs::metadata(path).map_err(|_| bad("artifact not statable"))?;
+    if !meta.is_file() {
+        return Err(bad("artifact is not a file"));
+    }
+    if meta.len() > max_bytes {
+        return Err(bad("artifact too large"));
+    }
+    let mut f = std::fs::File::open(path).map_err(|_| bad("artifact not readable"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    let mut total: u64 = 0;
+    loop {
+        let n = f.read(&mut buf).map_err(|_| bad("artifact read failed"))?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > max_bytes {
+            return Err(bad("artifact too large"));
+        }
+        hasher.update(&buf[..n]);
+    }
+    let got = hasher.finalize();
+    // เทียบทุกไบต์ก่อนตัดสิน (ไม่ early-return ในลูป)
+    let mut diff: u8 = 0;
+    for (a, b) in got.iter().zip(expected.iter()) {
+        diff |= a ^ b;
+    }
+    if diff != 0 {
+        return Err(bad("artifact hash mismatch"));
+    }
+    Ok(total)
+}
+
+/// ตรวจ exe ซ้ำทันทีก่อน spawn (บีบหน้าต่าง TOCTOU ระหว่าง `validate` กับ spawn)
+///
+/// `validate` คืน path ที่ canonicalize แล้ว แต่ไฟล์เป้าหมายอาจถูกสลับหลังตรวจ
+/// (symlink/file swap) ฟังก์ชันนี้ stat ไฟล์จริงอีกรอบแล้วตรวจซ้ำ: เป็นไฟล์ +
+/// รันได้ + ผ่าน allowlist ของ policy เหมือนเดิม ไม่ผ่าน = fail-closed
+/// (แพทเทิร์นเดียวกับที่ guest agent ใน MicroVM ต้องทำซ้ำหลังรับงานข้าม boundary)
+pub fn revalidate_exe(canon: &Path, policy: &Policy) -> Result<(), SandboxError> {
+    let bad = |m: &str| SandboxError::Invalid(m.to_string());
+    let meta = std::fs::metadata(canon).map_err(|_| bad("exe not statable (revalidate)"))?;
+    if !meta.is_file() {
+        return Err(bad("exe is not a file (revalidate)"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err(bad("exe is not executable (revalidate)"));
+        }
+    }
+    // กัน symlink ถูกสลับหลัง validate ครั้งแรก: canonicalize ซ้ำต้องได้เดิม
+    let recanon = std::fs::canonicalize(canon).map_err(|_| bad("exe not found (revalidate)"))?;
+    if recanon != canon {
+        return Err(bad("exe path changed after validate"));
+    }
+    let scope = canon.to_string_lossy().to_string();
+    match policy.evaluate_process(&scope) {
+        (Decision::Allow, _) => Ok(()),
+        (Decision::Deny, rule) => Err(bad(&format!(
+            "exe not allowlisted on revalidate ({})",
+            rule.unwrap_or_default()
+        ))),
+    }
+}
+
+/// จุดแยก backend ตาม `SandboxLevel` (seam ของ Phase 7)
+///
+/// - `Process` = พฤติกรรม MVP-B เดิม (`run_checked`) ไม่เปลี่ยน
+/// - `Container`/`MicroVm`/`Hardware` = ยังไม่มี backend ในขั้นเตรียมการ
+///   คืน `Disabled` แบบ fail-closed เสมอ (แม้เปิดฟีเจอร์ `microvm` แล้วก็ตาม
+///   จนกว่า milestone backend จะส่งมอบ) gateway ชั้นบนจึงไม่ต้องแยกเคสเอง
+pub fn run_checked_with_level(
+    spec: &ExecSpec,
+    policy: &Policy,
+    level: SandboxLevel,
+) -> Result<ExecOutcome, SandboxError> {
+    match level {
+        SandboxLevel::Process => run_checked(spec, policy),
+        SandboxLevel::Container => Err(SandboxError::Disabled(
+            "container backend not implemented; use Process level".into(),
+        )),
+        SandboxLevel::MicroVm => Err(SandboxError::Disabled(
+            "microvm backend not implemented (needs KVM + firecracker + verified image); use Process level".into(),
+        )),
+        SandboxLevel::Hardware => Err(SandboxError::Disabled(
+            "hardware backend not implemented; use Process level".into(),
+        )),
+    }
 }
 
 // ---- Linux namespace helpers (syscall ล้วน: เรียกได้จาก pre_exec) ----
@@ -730,6 +859,9 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
     #[cfg(target_os = "linux")]
     let _iso = probe_isolation();
 
+    // ตรวจ exe ซ้ำก่อน spawn (บีบ TOCTOU: validate ครั้งแรกอาจถูกสลับไฟล์คั่นกลาง)
+    revalidate_exe(&canon, policy)?;
+
     let mut child = cmd
         .spawn()
         .map_err(|e| SandboxError::Spawn(e.to_string()))?;
@@ -814,6 +946,7 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
 
 /// probe ความพร้อมกลไก OS แบบไม่ทิ้งผลข้างเคียง (spawn child ตัวเล็ก ๆ)
 /// userns/seccomp/pidns ลองของจริงใน child ส่วน cgroup ลองสร้าง-ลบทิ้ง
+/// KVM/Firecracker ตรวจแค่การมีอยู่ (ไม่ boot จริง) เพื่อใช้วางแผน Phase 7
 pub fn probe() -> SandboxProbe {
     SandboxProbe {
         userns: can_true_with(probe_userns),
@@ -829,7 +962,40 @@ pub fn probe() -> SandboxProbe {
                 .is_ok()
         },
         chattr: std::process::Command::new("chattr").output().is_ok(),
+        kvm: probe_kvm(),
+        firecracker: probe_firecracker(),
     }
+}
+
+/// `/dev/kvm` มีอยู่และเปิดอ่านได้ (ไม่ต้องมีสิทธิ์ใช้จริง)
+/// แค่บอกว่าเครื่องนี้มีโอกาสรัน MicroVM ได้ ต้องตรวจเวอร์ชันอีกทีตอน boot
+fn probe_kvm() -> bool {
+    std::fs::File::open("/dev/kvm").is_ok()
+}
+
+/// หาไบนารี `firecracker` ใน PATH (ไม่รัน ไม่ spawn)
+/// คืน true ถ้าเจอไฟล์รันได้ชื่อตรงใน PATH เท่านั้น
+fn probe_firecracker() -> bool {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join("firecracker");
+        if cand.is_file() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(md) = std::fs::metadata(&cand) {
+                    if md.permissions().mode() & 0o111 != 0 {
+                        return true;
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// probe ย่อยต้องเป็น fn ธรรมดา (ห้าม closure ที่ allocate) เพราะถูกเรียก
@@ -1177,6 +1343,100 @@ mod tests {
                 .iter()
                 .any(|d| d.starts_with("capability-drop")));
         }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // ---- Phase 7 เตรียมการ: probe + artifact + level dispatch + revalidate ----
+
+    #[test]
+    fn microvm_probe_reports_honestly() {
+        // probe ต้องไม่ panic และรายงานฟิลด์ KVM/Firecracker เสมอ
+        // (ค่าแล้วแต่เครื่อง: CI ไม่มี KVM ต้องได้ false ไม่ใช่ error)
+        let pr = probe();
+        let text = serde_json::to_string(&pr).unwrap();
+        assert!(text.contains("kvm"));
+        assert!(text.contains("firecracker"));
+        // ถ้าไม่มี /dev/kvm ต้องรายงาน false (ซื่อสัตย์ ไม่เงียบ)
+        if !Path::new("/dev/kvm").exists() {
+            assert!(!pr.kvm, "ไม่มี /dev/kvm ต้องรายงาน kvm=false");
+        }
+    }
+
+    #[test]
+    fn artifact_verify_roundtrip_and_mismatch() {
+        use sha2::{Digest, Sha256};
+        let dir = test_ws("artifact");
+        let p = dir.join("kernel.bin");
+        std::fs::write(&p, b"fake-kernel-image-v1").unwrap();
+        let mut h = Sha256::new();
+        h.update(b"fake-kernel-image-v1");
+        let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        // hash ตรงต้องผ่านและคืนขนาดไฟล์
+        let size = verify_artifact(&p, &hex, 1024 * 1024).unwrap();
+        assert_eq!(size, b"fake-kernel-image-v1".len() as u64);
+        // hash ผิดต้อง fail-closed (ห้าม boot)
+        let mut bad = hex.clone();
+        bad.replace_range(0..1, if &hex[0..1] == "a" { "b" } else { "a" });
+        assert!(verify_artifact(&p, &bad, 1024 * 1024).is_err());
+        // hex ผิดรูปต้อง fail-closed
+        assert!(verify_artifact(&p, "not-hex", 1024 * 1024).is_err());
+        // ไฟล์หายต้อง fail-closed
+        assert!(verify_artifact(&dir.join("missing"), &hex, 1024 * 1024).is_err());
+        // ไฟล์ใหญ่เกินเพดานต้อง fail-closed
+        assert!(verify_artifact(&p, &hex, 4).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revalidate_catches_policy_change() {
+        // ตรวจซ้ำต้องจับกรณี policy เปลี่ยนหลัง validate ครั้งแรก
+        // (จำลอง TOCTOU: อนุญาตตอนแรก แล้วถอด allowlist ก่อน spawn)
+        let ws = test_ws("reval");
+        let real = std::fs::canonicalize("/bin/true").unwrap();
+        let pol_allow = test_policy(&[&real.to_string_lossy()]);
+        let canon = validate(&spec("/bin/true", &ws), &pol_allow).unwrap();
+        assert!(revalidate_exe(&canon, &pol_allow).is_ok());
+        // policy ใหม่ไม่อนุญาตแล้ว -> revalidate ต้อง DENY
+        let pol_deny = test_policy(&[]);
+        assert!(revalidate_exe(&canon, &pol_deny).is_err());
+        // path ที่เปลี่ยนไป (canonicalize ซ้ำไม่ตรงเดิม) ต้อง DENY
+        let link = ws.join("true-link");
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink("/bin/true", &link);
+            if link.exists() {
+                let canon_link = std::fs::canonicalize(&link).unwrap();
+                // ส่ง path ที่ไม่ใช่ canonical (symlink) เข้า revalidate ต้องถูกจับ
+                // เพราะ recanonicalize แล้วไม่ตรงกับ input
+                assert!(revalidate_exe(&link, &pol_allow).is_err());
+                let _ = std::fs::remove_file(&link);
+                let _ = canon_link;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn non_process_levels_fail_closed() {
+        // Level ที่ยังไม่มี backend ต้อง Disabled เสมอ (fail-closed)
+        // gateway จึงไม่ต้องแยกเคสเอง และ CI ที่ไม่มี KVM ยังเขียว
+        let ws = test_ws("levels");
+        let real = std::fs::canonicalize("/bin/true").unwrap();
+        let pol = test_policy(&[&real.to_string_lossy()]);
+        let s = spec("/bin/true", &ws);
+        for level in [
+            SandboxLevel::Container,
+            SandboxLevel::MicroVm,
+            SandboxLevel::Hardware,
+        ] {
+            let r = run_checked_with_level(&s, &pol, level);
+            assert!(
+                matches!(r, Err(SandboxError::Disabled(_))),
+                "level {level:?} ต้อง Disabled"
+            );
+        }
+        // Process ยังรันได้ปกติ (ไม่ถดถอย)
+        assert!(run_checked_with_level(&s, &pol, SandboxLevel::Process).is_ok());
         let _ = std::fs::remove_dir_all(&ws);
     }
 }
