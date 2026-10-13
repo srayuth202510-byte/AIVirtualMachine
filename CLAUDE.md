@@ -147,7 +147,7 @@ Rust workspace implementing the spec in `AI Virtual Machine.md` (MVP-A: mediated
 
 ```bash
 make verify        # full gate: fmt-check + clippy(-D warnings) + tests + demo
-make ci            # เหมือน CI บน GitHub ทุกอย่าง (= verify + e2e)
+make ci            # เหมือน CI บน GitHub ทุกอย่าง (= verify + e2e + microvm)
 make test-adv      # adversarial must-deny suite only (spec §38)
 make test-microvm  # MicroVM ทั้งสาย (sandbox/tools/runtime + บูตจริงถ้ามี AIVM_MICROVM_PINS)
 make demo          # 12-case ALLOW/DENY self-test, throwaway temp dir (~1s)

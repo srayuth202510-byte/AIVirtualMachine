@@ -1,7 +1,7 @@
 # ทางลัดนักพัฒนา AIVM ดูรายการด้วย `make help`
 # ทุก target คือ cargo ธรรมดา ใช้ `rtk make <target>` ได้เหมือนกัน
 
-.PHONY: help build check test test-adv test-microvm demo e2e llama-smoke clippy fmt fmt-check verify ci clean query path explain graph-update debug-test
+.PHONY: help build check test test-adv test-microvm check-microvm demo e2e llama-smoke clippy fmt fmt-check verify ci clean query path explain graph-update debug-test
 
 help: ## แสดงวิธีใช้นี้
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS=":.*?## "} {printf "  %-10s %s\n", $$1, $$2}'
@@ -22,6 +22,9 @@ test-microvm: ## เทสต์ MicroVM ทั้งสาย (บูตจร�
 	cargo test -p aivm-sandbox --features microvm
 	cargo test -p aivm-tools --features microvm
 	cargo test -p aivm-runtime --features microvm
+
+check-microvm: ## lint โค้ดหลังฟีเจอร์ microvm ทั้งสาย (กันแก้พังเงียบ)
+	cargo clippy -p aivm-sandbox -p aivm-tools -p aivm-runtime -p aivm-cli --all-targets --features microvm -- -D warnings
 
 demo: ## self-test เส้น enforcement ครั้งเดียว (ตาราง ALLOW/DENY, temp dir)
 	cargo run -q -p aivm-cli -- demo
@@ -44,7 +47,7 @@ fmt-check: ## ตกถ้าฟอร์แมตเพี้ยน
 verify: fmt-check clippy test demo ## ด่านรวม: format + lint + test + self-test
 	@echo "verify: all green"
 
-ci: verify e2e ## เหมือน CI บน GitHub: verify + วงจร CLI ครบ
+ci: verify e2e check-microvm test-microvm ## เหมือน CI บน GitHub: verify + วงจร CLI ครบ + microvm
 
 clean: ## ลบ build artifact กับบ้าน VM เดโม
 	cargo clean

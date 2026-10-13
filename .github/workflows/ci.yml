@@ -1,6 +1,8 @@
 # CI ของ AIVM: ล็อกเกตคุณภาพทุก push/PR ห้าม main พังเงียบ
-# งานตรงกับ `make ci` ในเครื่อง (verify + e2e) ใช้ ubuntu ตัวเดียว
+# งานตรงกับ `make ci` ในเครื่อง (verify + e2e + microvm) ใช้ ubuntu ตัวเดียว
 # เพราะ milestone ถัดไป (sandbox) พึ่งพา Linux อยู่แล้ว
+# หมายเหตุ: runner ไม่มี KVM เทสต์บูตจริงจึง skip อย่างซื่อสัตย์ เหลือ
+# unit/adversarial/plumbing ที่ deterministic ไว้จับโค้ดหลังฟีเจอร์พัง
 name: ci
 
 on:
@@ -29,6 +31,12 @@ jobs:
 
       - name: เทสต์ทั้ง workspace (รวม adversarial)
         run: cargo test --workspace
+
+      - name: lint โค้ดหลังฟีเจอร์ microvm (กันแก้พังเงียบ)
+        run: cargo clippy -p aivm-sandbox -p aivm-tools -p aivm-runtime -p aivm-cli --all-targets --features microvm -- -D warnings
+
+      - name: เทสต์ MicroVM แบบมีฟีเจอร์ (บูตจริงข้ามเมื่อไม่มี KVM)
+        run: make test-microvm
 
       - name: self-test เส้น enforcement (12 เคส ALLOW/DENY)
         run: cargo run -q -p aivm-cli -- demo
