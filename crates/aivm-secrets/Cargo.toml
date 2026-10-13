@@ -1,0 +1,20 @@
+[package]
+name = "aivm-secrets"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+uuid = { workspace = true }
+aivm-capability = { path = "../aivm-capability" }
+aivm-policy = { path = "../aivm-policy" }
+aivm-audit = { path = "../aivm-audit" }
+aivm-cube = { path = "../aivm-cube" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["full"] }
