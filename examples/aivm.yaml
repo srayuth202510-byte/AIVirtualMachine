@@ -14,6 +14,14 @@ runtime:
 #   vcpu_count: 1      # 1..=32
 #   mem_mb: 256        # 64..=32768
 #   boot_timeout_secs: 60   # 5..=600
+#   jailer:                  # Optional: ใช้ jailer wrap firecracker (ต้อง root)
+#     jailer_path: ""        # "" = หาใน PATH, หรือระบุ path เต็ม
+#     jailer_id: ""          # "" = auto-generate
+#     chroot: true           # chroot isolation
+#     cgroup: true           # cgroup v2 isolation
+#     namespace: true        # namespace isolation (pid, net, mnt, ipc, uts)
+#     drop_caps: true        # drop all capabilities
+#     no_new_privs: true     # no new privileges
 
 model:
   provider: echo

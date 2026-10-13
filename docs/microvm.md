@@ -97,6 +97,29 @@ output ไม่ใช่ UTF-8 ถูกแทนด้วย U+FFFD, VMM ไ�
 | `artifact hash mismatch` | ไฟล์ถูกสลับ/โหลดมาเสีย — โหลดใหม่แล้วคำนวณ hash ใหม่ ห้ามแก้ hash ให้ตรงไฟล์ปลอม |
 | `microvm run timed out` | guest บูตช้า/ค้าง — เพิ่ม `boot_timeout_secs` (ไม่เกิน 600) หรือดู serial ผ่าน `KEEP_SCRATCH` |
 | `debugfs`/`mkfs.ext4` ล้ม | ลง `e2fsprogs` ไม่ครบ (ดู `docs/setup.md`) |
+| `jailer binary not found in PATH` | jailer ไม่ได้ติดตั้ง หรือ PATH ไม่ครบ — ติดตั้ง jailer หรือตั้ง `jailer_path` ใน config |
+| `jailer spawn failed` | ไม่มีสิทธิ์ root (jailer ต้องการ root) หรือ cgroup/namespace ไม่รองรับ |
 
-ข้อจำกัดที่รู้ตัว: VMM ถูกรันตรง ๆ ไม่ผ่าน `jailer` (ต้องใช้ root — นอกขอบเขต
-unprivileged ของ MVP), data drive อ่านอย่างเดียว, rootfs สำเนาเขียนได้แต่ทิ้งทุกครั้ง
+## 6. Jailer (Optional, requires root)
+
+Jailer เป็น wrapper ของ Firecracker ที่เพิ่ม isolation layers:
+- **chroot**: จำกัด filesystem visibility
+- **cgroup v2**: resource limits (CPU, memory, pids, I/O)
+- **namespaces**: pid, net, mnt, ipc, uts isolation
+- **capability dropping**: drop all capabilities
+- **no-new-privs**: prevent privilege escalation
+
+การใช้งาน: เพิ่มบล็อก `jailer:` ใน `aivm.yaml` (ดู `examples/aivm.yaml`) และรันด้วยสิทธิ์ root:
+
+```bash
+sudo cargo run -q -p aivm-cli -- --root /opt/aivm create coder --config ./examples/aivm.yaml
+```
+
+**ข้อจำกัด**: 
+- ต้องการ root (sudo) — นอกขอบเขต unprivileged ของ MVP
+- จำเป็นต้องติดตั้ง jailer (build จาก firecracker source หรือ download จาก release)
+- ความเร็ว boot ช้าลงเล็กน้อยจากการ setup chroot และ copy images
+
+## 7. ข้อจำกัดที่รู้ตัว
+
+VMM ถูกรันตรง ๆ (หรือผ่าน jailer) — data drive อ่านอย่างเดียว, rootfs สำเนาเขียนได้แต่ทิ้งทุกครั้ง
