@@ -108,3 +108,8 @@ crates/
 - [`docs/testing.md`](./docs/testing.md) — matrix คำสั่งทดสอบ, feature flags, CI
 - [`docs/architecture.md`](./docs/architecture.md) — เส้นทาง request, isolation levels, audit, invariants
 - [`CLAUDE.md`](./CLAUDE.md) — workflow สำหรับ agent (ไม่ใช่คู่มือผู้ใช้)
+
+## License
+
+Dual-licensed `MIT OR Apache-2.0` — ดู `LICENSE-MIT` และ `LICENSE-APACHE`
+ทุก crate ระบุ `license = "MIT OR Apache-2.0"` ใน `Cargo.toml` แล้ว
