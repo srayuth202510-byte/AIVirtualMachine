@@ -1,7 +1,7 @@
 # ทางลัดนักพัฒนา AIVM ดูรายการด้วย `make help`
 # ทุก target คือ cargo ธรรมดา ใช้ `rtk make <target>` ได้เหมือนกัน
 
-.PHONY: help build check test test-adv demo e2e llama-smoke clippy fmt fmt-check verify ci clean query path explain graph-update debug-test
+.PHONY: help build check test test-adv test-microvm demo e2e llama-smoke clippy fmt fmt-check verify ci clean query path explain graph-update debug-test
 
 help: ## แสดงวิธีใช้นี้
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS=":.*?## "} {printf "  %-10s %s\n", $$1, $$2}'
@@ -17,6 +17,11 @@ test: ## เทสต์ unit + integration ทั้งหมด
 
 test-adv: ## ชุด must-deny อย่างเดียว (สเปก §38)
 	cargo test -p aivm-adversarial
+
+test-microvm: ## เทสต์ MicroVM ทั้งสาย (บูตจริงรันด้วยถ้าตั้ง AIVM_MICROVM_PINS)
+	cargo test -p aivm-sandbox --features microvm
+	cargo test -p aivm-tools --features microvm
+	cargo test -p aivm-runtime --features microvm
 
 demo: ## self-test เส้น enforcement ครั้งเดียว (ตาราง ALLOW/DENY, temp dir)
 	cargo run -q -p aivm-cli -- demo

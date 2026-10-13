@@ -21,3 +21,6 @@ default = []
 # ส่งต่อฟีเจอร์ MicroVM backend ไปยัง aivm-sandbox (config + skeleton)
 # ปิดไว้โดยปริยายเพื่อให้ `make verify` เบาและไม่พึ่ง KVM ใน CI
 microvm = ["aivm-sandbox/microvm"]
+
+[dev-dependencies]
+sha2 = { workspace = true }

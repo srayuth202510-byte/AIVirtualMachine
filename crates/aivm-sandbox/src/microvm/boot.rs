@@ -11,15 +11,16 @@
 //! ยกเว้น path ที่ผ่าน validate/verify มาแล้ว — agent ปนคำสั่งไม่ได้
 
 use super::{ExecOutcome, ExecSpec, MicroVmConfig};
-use crate::SandboxError;
+use crate::{verify_artifact, SandboxError};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// เส้นตายรวมตั้งแต่ spawn จนจับ marker ได้ (boot ปกติใช้ไม่กี่วินาที)
-const BOOT_DEADLINE_SECS: u64 = 60;
+// หมายเหตุ: เส้นตายรวมตั้งแต่ spawn จนจับ marker ได้ถูกกำหนดต่อครั้ง
+// ผ่าน `cfg.boot_timeout_secs` (validate ช่วง 5..=600 ตั้งแต่ประตู shape)
+// boot ปกติใช้ไม่กี่วินาที
 /// เพดาน serial log ที่อ่านมา parse (กันหน่วยความจำบวม)
 const MAX_SERIAL_BYTES: u64 = 2 * 1024 * 1024;
 /// พื้นที่เผื่อใน data image นอกเหนือไฟล์ staging
@@ -36,6 +37,19 @@ impl Drop for KillOnDrop {
             let _ = c.wait();
         }
     }
+}
+
+/// ขนาด guest จริง = ค่าน้อยสุดระหว่าง quota ระดับ VM (`cfg`) กับ quota
+/// ระดับ task (`spec.limits`) — task ไม่มีทางได้ทรัพยากรเกินโควตาตัวเอง
+/// (fail-closed ด้าน quota: เดิมโค้ดเมิน `spec.limits` ทิ้ง ถ้า operator ตั้ง
+/// cfg ใหญ่กว่า task quota งานจะได้เกินโควตาแบบเงียบ ๆ) ค่าประหลาด (0)
+/// ถูกบีบเข้าช่วงที่ boot ได้เสมอ ไม่มีทาง panic/overflow
+fn effective_guest_size(cfg: &MicroVmConfig, limits: &crate::ResourceLimits) -> (u8, u32) {
+    let vcpu = (cfg.vcpu_count as u32).min(limits.cpu.max(1)).clamp(1, 32) as u8;
+    let mem = (cfg.mem_mb as u64)
+        .min(limits.memory_mb.max(64))
+        .clamp(64, 32768) as u32;
+    (vcpu, mem)
 }
 
 /// ห่อข้อความให้เป็น single-quoted sh literal (กันทุกไบต์ยกเว้น NUL
@@ -311,8 +325,11 @@ fn boot_and_run_inner(
     let spawn_err =
         |what: &str, e: std::io::Error| SandboxError::Spawn(format!("microvm {what} failed: {e}"));
     // 1. ก็อป rootfs ที่ verify แล้วไป scratch (ห้ามเขียนไฟล์ pin ต้นฉบับ)
+    // แล้ว verify สำเนาซ้ำ (กันไฟล์ถูกสลับระหว่าง verify กับก็อป/ก็อปเสีย —
+    // แพทเทิร์นเดียวกับ `revalidate_exe` ของ path Process)
     let guest_root = scratch.join("root.img");
     std::fs::copy(&cfg.rootfs_path, &guest_root).map_err(|e| spawn_err("rootfs copy", e))?;
+    verify_artifact(&guest_root, &cfg.rootfs_sha256, cfg.max_artifact_bytes)?;
     let kernel_abs = cfg
         .kernel_path
         .canonicalize()
@@ -437,14 +454,13 @@ fn boot_and_run_inner(
     let child = guard.0.as_mut().expect("guard holds child");
 
     // 6. configure ผ่าน API (ล้มขั้นไหนก็ fail-closed ไม่ boot)
+    // ขนาด guest ถูก clamp ด้วย quota ระดับ task แล้ว (ดู `effective_guest_size`)
+    let (eff_vcpu, eff_mem) = effective_guest_size(cfg, &spec.limits);
     wait_socket(&sock, Duration::from_secs(5))?;
     fc_put(
         &sock,
         "/machine-config",
-        &format!(
-            "{{\"vcpu_count\":{},\"mem_size_mib\":{}}}",
-            cfg.vcpu_count, cfg.mem_mb
-        ),
+        &format!("{{\"vcpu_count\":{eff_vcpu},\"mem_size_mib\":{eff_mem}}}"),
     )?;
     fc_put(
         &sock,
@@ -472,8 +488,8 @@ fn boot_and_run_inner(
     )?;
     fc_put(&sock, "/actions", "{\"action_type\":\"InstanceStart\"}")?;
 
-    // 7. รอ marker (เส้นตายรวม) ระหว่างนั้นถ้า VMM ตายก่อน = ล้มแบบดัง
-    let deadline = Instant::now() + Duration::from_secs(BOOT_DEADLINE_SECS);
+    // 7. รอ marker (เส้นตายรวมจาก config) ระหว่างนั้นถ้า VMM ตายก่อน = ล้มแบบดัง
+    let deadline = Instant::now() + Duration::from_secs(cfg.boot_timeout_secs);
     let exit_mark = format!("AIVM-{nonce}-EXIT:");
     loop {
         if serial_file_contains(&serial_log, &exit_mark, MAX_SERIAL_BYTES) {
@@ -497,26 +513,36 @@ fn boot_and_run_inner(
     let stderr = between(&log, &m_err_b, &m_err_e);
     let code = parse_exit(&log, &exit_mark)?;
     let _ = child;
+    // รายงานซื่อสัตย์: อะไร enforce แล้วเข้า applied อะไรยังหย่อนเข้า degraded
+    let mut applied = vec![
+        "microvm-boot".into(),
+        "image-pin-verify".into(),
+        "rootfs-copy-reverify".into(),
+        "task-quota-clamp".into(),
+        "exe-allowlist".into(),
+        "arg-schema".into(),
+        "kvm".into(),
+        "no-guest-network".into(),
+    ];
+    let mut degraded = vec![
+        "env_extra: ignored (not passed to guest)".to_string(),
+        "cwd: guest sees / (workspace on read-only data drive)".to_string(),
+        "pids_max: not enforced in guest (no cgroup inside microvm)".to_string(),
+        "serial-output: non-UTF-8 bytes replaced with U+FFFD (lossy)".to_string(),
+    ];
+    if cfg.fc_sha256.is_empty() {
+        degraded.push("vmm-binary: unpinned (set fc_sha256 to pin firecracker)".into());
+    } else {
+        applied.push("vmm-pin-verify".into());
+    }
     Ok(ExecOutcome {
         exe: canon.to_string_lossy().to_string(),
         argv: spec.args.clone(),
         code: Some(code),
         stdout,
         stderr,
-        applied: vec![
-            "microvm-boot".into(),
-            "image-pin-verify".into(),
-            "exe-allowlist".into(),
-            "arg-schema".into(),
-            "kvm".into(),
-            "no-guest-network".into(),
-        ],
-        degraded: vec![
-            "env_extra: ignored (not passed to guest)".into(),
-            "cwd: guest sees / (workspace on read-only data drive)".into(),
-            "resource-limits: spec.limits ignored; guest uses cfg vcpu_count/mem_mb".into(),
-            "serial-output: non-UTF-8 bytes replaced with U+FFFD (lossy)".into(),
-        ],
+        applied,
+        degraded,
     })
 }
 
@@ -585,6 +611,38 @@ fn parse_exit(log: &str, mark: &str) -> Result<i32, SandboxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // quota guest = ค่าน้อยสุดระหว่าง cfg ระดับ VM กับ limits ระดับ task
+    // (task ไม่มีทางได้เกินโควตาตัวเอง; ค่าประหลาดถูกบีบเข้าช่วง boot ได้)
+    #[test]
+    fn quota_clamp_takes_minimum() {
+        let cfg = MicroVmConfig {
+            vcpu_count: 4,
+            mem_mb: 2048,
+            ..MicroVmConfig::default()
+        };
+        // task quota เล็กกว่า: task ชนะ (ได้ไม่เกินโควตาตัวเอง)
+        let small = crate::ResourceLimits {
+            cpu: 2,
+            memory_mb: 1024,
+            pids_max: 64,
+        };
+        assert_eq!(effective_guest_size(&cfg, &small), (2, 1024));
+        // task quota ใหญ่กว่า: cfg ชนะ (ไม่เกิน quota ระดับ VM)
+        let big = crate::ResourceLimits {
+            cpu: 32,
+            memory_mb: 1 << 20,
+            pids_max: 64,
+        };
+        assert_eq!(effective_guest_size(&cfg, &big), (4, 2048));
+        // ค่าประหลาด (0) ถูกบีบเข้าช่วงต่ำสุด ไม่ panic
+        let zero = crate::ResourceLimits {
+            cpu: 0,
+            memory_mb: 0,
+            pids_max: 0,
+        };
+        assert_eq!(effective_guest_size(&cfg, &zero), (1, 64));
+    }
 
     // JSON string ต้อง escape control char ไม่ให้ path ผิดรูปทำ JSON พัง
     #[test]

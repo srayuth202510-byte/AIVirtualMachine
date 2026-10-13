@@ -149,6 +149,7 @@ Rust workspace implementing the spec in `AI Virtual Machine.md` (MVP-A: mediated
 make verify        # full gate: fmt-check + clippy(-D warnings) + tests + demo
 make ci            # เหมือน CI บน GitHub ทุกอย่าง (= verify + e2e)
 make test-adv      # adversarial must-deny suite only (spec §38)
+make test-microvm  # MicroVM ทั้งสาย (sandbox/tools/runtime + บูตจริงถ้ามี AIVM_MICROVM_PINS)
 make demo          # 12-case ALLOW/DENY self-test, throwaway temp dir (~1s)
 cargo adv          # alias for the adversarial suite
 cargo lint         # alias for strict clippy
@@ -211,6 +212,21 @@ Never re-read whole files the graph already located.
   ได้เพราะประตูคุม ไม่ใช่เพราะกัก tree สมบูรณ์แล้ว.
 - Audit: `rotate()` + `verify_sequence()` + `aivm audit <name>`; archive ถูกผนึก
   (+i เมื่อ FS รองรับ) ห้ามเขียนทับ.
+
+## MVP-B status ต่อ: MicroVM (Phase 7 Level 2, spec §Level 2)
+
+- `run_in_microvm` + `boot_and_run` บูต guest จริงแล้ว (drive-stuffing ผ่าน
+  Firecracker/KVM: rootfs สำเนา + init ฉีด + data drive จาก ldd closure +
+  จับผลทาง serial) เปิดด้วยฟีเจอร์ `microvm` ทั้งสาย (`aivm-cli/microvm`)
+  ปิดไว้โดยปริยาย (CI ไม่มี KVM — เทสต์บูตจริง skip อย่างซื่อสัตย์ถ้าไม่มี
+  `AIVM_MICROVM_PINS`)
+- ประตูตามลำดับ: validate → shape/timeout → pin kernel/rootfs → host
+  readiness (+ pin ไบนารี VMM ถ้าตั้ง `fc_sha256`) → boot พร้อมเส้นตาย
+  (`boot_timeout_secs` 5..=600) + KillOnDrop + verify สำเนา rootfs ซ้ำ
+  ขนาด guest = min(cfg quota, task `spec.limits`); guest ไม่มีเน็ตเลย
+- เทสต์ด้วย `make test-microvm` (+ `AIVM_MICROVM_PINS=/path/pins.json`
+  สำหรับ e2e true/false) ห้ามเพิ่ม exec surface ใหม่โดยไม่มี adversarial case
+  (กฎเดียวกับ MVP-B)
 
 ## Rules while editing
 

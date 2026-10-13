@@ -9,12 +9,18 @@
 //! 1. `validate` สเปกงาน (exe/policy/arg/env/cwd — ประตูเดียวกับ Process)
 //! 2. shape ของ config + `verify_artifact` kernel/rootfs (supply chain
 //!    ต้องมาก่อนตรวจ host: image ปลอมต้องตายก่อน ไม่ว่าเครื่องจะพร้อมหรือไม่)
-//! 3. host readiness: Linux + `/dev/kvm` + ไบนารี `firecracker`
+//! 3. host readiness: Linux + `/dev/kvm` + ไบนารี `firecracker` (+ pin
+//!    hash ของไบนารีถ้า operator ตั้ง `fc_sha256` ไว้)
 //! 4. boot จริงพร้อมเส้นตาย (timeout) ฆ่าทิ้งแบบ fail-closed เมื่อเกินเวลา
+//!    rootfs สำเนาถูก verify ซ้ำหลังก็อป (กันไฟล์ถูกสลับ/ก็อปเสีย)
+//! 5. ขนาด guest = ค่าน้อยสุดระหว่าง quota ระดับ VM (cfg) กับ quota ระดับ
+//!    task (`spec.limits`) — task ไม่มีทางได้เกินโควตาตัวเอง
 //!
-//! ข้อจำกัดที่รู้ตัว (spike): `env_extra` ถูกเมิน (gateway ไม่เคยส่งอยู่แล้ว)
+//! ข้อจำกัดที่รู้ตัว: `env_extra` ถูกเมิน (gateway ไม่เคยส่งอยู่แล้ว)
 //! cwd ใน guest คือ `/`, stdout/stderr แยกด้วย marker บน serial, output
-//! ต้องเป็น UTF-8 (เหมือน path เดิม) — ทุกข้อรายงานผ่าน `degraded`
+//! ต้องเป็น UTF-8 (เหมือน path เดิม), `pids_max` ไม่ถูก enforce ใน guest,
+//! vcpu/mem ถูก clamp ด้วย quota ระดับ task แล้ว, ไบนารี VMM ถูก pin ก็ต่อ
+//! เมื่อตั้ง `fc_sha256` — ทุกข้อรายงานผ่าน `applied`/`degraded`
 
 use super::{verify_artifact, ExecOutcome, ExecSpec, SandboxError};
 use aivm_policy::Policy;
@@ -23,6 +29,11 @@ use std::path::PathBuf;
 
 /// เพดานขนาด artifact ตั้งต้น (kernel + rootfs ไม่ควรเกินนี้)
 const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+/// เส้นตายบูต+รันตั้งต้น (boot ปกติใช้ไม่กี่วินาที)
+const BOOT_TIMEOUT_DEFAULT_SECS: u64 = 60;
+/// ขอบเขตเส้นตายที่อนุญาต (กัน operator ตั้ง 0 = ฆ่าทันที หรือค้างเป็นชั่วโมง)
+const BOOT_TIMEOUT_MIN_SECS: u64 = 5;
+const BOOT_TIMEOUT_MAX_SECS: u64 = 600;
 
 /// ภาพที่ต้องใช้บูต MicroVM หนึ่งครั้ง (pin ทุกไฟล์ด้วย sha256)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +59,13 @@ pub struct MicroVmConfig {
     /// เพดานขนาดไฟล์ artifact แต่ละไฟล์
     #[serde(default = "default_max_bytes")]
     pub max_artifact_bytes: u64,
+    /// sha256 hex ของไบนารี firecracker ที่อนุญาต (ว่าง = ไม่ pin,
+    /// รายงานใน `degraded` ให้ operator รู้ว่ายังไม่ pin)
+    #[serde(default)]
+    pub fc_sha256: String,
+    /// เส้นตายบูต+รันต่อครั้ง หน่วยวินาที (5..=600)
+    #[serde(default = "default_boot_timeout")]
+    pub boot_timeout_secs: u64,
 }
 
 fn default_vcpu() -> u8 {
@@ -58,6 +76,9 @@ fn default_mem_mb() -> u32 {
 }
 fn default_max_bytes() -> u64 {
     DEFAULT_MAX_ARTIFACT_BYTES
+}
+fn default_boot_timeout() -> u64 {
+    BOOT_TIMEOUT_DEFAULT_SECS
 }
 
 impl Default for MicroVmConfig {
@@ -70,6 +91,8 @@ impl Default for MicroVmConfig {
             vcpu_count: default_vcpu(),
             mem_mb: default_mem_mb(),
             max_artifact_bytes: default_max_bytes(),
+            fc_sha256: String::new(),
+            boot_timeout_secs: default_boot_timeout(),
         }
     }
 }
@@ -86,6 +109,9 @@ impl MicroVmConfig {
         }
         if self.max_artifact_bytes == 0 {
             return Err(bad("microvm max_artifact_bytes must be > 0"));
+        }
+        if !(BOOT_TIMEOUT_MIN_SECS..=BOOT_TIMEOUT_MAX_SECS).contains(&self.boot_timeout_secs) {
+            return Err(bad("microvm boot_timeout_secs out of range 5..=600"));
         }
         Ok(())
     }
@@ -126,6 +152,11 @@ pub fn run_in_microvm(
         let fc = super::find_firecracker().ok_or_else(|| {
             SandboxError::Disabled("microvm needs the firecracker binary in PATH".into())
         })?;
+        // supply chain ของ VMM เอง: pin ไว้ก็ต้องตรง (ไม่ pin = ยอมรับตาม
+        // PATH ของ operator แล้วรายงานใน `degraded` ให้รู้ตัว)
+        if !cfg.fc_sha256.is_empty() {
+            verify_artifact(&fc, &cfg.fc_sha256, cfg.max_artifact_bytes)?;
+        }
         boot::boot_and_run(spec, &canon, cfg, &fc)
     }
 }
@@ -190,6 +221,40 @@ mod tests {
     fn bad_shape_fails_closed_as_invalid() {
         let (spec, policy, mut cfg, ws) = fixture("shape");
         cfg.vcpu_count = 0;
+        assert!(matches!(
+            run_in_microvm(&spec, &policy, &cfg),
+            Err(SandboxError::Invalid(_))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // เส้นตายประหลาด (0 = ฆ่าทันที, เกินเพดาน = ค้างนาน) ต้องตายตั้งแต่ shape
+    #[test]
+    fn bad_boot_timeout_fails_closed_as_invalid() {
+        let (spec, policy, mut cfg, ws) = fixture("timeout");
+        cfg.boot_timeout_secs = 0;
+        assert!(matches!(
+            run_in_microvm(&spec, &policy, &cfg),
+            Err(SandboxError::Invalid(_))
+        ));
+        cfg.boot_timeout_secs = 601;
+        assert!(matches!(
+            run_in_microvm(&spec, &policy, &cfg),
+            Err(SandboxError::Invalid(_))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // pin ของไบนารี VMM ไม่ตรงต้องตายด้วย Invalid (supply chain ของ VMM เอง)
+    // ข้ามเมื่อเครื่องไม่มี firecracker (ยังไม่ถึงขั้นตรวจ pin = Disabled)
+    #[test]
+    fn wrong_fc_pin_fails_closed_as_invalid() {
+        if super::super::find_firecracker().is_none() {
+            eprintln!("skip: เครื่องนี้ไม่มี firecracker");
+            return;
+        }
+        let (spec, policy, mut cfg, ws) = fixture("fcpin");
+        cfg.fc_sha256 = "00".repeat(32);
         assert!(matches!(
             run_in_microvm(&spec, &policy, &cfg),
             Err(SandboxError::Invalid(_))

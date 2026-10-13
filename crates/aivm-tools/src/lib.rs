@@ -1163,4 +1163,48 @@ network: {{allow: [], deny: []}}
         assert!(log.contains("level-invalid"));
         assert!(log.contains("\"decision\":\"deny\""));
     }
+
+    // Phase 7 (ฟีเจอร์ microvm): pin ของไบนารี VMM ไม่ตรงต้อง DENY พร้อม
+    // audit เช่นกัน (supply chain ของ VMM เอง — attacker สลับไบนารีใน PATH
+    // แล้ว pin จับได้ต้องตายตั้งแต่ประตู ไม่ใช่บูตด้วย VMM ปลอม)
+    #[cfg(feature = "microvm")]
+    #[test]
+    fn exec_with_tampered_fc_pin_denied_with_audit() {
+        use sha2::{Digest, Sha256};
+        // sha256 hex ของไบต์ตั้งต้น (เทสต์คุมเอง ไม่พึ่งค่าตายตัว)
+        fn hex_of(data: &[u8]) -> String {
+            let mut h = Sha256::new();
+            h.update(data);
+            h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+        }
+        let (mut gw, mut cube, dir) = exec_harness();
+        let kern = dir.join("vmlinux");
+        let rootfs = dir.join("rootfs.ext4");
+        std::fs::write(&kern, b"k").unwrap();
+        std::fs::write(&rootfs, b"r").unwrap();
+        // pin ของ kernel/rootfs ถูก (ผ่านด่านแรก) แต่ pin ของ VMM ผิดเจตนา
+        gw.level = SandboxLevel::MicroVm;
+        gw.microvm_cfg = Some(aivm_sandbox::microvm::MicroVmConfig {
+            kernel_path: kern,
+            kernel_sha256: hex_of(b"k"),
+            rootfs_path: rootfs,
+            rootfs_sha256: hex_of(b"r"),
+            fc_sha256: "22".repeat(32),
+            ..aivm_sandbox::microvm::MicroVmConfig::default()
+        });
+        let r = gw.dispatch(
+            &mut cube,
+            &ToolRequest {
+                tool: "process.exec".into(),
+                path: "/bin/true".into(),
+                content: Some("[]".into()),
+            },
+        );
+        // เครื่องที่มี firecracker = pin ผิดต้องตายด้วย Invalid;
+        // เครื่องที่ไม่มี = ไปไม่ถึงขั้นตรวจ pin (Disabled) — deny + audit ทั้งคู่
+        assert!(matches!(r, Err(ToolError::Denied(_))));
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(log.contains("level-invalid") || log.contains("level-disabled"));
+        assert!(log.contains("\"decision\":\"deny\""));
+    }
 }
