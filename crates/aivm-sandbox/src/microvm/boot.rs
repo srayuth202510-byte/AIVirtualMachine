@@ -254,10 +254,11 @@ fn wait_socket(sock: &Path, timeout: Duration) -> Result<(), SandboxError> {
     ))
 }
 
-/// ข้อความระหว่าง marker คู่แรกที่เจอ (payload อาจมีบรรทัดอื่นปนได้
-/// แต่ชน nonce ต่อรันแทบเป็นไปไม่ได้)
+/// ข้อความระหว่าง marker คู่สุดท้ายที่เจอ (payload อาจมีบรรทัดอื่นปนได้
+/// แต่ชน nonce ต่อรันแทบเป็นไปไม่ได้) — ใช้ `rfind` ให้ตรงกับ `parse_exit`
+/// (ทั้งคู่ยึด marker ตัวสุดท้าย; nonce กันชนอยู่แล้ว)
 fn between(log: &str, begin: &str, end: &str) -> String {
-    let Some(a) = log.find(begin) else {
+    let Some(a) = log.rfind(begin) else {
         return String::new();
     };
     let rest = &log[a + begin.len()..];
@@ -513,27 +514,50 @@ fn boot_and_run_inner(
         degraded: vec![
             "env_extra: ignored (not passed to guest)".into(),
             "cwd: guest sees / (workspace on read-only data drive)".into(),
-            "serial-output: must be UTF-8".into(),
+            "resource-limits: spec.limits ignored; guest uses cfg vcpu_count/mem_mb".into(),
+            "serial-output: non-UTF-8 bytes replaced with U+FFFD (lossy)".into(),
         ],
     })
 }
 
-/// สตริงเป็น JSON string literal (escape แค่ " กับ \ — path ไม่มีตัวอื่น)
+/// สตริงเป็น JSON string literal (escape ครบตาม RFC 8259: `"` `\` และ
+/// control char `< 0x20` รวม `\n`/`\r`/`\t`/`\b`/`\f`) — path จาก
+/// canonicalize แทบไม่มีทางมี แต่กันไว้ไม่ให้ JSON พังพังพัง
 fn serde_json_string(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
-/// อ่านไฟล์ทั้งก้อนแบบมีเพดาน (เกินเพดานตัดทิ้ง — fail-open ไม่ได้เลยตัด)
+/// อ่านไฟล์ทั้งก้อนแบบมีเพดาน (เกินเพดานตัดทิ้ง)
+///
+/// อ่านเป็น bytes แล้วแปลงแบบ lossy — ไบต์ที่ไม่ใช่ UTF-8 (kernel log/output
+/// ไบนารี) กลายเป็น U+FFFD แทนที่จะทำให้อ่านล้มทั้งก้อน (marker เป็น ASCII
+/// จึงยังหาเจอเสมอ; พฤติกรรมนี้รายงานใน `degraded`)
 fn read_capped(path: &Path, cap: u64) -> String {
     let Ok(f) = std::fs::File::open(path) else {
         return String::new();
     };
-    let mut buf = String::new();
-    let _ = f.take(cap + 1).read_to_string(&mut buf);
-    if buf.len() as u64 > cap {
-        buf.truncate(cap as usize);
+    let mut bytes = Vec::new();
+    let _ = f.take(cap + 1).read_to_end(&mut bytes);
+    if bytes.len() as u64 > cap {
+        bytes.truncate(cap as usize);
     }
-    buf
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// มี marker ในไฟล์หรือยัง (อ่านแบบมีเพดาน)
@@ -556,4 +580,37 @@ fn parse_exit(log: &str, mark: &str) -> Result<i32, SandboxError> {
     let rest = log[pos + mark.len()..].lines().next().unwrap_or("").trim();
     rest.parse::<i32>()
         .map_err(|_| SandboxError::Spawn("microvm exit code unparsable".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // JSON string ต้อง escape control char ไม่ให้ path ผิดรูปทำ JSON พัง
+    #[test]
+    fn json_string_escapes_controls() {
+        assert_eq!(
+            serde_json_string("a\nb\tc\"d\\e"),
+            "\"a\\nb\\tc\\\"d\\\\e\""
+        );
+        assert_eq!(serde_json_string("x\u{1}y"), "\"x\\u0001y\"");
+        assert_eq!(serde_json_string("/mnt/data/a b"), "\"/mnt/data/a b\"");
+    }
+
+    // `between` ต้องยึด marker คู่สุดท้ายให้ตรงกับ `parse_exit` (rfind)
+    #[test]
+    fn between_and_parse_exit_agree_on_last_marker() {
+        let log = "N-BEGIN old N-END POST N-BEGIN new N-END N-EXIT:7\n";
+        assert_eq!(between(log, "N-BEGIN", "N-END"), " new ");
+        assert_eq!(parse_exit(log, "N-EXIT:").unwrap(), 7);
+    }
+
+    // marker หาย = Spawn (fail-closed ดัง ไม่เดาค่า)
+    #[test]
+    fn parse_exit_missing_marker_is_spawn() {
+        assert!(matches!(
+            parse_exit("no marker here", "N-EXIT:"),
+            Err(SandboxError::Spawn(_))
+        ));
+    }
 }

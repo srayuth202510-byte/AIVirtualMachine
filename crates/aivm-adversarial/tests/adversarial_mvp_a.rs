@@ -7,6 +7,7 @@ use aivm_audit::{AuditRecord, AuditWriter};
 use aivm_capability::{Capability, CapabilitySet};
 use aivm_cube::{AgentState, Cube, TransitionGuards};
 use aivm_policy::{Decision, EvalContext, Policy};
+use aivm_sandbox::SandboxLevel;
 use aivm_tools::ToolGateway;
 
 fn test_policy() -> Policy {
@@ -426,6 +427,27 @@ fn exec_bad_argv_shape_denied() {
         },
     );
     assert!(r.is_err());
+    adv_clean(&dir);
+}
+
+// Phase 7: ระดับ MicroVm ต้อง fail-closed เช่นกัน — ไม่มี backend/config
+// ที่สมบูรณ์ = DENY พร้อม audit (ห้ามเงียบผ่านเป็น Process)
+#[test]
+fn exec_microvm_level_must_deny() {
+    let real = std::fs::canonicalize("/bin/true")
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let (mut gw, mut cube, dir) = exec_harness("uvm", std::slice::from_ref(&real), &[], true);
+    gw.level = SandboxLevel::MicroVm;
+    let r = gw.dispatch(&mut cube, &exec_req("/bin/true", &[]));
+    assert!(r.is_err(), "MicroVm ที่ยังไม่พร้อมต้อง DENY");
+    let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+    assert!(
+        log.contains("level-disabled") || log.contains("level-invalid"),
+        "ต้องมี audit decision สำหรับระดับ MicroVm: {log}"
+    );
+    assert!(log.contains("\"decision\":\"deny\""));
     adv_clean(&dir);
 }
 
