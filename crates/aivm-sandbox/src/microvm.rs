@@ -1,18 +1,20 @@
 //! MicroVM backend — Phase 7 Level 2 (สเปก §Level 2: KVM + Firecracker).
 //!
-//! สถานะ: **skeleton** — สร้าง seam ให้ milestone ถัดไปเติมการ boot/exec จริง
-//! ตอนนี้ทำแค่ประตู fail-closed ตามลำดับ (spec gate → supply chain → host
-//! readiness) แล้วหยุดด้วย `Disabled` เสมอ ยังไม่มีการ spawn อะไรทั้งสิ้น
-//! (`make verify` จึงเขียวได้โดยไม่ต้องมี KVM/Firecracker)
+//! วิธีรัน: **drive-stuffing** — บูต rootfs ที่ verify แล้ว (สำเนาชั่วคราว
+//! ห้ามแตะไฟล์ pin ต้นฉบับ) ด้วย `init=` ที่ฉีดเข้าไป รัน exe ผ่าน data drive
+//! ที่สร้างจาก exe + ldd closure บน host แล้วจับผลทาง serial console
+//! (guest ไม่มีเน็ตเวิร์กเลยตั้งแต่เกิด — ไม่ได้ config ไว้)
 //!
 //! ลำดับประตู (ตั้งใจเรียงแบบนี้ ห้ามสลับ):
 //! 1. `validate` สเปกงาน (exe/policy/arg/env/cwd — ประตูเดียวกับ Process)
-//! 2. `verify_artifact` kernel + rootfs ด้วย sha256 ที่ pin ไว้ (supply chain
+//! 2. shape ของ config + `verify_artifact` kernel/rootfs (supply chain
 //!    ต้องมาก่อนตรวจ host: image ปลอมต้องตายก่อน ไม่ว่าเครื่องจะพร้อมหรือไม่)
-//! 3. Linux-only (Firecracker รันบน Linux เท่านั้น)
-//! 4. `/dev/kvm` เปิดได้
-//! 5. ไบนารี `firecracker` อยู่ใน PATH
-//! 6. `Disabled` (การ boot/exec จริงยังไม่ส่งมอบ)
+//! 3. host readiness: Linux + `/dev/kvm` + ไบนารี `firecracker`
+//! 4. boot จริงพร้อมเส้นตาย (timeout) ฆ่าทิ้งแบบ fail-closed เมื่อเกินเวลา
+//!
+//! ข้อจำกัดที่รู้ตัว (spike): `env_extra` ถูกเมิน (gateway ไม่เคยส่งอยู่แล้ว)
+//! cwd ใน guest คือ `/`, stdout/stderr แยกด้วย marker บน serial, output
+//! ต้องเป็น UTF-8 (เหมือน path เดิม) — ทุกข้อรายงานผ่าน `degraded`
 
 use super::{verify_artifact, ExecOutcome, ExecSpec, SandboxError};
 use aivm_policy::Policy;
@@ -89,18 +91,18 @@ impl MicroVmConfig {
     }
 }
 
-/// รันงานใน MicroVM (skeleton: ประตูครบแล้วหยุดที่ `Disabled`)
+/// รันงานใน MicroVM (boot จริง + จับผลทาง serial)
 ///
-/// ลำดับตามโมดูล doc — ทุกขั้นไม่ผ่านคือไม่ boot เด็ดขาด (`Invalid` สำหรับ
-/// spec/artifact/shape ปลอม, `Disabled` สำหรับ host ไม่พร้อม/ยังไม่ส่งมอบ)
-/// แยกชนิด error แบบนี้เพื่อให้ gateway audit เหตุได้ถูก (deny เหมือนกันหมด)
+/// ทุกขั้นไม่ผ่านคือไม่คืนผลสำเร็จเด็ดขาด (`Invalid` สำหรับ spec/artifact/
+/// shape ปลอม, `Disabled` สำหรับ host ไม่พร้อม, `Spawn` สำหรับ boot ล้ม
+/// หรือเกินเส้นตาย) gateway แปลงเป็น DENY ทั้งหมด
 pub fn run_in_microvm(
     spec: &ExecSpec,
     policy: &Policy,
     cfg: &MicroVmConfig,
 ) -> Result<ExecOutcome, SandboxError> {
     // 1. ประตูสเปกเดียวกับ Process (exe/policy/arg/env/cwd)
-    let _canon = super::validate(spec, policy)?;
+    let canon = super::validate(spec, policy)?;
     // 2. ตัวเลข config ต้องสมเหตุก่อน (ถูกกว่าแตะไฟล์)
     cfg.validate_shape()?;
     // 3. supply chain: kernel + rootfs ต้องตรง hash ที่ pin ไว้
@@ -109,7 +111,7 @@ pub fn run_in_microvm(
     // 4. host readiness (Linux + KVM + binary) — ไม่พร้อมคือ Disabled
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (spec, policy);
+        let _ = (spec, policy, cfg);
         return Err(SandboxError::Disabled(
             "microvm backend is Linux-only".into(),
         ));
@@ -121,17 +123,15 @@ pub fn run_in_microvm(
                 "microvm needs /dev/kvm (KVM not available on this host)".into(),
             ));
         }
-        if super::find_firecracker().is_none() {
-            return Err(SandboxError::Disabled(
-                "microvm needs the firecracker binary in PATH".into(),
-            ));
-        }
-        // 5. การ boot/exec จริงยังไม่ส่งมอบ (milestone ถัดไป)
-        Err(SandboxError::Disabled(
-            "microvm execution not yet implemented (skeleton); use Process level".into(),
-        ))
+        let fc = super::find_firecracker().ok_or_else(|| {
+            SandboxError::Disabled("microvm needs the firecracker binary in PATH".into())
+        })?;
+        boot::boot_and_run(spec, &canon, cfg, &fc)
     }
 }
+
+#[cfg(target_os = "linux")]
+mod boot;
 
 #[cfg(test)]
 mod tests {
@@ -221,15 +221,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 
-    // artifact ครบแต่ backend ยังเป็น skeleton: ต้อง Disabled เสมอ
-    // (ไม่ว่าเครื่องจะมี KVM/binary หรือไม่ — ยังไม่มีการ spawn จริง)
+    // kernel ปลอม (hash ตรงแต่บูตไม่ได้) ต้องล้มแบบ fail-closed
+    // (Deterministic ทุกเครื่อง: host พร้อม = boot ล้ม, ไม่พร้อม = Disabled)
     #[test]
-    fn valid_artifacts_still_disabled_as_skeleton() {
-        let (spec, policy, cfg, ws) = fixture("skel");
-        assert!(matches!(
-            run_in_microvm(&spec, &policy, &cfg),
-            Err(SandboxError::Disabled(_))
-        ));
+    fn garbage_kernel_fails_closed() {
+        let (spec, policy, cfg, ws) = fixture("garbage");
+        let r = run_in_microvm(&spec, &policy, &cfg);
+        assert!(r.is_err(), "kernel ปลอมต้องไม่รันสำเร็จ");
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // บูตจริงแบบ end-to-end (ต้องมี KVM + binary + ไฟล์ pins)
+    // ข้าม (แต่ยังเขียว) เมื่อรันใน CI ที่ไม่มีของพวกนี้: ตั้ง
+    // `AIVM_MICROVM_PINS=/path/pins.json` เพื่อเปิดเทสต์นี้
+    #[test]
+    fn real_boot_runs_true_and_false() {
+        let pins_path = std::env::var("AIVM_MICROVM_PINS").unwrap_or_default();
+        if pins_path.is_empty() {
+            eprintln!("skip: ตั้ง AIVM_MICROVM_PINS เพื่อทดสอบบูตจริง");
+            return;
+        }
+        if !super::super::kvm_available() || super::super::find_firecracker().is_none() {
+            eprintln!("skip: เครื่องนี้ไม่มี KVM/firecracker");
+            return;
+        }
+        let text = std::fs::read_to_string(&pins_path).expect("อ่าน pins.json ได้");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("pins.json เป็น JSON");
+        let kernel = v["kernel"]["path"].as_str().expect("มี kernel.path");
+        let ksha = v["kernel"]["sha256"].as_str().expect("มี kernel.sha256");
+        let rootfs = v["rootfs"]["path"].as_str().expect("มี rootfs.path");
+        let rsha = v["rootfs"]["sha256"].as_str().expect("มี rootfs.sha256");
+        for (exe, want) in [("/bin/true", 0), ("/bin/false", 1)] {
+            let ws = test_ws("realboot");
+            let real = std::fs::canonicalize(exe).unwrap();
+            let policy = Policy::from_yaml(&format!(
+                "name: t\nprocess:\n  allow: [\"{}\"]\n  deny: []\n",
+                real.display()
+            ))
+            .unwrap();
+            let spec = ExecSpec {
+                exe: PathBuf::from(exe),
+                args: vec![],
+                cwd: ws.clone(),
+                workspace: ws.clone(),
+                env_extra: vec![],
+                limits: crate::ResourceLimits::default(),
+            };
+            let cfg = MicroVmConfig {
+                kernel_path: PathBuf::from(kernel),
+                kernel_sha256: ksha.into(),
+                rootfs_path: PathBuf::from(rootfs),
+                rootfs_sha256: rsha.into(),
+                ..MicroVmConfig::default()
+            };
+            let out = run_in_microvm(&spec, &policy, &cfg)
+                .unwrap_or_else(|e| panic!("บูตจริงต้องผ่าน {exe}: {e}"));
+            assert_eq!(out.code, Some(want), "{exe} ต้อง exit {want}");
+            assert!(out.applied.contains(&"microvm-boot".to_string()));
+            let _ = std::fs::remove_dir_all(&ws);
+        }
     }
 }

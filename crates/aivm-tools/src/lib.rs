@@ -1130,32 +1130,24 @@ network: {{allow: [], deny: []}}
         assert!(log.contains("\"decision\":\"deny\""));
     }
 
-    // Phase 7 (ฟีเจอร์ microvm): มี config จริงแต่ backend ยังเป็น skeleton
-    // ต้อง DENY พร้อม audit เหมือนเดิม — config ไม่ได้เปิดช่องรัน
+    // Phase 7 (ฟีเจอร์ microvm): artifact ปลอมต้อง DENY พร้อม audit
+    // (deterministic ทุกเครื่อง — supply chain ตายก่อนถึงขั้น boot)
+    // ส่วน path บูตจริงมีเทสต์ host-gated ฝั่ง sandbox คุมอยู่แล้ว
     #[cfg(feature = "microvm")]
     #[test]
-    fn exec_with_microvm_cfg_still_denied_with_audit() {
-        use sha2::{Digest, Sha256};
+    fn exec_with_tampered_artifact_denied_with_audit() {
         let (mut gw, mut cube, dir) = exec_harness();
-        // สร้าง artifact ปลอมพร้อม hash ตรง (ผ่าน supply chain แต่ติด skeleton)
         let kern = dir.join("vmlinux");
         let rootfs = dir.join("rootfs.ext4");
         std::fs::write(&kern, b"k").unwrap();
         std::fs::write(&rootfs, b"r").unwrap();
-        let hex = |b: &[u8]| {
-            let mut h = Sha256::new();
-            h.update(b);
-            h.finalize()
-                .iter()
-                .map(|x| format!("{x:02x}"))
-                .collect::<String>()
-        };
         gw.level = SandboxLevel::MicroVm;
         gw.microvm_cfg = Some(aivm_sandbox::microvm::MicroVmConfig {
             kernel_path: kern,
-            kernel_sha256: hex(b"k"),
+            // hash ผิดเจตนา (ของจริงคือ sha256 ของ b"k")
+            kernel_sha256: "00".repeat(32),
             rootfs_path: rootfs,
-            rootfs_sha256: hex(b"r"),
+            rootfs_sha256: "11".repeat(32),
             ..aivm_sandbox::microvm::MicroVmConfig::default()
         });
         let r = gw.dispatch(
@@ -1168,6 +1160,7 @@ network: {{allow: [], deny: []}}
         );
         assert!(matches!(r, Err(ToolError::Denied(_))));
         let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
-        assert!(log.contains("level-disabled"));
+        assert!(log.contains("level-invalid"));
+        assert!(log.contains("\"decision\":\"deny\""));
     }
 }
