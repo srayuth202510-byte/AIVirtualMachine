@@ -2,6 +2,18 @@ name: coder
 
 runtime:
   isolation: sandbox
+  # ตัวอย่าง isolation ระดับ microvm — ต้อง build ด้วย `--features microvm`
+  # พร้อมบล็อก pins ข้างล่าง (ดู docs/microvm.md วิธีเตรียม pins.json):
+  # isolation: microvm
+# microvm:
+#   kernel_path: /home/USER/.local/share/aivm/microvm/vmlinux.bin
+#   kernel_sha256: "<sha256 64 hex ของไฟล์ข้างบน>"
+#   rootfs_path: /home/USER/.local/share/aivm/microvm/hello-rootfs.ext4
+#   rootfs_sha256: "<sha256 64 hex ของไฟล์ข้างบน>"
+#   fc_sha256: "<sha256 ของไบนารี firecracker>"   # ไม่ตั้ง = ไม่ pin VMM
+#   vcpu_count: 1      # 1..=32
+#   mem_mb: 256        # 64..=32768
+#   boot_timeout_secs: 60   # 5..=600
 
 model:
   provider: echo
