@@ -548,6 +548,24 @@ pub fn run_checked_with_level(
     }
 }
 
+/// จุดแยก backend พร้อม config MicroVM (ใช้เมื่อเปิดฟีเจอร์ `microvm`)
+///
+/// เหมือน `run_checked_with_level` แต่ระดับ MicroVm รับ `MicroVmConfig` จริง
+/// (kernel/rootfs pin + vcpu/mem) แทนค่า default ที่ deny ตั้งแต่ artifact
+/// หาย — gateway ส่ง config ที่ parse จาก `aivm.yaml` มาทางนี้
+#[cfg(feature = "microvm")]
+pub fn run_checked_with_level_and_cfg(
+    spec: &ExecSpec,
+    policy: &Policy,
+    level: SandboxLevel,
+    cfg: &microvm::MicroVmConfig,
+) -> Result<ExecOutcome, SandboxError> {
+    match level {
+        SandboxLevel::MicroVm => microvm::run_in_microvm(spec, policy, cfg),
+        _ => run_checked_with_level(spec, policy, level),
+    }
+}
+
 // ---- Linux namespace helpers (syscall ล้วน: เรียกได้จาก pre_exec) ----
 
 /// เขียนไฟล์ด้วย open/write/close ไม่ allocate (pre_exec ห้ามแตะ allocator)
@@ -1519,6 +1537,21 @@ mod tests {
         );
         // Process ยังรันได้ปกติ (ไม่ถดถอย)
         assert!(run_checked_with_level(&s, &pol, SandboxLevel::Process).is_ok());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // ตัวแปรรับ config ของ MicroVm: Process ต้องส่งผ่านเหมือนเดิม
+    // MicroVm ด้วย config ว่างต้อง deny (ไม่ว่า Invalid/Disabled ก็ห้ามรัน)
+    #[cfg(feature = "microvm")]
+    #[test]
+    fn level_and_cfg_routes_by_level() {
+        let ws = test_ws("andcfg");
+        let real = std::fs::canonicalize("/bin/true").unwrap();
+        let pol = test_policy(&[&real.to_string_lossy()]);
+        let s = spec("/bin/true", &ws);
+        let cfg = microvm::MicroVmConfig::default();
+        assert!(run_checked_with_level_and_cfg(&s, &pol, SandboxLevel::Process, &cfg).is_ok());
+        assert!(run_checked_with_level_and_cfg(&s, &pol, SandboxLevel::MicroVm, &cfg).is_err());
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

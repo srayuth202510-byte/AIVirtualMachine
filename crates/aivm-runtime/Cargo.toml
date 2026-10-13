@@ -21,3 +21,5 @@ aivm-model = { path = "../aivm-model" }
 [features]
 # ส่งต่อฟีเจอร์แบ็กเอนด์ local (llama.cpp) ไปยัง aivm-model
 llama = ["aivm-model/llama"]
+# ส่งต่อฟีเจอร์ MicroVM backend (config + skeleton) ทั้งสาย tools -> sandbox
+microvm = ["aivm-sandbox/microvm", "aivm-tools/microvm"]

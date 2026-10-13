@@ -21,3 +21,5 @@ aivm-sandbox = { path = "../aivm-sandbox" }
 [features]
 # เปิดแบ็กเอนด์ local (GGUF ผ่าน llama.cpp) ทั้งสาย cli -> supervisor -> runtime -> model
 llama = ["aivm-runtime/llama", "aivm-supervisor/llama"]
+# เปิด MicroVM backend (config + skeleton) ทั้งสาย cli -> runtime -> tools -> sandbox
+microvm = ["aivm-runtime/microvm"]

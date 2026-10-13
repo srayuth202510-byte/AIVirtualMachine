@@ -15,3 +15,13 @@ aivm-policy = { path = "../aivm-policy" }
 aivm-audit = { path = "../aivm-audit" }
 aivm-cube = { path = "../aivm-cube" }
 aivm-sandbox = { path = "../aivm-sandbox" }
+
+[dev-dependencies]
+# ใช้ในเทสต์ฟีเจอร์ microvm (คำนวณ sha256 ของ artifact ปลอม)
+sha2 = { workspace = true }
+
+[features]
+default = []
+# ส่งต่อฟีเจอร์ MicroVM backend ไปยัง aivm-sandbox (config + skeleton)
+# ปิดไว้โดยปริยายเพื่อให้ `make verify` เบาและไม่พึ่ง KVM ใน CI
+microvm = ["aivm-sandbox/microvm"]

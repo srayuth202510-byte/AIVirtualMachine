@@ -62,6 +62,11 @@ pub struct ToolGateway {
     /// `Process` = พฤติกรรม MVP-B เดิม ระดับอื่นที่ยังไม่มี backend จะ DENY
     /// แบบ fail-closed ตั้งแต่ gateway (I-7: มี audit ทุกครั้ง)
     pub level: SandboxLevel,
+    /// config MicroVM (kernel/rootfs pin + quota) ใช้เมื่อเปิดฟีเจอร์
+    /// `microvm` และ `level` เป็น MicroVm เท่านั้น — ไม่มี config
+    /// (= `None`) จะใช้ค่า default ที่ deny ตั้งแต่ artifact หาย
+    #[cfg(feature = "microvm")]
+    pub microvm_cfg: Option<aivm_sandbox::microvm::MicroVmConfig>,
     req_counter: u64,
 }
 
@@ -83,6 +88,8 @@ impl ToolGateway {
             session_id: session_id.to_string(),
             // ค่าเริ่มต้นคงพฤติกรรม MVP-B เดิม; Runtime จะเขียนทับจาก config
             level: SandboxLevel::Process,
+            #[cfg(feature = "microvm")]
+            microvm_cfg: None,
             req_counter: 0,
         }
     }
@@ -374,12 +381,31 @@ impl ToolGateway {
             self.audit_decision(cube, "execute", &scope, "deny", "no-capability", "error");
             return Err(ToolError::Denied("no capability".into()));
         }
-        let outcome = match aivm_sandbox::run_checked_with_level(&spec, &self.policy, self.level) {
+        // เปิดฟีเจอร์ `microvm` + มี config: ระดับ MicroVm เดินประตู
+        // skeleton ด้วย config จริง (pin hash + quota จาก `aivm.yaml`)
+        // ไม่มี config (= `None`) ตกไปใช้ค่า default ที่ deny อยู่ดี
+        #[cfg(feature = "microvm")]
+        let run_result = match &self.microvm_cfg {
+            Some(cfg) => {
+                aivm_sandbox::run_checked_with_level_and_cfg(&spec, &self.policy, self.level, cfg)
+            }
+            None => aivm_sandbox::run_checked_with_level(&spec, &self.policy, self.level),
+        };
+        #[cfg(not(feature = "microvm"))]
+        let run_result = aivm_sandbox::run_checked_with_level(&spec, &self.policy, self.level);
+        let outcome = match run_result {
             Ok(o) => o,
             // ระดับที่ยังไม่มี backend ต้อง DENY พร้อม audit (I-7) ไม่ใช่เงียบหาย
             Err(aivm_sandbox::SandboxError::Disabled(msg)) => {
                 self.audit_decision(cube, "execute", &scope, "deny", "level-disabled", "error");
                 return Err(ToolError::Denied(msg));
+            }
+            // ระดับ non-Process ที่ตายด้วย Invalid (เช่น artifact ไม่ผ่าน
+            // supply chain) ก็เป็น decision ด้านความปลอดภัย ต้อง audit เช่นกัน
+            // (Process คงพฤติกรรมเดิมทุกประการเพื่อไม่ให้เทสต์เก่าขยับ)
+            Err(e) if self.level != SandboxLevel::Process => {
+                self.audit_decision(cube, "execute", &scope, "deny", "level-invalid", "error");
+                return Err(ToolError::Denied(e.to_string()));
             }
             Err(e) => return Err(ToolError::Denied(e.to_string())),
         };
@@ -1080,6 +1106,8 @@ network: {{allow: [], deny: []}}
 
     // Phase 7: ระดับที่ยังไม่มี backend ต้อง DENY พร้อม audit (I-7)
     // แม้ policy + capability จะอนุญาตครบ (ประตู level มาก่อน execute)
+    // หมายเหตุ: เปิดฟีเจอร์ `microvm` แล้วเคสนี้ตายด้วย Invalid (artifact
+    // ของ config default หาย) แทน Disabled — deny + audit เหมือนกัน
     #[test]
     fn exec_denied_on_unimplemented_level_with_audit() {
         let (mut gw, mut cube, dir) = exec_harness();
@@ -1093,12 +1121,53 @@ network: {{allow: [], deny: []}}
             },
         );
         assert!(matches!(r, Err(ToolError::Denied(_))));
-        // ต้องมี audit decision ที่ deny ด้วยเหตุ level-disabled
+        // ต้องมี audit decision ที่ deny ด้วยเหตุระดับ level
         let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
         assert!(
-            log.contains("level-disabled"),
+            log.contains("level-disabled") || log.contains("level-invalid"),
             "ต้อง audit การ deny ระดับ level"
         );
         assert!(log.contains("\"decision\":\"deny\""));
+    }
+
+    // Phase 7 (ฟีเจอร์ microvm): มี config จริงแต่ backend ยังเป็น skeleton
+    // ต้อง DENY พร้อม audit เหมือนเดิม — config ไม่ได้เปิดช่องรัน
+    #[cfg(feature = "microvm")]
+    #[test]
+    fn exec_with_microvm_cfg_still_denied_with_audit() {
+        use sha2::{Digest, Sha256};
+        let (mut gw, mut cube, dir) = exec_harness();
+        // สร้าง artifact ปลอมพร้อม hash ตรง (ผ่าน supply chain แต่ติด skeleton)
+        let kern = dir.join("vmlinux");
+        let rootfs = dir.join("rootfs.ext4");
+        std::fs::write(&kern, b"k").unwrap();
+        std::fs::write(&rootfs, b"r").unwrap();
+        let hex = |b: &[u8]| {
+            let mut h = Sha256::new();
+            h.update(b);
+            h.finalize()
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect::<String>()
+        };
+        gw.level = SandboxLevel::MicroVm;
+        gw.microvm_cfg = Some(aivm_sandbox::microvm::MicroVmConfig {
+            kernel_path: kern,
+            kernel_sha256: hex(b"k"),
+            rootfs_path: rootfs,
+            rootfs_sha256: hex(b"r"),
+            ..aivm_sandbox::microvm::MicroVmConfig::default()
+        });
+        let r = gw.dispatch(
+            &mut cube,
+            &ToolRequest {
+                tool: "process.exec".into(),
+                path: "/bin/true".into(),
+                content: Some("[]".into()),
+            },
+        );
+        assert!(matches!(r, Err(ToolError::Denied(_))));
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(log.contains("level-disabled"));
     }
 }
