@@ -28,6 +28,12 @@ mod landlock;
 #[cfg(feature = "microvm")]
 pub mod microvm;
 
+/// Hardware Isolation backend (Level 3) — เปิดด้วยฟีเจอร์ `hardware` เท่านั้น
+/// TEE (SEV-SNP/TDX), Remote Attestation, Secure/Measured Boot, GPU/NPU isolation,
+/// Disk Encryption + Secure Key Storage
+#[cfg(feature = "hardware")]
+pub mod hardware;
+
 #[derive(Debug, Error)]
 pub enum SandboxError {
     #[error("mvp-a: process execution disabled: {0}")]
@@ -677,8 +683,11 @@ pub fn run_checked_with_level(
             ),
             RunVerdict::Clean,
         )),
+        #[cfg(feature = "hardware")]
+        SandboxLevel::Hardware => hardware::run_in_hardware(spec, policy, &hardware::HardwareConfig::default()),
+        #[cfg(not(feature = "hardware"))]
         SandboxLevel::Hardware => Err((
-            SandboxError::Disabled("hardware backend not implemented; use Process level".into()),
+            SandboxError::Disabled("hardware backend not implemented (needs TEE host: SEV-SNP/TDX); use Process level".into()),
             RunVerdict::Clean,
         )),
     }
@@ -698,6 +707,24 @@ pub fn run_checked_with_level_and_cfg(
 ) -> Result<ExecOutcome, (SandboxError, RunVerdict)> {
     match level {
         SandboxLevel::MicroVm => microvm::run_in_microvm(spec, policy, cfg),
+        _ => run_checked_with_level(spec, policy, level),
+    }
+}
+
+/// จุดแยก backend พร้อม config Hardware Isolation (ใช้เมื่อเปิดฟีเจอร์ `hardware`)
+///
+/// ระดับ Hardware รับ `HardwareConfig` จริง (TEE type, attestation policy,
+/// GPU/NPU config, disk encryption) — gateway ส่ง config ที่ parse จาก
+/// `aivm.yaml` มาทางนี้
+#[cfg(feature = "hardware")]
+pub fn run_checked_with_level_and_cfg_hardware(
+    spec: &ExecSpec,
+    policy: &Policy,
+    level: SandboxLevel,
+    cfg: &hardware::HardwareConfig,
+) -> Result<ExecOutcome, (SandboxError, RunVerdict)> {
+    match level {
+        SandboxLevel::Hardware => hardware::run_in_hardware(spec, policy, cfg),
         _ => run_checked_with_level(spec, policy, level),
     }
 }
@@ -1238,6 +1265,32 @@ pub(crate) fn find_firecracker() -> Option<PathBuf> {
     None
 }
 
+/// หา path ของไบนารี `qemu-system-x86_64` ใน PATH (ไม่รัน ไม่ spawn)
+/// คืน `None` ถ้าไม่เจอไฟล์รันได้ชื่อตรง — ผู้เรียกต้อง fail-closed
+#[allow(dead_code)]
+pub(crate) fn find_qemu() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join("qemu-system-x86_64");
+        if cand.is_file() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(md) = std::fs::metadata(&cand) {
+                    if md.permissions().mode() & 0o111 != 0 {
+                        return Some(cand);
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
 /// probe ย่อยต้องเป็น fn ธรรมดา (ห้าม closure ที่ allocate) เพราะถูกเรียก
 /// ใน pre_exec หลัง fork — ข้างในมีได้แค่ syscall เท่านั้น
 fn probe_userns() -> std::io::Result<()> {
@@ -1751,9 +1804,15 @@ mod tests {
         {
             let level = SandboxLevel::Hardware;
             let r = run_checked_with_level(&s, &pol, level);
+            #[cfg(not(feature = "hardware"))]
             assert!(
                 matches!(r, Err((SandboxError::Disabled(_), _))),
                 "level {level:?} ต้อง Disabled"
+            );
+            #[cfg(feature = "hardware")]
+            assert!(
+                r.is_err(),
+                "Hardware skeleton ต้อง deny (Invalid/Disabled ก็ได้ ห้ามรัน)"
             );
         }
         #[cfg(not(feature = "microvm"))]

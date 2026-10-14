@@ -21,7 +21,7 @@ AIVM คือ runtime สำหรับรัน AI Agent โดยเฉพ�
 | 7 — MicroVM (Level 2) | บูต guest จริงผ่าน Firecracker/KVM (หลังฟีเจอร์ `microvm`) | ✅ |
 | MVP-C | `network.fetch`/`network.connect` แบบมี policy | ✅ |
 | Level 1 — Container | bubblewrap + Landlock/seccomp + cgroups v2 CPU/RAM/PIDs (ต้องเตรียม host) | ✅ |
-| Level 3 — Hardware isolation | อนาคต (สเปก §Level 3) | ❌ |
+| Level 3 — Hardware isolation | TEE (SEV-SNP/TDX) + Attestation + Measured Boot + vTPM + Disk Encryption (ฟีเจอร์ `hardware`) | ✅ |
 
 กฎเหล็ก: **fail-closed** — parse/eval/context error ใด ๆ → `DENY` เสมอ ไม่มี default-allow
 

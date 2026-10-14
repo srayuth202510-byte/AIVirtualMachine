@@ -88,6 +88,55 @@ policy:
 #   alt_rootfs: { path: /path/rootfs2.ext4, sha256: "<64 hex>" }
 #   dna_jitter: false       # true = สุ่มลด vcpu/mem ≤25% ต่อบูต (ไม่เกิน quota)
 #   jailer: ...             # ดู examples/aivm.yaml (ต้อง root)
+
+# บล็อก hardware: (ใช้เมื่อเปิดฟีเจอร์ hardware เท่านั้น บิลด์ปกติเมินทิ้ง)
+# Level 3 — Hardware Isolation (TEE/Confidential Computing)
+# ต้องการ host ที่รองรับ AMD SEV-SNP (Zen 3+/Genoa) หรือ Intel TDX (Sapphire Rapids+)
+# hardware:
+#   tee_type: sevsnp              # sevsnp | tdx | generic (default: generic)
+#   attestation_mode: strict      # strict | best_effort | none (default: strict)
+#   kernel_path: /path/vmlinux.bin
+#   kernel_sha256: "<64 hex>"
+#   initrd_path: /path/initrd.img  # optional, สำหรับ measured boot
+#   initrd_sha256: "<64 hex>"
+#   rootfs_path: /path/rootfs.ext4
+#   rootfs_sha256: "<64 hex>"
+#   qemu_sha256: "<64 hex>"       # ไม่ตั้ง = ไม่ pin QEMU (รายงานใน degraded)
+#   vcpu_count: 2                 # 1..=256 (default 2)
+#   mem_mb: 2048                  # 1024..=1048576 (default 2048)
+#   max_artifact_bytes: 1073741824  # เพดานไฟล์ artifact (default 1GiB, ต้อง > 0)
+#   launch_timeout_secs: 120      # 10..=1800 (default 120)
+#   gpu:
+#     mig_enabled: false          # MIG (Multi-Instance GPU) — ต้องการ NVIDIA A100/H100
+#     mig_profile: ""             # 1g.5gb, 2g.10gb, 3g.20gb, 7g.40gb
+#     sriov_enabled: false        # SR-IOV Virtual Functions
+#     sriov_num_vfs: 0
+#     vgpu_enabled: false         # vGPU mediated device — ต้องการ NVIDIA vGPU license
+#     vgpu_type: ""               # nvidia-222, nvidia-223, etc.
+#   disk_encryption:
+#     enabled: false              # LUKS2 + vTPM-sealed key
+#     key_source: vtpm            # vtpm | tpm2 | passphrase (dev only)
+#     pcr_policy: "0,1,2,3,4,7"   # PCR indices สำหรับ unseal
+#     cipher: aes-xts-plain64
+#     key_size: 512
+#   measured_boot:
+#     enabled: false              # PCR measurements + secure boot
+#     expected_pcrs: {}           # map PCR index -> expected sha256 hex
+#     firmware: ovmf              # ovmf | sev-firmware
+#     secure_boot: false          # verify kernel/initrd signature
+#     cert_paths: []              # DB/DBX/KEK certificates
+#   vtpm:
+#     enabled: false              # swtpm + QEMU vTPM device
+#     swtpm_path: ""              # path to swtpm binary (default: PATH)
+#     tpm_state_dir: ""           # TPM state directory
+#     tpm2: true                  # TPM 2.0 spec
+#   alt_kernel: { path: /path/vmlinux2.bin, sha256: "<64 hex>" }  # G5 DNA
+#   alt_initrd: { path: /path/initrd2.img, sha256: "<64 hex>" }
+#   alt_rootfs: { path: /path/rootfs2.ext4, sha256: "<64 hex>" }
+#   dna_jitter: false             # true = สุ่มลด vcpu/mem ≤25% ต่อบูต (ไม่เกิน quota)
+#   tee_device_path: /dev/sev     # /dev/sev (SEV-SNP) หรือ /dev/tdx_guest (TDX)
+#   kds_cache_dir: ""             # AMD KDS certificate cache (SEV-SNP attestation)
+#   qemu_path: ""                 # path to qemu-system-x86_64 (default: PATH)
 ```
 
 ## หมายเหตุการบังคับใช้

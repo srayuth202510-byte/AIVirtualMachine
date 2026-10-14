@@ -18,3 +18,6 @@ default = []
 # Backend MicroVM (Firecracker) — ยังไม่มี dependency จริงในขั้นเตรียมการ
 # เปิดไว้เป็น seam ให้ milestone ถัดไปเติม backend โดยไม่แตะ exec path เดิม
 microvm = []
+# Backend Hardware Isolation (TEE/Confidential Computing) — Level 3
+# ต้องการ host ที่รองรับ SEV-SNP (AMD) หรือ TDX (Intel)
+hardware = []
