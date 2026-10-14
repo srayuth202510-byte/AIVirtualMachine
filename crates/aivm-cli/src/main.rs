@@ -191,8 +191,11 @@ fn main() -> Result<(), AnyErr> {
             let run = sup
                 .run_agent(&name, &task, max_steps, Some(&ws))
                 .map_err(err)?;
+            if !run.subtasks.is_empty() {
+                println!("subtasks: {}", run.subtasks.join(" -> "));
+            }
             for s in &run.steps {
-                println!("#{} {} -> {}", s.index, s.action, s.outcome);
+                println!("#{} [{}] {} -> {}", s.index, s.subtask, s.action, s.outcome);
             }
             match &run.summary {
                 Some(s) => println!("summary: {s}"),

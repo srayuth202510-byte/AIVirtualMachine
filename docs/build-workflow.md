@@ -2,6 +2,10 @@
 
 `make test-coding` ทดสอบวงจรอ่าน source → แก้ bug → compile → link → รัน test binary จริง ด้วย GCC, GNU as และ GNU ld ใน process sandbox โมเดลเป็น scripted model เพื่อให้ตรวจ runtime ได้แบบ deterministic โดยไม่ใช้ API key หรือ KVM
 
+เมื่อ task เป็นงานโค้ด agent จะแบ่ง prompt เป็น subtask `inspect → implement → verify → repair` แล้วส่งให้โมเดลทีละช่วง พร้อมคำแนะนำ tool ตามขั้น หลังแก้ไฟล์ agent จะเข้าสู่ verify ซึ่งบังคับให้เรียก `process.exec`; หลัง build/test ล้มเหลวจะเข้าสู่ repair เมื่อ test artifact ผ่านด้วย status 0 agent จะจบงานเอง การเรียก action เดิมซ้ำหรือเรียก tool นอก verify จะถูก audit และหากโมเดลยังวนซ้ำ agent จะหยุดด้วยสถานะ `stalled`
+
+โมเดลบางตัวส่งคำสั่ง build เป็นข้อความต่อท้าย executable ใน `process.exec.path` หรือส่งเนื้อหา source เป็น array ของบรรทัด Runtime แปลงกรณีเหล่านี้เป็น argv และข้อความตามลำดับโดยไม่เรียก shell จากนั้นยังส่งผ่าน `ToolGateway` และตรวจ executable, capability, output slots และ policy ตามปกติ
+
 ทดสอบ baseline ก่อน: `add(2, 3)` คืนค่าผิด ทำให้ test binary ออกด้วย status 1 จากนั้น agent แก้ `a - b` เป็น `a + b` ผ่าน filesystem gateway แล้ว build ใหม่ ผล test binary ต้องเป็น status 0 Audit chain ต้องตรวจผ่านและ quota ของ artifacts ต้องไม่เกินที่กำหนด ผล test จาก agent ไม่เปลี่ยน `tests_passed` ของ Cube; การเปลี่ยน state ยังต้องใช้หลักฐานจาก operator
 
 ## เปิดพื้นที่ output

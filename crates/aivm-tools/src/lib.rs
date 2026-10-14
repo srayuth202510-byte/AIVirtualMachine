@@ -1504,6 +1504,17 @@ impl ToolGateway {
     ) -> Result<(), ToolError> {
         self.audit_decision(cube, "intent", raw, "deny", "invalid-intent", reason)
     }
+
+    /// Audit a runtime guard decision that occurs after a valid intent has
+    /// been parsed (for example, a repeated successful action).
+    pub fn audit_agent_guard_deny(
+        &mut self,
+        cube: &mut Cube,
+        resource: &str,
+        reason: &str,
+    ) -> Result<(), ToolError> {
+        self.audit_decision(cube, "agent", resource, "deny", "agent-guard", reason)
+    }
 }
 
 /// normalize แบบ lexical (ไม่แตะ I/O): ตัด `.` กับ `..` ออก

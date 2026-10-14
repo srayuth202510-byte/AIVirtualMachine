@@ -61,7 +61,7 @@ cargo run -q -p aivm-cli -- audit coder
 |---|---|
 | `create <name> --config <yaml>` | สร้าง VM จาก `aivm.yaml` (validate ก่อนบูต) |
 | `run <name> [--prompt …]` | รันหนึ่งก้าวแบบผ่านตัวกลาง |
-| `agent <name> <task> [--max-steps N]` | agent loop เต็มรอบ (Phase 5) |
+| `agent <name> <task> [--max-steps N]` | agent loop เต็มรอบ; งานโค้ดแบ่ง inspect/implement/verify/repair |
 | `transition <name> <STATE> [--confidence F] [--tests-passed] [--policy-approved]` | เปลี่ยน state + ให้/เพิกถอนสิทธิ์ |
 | `approve-secret <name> <lease> [--by NAME]` | อนุมัติ PENDING secret lease (operator เท่านั้น) |
 | `inspect` / `state` / `capabilities` | ดู VM / state / สิทธิ์ |
