@@ -759,8 +759,7 @@ fn format_id_map(id: u32, buf: &mut [u8; 32]) -> usize {
 }
 
 /// เข้า user namespace แบบ unprivileged แล้ว map uid/gid ให้ตัวเองเป็น root
-/// ใน ns ใหม่ (ต้องเขียน setgroups=deny ก่อน gid_map) จากนั้นสร้าง PID
-/// namespace — ทำได้เพราะมี CAP_SYS_ADMIN ใน userns ที่เพิ่งสร้าง
+/// ใน ns ใหม่ (ต้องเขียน setgroups=deny ก่อน gid_map)
 #[cfg(target_os = "linux")]
 unsafe fn enter_user_ns() -> std::io::Result<()> {
     // ต้องอ่าน uid/gid *ก่อน* unshare: หลังเข้า userns แล้ว getuid() จะเห็นค่า
@@ -1237,12 +1236,14 @@ pub(crate) fn find_firecracker() -> Option<PathBuf> {
 /// probe ย่อยต้องเป็น fn ธรรมดา (ห้าม closure ที่ allocate) เพราะถูกเรียก
 /// ใน pre_exec หลัง fork — ข้างในมีได้แค่ syscall เท่านั้น
 fn probe_userns() -> std::io::Result<()> {
-    // SAFETY: syscall เดียว ไม่มี allocate
+    // ตรวจทั้ง namespace และ UID/GID mapping เหมือน runtime:
+    // unshare สำเร็จอย่างเดียวไม่ได้แปลว่า /proc อนุญาตให้เขียน mapping
+    // SAFETY: syscall ล้วน ไม่มี allocate; เรียกใน child ของ probe เท่านั้น
     unsafe {
-        if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(())
+        enter_user_ns()
     }
 }
 
@@ -1250,7 +1251,7 @@ fn probe_pid_namespace() -> std::io::Result<()> {
     // SAFETY: syscall ล้วน (userns + uid/gid map + pidns) ไม่ allocate
     // ใช้ลำดับเดียวกับ run_checked จริง เพื่อ probe ให้ตรงกับที่ใช้จริง
     unsafe {
-        enter_user_ns()?;
+        probe_userns()?;
         if libc::unshare(libc::CLONE_NEWPID) != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -1461,6 +1462,24 @@ mod tests {
         // รายงานอย่างเดียว ไม่ assert ค่า (แล้วแต่เครื่อง) แต่ต้องมีฟิลด์ครบ
         let text = serde_json::to_string(&pr).unwrap();
         assert!(text.contains("userns"));
+    }
+
+    #[test]
+    fn userns_probe_requires_mapped_identity() {
+        fn check_mapped_identity() -> std::io::Result<()> {
+            probe_userns()?;
+            // kernel ต้องเห็นตัวเราเป็น uid/gid 0 ใน namespace ใหม่จริง
+            // หาก probe ตรวจแค่ unshare จะเห็น overflow IDs แทน
+            if unsafe { libc::getuid() != 0 || libc::getgid() != 0 } {
+                return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+            }
+            Ok(())
+        }
+        assert_eq!(
+            can_true_with(probe_userns),
+            can_true_with(check_mapped_identity),
+            "userns readiness requires successful UID/GID mapping"
+        );
     }
 
     /// ตีความ subset ของ BPF ที่ builder ใช้: ld [k], jeq(jt/jf), ret
