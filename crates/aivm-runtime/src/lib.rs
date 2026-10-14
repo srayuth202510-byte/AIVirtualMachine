@@ -372,6 +372,9 @@ impl Runtime {
             .transition(next, guards)
             .map_err(|e| RuntimeError::Transition(e.to_string()))?;
         let state = next.to_string();
+        // G1: transition มาจาก operator (guards เป็นหลักฐานฝั่งคน) = มีคนดู
+        // แล้ว ล้าง quarantine/counter probing ให้เริ่มนับใหม่
+        self.gateway.clear_quarantine();
 
         let revoked = self.gateway.caps.revoke_stale(&state);
         if revoked > 0 {
@@ -1050,6 +1053,40 @@ microvm:
         let log = std::fs::read_to_string(base.join("audit.jsonl")).unwrap();
         assert!(log.matches("verdict:clean").count() >= 2);
         assert!(log.matches("dna:s").count() >= 2, "ต้องมี dna id: {log}");
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // G1: deny burst → quarantine → operator transition ล้าง → กลับมาปกติ
+    // (deterministic: threshold default 20, ทุก deny ในเสี้ยววินาทีเดียวกัน)
+    #[test]
+    fn transition_clears_quarantine() {
+        let (mut rt, base) = test_runtime("quar");
+        let real = std::fs::canonicalize("/bin/true")
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        rt.gateway.policy.process.allow.push(real.clone());
+        rt.gateway.caps.grant(aivm_capability::Capability::new(
+            "execute", "process", &real,
+        ));
+        let probe = aivm_tools::ToolRequest {
+            tool: "filesystem.read".into(),
+            path: "../../etc/passwd".into(),
+            content: None,
+        };
+        for _ in 0..20 {
+            assert!(rt.gateway.dispatch(&mut rt.cube, &probe).is_err());
+        }
+        // quarantine แล้ว: exec ที่ควร allow ต้องตาย
+        // quarantine แล้ว: exec ที่ควร allow ต้องตาย
+        let r = rt.gateway.exec(&mut rt.cube, "/bin/true", &[]);
+        assert!(r.is_err(), "quarantine ต้อง deny แม้มีสิทธิ์ครบ");
+        // operator transition (INIT → ANALYZE ไม่ต้องใช้ guard) ล้างให้
+        rt.transition_to(AgentState::Analyze, &TransitionGuards::default())
+            .unwrap();
+        let r = rt.gateway.exec(&mut rt.cube, "/bin/true", &[]);
+        assert!(r.is_ok(), "หลัง transition ต้องกลับมาปกติ");
         aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);
     }

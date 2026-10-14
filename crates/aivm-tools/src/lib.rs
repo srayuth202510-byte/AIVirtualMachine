@@ -20,7 +20,9 @@ use aivm_cube::{AgentState, Cube};
 use aivm_policy::{Decision, EvalContext, Policy};
 use aivm_sandbox::{ExecSpec, ResourceLimits, SandboxLevel};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -68,6 +70,90 @@ pub struct ToolGateway {
     #[cfg(feature = "microvm")]
     pub microvm_cfg: Option<aivm_sandbox::microvm::MicroVmConfig>,
     req_counter: u64,
+    deny_tracker: DenyTracker,
+}
+
+/// ตัวตัดวงจร deny-storm (G1 — `docs/threat-model.md`): agent ที่โดนยึดแล้ว
+/// ไล่ probe จะทิ้งรอย DENY ถี่ ๆ ตัวนี้เฝ้าหน้าต่างบานเลื่อนแล้ว quarantine
+/// ทั้ง gateway ชั่วคราว (fail-closed escalation)
+///
+/// ความซื่อสัตย์: นี่คือ circuit breaker กัน runaway loop / burst probing
+/// ไม่ใช่ตัวจับ slow probing (ต่ำกว่า threshold ตรวจไม่เจอโดยออกแบบ) และ
+/// ไม่ยืดเวลาเอง (hammer ต่อ = หมด cooldown แล้ว trigger ใหม่เป็นรอบ ๆ)
+#[derive(Debug)]
+pub struct DenyTracker {
+    stamps: VecDeque<Instant>,
+    quarantine_until: Option<Instant>,
+    threshold: u32,
+    window: Duration,
+    cooldown: Duration,
+}
+
+/// default แบบ conservative: demo (7 denies) กับเทสต์ปกติไม่มีทางถึง
+/// (margin กว้าง) แต่ loop ที่รันaway โดนตัดในนาทีเดียว
+impl Default for DenyTracker {
+    fn default() -> Self {
+        Self {
+            stamps: VecDeque::new(),
+            quarantine_until: None,
+            threshold: 20,
+            window: Duration::from_secs(60),
+            cooldown: Duration::from_secs(60),
+        }
+    }
+}
+
+impl DenyTracker {
+    #[cfg(test)]
+    fn test_config(threshold: u32, window_secs: u64, cooldown_secs: u64) -> Self {
+        Self {
+            stamps: VecDeque::new(),
+            quarantine_until: None,
+            threshold,
+            window: Duration::from_secs(window_secs),
+            cooldown: Duration::from_secs(cooldown_secs),
+        }
+    }
+
+    /// อยู่ใน quarantine หรือไม่ (หมดเวลาแล้วล้างเองแบบ lazy)
+    fn quarantined(&mut self, now: Instant) -> bool {
+        if let Some(until) = self.quarantine_until {
+            if now < until {
+                return true;
+            }
+            self.quarantine_until = None;
+        }
+        false
+    }
+
+    /// บันทึก deny หนึ่งครั้ง คืน true ถ้าเพิ่งเข้า quarantine รอบใหม่
+    /// (กำลัง quarantine อยู่แล้ว = นับต่อแต่ไม่ยืดเวลา — กัน attacker
+    /// ปักหลักยึด VM ไว้ตลอดด้วยการ hammer ไม่หยุด)
+    fn record_deny(&mut self, now: Instant) -> bool {
+        self.stamps.push_back(now);
+        while self
+            .stamps
+            .front()
+            .map(|t| now.duration_since(*t) > self.window)
+            .unwrap_or(false)
+        {
+            self.stamps.pop_front();
+        }
+        if self.quarantine_until.is_some_and(|u| now < u) {
+            return false;
+        }
+        if self.stamps.len() as u32 >= self.threshold {
+            self.quarantine_until = Some(now + self.cooldown);
+            return true;
+        }
+        false
+    }
+
+    /// ล้างสถานะ (operator เท่านั้น — เรียกจาก transition ฝั่ง runtime)
+    pub fn clear(&mut self) {
+        self.stamps.clear();
+        self.quarantine_until = None;
+    }
 }
 
 impl ToolGateway {
@@ -91,6 +177,7 @@ impl ToolGateway {
             #[cfg(feature = "microvm")]
             microvm_cfg: None,
             req_counter: 0,
+            deny_tracker: DenyTracker::default(),
         }
     }
 
@@ -98,6 +185,37 @@ impl ToolGateway {
     pub fn with_level(mut self, level: SandboxLevel) -> Self {
         self.level = level;
         self
+    }
+
+    /// ล้าง quarantine + ตัวนับ probing (operator เท่านั้น — runtime เรียก
+    /// จาก transition ที่ guard มาจากฝั่งคน)
+    pub fn clear_quarantine(&mut self) {
+        self.deny_tracker.clear();
+    }
+
+    /// G1: ประตู quarantine สำหรับทุก tool method (complete mediation —
+    /// เรียกตรงโดยไม่ผ่าน dispatch ก็หนีไม่พ้น) อยู่ใน quarantine = DENY
+    /// พร้อม audit ของตัวเอง
+    fn check_quarantine(
+        &mut self,
+        cube: &mut Cube,
+        action: &str,
+        resource: &str,
+    ) -> Result<(), ToolError> {
+        if self.deny_tracker.quarantined(Instant::now()) {
+            self.audit_decision(
+                cube,
+                action,
+                resource,
+                "deny",
+                "quarantine-probing",
+                "error",
+            );
+            return Err(ToolError::Denied(
+                "gateway quarantined after deny burst".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn ctx_of(cube: &Cube) -> EvalContext {
@@ -191,6 +309,27 @@ impl ToolGateway {
         rec.result = result.to_string();
         if decision == "deny" {
             cube.record_denial(rule);
+            // G1: deny ทุกครั้งเข้าหน้าต่างเฝ้าระวัง ครบ threshold = quarantine
+            // (record แยกอีกบรรทัด — I-7: การเริ่ม quarantine ต้องมีรอยของตัวเอง)
+            if self.deny_tracker.record_deny(Instant::now()) {
+                self.req_counter += 1;
+                let mut q = AuditRecord::new(
+                    0,
+                    &self.agent,
+                    &self.session_id,
+                    &format!("req_{:06}", self.req_counter),
+                    &cube.current_state().to_string(),
+                    "quarantine",
+                    resource,
+                    "deny",
+                    &self.policy.name,
+                );
+                q.rule_matched = "probing-threshold".to_string();
+                q.result = "quarantine-started".to_string();
+                if let Err(e) = self.audit.append(q) {
+                    eprintln!("[audit] append failed: {e}");
+                }
+            }
         }
         if let Err(e) = self.audit.append(rec) {
             eprintln!("[audit] append failed: {e}");
@@ -273,6 +412,7 @@ impl ToolGateway {
     }
 
     pub fn read(&mut self, cube: &mut Cube, path: &str) -> Result<ToolResult, ToolError> {
+        self.check_quarantine(cube, "read", path)?;
         let canon = self.enforce(cube, "read", path)?;
         // เปิดพร้อมเช็ก symlink: ปฏิเสธไฟล์ symlink (ใกล้เคียง O_NOFOLLOW)
         let meta = std::fs::symlink_metadata(&canon).map_err(|e| ToolError::Io(e.to_string()))?;
@@ -294,6 +434,7 @@ impl ToolGateway {
         path: &str,
         content: &str,
     ) -> Result<ToolResult, ToolError> {
+        self.check_quarantine(cube, "write", path)?;
         let canon = self.enforce(cube, "write", path)?;
         if let Some(parent) = canon.parent() {
             std::fs::create_dir_all(parent).map_err(|e| ToolError::Io(e.to_string()))?;
@@ -314,6 +455,7 @@ impl ToolGateway {
 
     /// `code.search`: ค้น substring ในไฟล์ workspace (ใช้ scope แบบ read)
     pub fn search(&mut self, cube: &mut Cube, query: &str) -> Result<ToolResult, ToolError> {
+        self.check_quarantine(cube, "search", query)?;
         let ws_str = self.workspace.to_string_lossy().to_string();
         // บังคับ scope แบบ read บน workspace root เองก่อน
         let _ = self.enforce(cube, "search", &ws_str)?;
@@ -362,6 +504,7 @@ impl ToolGateway {
         exe: &str,
         args: &[String],
     ) -> Result<ToolResult, ToolError> {
+        self.check_quarantine(cube, "execute", exe)?;
         let spec = ExecSpec {
             exe: PathBuf::from(exe),
             args: args.to_vec(),
@@ -461,6 +604,7 @@ impl ToolGateway {
         use std::time::Duration;
 
         // Parse request
+        self.check_quarantine(cube, "network:fetch", url)?;
         let req: NetworkFetchRequest = match content {
             Some(s) => serde_json::from_str(s).map_err(|e| {
                 self.audit_decision(cube, "network:fetch", url, "deny", "bad-request", "error");
@@ -615,6 +759,7 @@ impl ToolGateway {
         use std::net::TcpStream;
         use std::time::Duration;
 
+        self.check_quarantine(cube, "network:connect", host_port)?;
         let req: NetworkConnectRequest = match content {
             Some(s) => serde_json::from_str(s).map_err(|e| {
                 self.audit_decision(
@@ -714,6 +859,10 @@ impl ToolGateway {
         cube: &mut Cube,
         req: &ToolRequest,
     ) -> Result<ToolResult, ToolError> {
+        // G1: อยู่ใน quarantine = DENY ทุก tool ตั้งแต่ประตู (fail-closed
+        // escalation) — operator ปลดผ่าน transition หรือรอหมด cooldown
+        // (ไม่ยืดเวลาเอง) ตรวจซ้ำในแต่ละ method ด้วย (complete mediation)
+        self.check_quarantine(cube, req.tool.as_str(), req.path.as_str())?;
         // มีแค่ tool ที่ผ่านตัวกลางตามรายการ อย่างอื่นคือ DENY
         match req.tool.as_str() {
             "filesystem.read" => self.read(cube, &req.path),
@@ -1265,5 +1414,74 @@ network: {{allow: [], deny: []}}
         let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
         assert!(log.contains("level-invalid") || log.contains("level-disabled"));
         assert!(log.contains("\"decision\":\"deny\""));
+    }
+
+    // G1: tracker ลั่นที่ threshold พอดี ไม่ยืดเวลาเอง หมด cooldown แล้วนับใหม่
+    #[test]
+    fn deny_tracker_triggers_no_extend_and_rearms() {
+        let mut t = DenyTracker::test_config(3, 60, 60);
+        let now = Instant::now();
+        assert!(!t.record_deny(now));
+        assert!(!t.record_deny(now));
+        // ครั้งที่ 3 = ครบ threshold ลั่นรอบใหม่
+        assert!(t.record_deny(now));
+        assert!(t.quarantined(now));
+        // hammer ต่อระหว่าง quarantine = นับแต่ไม่ยืดเวลา (ไม่คืน true อีก)
+        let arm = t.quarantine_until;
+        assert!(!t.record_deny(now));
+        assert!(!t.record_deny(now));
+        assert_eq!(t.quarantine_until, arm);
+        // cooldown = 0 อีกรอบ: หมดทันที แต่ record ใหม่ลั่นซ้ำได้ (re-arm)
+        let mut z = DenyTracker::test_config(2, 60, 0);
+        assert!(!z.record_deny(now));
+        assert!(z.record_deny(now));
+        assert!(!z.quarantined(now));
+        assert!(z.record_deny(now));
+    }
+
+    // G1: deny burst ครบ threshold → gateway quarantine (allow ที่ควรผ่านก็ตาย)
+    // deterministic: threshold default 20, ทุก deny เกิดในเสี้ยววินาทีเดียวกัน
+    #[test]
+    fn probing_burst_quarantines_gateway() {
+        // เส้นแบ่ง: 19 denies ยังปกติ
+        let (mut gw, mut cube, _d) = exec_harness();
+        let probe = ToolRequest {
+            tool: "filesystem.read".into(),
+            path: "../../etc/passwd".into(),
+            content: None,
+        };
+        for _ in 0..19 {
+            assert!(gw.dispatch(&mut cube, &probe).is_err());
+        }
+        let ok = gw.dispatch(
+            &mut cube,
+            &ToolRequest {
+                tool: "process.exec".into(),
+                path: "/bin/true".into(),
+                content: Some("[]".into()),
+            },
+        );
+        assert!(ok.is_ok(), "19 denies ต้องยังไม่ quarantine");
+
+        // ครบ 20 = quarantine ครั้งที่ 21 (ของที่ควร allow) ต้องตายพร้อม audit
+        let (mut gw, mut cube, dir) = exec_harness();
+        for _ in 0..20 {
+            assert!(gw.dispatch(&mut cube, &probe).is_err());
+        }
+        let r = gw.dispatch(
+            &mut cube,
+            &ToolRequest {
+                tool: "process.exec".into(),
+                path: "/bin/true".into(),
+                content: Some("[]".into()),
+            },
+        );
+        assert!(matches!(r, Err(ToolError::Denied(_))));
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(log.contains("quarantine-started"), "ต้องมีรอยเริ่ม quarantine");
+        assert!(
+            log.contains("quarantine-probing"),
+            "ต้องมีรอย deny ระหว่าง quarantine"
+        );
     }
 }

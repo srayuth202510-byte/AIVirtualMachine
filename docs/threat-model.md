@@ -110,10 +110,10 @@ DNA ทุกครั้งต้องลง audit (ไม่รวม secret)
 
 | id | threat | ของที่ขาด | ความสำคัญ |
 |---|---|---|---|
-| G1 | A1 probing | rate-limit / quarantine เมื่อ DENY ซ้ำ + test | สูง — วันนี้เห็น probing ใน audit แต่ไม่มี action อัตโนมัติ |
+| G1 | A1 probing | ✅ เสร็จ: `DenyTracker` (20 denies / 60s → quarantine 60s ทั้ง gateway ทุก method รวมเรียกตรง + audit `quarantine-started`/`quarantine-probing` + ไม่ยืดเวลาเอง + operator transition ล้าง) — เป็น circuit breaker กัน runaway loop/burst ไม่ใช่ตัวจับ slow probing | เสร็จ |
 | G2 | A2 poisoned input | test ป้อน payload ปนเปื้อนผ่าน read → intent ต้องไม่ escalate | กลาง — design กันอยู่ แต่ไม่มี test ผูก |
 | G3 | A3 escape signal | ✅ เสร็จ: `RunVerdict` (`Clean`/`Suspect`/`Compromise` + reason ตายตัว) แนบคู่ error ทุกขั้นบูตแบบ explicit + ลง audit ทุก decision — VMM ตายก่อน marker / สำเนาถูกสลับ = `Compromise`, timeout / marker หาย / exit parse ไม่ได้ = `Suspect`, deny ตั้งแต่ประตู / infra ล้ม = `Clean` | เสร็จ |
 | G4 | A4 gateway wiring | ต่อ secrets crate เข้า gateway (`secret.request` tool + injection + audit) + adversarial | สูง — ของมีแต่ยังไม่ต่อสาย |
 | G5 | A3/A4 DNA | ✅ เสร็จ: DNA ต่อบูต (marker scheme V0/V1 + init tmp layout + เลือก image จากชุดที่ verify แล้ว + jitter resource opt-in + secret lease ไม่ซ้ำ) + dna id ลง audit (`dna:s…`) | เสร็จ |
 
-ลำดับแนะนำ: ~~G3 → G5 →~~ G1 → G4 → G2 (G4 ใหญ่สุด แยกงานต่างหากได้)
+ลำดับแนะนำ: ~~G3 → G5 → G1 →~~ G4 → G2 (G4 ใหญ่สุด แยกงานต่างหากได้)

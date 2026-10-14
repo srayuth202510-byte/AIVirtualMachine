@@ -20,6 +20,9 @@ Sandbox (ดูตาราง isolation)
 
 AI ไม่มี direct access ไปยัง host OS (I-1) ทุกขั้นตรวจก่อนรัน (I-9)
 สงสัย = DENY (I-6) AI แก้ boundary ตัวเองไม่ได้ (I-5)
+deny burst (20 ครั้ง/60 วิ) = quarantine ทั้ง gateway 60 วิ (circuit breaker
+กัน runaway loop — เรียก method ตรงโดยไม่ผ่าน dispatch ก็หนีไม่พ้น,
+operator transition ล้างได้, ไม่ยืดเวลาเอง)
 
 ## Isolation levels (`runtime.isolation`)
 
