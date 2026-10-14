@@ -965,6 +965,8 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
 
             // ไม่ fork ใน pre_exec: mediator จะถือ exec-error pipe ทำให้ spawn ค้าง
             // PID namespace จึงรายงาน degraded; Landlock/seccomp ยังบังคับเสมอ
+            // หมายเหตุ: PID namespace จะทำให้ compiler/test runner ที่ spawn
+            // subprocess ทำงานผิดปกติ ใช้ MicroVM สำหรับ kernel-level isolation
             let mut isolation = 0u8;
             if enter_user_ns().is_ok() {
                 isolation |= 1;

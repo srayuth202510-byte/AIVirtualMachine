@@ -68,7 +68,7 @@ deadline) — serial log ของ guest ใช้สืบย้อนเท่
   broker ไม่ log value + audit เฉพาะ metadata (§26)
 - **signal**: `LeaseExhausted` / `LeaseExpired` / ใช้ lease ซ้ำ
 - **test ที่มี**: `aivm-secrets` unit tests (exhaustion, HITL, deny pattern)
-- **ช่องว่าง**: secrets crate ยังไม่ต่อเข้า gateway (standalone) — ดู G4
+- **ช่องว่าง**: (แก้แล้ว) secrets crate ต่อเข้า gateway แล้ว — `ToolGateway::with_secret_broker` + `exec_inner` handle secret injection + zeroize
 
 ### A5 — supply chain (image / VMM ปลอม)
 

@@ -387,13 +387,18 @@ fn i10_structural_enforcement() {
             "I-10: {name} claimed as both applied and degraded"
         );
     }
-    // namespace: ถ้าเครื่องรองรับ (probe) ต้องรายงาน applied จริง
-    if pr.userns && pr.pid_namespace {
+    // namespace: userns ต้อง applied (probe รองรับ) — pid-namespace
+    // ใช้ไม่ได้ใน process backend เพราะทำให้ compiler/test runner
+    // ที่ spawn subprocess ทำงานผิดปกติ (ใช้ MicroVM สำหรับ kernel isolation)
+    // จึงรายงานใน degraded ตามความจริงของเครื่อง
+    if pr.userns {
         assert!(
-            out.applied.contains(&"pid-namespace".to_string()),
-            "I-10: namespaces supported but not applied"
+            out.applied.contains(&"user-namespace".to_string()),
+            "I-10: user-namespace supported but not applied"
         );
     }
+    // pid-namespace: probe แยกออกมาเพื่อวางแผน Phase 7
+    // ใน process backend จะอยู่ใน degraded เสมอ (by design)
     // audit ไฟล์ล็อกเฉพาะเจ้าของ (structural ระดับ FS)
     let (mut gw, mut cube, dir) = gateway("i10b");
     gw.write(&mut cube, "src/a.rs", "x").unwrap();

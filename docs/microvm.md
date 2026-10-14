@@ -157,3 +157,107 @@ sudo cargo run -q -p aivm-cli -- --root /opt/aivm create coder --config ./exampl
 ## 7. ข้อจำกัดที่รู้ตัว
 
 VMM ถูกรันตรง ๆ (หรือผ่าน jailer) — data drive อ่านอย่างเดียว, rootfs สำเนาเขียนได้แต่ทิ้งทุกครั้ง
+
+## 8. การยืนยัน MicroVM บน KVM จริง (Verification Guide)
+
+เพื่อยืนยัน MicroVM ทำงานบน KVM จริง (ไม่ใช่แค่ unit test) ต้องมี:
+
+### Prerequisites
+```bash
+# 1. KVM available
+ls -la /dev/kvm          # ต้องมี และ user อยู่ในกลุ่ม kvm
+
+# 2. Firecracker binary พร้อม pin hash
+firecracker --version    # ต้องตรงกับ fc_sha256 ใน config
+
+# 3. Kernel + rootfs artifacts พร้อม pins.json
+export AIVM_MICROVM_PINS=/path/to/pins.json
+```
+
+### ทดสอบบูตจริง
+```bash
+# Build with microvm feature
+cargo build -p aivm-cli --features microvm
+
+# Run microvm tests (includes real boot if PINS + KVM available)
+make test-microvm
+
+# หรือรันเฉพาะ e2e test บน runtime
+AIVM_MICROVM_PINS=/path/to/pins.json cargo test -p aivm-runtime --features microvm microvm_real_boot
+```
+
+### สิ่งที่ควรตรวจสอบหลังบูตจริง
+- `applied` มี `microvm-boot`, `image-pin-verify`, `rootfs-copy-reverify`, `kvm`, `no-guest-network`
+- `degraded` รายงานสิ่งที่ยังหย่อน: `env_extra: ignored`, `cwd: guest sees /`, `pids_max: not enforced in guest`
+- Audit log มี `verdict:clean` และ `dna:s{scheme}-k{0|1}-r{0|1}-{vcpu}x{mem}-{tmp}`
+- Serial log (ถ้า `AIVM_MICROVM_KEEP_SCRATCH=1`) แสดง marker และ exit code
+
+### CI/CD Integration
+CI (ubuntu-latest) **ไม่มี KVM** ดังนั้น:
+- Unit/plumbing tests ทำงานได้ (ไม่ต้องการ KVM)
+- Real boot tests **skip อย่างซื่อสัตย์** (เขียว ไม่ fail)
+- สำหรับการ verify จริง ให้รันบน self-hosted runner ที่มี KVM + artifacts
+
+## 9. Coding Workflow กับโมเดลจริง (Real Model Integration)
+
+ปัจจุบัน `make test-coding` ใช้ **scripted model** (deterministic, ไม่ต้องใช้ API key) สำหรับ CI
+
+### ใช้โมเดลจริง (LLM) สำหรับ development/debug
+```bash
+# 1. ติดตั้ง llama.cpp feature
+cargo build -p aivm-cli --features llama
+
+# 2. เตรียม GGUF model file
+# ดาวน์โหลดจาก Hugging Face เช่น: qwen2.5-coder-7b-instruct-q4_k_m.gguf
+
+# 3. รัน smoke test
+make llama-smoke MODEL=/path/to/model.gguf PROMPT='fix the add function'
+
+# 4. หรือสร้าง VM config ใช้โมเดล local
+# ใน aivm.yaml:
+# model:
+#   provider: local
+#   name: qwen
+#   local:
+#     model_path: /path/to/model.gguf
+#     ctx_size: 8192
+```
+
+### ข้อจำกัดการทดสอบกับโมเดลจริง
+- **Non-deterministic**: โมเดลจริงอาจตอบต่างกันทุกครั้ง ทำให้ CI flaky
+- **ต้องมี GPU/CPU resources** ที่เพียงพอ
+- **ไม่มี adversarial coverage** อัตโนมัติ — ต้องเพิ่ม test cases เอง
+- แนะนำให้ใช้ scripted model สำหรับ CI/regression และโมเดลจริงสำหรับ manual validation
+
+## 10. Network Integration กับปลายทางจริง (Real Network Endpoints)
+
+Network gateway ปัจจุบันรองรับ `network.fetch` และ `network.connect` ผ่าน policy allowlist + capability
+
+### ทดสอบกับปลายทางจริง
+```yaml
+# aivm.yaml
+network:
+  allow: [github.com, api.github.com, crates.io]
+tools:
+  allow: [curl]  # ต้องอนุญาต curl ใน process allowlist ด้วย
+capabilities:
+  initial: [read:workspace, search:code, network:github.com]
+policy:
+  require_test_before_network: true
+```
+
+### ข้อจำกัด
+- **Default deny all** — ต้อง allowlist domain/IP ทุกตัวที่ต้องการเข้าถึง
+- **Private CIDR blocked** — 10/8, 192.168/16, 172.16/12, 127.0.0.1, ::1, 169.254.169.254 (cloud metadata)
+- **HTTPS only** — network capability ต้องการ `require_tls: true` และ port 443
+- **No redirects** — redirect (3xx) ถูกปฏิเสธ ต้อง authorize target ใหม่
+- **DNS resolution ผ่าน host** — ไม่มี DNS server ใน sandbox ต้อง resolve บน host แล้วตรวจ IP
+
+### การทดสอบ integration
+```bash
+# ต้องมี network capability + policy allow + state VALIDATE (tests_passed=true)
+# รันผ่าน agent loop หรือ CLI:
+aivm run coder --task "fetch latest release from github.com"
+```
+
+**หมายเหตุ**: Network integration tests ไม่อยู่ใน CI เพราะพึ่งพา external endpoints แนะนำให้ทดสอบ manual บนเครื่องที่มี network access

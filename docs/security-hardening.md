@@ -11,7 +11,7 @@
 - Subprocess อ่านได้เฉพาะไฟล์ workspace ที่ผ่าน policy และexecutable ที่ allowlist และไฟล์ libraries/loader ใน `/usr/lib`, `/usr/lib64`, `/lib`, `/lib64` รวม loader cache และอุปกรณ์ที่ระบุไว้ โปรแกรมเขียนได้เฉพาะไฟล์ workspace ที่มีอยู่แล้วและผ่าน write policy; สร้างไฟล์ใหม่ผ่าน filesystem gateway
 - จำกัด memory, CPU affinity และ file size จาก resource config; gateway ตรวจผลรวมขนาด workspace ก่อนเขียน ส่วน process แบ่งงบเขียนระหว่างไฟล์ที่เขียนได้อย่าง conservative
 - อ่าน stdout/stderr พร้อมกัน มี deadline และฆ่า process group เมื่อจบหรือหมดเวลา ปฏิเสธ `setsid`/`setpgid` หลังเริ่มงานเพื่อกันลูกแยกกลุ่มหนี cleanup
-- Namespace เป็นชั้นเสริมและรายงานจากผล syscall จริง PID namespace ของ process backend รายงานว่าไม่ได้ใช้; งานที่ต้องการแยก PID/kernel ให้ใช้ MicroVM
+- Namespace เป็นชั้นเสริมและรายงานจากผล syscall จริง: user/mount/network namespace ใช้งานได้ PID namespace **ไม่ได้ใช้ใน process backend** (by design) เพราะทำให้ compiler/test runner ที่ spawn subprocess ทำงานผิดปกติ — งานที่ต้องการแยก PID/kernel ให้ใช้ MicroVM แทน (ดู `crates/aivm-sandbox/src/lib.rs` ความคิดเห็นใน `run_checked`)
 
 เปิด bounded output slots ได้ด้วย `build.enabled` โดย operator: gateway เตรียมไฟล์ใน `.aivm-build` และให้ compiler เขียนเฉพาะ slots ที่ประกาศ จำกัดจำนวนไฟล์และขนาดรายไฟล์ ไม่ได้ให้ child สร้างไฟล์ทั่วไป ดู [build-workflow.md](build-workflow.md) สำหรับรูปแบบ intent และข้อจำกัดของ build tools ที่ใช้ temporary files แบบสุ่ม
 
@@ -26,7 +26,7 @@ secrets:
   hitl_required_for: ["high"]
 ```
 
-หากไม่ตั้ง `low_risk_allow` ค่าเริ่มต้นของ resource เป็น High โปรแกรมที่ได้รับ secret ไม่มีสิทธิ์เขียน workspace และ stdout/stderr ทั้งหมดถูกปิดก่อนคืนให้ agent เพื่อกันการส่งค่าแบบเข้ารหัสกลับมา ต้องตรวจผลการทำงานผ่าน exit status/audit metadata แทน
+หากไม่ตั้ง `low_risk_allow` ค่าเริ่มต้นของ resource เป็น High โปรแกรมที่ได้รับ secret จะได้รับผ่าน environment variable (inject ผ่าน `env_extra` ใน `ExecSpec`) และค่า secret จะถูก zeroize ทันทีหลัง spawn เสร็จ ผลลัพธ์ที่คืนให้ agent จะเป็น `[REDACTED]` แทน stdout/stderr จริง เพื่อป้องกันการส่งค่า secret กลับมา ต้องตรวจผลการทำงานผ่าน exit status/audit metadata แทน (ดู `crates/aivm-tools/src/lib.rs` ฟังก์ชัน `exec_inner`)
 
 ## Audit และ state
 

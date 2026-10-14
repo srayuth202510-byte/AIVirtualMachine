@@ -47,6 +47,10 @@ Tool result แสดง exit status, stdout และ stderr Agent observation 
 
 ## ขอบเขตของ profile นี้
 
-รองรับงานที่ระบุ output filenames ได้ล่วงหน้า Workflow ที่ทดสอบเป็น C บน Linux x86_64/glibc ใช้ GCC compile ด้วย `-pipe` และ GNU ld link โดยตรง GCC driver ในขั้น link, Cargo และ build tools ที่ต้องสร้าง temporary files แบบชื่อสุ่มยังไม่รองรับโดย profile นี้ ไม่มีการเปิด `/tmp` หรือให้สิทธิ์สร้างไฟล์กว้างเพื่อหลบข้อจำกัด
+รองรับงานที่ระบุ output filenames ได้ล่วงหน้า (Known Output Profile) Workflow ที่ทดสอบเป็น C บน Linux x86_64/glibc ใช้ GCC compile ด้วย `-pipe` และ GNU ld link โดยตรง GCC driver ในขั้น link
 
-การรัน `make ci` รวม integration suite นี้ด้วย ต้องมี GCC/binutils และ C runtime startup objects ในเครื่อง เช่นเดียวกับ CI Ubuntu
+**ข้อจำกัดที่รู้จัก (Known Limitations):**
+
+- **Cargo และ build tools ที่สร้าง temporary files แบบชื่อสุ่ม (Random Temp Files) ยังไม่รองรับ** — profile นี้ออกแบบสำหรับ compiler/linker ที่เขียน output ไปยัง path ที่ระบุล่วงหน้าเท่านั้น ไม่มีการเปิด `/tmp` หรือให้สิทธิ์สร้างไฟล์กว้างเพื่อหลบข้อจำกัด
+- เพื่อรองรับ Cargo จำเป็นต้องเพิ่ม "Temp Directory Profile" ใหม่: gateway จอง temp directory แบบ bounded (Landlock allow write เฉพาะ temp dir + rlimit fsize + auto-cleanup) และ tool 宣告ต้องระบุ `temp_dir: true` ใน intent — งานนี้ยังไม่ได้ implement (ดู `crates/aivm-tools/src/build.rs` และ `crates/aivm-sandbox/src/landlock.rs`)
+- การรัน `make ci` รวม integration suite นี้ด้วย ต้องมี GCC/binutils และ C runtime startup objects ในเครื่อง เช่นเดียวกับ CI Ubuntu
