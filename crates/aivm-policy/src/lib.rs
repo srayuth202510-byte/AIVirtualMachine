@@ -119,7 +119,37 @@ pub struct EvalContext {
 impl Policy {
     /// โหลดแบบ fail-closed: YAML เสียได้ Err ผู้เรียกต้องปฏิเสธการสตาร์ต
     pub fn from_yaml(text: &str) -> Result<Self, PolicyError> {
-        serde_yaml::from_str(text).map_err(|e| PolicyError::Parse(e.to_string()))
+        let policy: Self =
+            serde_yaml::from_str(text).map_err(|e| PolicyError::Parse(e.to_string()))?;
+        policy.validate_syntax()?;
+        Ok(policy)
+    }
+
+    /// syntax error ต้องปฏิเสธ policy ทั้งชุด ไม่แปลงเป็น rule ที่ไม่ match
+    fn validate_syntax(&self) -> Result<(), PolicyError> {
+        for rule in &self.rules {
+            if !matches!(rule.effect.as_deref(), None | Some("allow") | Some("deny")) {
+                return Err(PolicyError::Parse("unknown rule effect".into()));
+            }
+            if let Some(when) = &rule.when {
+                eval_when(when, &EvalContext::default()).map_err(PolicyError::Parse)?;
+            }
+        }
+        for pattern in self
+            .filesystem
+            .read
+            .iter()
+            .chain(&self.filesystem.write)
+            .chain(&self.filesystem.deny)
+            .chain(&self.process.allow)
+            .chain(&self.process.deny)
+            .chain(&self.network.allow)
+            .chain(&self.network.deny)
+            .chain(self.rules.iter().map(|r| &r.scope))
+        {
+            glob::Pattern::new(pattern).map_err(|e| PolicyError::Parse(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// ประเมิน action บน filesystem เทียบกับ policy
@@ -131,6 +161,9 @@ impl Policy {
         canonical_path: &str,
         ctx: &EvalContext,
     ) -> (Decision, Option<String>) {
+        if self.validate_syntax().is_err() {
+            return (Decision::Deny, Some("invalid-policy".into()));
+        }
         // 1. deny list ชนะเสมอ
         for pat in &self.filesystem.deny {
             if match_pattern(pat, canonical_path) {
@@ -181,6 +214,9 @@ impl Policy {
     }
 
     pub fn evaluate_process(&self, executable: &str) -> (Decision, Option<String>) {
+        if self.validate_syntax().is_err() {
+            return (Decision::Deny, Some("invalid-policy".into()));
+        }
         for pat in &self.process.deny {
             if match_pattern(pat, executable) {
                 return (Decision::Deny, Some(format!("deny-list:{pat}")));
@@ -195,12 +231,15 @@ impl Policy {
     }
 
     pub fn evaluate_network(&self, host: &str, ctx: &EvalContext) -> (Decision, Option<String>) {
+        if self.validate_syntax().is_err() {
+            return (Decision::Deny, Some("invalid-policy".into()));
+        }
         // เครือข่ายส่วนตัว/loopback/metadata ปฏิเสธเสมอ (defense in depth §18)
         if is_blocked_network(host) {
             return (Decision::Deny, Some("blocked-range".into()));
         }
         for pat in &self.network.deny {
-            if match_pattern(pat, host) {
+            if network_pattern(pat, host) {
                 return (Decision::Deny, Some(format!("deny-list:{pat}")));
             }
         }
@@ -209,7 +248,7 @@ impl Policy {
             if rule.effect.as_deref() == Some("deny")
                 && rule.action == "network"
                 && rule.resource == "network"
-                && match_pattern(&rule.scope, host)
+                && network_pattern(&rule.scope, host)
                 && rule_matches(rule, ctx)
             {
                 return (Decision::Deny, Some(format!("rule:{}", rule.id)));
@@ -219,7 +258,7 @@ impl Policy {
             return (Decision::Deny, Some("require-test-before-network".into()));
         }
         for pat in &self.network.allow {
-            if match_pattern(pat, host) {
+            if network_pattern(pat, host) {
                 if self.gated("network", "network", host, ctx) {
                     return (Decision::Allow, Some(format!("allow-list:{pat}")));
                 }
@@ -277,105 +316,140 @@ pub fn match_pattern(pattern: &str, value: &str) -> bool {
     if pattern == "*" || pattern == "**" {
         return true;
     }
-    // ใช้ความหมายแบบ `glob` crate กับทั้งสตริง ถ้าไม่ได้ผลค่อยถอยมา
-    // เช็กแบบ substring/prefix สำหรับ scope สไตล์ workspace
-    if pattern.contains('*') {
-        if let Ok(pat) = glob::Pattern::new(pattern) {
-            if pat.matches(value) {
-                return true;
-            }
-        }
-        // `**/x` match ส่วน `x` ที่อยู่ตรงไหนก็ได้ด้วย
-        let stripped: String = pattern
-            .trim_start_matches("**/")
-            .trim_start_matches("*/")
-            .to_string();
-        let stripped = stripped.trim_end_matches("/**").trim_end_matches("/*");
-        let needle = stripped.trim_matches('*');
-        if !needle.is_empty() && value.contains(needle) {
-            return true;
-        }
-        return false;
+    if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+        return glob::Pattern::new(pattern)
+            .map(|p| p.matches(value))
+            .unwrap_or(false);
     }
-    // path ธรรมดา: ต้องตรงกันพอดีหรือเป็น prefix แบบไดเรกทอรี
-    if value == pattern {
-        return true;
-    }
-    value.starts_with(&format!("{}/", pattern.trim_end_matches('/')))
+    value == pattern || value.starts_with(&format!("{}/", pattern.trim_end_matches('/')))
 }
 
-fn is_blocked_network(host: &str) -> bool {
-    let h = host.to_lowercase();
-    h == "127.0.0.1"
-        || h == "::1"
-        || h == "localhost"
-        || h == "169.254.169.254"
-        || h.starts_with("10.")
-        || h.starts_with("192.168.")
-        || h.starts_with("169.254.")
-        || h.starts_with("100.64.")
-        || h.starts_with("172.16.")
-        || h.starts_with("172.17.")
-        || h.starts_with("172.18.")
-        || (h.starts_with("172.")
-            && h.split('.')
-                .nth(1)
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(|n| (16..=31).contains(&n))
-                .unwrap_or(false))
+/// ตรวจ IP จริง รวม IPv4-mapped IPv6 และ loopback ทั้งช่วง
+pub fn is_public_address(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_multicast()
+                || ip.is_documentation()
+                || a == 0
+                || a >= 240
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 198 && (b == 18 || b == 19)))
+        }
+        IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return is_public_address(IpAddr::V4(v4));
+            }
+            let a = ip.segments()[0];
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || a & 0xfe00 == 0xfc00
+                || a & 0xffc0 == 0xfe80
+                || (a == 0x2001 && ip.segments()[1] == 0x0db8))
+        }
+    }
+}
+
+fn network_host(target: &str) -> &str {
+    if let Some(rest) = target.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    if target.parse::<std::net::IpAddr>().is_ok() {
+        return target;
+    }
+    target
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(target)
+}
+fn is_blocked_network(target: &str) -> bool {
+    let host = network_host(target);
+    host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| !is_public_address(ip))
+            .unwrap_or(false)
+}
+fn network_pattern(pattern: &str, target: &str) -> bool {
+    if pattern.contains(':') {
+        return match_pattern(pattern, target);
+    }
+    let host = network_host(target);
+    // scope แบบ hostname ไม่ระบุ port หมายถึง HTTPS default port เท่านั้น
+    if host != target && !target.ends_with(":443") {
+        return false;
+    }
+    match_pattern(pattern, host)
 }
 
 fn rule_matches(rule: &Rule, ctx: &EvalContext) -> bool {
     match &rule.when {
         None => true,
-        Some(w) => eval_when(w, ctx),
+        Some(w) => eval_when(w, ctx).unwrap_or(false),
     }
 }
 
 /// ตัวประเมิน `&&` อย่างง่ายสำหรับ MVP (อนาคตใช้ CEL เต็ม)
-fn eval_when(when: &str, ctx: &EvalContext) -> bool {
+fn eval_when(when: &str, ctx: &EvalContext) -> Result<bool, String> {
+    let mut matches = true;
     for clause in when.split("&&") {
-        let c = clause.trim();
-        if c.is_empty() {
-            continue;
-        }
-        if !eval_clause(c, ctx) {
-            return false;
-        }
+        matches &= eval_clause(clause.trim(), ctx)?;
     }
-    true
+    Ok(matches)
 }
-
-fn eval_clause(c: &str, ctx: &EvalContext) -> bool {
-    // state == 'VALIDATE'
+fn eval_clause(c: &str, ctx: &EvalContext) -> Result<bool, String> {
+    let bad = || format!("invalid policy predicate: {c}");
+    let state = |text: &str| -> Result<String, String> {
+        let t = text.trim();
+        if t.len() < 2
+            || !(t.starts_with('\'') && t.ends_with('\'') || t.starts_with('"') && t.ends_with('"'))
+        {
+            return Err(bad());
+        }
+        let value = &t[1..t.len() - 1];
+        if !matches!(value, "INIT" | "ANALYZE" | "MODIFY" | "VALIDATE" | "DEPLOY") {
+            return Err(bad());
+        }
+        Ok(value.into())
+    };
     if let Some(rest) = c.strip_prefix("state ==") {
-        let want = rest.trim().trim_matches('\'').trim_matches('"');
-        return ctx.state == want;
+        return Ok(ctx.state == state(rest)?);
     }
-    // state in {'MODIFY', 'VALIDATE'}
     if let Some(rest) = c.strip_prefix("state in") {
-        let rest = rest.trim().trim_start_matches('{').trim_end_matches('}');
+        let rest = rest
+            .trim()
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .ok_or_else(bad)?;
+        let mut matched = false;
         for item in rest.split(',') {
-            let want = item.trim().trim_matches('\'').trim_matches('"');
-            if ctx.state == want {
-                return true;
-            }
+            matched |= ctx.state == state(item)?;
         }
-        return false;
+        return Ok(matched);
     }
-    // confidence >= 0.8
     if let Some(rest) = c.strip_prefix("confidence >=") {
-        if let Ok(v) = rest.trim().parse::<f64>() {
-            return ctx.confidence >= v;
+        let value = rest.trim().parse::<f64>().map_err(|_| bad())?;
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(bad());
         }
-        return false; // fail-closed: parse ไม่ได้คือไม่ผ่าน
+        return Ok(ctx.confidence.is_finite() && ctx.confidence >= value);
     }
     if let Some(rest) = c.strip_prefix("tests_passed ==") {
-        let want = rest.trim() == "true";
-        return ctx.tests_passed == want;
+        return match rest.trim() {
+            "true" => Ok(ctx.tests_passed),
+            "false" => Ok(!ctx.tests_passed),
+            _ => Err(bad()),
+        };
     }
-    // predicate ที่ไม่รู้จัก = fail-closed (rule นี้ไม่ match)
-    false
+    Err(bad())
 }
 
 /// Policy Document ที่มี metadata สำหรับ versioning
@@ -647,29 +721,22 @@ impl PolicyEvaluator {
         };
         let policy_version = self.manager.active.get("default").copied().unwrap_or(0);
 
-        // 3. ตรวจสอบ Capability (fail-closed)
-        if caps.authorize(req.action, req.resource, req.scope).is_err() {
-            return (Decision::Deny, "no-capability".into(), policy_version);
-        }
-
-        // 4. ตรวจสอบ Constraints (max_bytes, max_calls, network constraints)
-        // หา capability ที่ใช้อยู่
-        if let Ok(idx) = caps.authorize(req.action, req.resource, req.scope) {
-            if let Some(cap) = caps.caps.get(idx) {
-                if let Err(e) = cap.check_constraints(
-                    req.request_bytes,
-                    None,
-                    req.protocol,
-                    req.port,
-                    req.response_bytes,
-                ) {
-                    return (
-                        Decision::Deny,
-                        format!("constraint-violation: {e}"),
-                        policy_version,
-                    );
-                }
-            }
+        let context = aivm_capability::AuthorizationContext {
+            request_bytes: req.request_bytes,
+            protocol: req.protocol,
+            port: req.port,
+            response_bytes: req.response_bytes,
+            timeout_ms: None,
+        };
+        if caps
+            .authorize_with_context(req.action, req.resource, req.scope, &context)
+            .is_err()
+        {
+            return (
+                Decision::Deny,
+                "no-capability-or-constraint".into(),
+                policy_version,
+            );
         }
 
         // 5. ตรวจสอบ Policy (fail-closed)
@@ -1070,5 +1137,54 @@ system:
         let result = mgr.set_active("test", 999);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn malformed_deny_rules_fail_closed_even_with_allow_list() {
+        let mut policy = Policy::default();
+        policy.filesystem.read = vec!["/workspace".into()];
+        policy.rules.push(Rule {
+            id: "broken".into(),
+            action: "read".into(),
+            resource: "filesystem".into(),
+            scope: "/workspace/**".into(),
+            when: Some("unknown == true".into()),
+            effect: Some("deny".into()),
+        });
+        assert_eq!(
+            policy
+                .evaluate_fs("read", "/workspace/a", &EvalContext::default())
+                .0,
+            Decision::Deny
+        );
+        assert!(Policy::from_yaml(&serde_yaml::to_string(&policy).unwrap()).is_err());
+    }
+
+    #[test]
+    fn wildcard_domains_are_anchored_and_private_ips_include_ports() {
+        let mut policy = Policy {
+            require_test_before_network: false,
+            ..Default::default()
+        };
+        policy.network.allow = vec!["*.example.com".into(), "127.0.0.2:443".into()];
+        let ctx = EvalContext::default();
+        assert_eq!(
+            policy.evaluate_network("api.example.com:443", &ctx).0,
+            Decision::Allow
+        );
+        assert_eq!(
+            policy
+                .evaluate_network("api.example.com.attacker.test:443", &ctx)
+                .0,
+            Decision::Deny
+        );
+        for target in [
+            "127.0.0.2:443",
+            "127.0.0.1:443",
+            "[::1]:443",
+            "[::ffff:127.0.0.1]:443",
+        ] {
+            assert_eq!(policy.evaluate_network(target, &ctx).0, Decision::Deny);
+        }
     }
 }

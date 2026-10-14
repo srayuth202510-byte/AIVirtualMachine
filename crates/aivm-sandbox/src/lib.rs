@@ -18,6 +18,8 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use thiserror::Error;
+#[cfg(target_os = "linux")]
+mod landlock;
 
 /// MicroVM backend (Phase 7) — เปิดด้วยฟีเจอร์ `microvm` เท่านั้น
 /// ตอนนี้เป็น skeleton (ประตู fail-closed ยังไม่มีการ boot จริง) เพื่อให้
@@ -41,6 +43,13 @@ pub struct ResourceLimits {
     pub cpu: u32,
     pub memory_mb: u64,
     pub pids_max: u64,
+    /// จำกัดขนาดไฟล์และการเขียน workspace (MiB)
+    #[serde(default = "default_storage_mb")]
+    pub storage_mb: u64,
+}
+
+fn default_storage_mb() -> u64 {
+    5 * 1024
 }
 
 impl Default for ResourceLimits {
@@ -49,6 +58,7 @@ impl Default for ResourceLimits {
             cpu: 2,
             memory_mb: 1024,
             pids_max: 64,
+            storage_mb: default_storage_mb(),
         }
     }
 }
@@ -115,6 +125,14 @@ pub struct ExecSpec {
     /// env เพิ่มเติมที่อนุญาต (กฎคีย์ดูใน validate: สะอาด + ไม่ใช่ตัวอันตราย)
     pub env_extra: Vec<(String, String)>,
     pub limits: ResourceLimits,
+    /// เส้นตายจริง (ms) นอกเหนือ CPU rlimit
+    pub timeout_ms: u64,
+}
+
+impl ExecSpec {
+    fn timeout_ms(&self) -> u64 {
+        self.timeout_ms.clamp(1, 120000)
+    }
 }
 
 /// ผลการรัน: รวมสิ่งที่บังคับใช้จริง + สิ่งที่ลดระดับ (audit ได้ทั้งหมด)
@@ -176,6 +194,21 @@ const SANDBOX_PATH: &str = "/usr/bin:/bin";
 /// syscall อันตรายชั้นนี้คือแนวป้องกันที่ใช้ได้จริง (ดู Docker/systemd default profile)
 #[cfg(target_os = "linux")]
 const DANGEROUS_SYSCALLS: &[libc::c_long] = &[
+    // process ที่ไม่ไว้วางใจห้ามส่งสัญญาณไปยัง host processes
+    libc::SYS_kill,
+    libc::SYS_tkill,
+    libc::SYS_tgkill,
+    libc::SYS_pidfd_open,
+    libc::SYS_pidfd_send_signal,
+    libc::SYS_setpgid,
+    libc::SYS_setsid,
+    libc::SYS_socket,
+    libc::SYS_socketpair,
+    libc::SYS_connect,
+    libc::SYS_bind,
+    libc::SYS_listen,
+    libc::SYS_accept,
+    libc::SYS_accept4,
     libc::SYS_ptrace,
     libc::SYS_mount,
     libc::SYS_umount2,
@@ -280,6 +313,16 @@ unsafe fn build_dangerous_filter() -> Vec<libc::sock_filter> {
         },
     ];
 
+    // x32 ใช้ audit arch เดียวกับ x86_64 แต่ syscall number มี bit 30
+    // ปฏิเสธ ABI นี้เพื่อไม่ให้ใช้ syscall ที่หลุดจาก denylist
+    filter.push(libc::sock_filter {
+        code: 0x35,
+        jt: 0,
+        jf: 1,
+        k: 0x40000000,
+    });
+    filter.push(ret(0x00000000));
+
     // เทียบ denylist: "ตรง" -> กระโดดไป ret KILL (jt = offset จาก i+1)
     // "ไม่ตรง" -> เทียบตัวถัดไป; ตัวสุดท้ายไม่ตรง -> ไหลไป ret ALLOW
     for (i, &nr) in DANGEROUS_SYSCALLS.iter().enumerate() {
@@ -293,8 +336,7 @@ unsafe fn build_dangerous_filter() -> Vec<libc::sock_filter> {
 
 /// ติดตั้ง seccomp filter ใน process ปัจจุบัน (ทำใน child หลัง fork)
 #[cfg(target_os = "linux")]
-unsafe fn install_dangerous_filter() -> std::io::Result<()> {
-    let filter = build_dangerous_filter();
+unsafe fn install_dangerous_filter(filter: &[libc::sock_filter]) -> std::io::Result<()> {
     let prog = libc::sock_fprog {
         len: filter.len() as u16,
         filter: filter.as_ptr() as *mut libc::sock_filter,
@@ -337,6 +379,16 @@ fn interpreter_basename(name: &str) -> bool {
 /// (ไม่แยก logic กัน กัน TOCTOU เชิงนโยบาย)
 pub fn validate(spec: &ExecSpec, policy: &Policy) -> Result<PathBuf, SandboxError> {
     let bad = |m: &str| SandboxError::Invalid(m.to_string());
+    if !(1..=120000).contains(&spec.timeout_ms) {
+        return Err(bad("exec timeout out of range"));
+    }
+    if spec.limits.cpu == 0
+        || spec.limits.memory_mb == 0
+        || spec.limits.storage_mb == 0
+        || spec.limits.pids_max == 0
+    {
+        return Err(bad("resource quotas must be positive"));
+    }
     // 1. exe ต้อง absolute + มีอยู่จริง + เป็นไฟล์รันได้
     if !spec.exe.is_absolute() {
         return Err(bad("exe must be an absolute path"));
@@ -670,7 +722,7 @@ fn format_id_map(id: u32, buf: &mut [u8; 32]) -> usize {
 /// ใน ns ใหม่ (ต้องเขียน setgroups=deny ก่อน gid_map) จากนั้นสร้าง PID
 /// namespace — ทำได้เพราะมี CAP_SYS_ADMIN ใน userns ที่เพิ่งสร้าง
 #[cfg(target_os = "linux")]
-unsafe fn enter_user_then_pid_ns() -> std::io::Result<()> {
+unsafe fn enter_user_ns() -> std::io::Result<()> {
     // ต้องอ่าน uid/gid *ก่อน* unshare: หลังเข้า userns แล้ว getuid() จะเห็นค่า
     // overflow (65534) เพราะยังไม่มี mapping — เคอร์เนลเทียบกับ kuid ตัวจริง
     // (ผู้เขียนต้อง map uid ของตัวเองได้)
@@ -686,9 +738,6 @@ unsafe fn enter_user_then_pid_ns() -> std::io::Result<()> {
     write_bytes(c"/proc/self/uid_map".as_ptr(), &buf[..n])?;
     let n = format_id_map(gid, &mut buf);
     write_bytes(c"/proc/self/gid_map".as_ptr(), &buf[..n])?;
-    if libc::unshare(libc::CLONE_NEWPID) != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
     Ok(())
 }
 
@@ -762,52 +811,6 @@ unsafe fn enter_mount_and_net_ns() -> std::io::Result<()> {
     Ok(())
 }
 
-/// remount /proc ใน PID namespace ใหม่ (ทำใน child หลัง fork)
-#[cfg(target_os = "linux")]
-unsafe fn remount_proc() -> std::io::Result<()> {
-    if libc::mount(
-        c"proc".as_ptr(),
-        c"/proc".as_ptr(),
-        c"proc".as_ptr(),
-        0,
-        std::ptr::null(),
-    ) != 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// สถานะความพร้อมของ namespace + seccomp + mount + net
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, Default)]
-struct IsolationStatus {
-    userns: bool,
-    pidns: bool,
-    mountns: bool,
-    netns: bool,
-    seccomp: bool,
-    capdrop: bool,
-}
-
-/// เครื่องนี้รองรับ namespace + isolation แบบใด (probe แล้ว cache)
-#[cfg(target_os = "linux")]
-fn probe_isolation() -> IsolationStatus {
-    static SUPPORTED: std::sync::OnceLock<IsolationStatus> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        let pr = probe();
-        // mount/net ns ทำได้ถ้า userns ทำได้ (เพราะต้องมี CAP_SYS_ADMIN)
-        IsolationStatus {
-            userns: pr.userns,
-            pidns: pr.pid_namespace,
-            mountns: pr.userns,
-            netns: pr.userns,
-            seccomp: pr.seccomp_install,
-            capdrop: pr.userns,
-        }
-    })
-}
-
 /// รันโปรแกรมตามสเปกที่ผ่านประตูแล้ว พร้อม hardening ใน pre_exec
 /// (Linux เท่านั้น ที่อื่นปฏิเสธแบบ fail-closed)
 pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, SandboxError> {
@@ -821,7 +824,55 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
     };
     let mem_bytes = spec.limits.memory_mb.saturating_mul(1024 * 1024);
     let nproc = spec.limits.pids_max;
+    let storage_bytes = spec.limits.storage_mb.saturating_mul(1024 * 1024);
     let env_extra = spec.env_extra.clone();
+    #[cfg(target_os = "linux")]
+    let (filesystem_rules, filesystem_fsize_limit) = {
+        let mut filesystem_policy = policy.clone();
+        if !env_extra.is_empty() {
+            filesystem_policy.filesystem.write.clear();
+        }
+        landlock::prepare(&ws, &canon, &filesystem_policy, storage_bytes)?
+    };
+    #[cfg(target_os = "linux")]
+    let dangerous_filter = unsafe { build_dangerous_filter() };
+    #[cfg(target_os = "linux")]
+    let cpu_mask = unsafe {
+        let mut available: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut available) != 0 {
+            return Err(SandboxError::Spawn(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        let mut selected: libc::cpu_set_t = std::mem::zeroed();
+        let mut count = 0;
+        for cpu in 0..libc::CPU_SETSIZE as usize {
+            if libc::CPU_ISSET(cpu, &available) && count < spec.limits.cpu {
+                libc::CPU_SET(cpu, &mut selected);
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return Err(SandboxError::Invalid("CPU quota must be positive".into()));
+        }
+        selected
+    };
+    #[cfg(target_os = "linux")]
+    let (mut isolation_reader, isolation_writer) = {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(SandboxError::Spawn(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        }
+    };
 
     let mut cmd = Command::new(&canon);
     cmd.args(&spec.args)
@@ -841,6 +892,12 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
         // ห้าม allocate/panic (panic ตรงนี้คือ abort) ทุกขั้นล้มคือ
         // child ตายก่อน exec = fail-closed
         cmd.pre_exec(move || {
+            if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpu_mask) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             // 1. no-new-privs: ปิดช่องอัปสิทธิ์ผ่าน setuid/exec
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
@@ -860,62 +917,39 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
                 return Err(std::io::Error::last_os_error());
             }
 
-            // 3. user + PID namespace แล้ว fork ให้ลูกเป็น PID 1 ใน ns ใหม่
-            //    (unshare(CLONE_NEWPID) มีผลกับลูกที่ fork ทีหลังเท่านั้น)
-            //    best-effort: เครื่องไหนไม่รองรับก็รันต่อแบบ degraded — gateway
-            //    ยังเป็นประตูหลัก (รายงานผลจริงผ่าน applied/degraded)
-            if enter_user_then_pid_ns().is_ok() {
-                // ลด capabilities ทั้งหมด (defense in depth)
-                let _ = drop_capabilities();
-
-                // mount + network namespace (ทำหลัง userns จึงมี CAP_SYS_ADMIN)
-                let _ = enter_mount_and_net_ns();
-
-                let pid = libc::fork();
-                if pid < 0 {
-                    return Err(std::io::Error::last_os_error());
+            // ไม่ fork ใน pre_exec: mediator จะถือ exec-error pipe ทำให้ spawn ค้าง
+            // PID namespace จึงรายงาน degraded; Landlock/seccomp ยังบังคับเสมอ
+            let mut isolation = 0u8;
+            if enter_user_ns().is_ok() {
+                isolation |= 1;
+                if enter_mount_and_net_ns().is_ok() {
+                    isolation |= 4 | 8;
                 }
-                if pid > 0 {
-                    // ตัวกลาง: รอลูกแล้วออกด้วยสถานะเดียวกัน (ไม่ exec)
-                    let mut status: libc::c_int = 0;
-                    while libc::waitpid(pid, &mut status, 0) < 0 {
-                        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                            break;
-                        }
-                    }
-                    let code = if libc::WIFEXITED(status) {
-                        libc::WEXITSTATUS(status)
-                    } else if libc::WIFSIGNALED(status) {
-                        128 + libc::WTERMSIG(status)
-                    } else {
-                        1
-                    };
-                    libc::_exit(code);
-                }
-                // ลูกเดินต่อ: ตอนนี้เป็น PID 1 ใน ns ใหม่
-                // pdeathsig ถูกล้างตอน fork ต้องตั้งใหม่ให้ชี้ไปตัวกลาง:
-                // ตัวกลางตาย (เช่น parent หลักตายแล้วตัวกลางโดน SIGKILL) หลานตายตาม
-                // กัน race ที่ตัวกลางตายก่อนตั้ง: ถ้า ppid กลายเป็น 1 (init host)
-                // แสดงว่ากำพร้าแล้ว ให้ตายทันทีแบบ fail-closed
-                let _ = libc::prctl(
-                    libc::PR_SET_PDEATHSIG,
-                    libc::SIGKILL as libc::c_ulong,
-                    0,
-                    0,
-                    0,
-                );
-                if libc::getppid() == 1 {
-                    libc::_exit(1);
+                if drop_capabilities().is_ok() {
+                    isolation |= 16;
                 }
             }
-
-            // 4. remount /proc ใน PID namespace ใหม่ (ต้องทำก่อน seccomp
-            //    เพราะ mount อยู่ใน denylist)
-            let _ = remount_proc();
-
+            // Landlock ตกทอดถึงลูกทุกตัว; ไม่รองรับหรือ restrict ไม่สำเร็จ = DENY
+            if libc::syscall(
+                libc::SYS_landlock_restrict_self,
+                std::os::fd::AsRawFd::as_raw_fd(&filesystem_rules),
+                0,
+            ) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
             // 5. seccomp denylist: default-allow + KILL syscall อันตราย
             //    (ติดหลัง remount /proc เพราะ mount ถูก KILL)
-            let _ = install_dangerous_filter();
+            install_dangerous_filter(&dangerous_filter)?;
+            isolation |= 32;
+            if libc::write(
+                std::os::fd::AsRawFd::as_raw_fd(&isolation_writer),
+                &isolation as *const u8 as *const libc::c_void,
+                1,
+            ) != 1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
 
             // 6. rlimits: เพดานทรัพยากรที่ลดได้อย่างเดียว (unprivileged ทำได้)
             //    ตั้งหลัง fork เพื่อไม่ให้ RLIMIT_NPROC ไปบล็อก fork ภายใน
@@ -933,7 +967,7 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
             cap(libc::RLIMIT_CPU, SANDBOX_CPU_SECS as libc::rlim_t)?;
             cap(
                 libc::RLIMIT_FSIZE,
-                (SANDBOX_FS_MB * 1024 * 1024) as libc::rlim_t,
+                filesystem_fsize_limit.min(SANDBOX_FS_MB * 1024 * 1024) as libc::rlim_t,
             )?;
             cap(libc::RLIMIT_NPROC, nproc as libc::rlim_t)?;
             Ok(())
@@ -947,26 +981,94 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
         ));
     }
 
-    #[cfg(target_os = "linux")]
-    let _iso = probe_isolation();
-
     // ตรวจ exe ซ้ำก่อน spawn (บีบ TOCTOU: validate ครั้งแรกอาจถูกสลับไฟล์คั่นกลาง)
     revalidate_exe(&canon, policy)?;
 
     let mut child = cmd
         .spawn()
         .map_err(|e| SandboxError::Spawn(e.to_string()))?;
-    // อ่าน output แบบมีเพดานกันหน่วยความจำบวม
-    let mut out = String::new();
-    if let Some(h) = child.stdout.take() {
-        let _ = h.take(MAX_OUTPUT + 1).read_to_string(&mut out);
+    #[cfg(target_os = "linux")]
+    let isolation = {
+        let mut value = [0u8];
+        isolation_reader
+            .read_exact(&mut value)
+            .map_err(|e| SandboxError::Spawn(e.to_string()))?;
+        value[0]
+    };
+    // drain pipe สองเส้นพร้อมกันและมี wall-clock deadline
+    fn drain<R: Read + Send + 'static>(
+        mut pipe: R,
+    ) -> std::thread::JoinHandle<std::io::Result<(String, bool)>> {
+        std::thread::spawn(move || {
+            let mut saved = Vec::new();
+            let mut buffer = [0u8; 8192];
+            let mut truncated = false;
+            loop {
+                let n = pipe.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                let keep = n.min((MAX_OUTPUT as usize).saturating_sub(saved.len()));
+                saved.extend_from_slice(&buffer[..keep]);
+                truncated |= keep < n;
+            }
+            Ok((String::from_utf8_lossy(&saved).into_owned(), truncated))
+        })
     }
-    let mut err_s = String::new();
-    if let Some(h) = child.stderr.take() {
-        let _ = h.take(MAX_OUTPUT + 1).read_to_string(&mut err_s);
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| SandboxError::Spawn("stdout pipe missing".into()))?,
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .ok_or_else(|| SandboxError::Spawn("stderr pipe missing".into()))?,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(spec.timeout_ms());
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Ok(None) => {
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout.join();
+                let _ = stderr.join();
+                return Err(SandboxError::Spawn("process wall-clock timeout".into()));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SandboxError::Spawn(error.to_string()));
+            }
+        }
+    };
+    // ลูกที่ fork แล้วถือ pipe ค้างต้องตายด้วย แม้ process หลักจบก่อน
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
+    let output = |handle: std::thread::JoinHandle<std::io::Result<(String, bool)>>| {
+        handle
+            .join()
+            .map_err(|_| SandboxError::Spawn("output reader panicked".into()))?
+            .map_err(|e| SandboxError::Spawn(e.to_string()))
+    };
+    let (out, out_truncated) = output(stdout)?;
+    let (err_s, err_truncated) = output(stderr)?;
     #[allow(unused_mut)]
     let mut applied: Vec<String> = vec![
+        "cpu-affinity".into(),
+        "landlock-filesystem".into(),
+        "process-group-cleanup".into(),
+        "wall-clock-deadline".into(),
         "exe-allowlist".into(),
         "arg-schema".into(),
         "env-scrub".into(),
@@ -976,7 +1078,10 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
         "pdeathsig-sigkill".into(),
         format!("rlimit-as={mem_bytes}"),
         format!("rlimit-cpu={SANDBOX_CPU_SECS}s"),
-        format!("rlimit-fsize={SANDBOX_FS_MB}MiB"),
+        format!(
+            "rlimit-fsize={}bytes",
+            filesystem_fsize_limit.min(SANDBOX_FS_MB * 1024 * 1024)
+        ),
         format!("rlimit-nproc={nproc}"),
     ];
     #[allow(unused_mut)]
@@ -984,46 +1089,25 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
     // รายงานตามความจริงของเครื่องนี้ (สเปก §12.1.1): กลไกที่ใช้ไม่ได้ต้องดัง
     #[cfg(target_os = "linux")]
     {
-        let iso = probe_isolation();
-        if iso.userns && iso.pidns {
-            applied.push("user-namespace".into());
-            applied.push("pid-namespace".into());
-        } else {
-            degraded.push("user-namespace: unavailable".into());
-            degraded.push("pid-namespace: unavailable (needs unprivileged userns)".into());
-        }
-        if iso.mountns {
-            applied.push("mount-namespace".into());
-        } else {
-            degraded.push("mount-namespace: not applied".into());
-        }
-        if iso.netns {
-            applied.push("network-namespace".into());
-        } else {
-            degraded.push("network-namespace: not applied".into());
-        }
-        // capability-drop: รองรับถ้า userns รองรับ (capset ทำได้ใน userns)
-        if iso.capdrop {
-            applied.push("capability-drop".into());
-        } else {
-            degraded.push("capability-drop: not applied".into());
-        }
-        // seccomp denylist: รองรับถ้า probe ยืนยันว่า seccomp(2) ใช้ได้
-        if iso.seccomp {
-            applied.push("seccomp-filter".into());
-        } else {
-            degraded.push("seccomp-filter: not installed".into());
+        for (bit, label) in [
+            (1, "user-namespace"),
+            (2, "pid-namespace"),
+            (4, "mount-namespace"),
+            (8, "network-namespace"),
+            (16, "capability-drop"),
+            (32, "seccomp-filter"),
+        ] {
+            if isolation & bit != 0 {
+                applied.push(label.into());
+            } else {
+                degraded.push(format!("{label}: not applied"));
+            }
         }
     }
-    if out.len() as u64 > MAX_OUTPUT || err_s.len() as u64 > MAX_OUTPUT {
-        out.truncate(MAX_OUTPUT as usize);
-        err_s.truncate(MAX_OUTPUT as usize);
-        degraded.push("output-truncated@1MiB".to_string());
+    if out_truncated || err_truncated {
+        degraded.push("output-truncated@1MiB".into());
     }
-    let code = child
-        .wait()
-        .map_err(|e| SandboxError::Spawn(e.to_string()))?
-        .code();
+    let code = status.code();
     Ok(ExecOutcome {
         exe: canon.to_string_lossy().to_string(),
         argv: spec.args.clone(),
@@ -1117,7 +1201,13 @@ fn probe_userns() -> std::io::Result<()> {
 fn probe_pid_namespace() -> std::io::Result<()> {
     // SAFETY: syscall ล้วน (userns + uid/gid map + pidns) ไม่ allocate
     // ใช้ลำดับเดียวกับ run_checked จริง เพื่อ probe ให้ตรงกับที่ใช้จริง
-    unsafe { enter_user_then_pid_ns() }
+    unsafe {
+        enter_user_ns()?;
+        if libc::unshare(libc::CLONE_NEWPID) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 fn probe_seccomp() -> std::io::Result<()> {
@@ -1206,6 +1296,7 @@ mod tests {
             cwd: ws.to_path_buf(),
             workspace: ws.to_path_buf(),
             env_extra: vec![],
+            timeout_ms: 30000,
             limits: ResourceLimits::default(),
         }
     }
@@ -1342,6 +1433,13 @@ mod tests {
                         ins.jf as usize
                     };
                 }
+                0x35 => {
+                    pc += 1 + if a >= ins.k {
+                        ins.jt as usize
+                    } else {
+                        ins.jf as usize
+                    };
+                }
                 0x06 => return ins.k,
                 other => panic!("unexpected BPF insn 0x{other:x}"),
             }
@@ -1378,7 +1476,7 @@ mod tests {
         let f = unsafe { build_dangerous_filter() };
         assert_eq!(
             bpf_verdict(&f, 0xc000003e, libc::SYS_socket as u32),
-            0x7fff0000
+            0x00000000
         );
         assert_eq!(
             bpf_verdict(&f, 0xc000003e, libc::SYS_reboot as u32),
@@ -1423,9 +1521,11 @@ mod tests {
         .unwrap();
         assert!(out.success());
         // ถ้า userns รองรับ -> mount + net ns ต้อง applied ด้วย
-        if out.applied.iter().any(|a| a == "user-namespace") {
-            assert!(out.applied.iter().any(|a| a == "mount-namespace"));
-            assert!(out.applied.iter().any(|a| a == "network-namespace"));
+        for label in ["mount-namespace", "network-namespace"] {
+            assert_ne!(
+                out.applied.iter().any(|s| s == label),
+                out.degraded.iter().any(|s| s.starts_with(label))
+            );
         }
         let _ = std::fs::remove_dir_all(&ws);
     }
@@ -1595,5 +1695,67 @@ mod tests {
         assert!(run_checked_with_level_and_cfg(&s, &pol, SandboxLevel::Process, &cfg).is_ok());
         assert!(run_checked_with_level_and_cfg(&s, &pol, SandboxLevel::MicroVm, &cfg).is_err());
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn process_cannot_read_host_or_policy_denied_files() {
+        let ws = test_ws("landlock");
+        let outside = test_ws("landlock-outside").join("private.txt");
+        std::fs::write(&outside, "HOST-PRIVATE").unwrap();
+        std::fs::write(ws.join("allowed.txt"), "ALLOWED").unwrap();
+        std::fs::write(ws.join("private.txt"), "DENIED").unwrap();
+        let exe = std::fs::canonicalize("/bin/cat").unwrap();
+        let mut policy = test_policy(&[&exe.to_string_lossy()]);
+        policy.filesystem.read = vec![ws.display().to_string()];
+        policy.filesystem.deny = vec![ws.join("private.txt").display().to_string()];
+        for path in [&outside, &ws.join("private.txt"), &ws.join("allowed.txt")] {
+            let mut job = spec("/bin/cat", &ws);
+            job.args = vec![path.display().to_string()];
+            let out = run_checked(&job, &policy).unwrap();
+            assert!(!out.stdout.contains("HOST-PRIVATE"));
+            assert!(!out.stdout.contains("DENIED"));
+            if path.ends_with("allowed.txt") {
+                assert!(out.stdout.contains("ALLOWED"));
+            } else {
+                assert!(!out.success());
+            }
+        }
+        let _ = std::fs::remove_dir_all(ws);
+        let _ = std::fs::remove_dir_all(outside.parent().unwrap());
+    }
+
+    #[test]
+    fn stderr_flood_does_not_deadlock_and_sleep_has_deadline() {
+        let ws = test_ws("pipes");
+        let cat = std::fs::canonicalize("/bin/cat").unwrap();
+        let mut job = spec("/bin/cat", &ws);
+        job.args = vec![format!("/missing-{}", "x".repeat(900)); MAX_ARGS];
+        job.timeout_ms = 3000;
+        let out = run_checked(&job, &test_policy(&[&cat.to_string_lossy()])).unwrap();
+        assert!(!out.success());
+        assert!(out.stderr.len() > 8192);
+        let sleep = std::fs::canonicalize("/bin/sleep").unwrap();
+        let mut job = spec("/bin/sleep", &ws);
+        job.args = vec!["10".into()];
+        job.timeout_ms = 50;
+        let start = std::time::Instant::now();
+        assert!(matches!(
+            run_checked(&job, &test_policy(&[&sleep.to_string_lossy()])),
+            Err(SandboxError::Spawn(_))
+        ));
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        let _ = std::fs::remove_dir_all(ws);
+    }
+    #[test]
+    fn x32_syscalls_cannot_bypass_seccomp() {
+        let filter = unsafe { build_dangerous_filter() };
+        assert_eq!(
+            bpf_verdict(&filter, 0xc000003e, 0x40000000 | libc::SYS_socket as u32),
+            0
+        );
+        assert_eq!(
+            bpf_verdict(&filter, 0xc000003e, 0x40000000 | libc::SYS_read as u32),
+            0
+        );
     }
 }

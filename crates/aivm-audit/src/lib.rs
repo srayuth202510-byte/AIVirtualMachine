@@ -22,6 +22,8 @@ pub enum AuditError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRecord {
+    #[serde(default = "legacy_hash_version")]
+    pub hash_version: u8,
     pub seq: u64,
     pub timestamp: i64,
     pub agent: String,
@@ -44,6 +46,10 @@ pub struct AuditRecord {
     pub hash_entry: String,
 }
 
+fn legacy_hash_version() -> u8 {
+    1
+}
+
 impl AuditRecord {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -58,6 +64,7 @@ impl AuditRecord {
         policy: &str,
     ) -> Self {
         Self {
+            hash_version: 2,
             seq,
             timestamp: Utc::now().timestamp(),
             agent: agent.to_string(),
@@ -78,6 +85,27 @@ impl AuditRecord {
     }
 
     fn canonical(&self) -> String {
+        if self.hash_version == 2 {
+            return serde_json::to_string(&(
+                self.hash_version,
+                self.seq,
+                self.timestamp,
+                &self.agent,
+                &self.session_id,
+                &self.request_id,
+                &self.state,
+                &self.action,
+                &self.resource,
+                &self.decision,
+                &self.policy,
+                &self.capability,
+                &self.result,
+                &self.rule_matched,
+                &self.state_transition,
+                &self.hash_prev,
+            ))
+            .expect("string fields serialize");
+        }
         format!(
             "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.seq,
@@ -133,6 +161,9 @@ impl AuditWriter {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditError> {
         let path = path.as_ref().to_path_buf();
         // กู้ปลาย chain เดิม เพื่อให้ rotate/restart แล้วต่อเนื่องกัน
+        if path.exists() {
+            Self::verify(&path)?;
+        }
         let (seq, prev_hash) = read_tip(&path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -183,6 +214,9 @@ impl AuditWriter {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "audit".to_string());
         let archived = self.path.with_file_name(format!("{stem}.{suffix}.jsonl"));
+        if archived.exists() {
+            return Err(AuditError::Io("archive already exists".into()));
+        }
         std::fs::rename(&self.path, &archived).map_err(|e| AuditError::Io(e.to_string()))?;
         // ผนึก archive (immutable เมื่อ FS รองรับ): rotate ซ้ำด้วย suffix
         // เดิมจะล้มแบบ fail-closed แทนที่จะเขียนทับของที่ผนึกแล้ว
@@ -207,7 +241,9 @@ impl AuditWriter {
         rec.seq = self.seq;
         rec.seal(&self.prev_hash);
         let line = serde_json::to_string(&rec).map_err(|e| AuditError::Ser(e.to_string()))?;
+        use std::os::unix::fs::OpenOptionsExt;
         let mut f = OpenOptions::new()
+            .mode(0o600)
             .create(true)
             .append(true)
             .open(&self.path)
@@ -255,6 +291,9 @@ impl AuditWriter {
                         rec.seq
                     )));
                 }
+            }
+            if !matches!(rec.hash_version, 1 | 2) {
+                return Err(AuditError::Ser("unsupported audit hash version".into()));
             }
             let mut check = rec.clone();
             let claimed = rec.hash_entry.clone();
@@ -481,6 +520,47 @@ mod tests {
         test_record(&mut w, "r1");
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        clean(&dir);
+    }
+
+    #[test]
+    fn every_evidence_field_is_sealed() {
+        let dir = test_dir("evidence");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let mut writer = AuditWriter::open(&path).unwrap();
+        test_record(&mut writer, "r1");
+        clear_flags(&dir);
+        let original: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        for field in ["result", "capability", "rule_matched", "state_transition"] {
+            let mut changed = original.clone();
+            changed[field] = "FORGED".into();
+            std::fs::write(&path, serde_json::to_string(&changed).unwrap()).unwrap();
+            assert!(
+                AuditWriter::verify(&path).is_err(),
+                "unsealed field: {field}"
+            );
+            assert!(
+                AuditWriter::open(&path).is_err(),
+                "must not append to corrupt chain"
+            );
+        }
+        clean(&dir);
+    }
+
+    #[test]
+    fn rotation_never_overwrites_an_archive() {
+        let dir = test_dir("rotate-collision");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let mut writer = AuditWriter::open(&path).unwrap();
+        test_record(&mut writer, "r1");
+        let archive = writer.rotate("same").unwrap();
+        let old = std::fs::read(&archive).unwrap();
+        test_record(&mut writer, "r2");
+        assert!(writer.rotate("same").is_err());
+        assert_eq!(std::fs::read(&archive).unwrap(), old);
         clean(&dir);
     }
 }

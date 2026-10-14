@@ -948,6 +948,7 @@ mod tests {
             cpu: 2,
             memory_mb: 1024,
             pids_max: 64,
+            storage_mb: 5120,
         };
         assert_eq!(effective_guest_size(&cfg, &small), (2, 1024));
         // task quota ใหญ่กว่า: cfg ชนะ (ไม่เกิน quota ระดับ VM)
@@ -955,6 +956,7 @@ mod tests {
             cpu: 32,
             memory_mb: 1 << 20,
             pids_max: 64,
+            storage_mb: 5120,
         };
         assert_eq!(effective_guest_size(&cfg, &big), (4, 2048));
         // ค่าประหลาด (0) ถูกบีบเข้าช่วงต่ำสุด ไม่ panic
@@ -962,6 +964,7 @@ mod tests {
             cpu: 0,
             memory_mb: 0,
             pids_max: 0,
+            storage_mb: 0,
         };
         assert_eq!(effective_guest_size(&cfg, &zero), (1, 64));
     }

@@ -55,6 +55,7 @@ policy:
 # secrets:
 #   allow: ["github_token:read"]
 #   deny: ["github_token:admin"]
+#   low_risk_allow: ["github_token:read"] # operator เท่านั้นที่กำหนด Low-risk
 #   hitl_required_for: ["high"]   # low-risk ออก lease ให้เลย high ต้อง approve
 #   max_ttl_seconds: 3600         # 0 = ไม่จำกัด
 #   max_uses_allowed: 5           # 0 = ไม่จำกัด

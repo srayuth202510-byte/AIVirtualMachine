@@ -289,6 +289,7 @@ mod tests {
             cwd: ws.clone(),
             workspace: ws.clone(),
             env_extra: vec![],
+            timeout_ms: 30000,
             limits: ResourceLimits::default(),
         };
         let cfg = MicroVmConfig {
@@ -334,7 +335,7 @@ mod tests {
     // ข้ามเมื่อเครื่องไม่มี firecracker (ยังไม่ถึงขั้นตรวจ pin = Disabled)
     #[test]
     fn wrong_fc_pin_fails_closed_as_invalid() {
-        if super::super::find_firecracker().is_none() {
+        if !super::super::kvm_available() || super::super::find_firecracker().is_none() {
             eprintln!("skip: เครื่องนี้ไม่มี firecracker");
             return;
         }
@@ -446,6 +447,7 @@ mod tests {
                 cwd: ws.clone(),
                 workspace: ws.clone(),
                 env_extra: vec![],
+                timeout_ms: 30000,
                 limits: crate::ResourceLimits::default(),
             };
             let cfg = MicroVmConfig {

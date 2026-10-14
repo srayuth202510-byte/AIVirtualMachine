@@ -172,7 +172,10 @@ version = "0.1.0"
 dependencies = [
  "aivm-cube",
  "aivm-runtime",
+ "aivm-tools",
+ "libc",
  "serde",
+ "serde_json",
  "serde_yaml",
  "thiserror 1.0.69",
 ]
@@ -187,13 +190,16 @@ dependencies = [
  "aivm-policy",
  "aivm-sandbox",
  "aivm-secrets",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 1.0.69",
  "ureq",
  "url",
+ "uuid",
  "walkdir",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

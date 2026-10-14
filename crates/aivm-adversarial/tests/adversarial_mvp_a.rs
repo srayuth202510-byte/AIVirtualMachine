@@ -510,6 +510,7 @@ fn secret_harness_adv(tag: &str) -> (ToolGateway, Cube, std::path::PathBuf) {
     let (gw, cube, dir) = exec_harness(tag, std::slice::from_ref(&real), &[], true);
     let mut broker = aivm_secrets::SecretBroker::new(
         aivm_secrets::SecretPolicy {
+            low_risk_allow: vec!["*".into()],
             allow: vec!["tok:read".into()],
             deny: vec![],
             hitl_required_for: vec![aivm_secrets::RiskLevel::High],
@@ -583,6 +584,7 @@ fn secret_unknown_resource_must_deny() {
     let (gw, cube, dir2) = exec_harness("unknown2", std::slice::from_ref(&real), &[], true);
     let mut broker = aivm_secrets::SecretBroker::new(
         aivm_secrets::SecretPolicy {
+            low_risk_allow: vec!["*".into()],
             allow: vec!["ghost:read".into()],
             deny: vec![],
             hitl_required_for: vec![],
@@ -618,6 +620,7 @@ fn secret_high_risk_without_hitl_must_deny() {
     let (gw, cube, dir) = exec_harness("hitl", std::slice::from_ref(&real), &[], true);
     let mut broker = aivm_secrets::SecretBroker::new(
         aivm_secrets::SecretPolicy {
+            low_risk_allow: vec!["*".into()],
             allow: vec!["tok:write".into()],
             deny: vec![],
             hitl_required_for: vec![aivm_secrets::RiskLevel::High],

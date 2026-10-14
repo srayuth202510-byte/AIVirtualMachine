@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+libc = "0.2"
+serde_json = { workspace = true }
+aivm-tools = { path = "../aivm-tools" }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }

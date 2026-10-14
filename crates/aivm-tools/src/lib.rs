@@ -40,6 +40,7 @@ pub enum ToolError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolRequest {
     pub tool: String, // "filesystem.read" | "filesystem.write" | "code.search" | "process.exec"
     /// filesystem/search: path  |  process.exec: absolute exe path
@@ -94,6 +95,9 @@ pub struct SecretRequestBody {
 const MAX_SECRET_FIELD: usize = 256;
 /// เพดานความยาว lease id (uuid ~36 ตัวอักษร)
 const MAX_LEASE_ID: usize = 128;
+const MAX_FILE_BYTES: u64 = 1024 * 1024;
+mod secure_fs;
+pub mod state_store;
 
 pub struct ToolGateway {
     pub workspace: PathBuf,
@@ -111,6 +115,8 @@ pub struct ToolGateway {
     /// (= `None`) จะใช้ค่า default ที่ deny ตั้งแต่ artifact หาย
     #[cfg(feature = "microvm")]
     pub microvm_cfg: Option<aivm_sandbox::microvm::MicroVmConfig>,
+    pub limits: ResourceLimits,
+    pub state_path: Option<PathBuf>,
     req_counter: u64,
     deny_tracker: DenyTracker,
     /// Secret broker (G4 §26): `None` = ไม่ตั้งค่า → `secret.request` และ
@@ -221,6 +227,8 @@ impl ToolGateway {
             level: SandboxLevel::Process,
             #[cfg(feature = "microvm")]
             microvm_cfg: None,
+            limits: ResourceLimits::default(),
+            state_path: None,
             req_counter: 0,
             deny_tracker: DenyTracker::default(),
             secret_broker: None,
@@ -259,6 +267,18 @@ impl ToolGateway {
         }
     }
 
+    /// consume quota/lease ลงดิสก์ก่อน side effect ป้องกัน replay หลัง crash
+    fn checkpoint(&self, cube: &Cube) -> Result<(), ToolError> {
+        if let Some(path) = &self.state_path {
+            let text = serde_json::to_string(&serde_json::json!({
+                "cube": cube, "caps": self.caps, "leases": self.live_secret_leases()
+            }))
+            .map_err(|e| ToolError::Io(e.to_string()))?;
+            state_store::write_private(path, &text).map_err(|e| ToolError::Io(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// G1: ประตู quarantine สำหรับทุก tool method (complete mediation —
     /// เรียกตรงโดยไม่ผ่าน dispatch ก็หนีไม่พ้น) อยู่ใน quarantine = DENY
     /// พร้อม audit ของตัวเอง
@@ -276,7 +296,7 @@ impl ToolGateway {
                 "deny",
                 "quarantine-probing",
                 "error",
-            );
+            )?;
             return Err(ToolError::Denied(
                 "gateway quarantined after deny burst".into(),
             ));
@@ -358,7 +378,7 @@ impl ToolGateway {
         decision: &str,
         rule: &str,
         result: &str,
-    ) {
+    ) -> Result<(), ToolError> {
         self.req_counter += 1;
         let mut rec = AuditRecord::new(
             0,
@@ -392,14 +412,15 @@ impl ToolGateway {
                 );
                 q.rule_matched = "probing-threshold".to_string();
                 q.result = "quarantine-started".to_string();
-                if let Err(e) = self.audit.append(q) {
-                    eprintln!("[audit] append failed: {e}");
-                }
+                self.audit
+                    .append(q)
+                    .map_err(|e| ToolError::Audit(e.to_string()))?;
             }
         }
-        if let Err(e) = self.audit.append(rec) {
-            eprintln!("[audit] append failed: {e}");
-        }
+        self.audit
+            .append(rec)
+            .map_err(|e| ToolError::Audit(e.to_string()))?;
+        Ok(())
     }
 
     /// บังคับใช้ร่วมกัน: canonicalize -> capability -> policy
@@ -409,7 +430,7 @@ impl ToolGateway {
         cube: &mut Cube,
         action: &str, // read|write|search
         requested: &str,
-    ) -> Result<PathBuf, ToolError> {
+    ) -> Result<(PathBuf, usize), ToolError> {
         // I-7: แม้ deny ตั้งแต่ขั้น canonicalize ก็ต้องมี audit record
         // (complete mediation นับ denied attempts ด้วย)
         let canon = match self.canonicalize(requested) {
@@ -422,7 +443,7 @@ impl ToolGateway {
                     ToolError::Io(m) => format!("canonicalize-io:{m}"),
                     ToolError::Audit(m) => format!("audit:{m}"),
                 };
-                self.audit_decision(cube, action, requested, "deny", &label, "error");
+                self.audit_decision(cube, action, requested, "deny", &label, "error")?;
                 return Err(e);
             }
         };
@@ -431,20 +452,26 @@ impl ToolGateway {
 
         // ไฟล์ขอบเขต: ห้ามเขียนผ่าน gateway เด็ดขาด (deny เชิงโครงสร้าง)
         if action == "write" && is_boundary_path(&canon) {
-            self.audit_decision(cube, action, &scope, "deny", "boundary-write", "error");
+            self.audit_decision(cube, action, &scope, "deny", "boundary-write", "error")?;
             return Err(ToolError::Denied("boundary path is read-only".into()));
         }
 
-        // เช็ก capability (fail-closed)
-        if self.caps.authorize(action, "filesystem", &scope).is_err() {
-            // search ใช้สิทธิ์ read แทนได้ถ้าไม่มี search
-            let fallback_ok =
-                action == "search" && self.caps.authorize("read", "filesystem", &scope).is_ok();
-            if !fallback_ok {
-                self.audit_decision(cube, action, &scope, "deny", "no-capability", "error");
+        // ผูก constraints กับใบที่ consume จริง ไม่ใช้ใบอื่นที่หมดอายุ/หมดโควต้า
+        let cap_index = match self.caps.authorize(action, "filesystem", &scope) {
+            Ok(index) => index,
+            Err(_) if action == "search" => match self.caps.authorize("read", "filesystem", &scope)
+            {
+                Ok(index) => index,
+                Err(_) => {
+                    self.audit_decision(cube, action, &scope, "deny", "no-capability", "error")?;
+                    return Err(ToolError::Denied("no capability".into()));
+                }
+            },
+            Err(_) => {
+                self.audit_decision(cube, action, &scope, "deny", "no-capability", "error")?;
                 return Err(ToolError::Denied("no capability".into()));
             }
-        }
+        };
 
         // เช็ก policy (fail-closed)
         let policy_action = if action == "search" { "read" } else { action };
@@ -459,9 +486,10 @@ impl ToolGateway {
                     &scope,
                     "allow",
                     rule.as_deref().unwrap_or(""),
-                    "success",
-                );
-                Ok(canon)
+                    "authorized",
+                )?;
+                self.checkpoint(cube)?;
+                Ok((canon, cap_index))
             }
             Decision::Deny => {
                 self.audit_decision(
@@ -471,22 +499,48 @@ impl ToolGateway {
                     "deny",
                     rule.as_deref().unwrap_or("default-deny"),
                     "error",
-                );
+                )?;
                 Err(ToolError::Denied(rule.unwrap_or("default-deny".into())))
             }
         }
     }
 
+    fn check_file_size(&self, cap_index: usize, bytes: u64) -> Result<(), ToolError> {
+        if bytes > MAX_FILE_BYTES {
+            return Err(ToolError::Denied("file size limit exceeded".into()));
+        }
+        self.caps.caps[cap_index]
+            .check_constraints(Some(bytes), None, None, None, None)
+            .map_err(|_| ToolError::Denied("file size constraint exceeded".into()))
+    }
+
     pub fn read(&mut self, cube: &mut Cube, path: &str) -> Result<ToolResult, ToolError> {
         self.check_quarantine(cube, "read", path)?;
-        let canon = self.enforce(cube, "read", path)?;
-        // เปิดพร้อมเช็ก symlink: ปฏิเสธไฟล์ symlink (ใกล้เคียง O_NOFOLLOW)
-        let meta = std::fs::symlink_metadata(&canon).map_err(|e| ToolError::Io(e.to_string()))?;
-        if meta.file_type().is_symlink() {
-            self.audit_decision(cube, "read", path, "deny", "symlink-file", "error");
-            return Err(ToolError::Denied("symlink files not followed".into()));
-        }
-        let content = std::fs::read_to_string(&canon).map_err(|e| ToolError::Io(e.to_string()))?;
+        let (canon, cap_index) = self.enforce(cube, "read", path)?;
+        use std::io::Read;
+        let result = (|| {
+            let file = secure_fs::open(&self.workspace, &canon, false)?;
+            let size = file
+                .metadata()
+                .map_err(|e| ToolError::Io(e.to_string()))?
+                .len();
+            self.check_file_size(cap_index, size)?;
+            let mut content = String::new();
+            file.take(MAX_FILE_BYTES + 1)
+                .read_to_string(&mut content)
+                .map_err(|e| ToolError::Io(e.to_string()))?;
+            self.check_file_size(cap_index, content.len() as u64)?;
+            Ok::<_, ToolError>(content)
+        })();
+        self.audit_decision(
+            cube,
+            "read",
+            path,
+            if result.is_ok() { "allow" } else { "deny" },
+            "outcome",
+            if result.is_ok() { "success" } else { "error" },
+        )?;
+        let content = result?;
         Ok(ToolResult {
             ok: true,
             decision: "allow".into(),
@@ -501,17 +555,45 @@ impl ToolGateway {
         content: &str,
     ) -> Result<ToolResult, ToolError> {
         self.check_quarantine(cube, "write", path)?;
-        let canon = self.enforce(cube, "write", path)?;
-        if let Some(parent) = canon.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| ToolError::Io(e.to_string()))?;
-        }
-        // ยืนยัน containment อีกครั้งก่อนลงมือ (กัน TOCTOU) ตกก็ audit
-        let ws = normalize(&self.workspace);
-        if canon != ws && !canon.starts_with(&ws) {
-            self.audit_decision(cube, "write", path, "deny", "containment-recheck", "error");
-            return Err(ToolError::Denied("containment re-check failed".into()));
-        }
-        std::fs::write(&canon, content).map_err(|e| ToolError::Io(e.to_string()))?;
+        let (canon, cap_index) = self.enforce(cube, "write", path)?;
+        use std::io::Write;
+        let result = (|| {
+            self.check_file_size(cap_index, content.len() as u64)?;
+            let used = walkdir::WalkDir::new(&self.workspace)
+                .into_iter()
+                .try_fold(0u64, |used, entry| {
+                    let entry = entry.map_err(|e| ToolError::Io(e.to_string()))?;
+                    let meta = entry.metadata().map_err(|e| ToolError::Io(e.to_string()))?;
+                    Ok::<_, ToolError>(used.saturating_add(if meta.is_file() {
+                        meta.len()
+                    } else {
+                        0
+                    }))
+                })?;
+            let previous = std::fs::symlink_metadata(&canon)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if used
+                .saturating_sub(previous)
+                .saturating_add(content.len() as u64)
+                > self.limits.storage_mb.saturating_mul(1024 * 1024)
+            {
+                return Err(ToolError::Denied("workspace storage quota exceeded".into()));
+            }
+            secure_fs::open(&self.workspace, &canon, true).and_then(|mut file| {
+                file.write_all(content.as_bytes())
+                    .map_err(|e| ToolError::Io(e.to_string()))
+            })
+        })();
+        self.audit_decision(
+            cube,
+            "write",
+            path,
+            if result.is_ok() { "allow" } else { "deny" },
+            "outcome",
+            if result.is_ok() { "success" } else { "error" },
+        )?;
+        result?;
         Ok(ToolResult {
             ok: true,
             decision: "allow".into(),
@@ -520,37 +602,74 @@ impl ToolGateway {
     }
 
     /// `code.search`: ค้น substring ในไฟล์ workspace (ใช้ scope แบบ read)
-    pub fn search(&mut self, cube: &mut Cube, query: &str) -> Result<ToolResult, ToolError> {
-        self.check_quarantine(cube, "search", query)?;
-        let ws_str = self.workspace.to_string_lossy().to_string();
-        // บังคับ scope แบบ read บน workspace root เองก่อน
-        let _ = self.enforce(cube, "search", &ws_str)?;
-        let mut hits = vec![];
-        for entry in walkdir::WalkDir::new(&self.workspace)
+    /// อ่าน context ผ่าน gateway เท่านั้น ไม่รับ root จากผู้เรียก RAG
+    pub fn context_files(&mut self, cube: &mut Cube) -> Result<Vec<(String, String)>, ToolError> {
+        let paths: Vec<PathBuf> = walkdir::WalkDir::new(&self.workspace)
             .max_depth(8)
             .into_iter()
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .filter(|e| e.file_type().is_file())
-        {
-            let p = entry.path();
-            // ข้ามไดเรกทอรีขอบเขต
-            if is_boundary_path(p) {
+            .map(|e| e.into_path())
+            .collect();
+        let mut files = Vec::new();
+        let mut total = 0usize;
+        for path in paths {
+            let scope = path.to_string_lossy();
+            if is_boundary_path(&path)
+                || self
+                    .policy
+                    .evaluate_fs("read", &scope, &Self::ctx_of(cube))
+                    .0
+                    != Decision::Allow
+                || !self.caps.caps.iter().any(|cap| {
+                    cap.check_usable().is_ok() && cap.covers("read", "filesystem", &scope)
+                })
+            {
                 continue;
             }
-            if let Ok(text) = std::fs::read_to_string(p) {
-                for (i, line) in text.lines().enumerate() {
-                    if line.contains(query) {
-                        hits.push(format!("{}:{}: {}", p.display(), i + 1, line.trim()));
-                        if hits.len() >= 50 {
-                            break;
-                        }
+            match self.read(cube, &scope) {
+                Ok(result) => {
+                    total += result.output.len();
+                    if total > 8 * 1024 * 1024 {
+                        break;
+                    }
+                    let rel = path
+                        .strip_prefix(&self.workspace)
+                        .map_err(|e| ToolError::Denied(e.to_string()))?;
+                    files.push((rel.to_string_lossy().into_owned(), result.output));
+                }
+                Err(ToolError::Audit(e)) => return Err(ToolError::Audit(e)),
+                Err(_) => continue,
+            }
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(files)
+    }
+
+    pub fn search(&mut self, cube: &mut Cube, query: &str) -> Result<ToolResult, ToolError> {
+        self.check_quarantine(cube, "search", query)?;
+        let workspace = self.workspace.clone();
+        self.enforce(cube, "search", &workspace.to_string_lossy())?;
+        let mut hits = Vec::new();
+        for (path, content) in self.context_files(cube)? {
+            for (line_number, line) in content.lines().enumerate() {
+                if line.contains(query) {
+                    hits.push(format!(
+                        "{}:{}: {}",
+                        self.workspace.join(&path).display(),
+                        line_number + 1,
+                        line.trim()
+                    ));
+                    if hits.len() == 50 {
+                        break;
                     }
                 }
             }
-            if hits.len() >= 50 {
+            if hits.len() == 50 {
                 break;
             }
         }
+        self.audit_decision(cube, "search", query, "allow", "mediated-search", "success")?;
         Ok(ToolResult {
             ok: true,
             decision: "allow".into(),
@@ -598,7 +717,7 @@ impl ToolGateway {
                 "deny",
                 "secret-unsupported-microvm",
                 "error",
-            );
+            )?;
             return Err(ToolError::Denied(
                 "secret injection not supported at microvm level".into(),
             ));
@@ -609,17 +728,19 @@ impl ToolGateway {
             cwd: self.workspace.clone(),
             workspace: self.workspace.clone(),
             env_extra: vec![],
-            limits: ResourceLimits::default(),
+            timeout_ms: 30000,
+            limits: self.limits.clone(),
         };
         // ประตูชั้นแรก (fail-closed ไม่ spawn) หมายเหตุ: ประตูนี้ตรวจซ้ำ
         // อีกรอบใน run_checked ข้างล่างโดยตั้งใจ
         let canon = aivm_sandbox::validate(&spec, &self.policy).map_err(|e| {
-            self.audit_decision(cube, "execute", exe, "deny", "exec-gate", "error");
-            ToolError::Denied(e.to_string())
+            self.audit_decision(cube, "execute", exe, "deny", "exec-gate", "error")
+                .err()
+                .unwrap_or_else(|| ToolError::Denied(e.to_string()))
         })?;
         let scope = canon.to_string_lossy().to_string();
         if self.caps.authorize("execute", "process", &scope).is_err() {
-            self.audit_decision(cube, "execute", &scope, "deny", "no-capability", "error");
+            self.audit_decision(cube, "execute", &scope, "deny", "no-capability", "error")?;
             return Err(ToolError::Denied("no capability".into()));
         }
         // secret lease (G4): resolve หลัง validate+caps (deny ก่อนหน้าไม่เผา
@@ -630,7 +751,7 @@ impl ToolGateway {
         let mut secret_env: Vec<(String, String)> = vec![];
         if let Some(lid) = lease_id {
             if lid.is_empty() || lid.len() > MAX_LEASE_ID {
-                self.audit_decision(cube, "execute", &scope, "deny", "bad-lease-id", "error");
+                self.audit_decision(cube, "execute", &scope, "deny", "bad-lease-id", "error")?;
                 return Err(ToolError::Denied("bad secret lease id".into()));
             }
             enum Resolve {
@@ -693,27 +814,42 @@ impl ToolGateway {
                     secret_env = env;
                 }
                 Resolve::Deny { rule, msg } => {
-                    self.audit_decision(cube, "execute", &scope, "deny", rule, "error");
+                    self.audit_decision(cube, "execute", &scope, "deny", rule, "error")?;
                     return Err(ToolError::Denied(msg));
                 }
             }
         }
+        self.audit_decision(
+            cube,
+            "execute",
+            &scope,
+            "allow",
+            "exec-authorized",
+            "authorized",
+        )?;
+        self.checkpoint(cube)?;
         spec.env_extra = secret_env;
         // เปิดฟีเจอร์ `microvm` + มี config: ระดับ MicroVm เดินประตู
         // skeleton ด้วย config จริง (pin hash + quota จาก `aivm.yaml`)
         // ไม่มี config (= `None`) ตกไปใช้ค่า default ที่ deny อยู่ดี
         #[cfg(feature = "microvm")]
-        let run_result = match &self.microvm_cfg {
+        let mut run_result = match &self.microvm_cfg {
             Some(cfg) => {
                 aivm_sandbox::run_checked_with_level_and_cfg(&spec, &self.policy, self.level, cfg)
             }
             None => aivm_sandbox::run_checked_with_level(&spec, &self.policy, self.level),
         };
         #[cfg(not(feature = "microvm"))]
-        let run_result = aivm_sandbox::run_checked_with_level(&spec, &self.policy, self.level);
+        let mut run_result = aivm_sandbox::run_checked_with_level(&spec, &self.policy, self.level);
         // value ใน env ล้างทันทีที่ spawn เสร็จ (child ได้สำเนาของตัวเองไปแล้ว
         // broker เก็บต้นฉบับตาม max_uses — gateway ไม่ถือค้าง)
         for (_, v) in spec.env_extra.iter_mut() {
+            if !v.is_empty() {
+                if let Ok(outcome) = &mut run_result {
+                    outcome.stdout = "[REDACTED]".into();
+                    outcome.stderr = "[REDACTED]".into();
+                }
+            }
             zeroize_secret(v);
         }
         // verdict ลง audit ทุก decision (G3): allow = verdict:clean เสมอ
@@ -729,7 +865,7 @@ impl ToolGateway {
                     "deny",
                     "level-disabled",
                     &format!("verdict:{}:{}", v.label(), v.reason()),
-                );
+                )?;
                 return Err(ToolError::Denied(msg));
             }
             // ระดับ non-Process ที่ตายด้วย Invalid (เช่น artifact ไม่ผ่าน
@@ -743,10 +879,13 @@ impl ToolGateway {
                     "deny",
                     "level-invalid",
                     &format!("verdict:{}:{}", v.label(), v.reason()),
-                );
+                )?;
                 return Err(ToolError::Denied(e.to_string()));
             }
-            Err((e, _)) => return Err(ToolError::Denied(e.to_string())),
+            Err((e, _)) => {
+                self.audit_decision(cube, "execute", &scope, "deny", "exec-failed", "error")?;
+                return Err(ToolError::Denied(e.to_string()));
+            }
         };
         self.audit_decision(
             cube,
@@ -764,7 +903,7 @@ impl ToolGateway {
                 lease_tag,
             ),
             "success",
-        );
+        )?;
         Ok(ToolResult {
             ok: outcome.success(),
             decision: "allow".into(),
@@ -782,256 +921,255 @@ impl ToolGateway {
         url: &str,
         content: Option<&str>,
     ) -> Result<ToolResult, ToolError> {
-        use std::time::Duration;
-
-        // Parse request
         self.check_quarantine(cube, "network:fetch", url)?;
-        let req: NetworkFetchRequest = match content {
-            Some(s) => serde_json::from_str(s).map_err(|e| {
-                self.audit_decision(cube, "network:fetch", url, "deny", "bad-request", "error");
-                ToolError::Denied(format!("invalid network.fetch request: {e}"))
-            })?,
-            None => NetworkFetchRequest::default(),
-        };
-
-        // Extract host and port from URL for capability scope
-        let (host, port, protocol) = parse_url(url)?;
-
-        // Build scope for capability check (host:port)
-        let scope = format!("{host}:{port}");
-
-        // Check capability
-        let action = if req.method.eq_ignore_ascii_case("GET") {
-            "network:fetch"
-        } else {
-            "network:connect"
-        };
-        let ctx = Self::ctx_of(cube);
-        // For now, direct policy check
-        if self.caps.authorize(action, "network", &scope).is_err() {
-            self.audit_decision(cube, action, &scope, "deny", "no-capability", "error");
-            return Err(ToolError::Denied("no network capability".into()));
-        }
-
-        // Check network constraints
-        if let Ok(idx) = self.caps.authorize(action, "network", &scope) {
-            if let Some(cap) = self.caps.caps.get(idx) {
-                if let Err(e) = cap.check_constraints(
-                    req.body.as_ref().map(|b| b.len() as u64),
-                    None,
-                    Some(&protocol),
-                    Some(port),
-                    None,
-                ) {
-                    self.audit_decision(
-                        cube,
-                        action,
-                        &scope,
-                        "deny",
-                        &format!("constraint-violation: {e}"),
-                        "error",
-                    );
-                    return Err(ToolError::Denied(format!(
-                        "network constraint violation: {e}"
-                    )));
-                }
-            }
-        }
-
-        // Check policy
-        let (decision, reason) = self.policy.evaluate_network(&scope, &ctx);
-        if decision == aivm_policy::Decision::Deny {
+        let result = self.fetch_checked(cube, url, content);
+        if let Err(ref error) = result {
             self.audit_decision(
                 cube,
-                action,
-                &scope,
+                "network:fetch",
+                url,
                 "deny",
-                reason.as_deref().unwrap_or_default(),
-                "error",
-            );
-            return Err(ToolError::Denied(format!(
-                "network policy denied: {}",
-                reason.as_deref().unwrap_or_default()
-            )));
+                "fetch-failed",
+                &error.to_string(),
+            )?;
         }
+        result
+    }
 
-        // Perform HTTP request using ureq
-        let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(30000));
-        let agent = ureq::Agent::new();
-
-        let mut request = match req.method.to_uppercase().as_str() {
-            "GET" => agent.get(url).timeout(timeout),
-            "POST" => agent.post(url).timeout(timeout),
-            "PUT" => agent.put(url).timeout(timeout),
-            "DELETE" => agent.delete(url).timeout(timeout),
-            "PATCH" => agent.patch(url).timeout(timeout),
-            "HEAD" => agent.head(url).timeout(timeout),
-            _ => {
-                return Err(ToolError::Denied(format!(
-                    "unsupported HTTP method: {}",
-                    req.method
-                )))
-            }
+    fn fetch_checked(
+        &mut self,
+        cube: &mut Cube,
+        url: &str,
+        content: Option<&str>,
+    ) -> Result<ToolResult, ToolError> {
+        use aivm_capability::AuthorizationContext;
+        use std::io::Read;
+        let req: NetworkFetchRequest = serde_json::from_str(content.unwrap_or("{}"))
+            .map_err(|e| ToolError::Denied(format!("invalid network.fetch request: {e}")))?;
+        let (host, port, protocol) = parse_url(url)?;
+        let scope = network_scope(&host, port);
+        let action =
+            if req.method.eq_ignore_ascii_case("GET") || req.method.eq_ignore_ascii_case("HEAD") {
+                "network:fetch"
+            } else {
+                "network:connect"
+            };
+        let timeout_ms = req.timeout_ms.unwrap_or(30000);
+        if !(1..=60000).contains(&timeout_ms) {
+            return Err(ToolError::Denied("invalid timeout".into()));
+        }
+        let context = AuthorizationContext {
+            request_bytes: req.body.as_ref().map(|v| v.len() as u64),
+            protocol: Some(&protocol),
+            port: Some(port),
+            timeout_ms: Some(timeout_ms),
+            ..Default::default()
         };
-
-        for (k, v) in req.headers {
-            request = request.set(&k, &v);
+        let idx = self
+            .caps
+            .authorize_with_context(action, "network", &scope, &context)
+            .map_err(|e| ToolError::Denied(format!("network capability or constraint: {e}")))?;
+        if self.policy.evaluate_network(&scope, &Self::ctx_of(cube)).0 != Decision::Allow {
+            return Err(ToolError::Denied("network policy denied".into()));
         }
-
-        let response = if let Some(body) = req.body {
-            request.send_string(&body)
-        } else {
-            request.call()
+        let method = req.method.to_uppercase();
+        if !matches!(
+            method.as_str(),
+            "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD"
+        ) {
+            return Err(ToolError::Denied("unsupported HTTP method".into()));
         }
-        .map_err(|e| ToolError::Io(e.to_string()))?;
-
-        let status: u16 = response.status();
-        let response_body = response
-            .into_string()
-            .map_err(|e| ToolError::Io(e.to_string()))?;
-
-        // Check response size constraint
-        if let Ok(idx) = self.caps.authorize(action, "network", &scope) {
-            if let Some(cap) = self.caps.caps.get(idx) {
-                if let Err(e) =
-                    cap.check_constraints(None, None, None, None, Some(response_body.len() as u64))
-                {
-                    self.audit_decision(
-                        cube,
-                        action,
-                        &scope,
-                        "deny",
-                        &format!("constraint-violation: {e}"),
-                        "error",
-                    );
-                    return Err(ToolError::Denied(format!(
-                        "response size constraint violation: {e}"
-                    )));
-                }
-            }
+        if req.headers.keys().any(|key| {
+            matches!(
+                key.to_ascii_lowercase().as_str(),
+                "host" | "connection" | "content-length" | "transfer-encoding"
+            )
+        }) {
+            return Err(ToolError::Denied("protected HTTP header".into()));
         }
-
+        // resolve ครั้งเดียว ตรวจทุก IP แล้วตรึง resolver; ไม่ตาม redirect
+        let addresses = public_addresses(&host, port)?;
         self.audit_decision(
             cube,
             action,
             &scope,
             "allow",
-            &format!("status:{}", status),
+            "network-authorized",
+            "authorized",
+        )?;
+        self.checkpoint(cube)?;
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .resolver(move |_: &str| Ok(addresses.clone()))
+            .build();
+        let mut request = agent
+            .request(&method, url)
+            .timeout(Duration::from_millis(timeout_ms));
+        for (key, value) in req.headers {
+            request = request.set(&key, &value);
+        }
+        let response = match if let Some(body) = req.body {
+            request.send_string(&body)
+        } else {
+            request.call()
+        } {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(error) => return Err(ToolError::Io(error.to_string())),
+        };
+        let status = response.status();
+        if (300..400).contains(&status) {
+            return Err(ToolError::Denied(
+                "redirects are disabled; authorize target separately".into(),
+            ));
+        }
+        let limit = self.caps.caps[idx]
+            .constraints
+            .max_response_bytes
+            .unwrap_or(MAX_FILE_BYTES)
+            .min(MAX_FILE_BYTES);
+        let mut body = Vec::new();
+        response
+            .into_reader()
+            .take(limit + 1)
+            .read_to_end(&mut body)
+            .map_err(|e| ToolError::Io(e.to_string()))?;
+        if body.len() as u64 > limit {
+            return Err(ToolError::Denied("response size limit exceeded".into()));
+        }
+        let output =
+            String::from_utf8(body).map_err(|_| ToolError::Io("response is not UTF-8".into()))?;
+        self.audit_decision(
+            cube,
+            action,
+            &scope,
+            "allow",
+            &format!("status:{status}"),
             "success",
-        );
-
+        )?;
         Ok(ToolResult {
             ok: (200..300).contains(&status),
             decision: "allow".into(),
-            output: response_body,
+            output,
         })
     }
 
-    /// `network.connect`: Raw TCP/TLS connection
-    ///
-    /// path: "host:port" (e.g., "api.github.com:443")
-    /// content: JSON { "protocol": "tcp", "tls": true, "timeout_ms": 30000 }
     pub fn network_connect(
         &mut self,
         cube: &mut Cube,
         host_port: &str,
         content: Option<&str>,
     ) -> Result<ToolResult, ToolError> {
-        use std::net::TcpStream;
-        use std::time::Duration;
-
         self.check_quarantine(cube, "network:connect", host_port)?;
-        let req: NetworkConnectRequest = match content {
-            Some(s) => serde_json::from_str(s).map_err(|e| {
-                self.audit_decision(
-                    cube,
-                    "network:connect",
-                    host_port,
-                    "deny",
-                    "bad-request",
-                    "error",
-                );
-                ToolError::Denied(format!("invalid network.connect request: {e}"))
-            })?,
-            None => NetworkConnectRequest::default(),
-        };
+        let result = self.connect_checked(cube, host_port, content);
+        if let Err(ref error) = result {
+            self.audit_decision(
+                cube,
+                "network:connect",
+                host_port,
+                "deny",
+                "connect-failed",
+                &error.to_string(),
+            )?;
+        }
+        result
+    }
 
-        // Parse host:port
+    fn connect_checked(
+        &mut self,
+        cube: &mut Cube,
+        host_port: &str,
+        content: Option<&str>,
+    ) -> Result<ToolResult, ToolError> {
+        use aivm_capability::AuthorizationContext;
+        let req: NetworkConnectRequest = serde_json::from_str(content.unwrap_or("{}"))
+            .map_err(|e| ToolError::Denied(format!("invalid network.connect request: {e}")))?;
+        if req.protocol != "tcp" {
+            return Err(ToolError::Denied("protocol must be tcp".into()));
+        }
         let (host, port) = parse_host_port(host_port)?;
-        let scope = format!("{host}:{port}");
-
-        // Check capability
-        let ctx = Self::ctx_of(cube);
-        if self
-            .caps
-            .authorize("network:connect", "network", &scope)
-            .is_err()
-        {
-            self.audit_decision(
-                cube,
-                "network:connect",
-                &scope,
-                "deny",
-                "no-capability",
-                "error",
-            );
-            return Err(ToolError::Denied("no network capability".into()));
+        let scope = network_scope(&host, port);
+        let timeout_ms = req.timeout_ms.unwrap_or(30000);
+        if !(1..=60000).contains(&timeout_ms) {
+            return Err(ToolError::Denied("invalid timeout".into()));
         }
-
-        // Check policy
-        let (decision, reason) = self.policy.evaluate_network(&scope, &ctx);
-        if decision == aivm_policy::Decision::Deny {
-            self.audit_decision(
-                cube,
-                "network:connect",
-                &scope,
-                "deny",
-                reason.as_deref().unwrap_or_default(),
-                "error",
-            );
-            return Err(ToolError::Denied(format!(
-                "network policy denied: {}",
-                reason.as_deref().unwrap_or_default()
-            )));
+        let protocol = if req.tls { "https" } else { "tcp" };
+        let context = AuthorizationContext {
+            protocol: Some(protocol),
+            port: Some(port),
+            timeout_ms: Some(timeout_ms),
+            ..Default::default()
+        };
+        self.caps
+            .authorize_with_context("network:connect", "network", &scope, &context)
+            .map_err(|e| ToolError::Denied(format!("network capability or constraint: {e}")))?;
+        if self.policy.evaluate_network(&scope, &Self::ctx_of(cube)).0 != Decision::Allow {
+            return Err(ToolError::Denied("network policy denied".into()));
         }
-
-        // Establish connection
-        let addr = format!("{host}:{port}");
-        let socket_addr: std::net::SocketAddr = addr
-            .parse()
-            .map_err(|e: std::net::AddrParseError| ToolError::Io(e.to_string()))?;
-        let _stream = TcpStream::connect_timeout(
-            &socket_addr,
-            Duration::from_millis(req.timeout_ms.unwrap_or(30000)),
-        )
-        .map_err(|e| ToolError::Io(e.to_string()))?;
-
-        // If TLS requested, wrap with native-tls (simplified - would need native-tls crate)
+        let addresses = public_addresses(&host, port)?;
+        self.audit_decision(
+            cube,
+            "network:connect",
+            &scope,
+            "allow",
+            "network-authorized",
+            "authorized",
+        )?;
+        self.checkpoint(cube)?;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut stream = None;
+        for addr in addresses {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if let Ok(connected) = std::net::TcpStream::connect_timeout(&addr, remaining) {
+                stream = Some(connected);
+                break;
+            }
+        }
+        let mut stream = stream.ok_or_else(|| ToolError::Io("connection failed".into()))?;
         if req.tls {
-            // For MVP, just note TLS was requested
-            self.audit_decision(
-                cube,
-                "network:connect",
-                &scope,
-                "allow",
-                "tls-connected",
-                "success",
-            );
-        } else {
-            self.audit_decision(
-                cube,
-                "network:connect",
-                &scope,
-                "allow",
-                "tcp-connected",
-                "success",
-            );
+            use ureq::rustls;
+            let roots =
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let server = rustls::pki_types::ServerName::try_from(host.clone())
+                .map_err(|_| ToolError::Denied("invalid TLS server name".into()))?;
+            let mut tls = rustls::ClientConnection::new(std::sync::Arc::new(config), server)
+                .map_err(|e| ToolError::Io(e.to_string()))?;
+            while tls.is_handshaking() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(ToolError::Io("TLS handshake timeout".into()));
+                }
+                stream
+                    .set_read_timeout(Some(remaining))
+                    .map_err(|e| ToolError::Io(e.to_string()))?;
+                stream
+                    .set_write_timeout(Some(remaining))
+                    .map_err(|e| ToolError::Io(e.to_string()))?;
+                tls.complete_io(&mut stream)
+                    .map_err(|e| ToolError::Io(format!("TLS handshake: {e}")))?;
+            }
         }
-
+        self.audit_decision(
+            cube,
+            "network:connect",
+            &scope,
+            "allow",
+            if req.tls {
+                "tls-connected"
+            } else {
+                "tcp-connected"
+            },
+            "success",
+        )?;
         Ok(ToolResult {
             ok: true,
             decision: "allow".into(),
-            output: format!("connected to {addr}"),
+            output: format!("connected to {scope}"),
         })
     }
 
@@ -1065,7 +1203,7 @@ impl ToolGateway {
                                 Err(_) => {
                                     self.audit_decision(
                                         cube, "execute", &req.path, "deny", "bad-argv", "error",
-                                    );
+                                    )?;
                                     return Err(ToolError::Denied(
                                         "argv must be a JSON array of strings".into(),
                                     ));
@@ -1087,7 +1225,7 @@ impl ToolGateway {
                 self.network_connect(cube, &req.path, req.content.as_deref())
             }
             other => {
-                self.audit_decision(cube, other, &req.path, "deny", "unknown-tool", "error");
+                self.audit_decision(cube, other, &req.path, "deny", "unknown-tool", "error")?;
                 Err(ToolError::Denied(format!("unknown tool: {other}")))
             }
         }
@@ -1253,7 +1391,8 @@ impl ToolGateway {
                     "allow",
                     "lease-issued",
                     "success",
-                );
+                )?;
+                self.checkpoint(cube)?;
                 Ok(ToolResult {
                     ok: true,
                     decision: "allow".into(),
@@ -1265,7 +1404,8 @@ impl ToolGateway {
                 msg,
                 audit_result,
             } => {
-                self.audit_decision(cube, "secret.request", &scope, "deny", rule, &audit_result);
+                self.audit_decision(cube, "secret.request", &scope, "deny", rule, &audit_result)?;
+                self.checkpoint(cube)?;
                 Err(ToolError::Denied(msg))
             }
         }
@@ -1274,15 +1414,22 @@ impl ToolGateway {
     /// deny  helper ของ `secret.request` (audit + Err ในรูปเดียว — resource
     /// ยังไม่รู้ตอน parse จึงใช้ "-")
     fn deny_secret(&mut self, cube: &mut Cube, rule: &str, msg: &str) -> ToolError {
-        self.audit_decision(cube, "secret.request", "-", "deny", rule, "error");
+        if let Err(e) = self.audit_decision(cube, "secret.request", "-", "deny", rule, "error") {
+            return e;
+        }
         ToolError::Denied(msg.to_string())
     }
 
     /// บันทึกการปฏิเสธที่ระดับ intent (parse ไม่ผ่าน หรืออ้าง tool ที่ไม่รู้จัก)
     /// I-7: ทุก decision ต้องมี audit แม้ยังไม่ถึงขั้น dispatch (complete mediation)
     /// `raw` คือข้อความดิบจากโมเดล — ผู้เรียกควรตัดให้สั้นก่อนส่งเข้ามา
-    pub fn audit_intent_deny(&mut self, cube: &mut Cube, reason: &str, raw: &str) {
-        self.audit_decision(cube, "intent", raw, "deny", "invalid-intent", reason);
+    pub fn audit_intent_deny(
+        &mut self,
+        cube: &mut Cube,
+        reason: &str,
+        raw: &str,
+    ) -> Result<(), ToolError> {
+        self.audit_decision(cube, "intent", raw, "deny", "invalid-intent", reason)
     }
 }
 
@@ -1310,6 +1457,8 @@ fn is_boundary_path(p: &Path) -> bool {
         || s.ends_with(".env")
         || s.contains(".env.")
         || s.contains("/secrets/")
+        || s.ends_with("/secrets.yaml")
+        || s.ends_with("/state.json")
         || s.contains("/.git/config")
 }
 
@@ -1460,6 +1609,7 @@ use std::collections::HashMap;
 
 /// Network fetch request structure
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct NetworkFetchRequest {
     #[serde(default = "default_get")]
     method: String,
@@ -1481,6 +1631,7 @@ fn default_timeout() -> Option<u64> {
 
 /// Network connect request structure
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct NetworkConnectRequest {
     #[serde(default = "default_tcp")]
     protocol: String,
@@ -1499,27 +1650,66 @@ fn parse_url(url: &str) -> Result<(String, u16, String), ToolError> {
     let parsed =
         url::Url::parse(url).map_err(|e| ToolError::Denied(format!("invalid URL: {e}")))?;
     let protocol = parsed.scheme().to_string();
+    if !matches!(protocol.as_str(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(ToolError::Denied(
+            "HTTP(S) URL without credentials required".into(),
+        ));
+    }
     let host = parsed
         .host_str()
         .ok_or_else(|| ToolError::Denied("URL missing host".into()))?
-        .to_string();
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
     let port = parsed
-        .port()
-        .unwrap_or_else(|| if protocol == "https" { 443 } else { 80 });
+        .port_or_known_default()
+        .ok_or_else(|| ToolError::Denied("URL missing port".into()))?;
+    if port == 0 {
+        return Err(ToolError::Denied("invalid port".into()));
+    }
     Ok((host, port, protocol))
 }
 
-/// Parse host:port string
-fn parse_host_port(host_port: &str) -> Result<(String, u16), ToolError> {
-    let parts: Vec<&str> = host_port.split(':').collect();
-    if parts.len() != 2 {
-        return Err(ToolError::Denied("invalid host:port format".into()));
+fn parse_host_port(target: &str) -> Result<(String, u16), ToolError> {
+    if let Ok(addr) = target.parse::<std::net::SocketAddr>() {
+        return Ok((addr.ip().to_string(), addr.port()));
     }
-    let host = parts[0].to_string();
-    let port = parts[1]
+    let (host, port) = target
+        .rsplit_once(':')
+        .ok_or_else(|| ToolError::Denied("host:port required".into()))?;
+    let port: u16 = port
         .parse()
         .map_err(|_| ToolError::Denied("invalid port".into()))?;
-    Ok((host, port))
+    if host.is_empty() || host.contains(['/', '@', ':']) || port == 0 {
+        return Err(ToolError::Denied("invalid host:port".into()));
+    }
+    Ok((host.to_ascii_lowercase(), port))
+}
+fn network_scope(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+fn public_addresses(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, ToolError> {
+    use std::net::ToSocketAddrs;
+    let addresses: Vec<_> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| ToolError::Io(e.to_string()))?
+        .collect();
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|a| !aivm_policy::is_public_address(a.ip()))
+    {
+        return Err(ToolError::Denied(
+            "private, loopback, or reserved destination".into(),
+        ));
+    }
+    Ok(addresses)
 }
 
 /// ล้างค่า secret ใน env pairs (best-effort zeroize — เรียกทุกทางออก
@@ -1639,6 +1829,7 @@ network: {{allow: [], deny: []}}
         ));
         let mut broker = aivm_secrets::SecretBroker::new(
             aivm_secrets::SecretPolicy {
+                low_risk_allow: vec!["*".into()],
                 allow: vec!["test_token:read".into(), "test_token:write".into()],
                 deny: vec![],
                 hitl_required_for: vec![aivm_secrets::RiskLevel::High],
@@ -2033,7 +2224,10 @@ network: {{allow: [], deny: []}}
         // ครั้งแรก: inject สำเร็จ เห็นค่าใน stdout
         let r = run(&mut gw, &mut cube, Some(lease_id.clone())).unwrap();
         assert!(r.ok);
-        assert!(r.output.contains("TOP-SECRET-XYZ"), "child env ต้องมี secret");
+        assert_eq!(
+            r.output, "[REDACTED]",
+            "output ของ secret consumer ต้องไม่เข้าบริบทโมเดล"
+        );
         // ใช้ซ้ำ: one-time lease หมดแล้ว
         let r = run(&mut gw, &mut cube, Some(lease_id));
         assert!(matches!(r, Err(ToolError::Denied(_))));
@@ -2080,5 +2274,104 @@ network: {{allow: [], deny: []}}
         assert!(matches!(r, Err(ToolError::Denied(_))));
         let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
         assert!(log.contains("secret-unsupported-microvm"));
+    }
+
+    // regression: search/RAG ต้องไม่คืนไฟล์ที่ policy ห้ามอ่าน
+    #[test]
+    fn search_and_context_respect_file_denials() {
+        let (mut gw, mut cube, dir) = harness();
+        std::fs::write(dir.join("private.txt"), "PRIVATE-REGRESSION").unwrap();
+        gw.policy
+            .filesystem
+            .deny
+            .push(dir.join("private.txt").display().to_string());
+        assert!(gw.read(&mut cube, "private.txt").is_err());
+        assert!(!gw
+            .search(&mut cube, "PRIVATE-REGRESSION")
+            .unwrap()
+            .output
+            .contains("PRIVATE-REGRESSION"));
+        assert!(!gw
+            .context_files(&mut cube)
+            .unwrap()
+            .iter()
+            .any(|(_, text)| text.contains("PRIVATE-REGRESSION")));
+    }
+
+    #[test]
+    fn audit_failure_prevents_write() {
+        let (mut gw, mut cube, dir) = harness();
+        aivm_audit::clear_flags(&dir);
+        let path = dir.join("audit.jsonl");
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            gw.write(&mut cube, "src/blocked.rs", "x"),
+            Err(ToolError::Audit(_))
+        ));
+        assert!(!dir.join("src/blocked.rs").exists());
+    }
+
+    #[test]
+    fn file_size_constraints_apply_to_reads_and_writes() {
+        let (mut gw, mut cube, dir) = harness();
+        std::fs::write(dir.join("src/large.rs"), "too large").unwrap();
+        for cap in &mut gw.caps.caps {
+            cap.constraints.max_bytes = Some(1);
+        }
+        assert!(gw.read(&mut cube, "src/large.rs").is_err());
+        assert!(gw.write(&mut cube, "src/new.rs", "too large").is_err());
+        assert!(!dir.join("src/new.rs").exists());
+    }
+
+    #[test]
+    fn network_constraints_cannot_be_skipped_when_quota_exhausts() {
+        let (mut gw, mut cube, _) = harness();
+        gw.policy.network.allow = vec!["example.com".into()];
+        gw.policy.require_test_before_network = false;
+        gw.caps.grant(
+            Capability::new("network:connect", "network", "example.com:443")
+                .with_max_uses(1)
+                .with_constraints(aivm_capability::Constraints::new().with_max_bytes(1)),
+        );
+        let result = gw.network_fetch(
+            &mut cube,
+            "https://example.com/",
+            Some(r#"{"method":"POST","body":"xx"}"#),
+        );
+        assert!(matches!(result, Err(ToolError::Denied(_))));
+        let cap = gw
+            .caps
+            .caps
+            .iter()
+            .find(|c| c.resource == "network")
+            .unwrap();
+        assert_eq!(cap.used_count, 0, "constraint ต้องตรวจครบก่อน consume/ส่งข้อมูล");
+    }
+
+    #[test]
+    fn private_network_destinations_and_unknown_schema_are_denied() {
+        for host in ["127.0.0.2", "10.1.2.3", "::ffff:127.0.0.1", "::1"] {
+            assert!(public_addresses(host, 443).is_err());
+        }
+        assert!(parse_url("file:///etc/passwd").is_err());
+        assert!(parse_url("https://user:pass@example.com/").is_err());
+        assert!(serde_json::from_str::<NetworkFetchRequest>(r#"{"redirects":true}"#).is_err());
+        assert_eq!(parse_host_port("[::1]:443").unwrap(), ("::1".into(), 443));
+    }
+    #[test]
+    fn exhausted_capability_cannot_supply_larger_file_constraints() {
+        let (mut gw, mut cube, dir) = harness();
+        std::fs::write(dir.join("src/large.rs"), "large").unwrap();
+        let scope = dir.display().to_string();
+        gw.caps = CapabilitySet::new(vec![
+            Capability::new("read", "filesystem", &scope)
+                .with_max_uses(1)
+                .with_constraints(aivm_capability::Constraints::new().with_max_bytes(1)),
+            Capability::new("read", "filesystem", &scope)
+                .with_max_uses(0)
+                .with_constraints(aivm_capability::Constraints::new().with_max_bytes(100)),
+        ]);
+        assert!(gw.read(&mut cube, "src/large.rs").is_err());
     }
 }

@@ -27,9 +27,9 @@ operator transition ล้างได้, ไม่ยืดเวลาเอ�
 ## Secrets (G4 §26)
 
 `secret.request` (structured schema เข้ม) → broker ตรวจ capability + policy →
-Low-risk ออก one-time lease (คืนแต่ lease_id) / High-risk ไม่มี approval =
+Low-risk ที่ operator ตั้ง `low_risk_allow` ออก one-time lease (คืนแต่ lease_id) / High-risk ไม่มี approval =
 DENY + audit `hitl-required` → `process.exec` แนบ `{"argv":[…],"secret":id}`
-ฉีดค่าเข้า child env (`env_extra` ช่องเดียว) แล้ว zeroize — value ไม่มีทาง
+ฉีดค่าเข้า child env (`env_extra` ช่องเดียว) แล้ว zeroize + ปิด process output/สิทธิ์เขียนไฟล์ — value ไม่มีทาง
 อยู่ AI context/memory/audit (redaction โดย construction) ระดับ microvm
 inject ไม่ได้ = DENY ตรง ๆ ไม่เงียบทิ้ง
 
@@ -42,7 +42,7 @@ approve = DENY (`lease-not-approved`)
 
 | ค่า | backend | สถานะ |
 |---|---|---|
-| `sandbox` / `process` | OS sandbox: userns, PID/mount/net namespace (best-effort + รายงาน), seccomp denylist, rlimit, no-new-privs, pdeathsig ซ้ำในหลาน | default (MVP-B) |
+| `sandbox` / `process` | Landlock ABI >= 3 + seccomp (บังคับ), user/mount/net namespace แบบ best-effort พร้อมรายงานจริง, rlimit, CPU affinity, deadline, process group cleanup | default (MVP-B) |
 | `microvm` | บูต guest จริงต่อครั้ง (Firecracker/KVM, drive-stuffing, ไม่มีเน็ต) | ต้องเปิดฟีเจอร์ `microvm` + บล็อก pins (ดู `docs/microvm.md`) |
 | `container` | ยังไม่มี backend → DENY พร้อม audit | fail-closed |
 | `hardware` | อนาคต (สเปก §Level 3) → DENY พร้อม audit | fail-closed |
@@ -58,6 +58,7 @@ guard ต่อขอบ: `confidence` (→MODIFY), `tests_passed` (→VALIDATE)
 
 ## Audit (I-7, I-10)
 
+- Hash version 2 ครอบคลุมหลักฐานทุกฟิลด์; audit failure หยุดก่อน action (รุ่นเก่าไม่มีหลักประกันเพิ่มย้อนหลัง)
 - ทุก request + decision + outcome ลง `audit.jsonl` **นอก** boundary ที่ agent แตะถึง
 - append-only + hash chain (`verify_sequence`, `aivm audit`) + `rotate()`
   (archive ถูกผนึก ห้ามเขียนทับ)

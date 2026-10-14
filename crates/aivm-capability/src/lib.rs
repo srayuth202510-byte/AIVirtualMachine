@@ -155,6 +155,16 @@ pub struct Capability {
     pub used_count: u64,
 }
 
+/// ข้อมูลสำหรับตรวจ constraints และ consume สิทธิ์ครั้งเดียว
+#[derive(Default)]
+pub struct AuthorizationContext<'a> {
+    pub request_bytes: Option<u64>,
+    pub protocol: Option<&'a str>,
+    pub port: Option<u16>,
+    pub response_bytes: Option<u64>,
+    pub timeout_ms: Option<u64>,
+}
+
 impl Capability {
     pub fn new(action: &str, resource: &str, scope: &str) -> Self {
         Self {
@@ -299,6 +309,20 @@ impl Capability {
         if self.action != action || self.resource != resource {
             return false;
         }
+        if resource == "network" {
+            if let (Some((allowed_host, allowed_port)), Some((host, port))) =
+                (self.scope.rsplit_once(':'), scope.rsplit_once(':'))
+            {
+                if allowed_port != port {
+                    return false;
+                }
+                if let Some(suffix) = allowed_host.strip_prefix("*.") {
+                    return host.ends_with(&format!(".{suffix}")) && host.len() > suffix.len() + 1;
+                }
+                return allowed_host == host || allowed_host == "*";
+            }
+            return self.scope == scope;
+        }
         scope_covers(&self.scope, scope)
     }
 
@@ -317,7 +341,16 @@ impl Capability {
             ));
         }
         // ตรวจสอบ max_calls constraint (network params not available here, checked in PolicyEvaluator)
-        self.check_constraints(None, Some(self.used_count as u32 + 1), None, None, None)?;
+        if self
+            .constraints
+            .max_calls
+            .is_some_and(|max| self.used_count >= u64::from(max))
+        {
+            return Err(CapabilityError::BudgetExceeded(
+                self.constraints.max_calls.unwrap() as u64,
+            ));
+        }
+        self.check_constraints(None, None, None, None, None)?;
         self.used_count += 1;
         Ok(())
     }
@@ -382,6 +415,49 @@ impl CapabilitySet {
             }
         }
         Err(mismatch.unwrap_or(CapabilityError::Mismatch))
+    }
+
+    pub fn authorize_with_context(
+        &mut self,
+        action: &str,
+        resource: &str,
+        scope: &str,
+        ctx: &AuthorizationContext<'_>,
+    ) -> Result<usize, CapabilityError> {
+        for (index, cap) in self.caps.iter_mut().enumerate() {
+            if cap.check_usable().is_err() || !cap.covers(action, resource, scope) {
+                continue;
+            }
+            if cap
+                .constraints
+                .timeout_ms
+                .is_some_and(|max| ctx.timeout_ms.is_some_and(|value| value > max))
+            {
+                continue;
+            }
+            if cap
+                .check_constraints(
+                    ctx.request_bytes,
+                    None,
+                    ctx.protocol,
+                    ctx.port,
+                    ctx.response_bytes,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            if cap
+                .constraints
+                .max_calls
+                .is_some_and(|max| cap.used_count >= u64::from(max))
+            {
+                continue;
+            }
+            cap.used_count += 1;
+            return Ok(index);
+        }
+        Err(CapabilityError::Mismatch)
     }
 
     /// เพิกถอนใบที่ condition ผูกกับ state ที่เราไม่ได้อยู่แล้ว (§14.3)

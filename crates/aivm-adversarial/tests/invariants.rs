@@ -250,13 +250,8 @@ fn i6_fail_closed_on_uncertainty() {
     // predicate แปลกใน when: rule ไม่ match (deny-by-default คุมต่อ)
     let pr = Policy::from_yaml(
         "name: t\nfilesystem:\n  read: [/workspace]\n  write: [/workspace/src]\n  deny: []\nrules:\n  - id: weird\n    action: write\n    resource: filesystem\n    scope: /workspace/src/**\n    when: \"vibes == 'good'\"\n",
-    )
-    .unwrap();
-    assert_eq!(
-        pr.evaluate_fs("write", "/workspace/src/a.rs", &EvalContext::default())
-            .0,
-        Decision::Deny
     );
+    assert!(pr.is_err(), "predicate ที่ประเมินไม่ได้ต้องปฏิเสธตอนโหลด");
     inv_clean(&dir);
 }
 
@@ -277,7 +272,7 @@ fn i7_every_decision_audited() {
             }
         )
         .is_err()); // deny
-    assert_eq!(audit_lines(&dir) - before, 3);
+    assert_eq!(audit_lines(&dir) - before, 4);
     // chain ตรวจผ่าน (ไม่มีใครแก้ระหว่างทาง)
     assert!(AuditWriter::verify(dir.join("audit.jsonl")).is_ok());
     // grant จาก transition ก็ถูก audit ด้วย
@@ -307,7 +302,7 @@ fn i7_every_decision_audited() {
         .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
         .unwrap_or(0);
     assert_eq!(granted, 1);
-    assert_eq!(after_rt - before_rt, granted);
+    assert_eq!(after_rt - before_rt, granted + 2); // grant + สอง validated transitions
     assert!(AuditWriter::verify(&audit_p).is_ok());
     inv_clean(&dir);
     inv_clean(&rt_dir);
@@ -369,6 +364,7 @@ fn i10_structural_enforcement() {
     .unwrap();
     let out = aivm_sandbox::run_checked(
         &aivm_sandbox::ExecSpec {
+            timeout_ms: 30000,
             exe: std::path::PathBuf::from("/bin/true"),
             args: vec![],
             cwd: ws.clone(),

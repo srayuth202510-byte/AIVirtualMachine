@@ -5,12 +5,15 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+libc = "0.2"
+uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 walkdir = { workspace = true }
 ureq = { version = "2.9", features = ["json", "charset", "cookies", "tls"] }
 url = "2.5"
+webpki-roots = "0.26"
 aivm-capability = { path = "../aivm-capability" }
 aivm-policy = { path = "../aivm-policy" }
 aivm-audit = { path = "../aivm-audit" }

@@ -16,53 +16,15 @@ use aivm_cube::rag;
 use aivm_cube::Cube;
 use aivm_model::Model;
 use aivm_tools::{ToolGateway, ToolRequest};
-use serde::Serialize;
-use std::path::Path;
+use serde::{Deserialize, Serialize};
 
-/// อ่านไฟล์ทั้งหมดใน workspace (recursive) เป็น (path, content) pairs
-fn read_workspace_files(ws: &Path) -> Vec<(String, String)> {
-    let mut files = Vec::new();
-    collect_files(ws, ws, &mut files);
-    files
-}
-
-fn collect_files(dir: &Path, ws: &Path, out: &mut Vec<(String, String)>) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if std::fs::symlink_metadata(&path)
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(true)
-            {
-                continue;
-            }
-            if path.is_dir() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name.starts_with('.') || matches!(name, "target" | "node_modules") {
-                    continue;
-                }
-                collect_files(&path, ws, out);
-            } else if path.is_file()
-                && !path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .starts_with('.')
-            {
-                // ตัด prefix workspace ออกจาก key
-                let rel = path.strip_prefix(ws).unwrap_or(&path);
-                let key = rel.to_string_lossy().to_string();
-                let content = std::fs::read_to_string(&path).unwrap_or_default();
-                out.push((key, content));
-            }
-        }
-    }
-}
-
-/// สร้าง RAG index จากไฟล์ใน workspace
-pub fn build_workspace_index(ws: &Path, current_state: u32) -> rag::RagIndex {
-    let files = read_workspace_files(ws);
-    rag::build_index(&files, current_state)
+/// สร้าง RAG ผ่าน gateway: ไม่มี API ให้เลือก root ที่ข้าม policy
+pub fn build_workspace_index(
+    gateway: &mut ToolGateway,
+    cube: &mut Cube,
+) -> Result<rag::RagIndex, aivm_tools::ToolError> {
+    let files = gateway.context_files(cube)?;
+    Ok(rag::build_index(&files, cube.current_state() as u32))
 }
 
 /// tool ที่ยอมรับในระดับ intent (deny-by-default: นอกลิสต์ = ปฏิเสธ)
@@ -123,92 +85,38 @@ pub struct AgentRun {
     pub stopped: String,
 }
 
-/// สกัด JSON object แรกในข้อความ (รองรับกรณีโมเดลห่อด้วย ```json หรือมีคำเกิน)
-/// คืน slice ของ object ที่วงเล็บปีกกาสมดุลแล้ว โดยไม่สนใจ `{`/`}` ในสตริง
-fn extract_json_object(s: &str) -> Option<&str> {
-    let start = s.find('{')?;
-    let bytes = s.as_bytes();
-    let mut depth = 0usize;
-    let mut in_str = false;
-    let mut escaped = false;
-    for (i, &c) in bytes.iter().enumerate().skip(start) {
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if c == b'\\' {
-                escaped = true;
-            } else if c == b'"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match c {
-            b'"' => in_str = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&s[start..=i]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 /// parse intent จากข้อความโมเดลแบบ fail-closed
 ///
 /// ทุกความผิดพลาด (ไม่มี JSON, JSON พัง, ขาด field, tool ไม่อยู่ในลิสต์)
 /// คืน `Err` — ผู้เรียกต้องถือเป็น DENY และห้ามรันอะไรทั้งสิ้น
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FinishIntent {
+    done: bool,
+    #[serde(default)]
+    summary: String,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ParsedIntent {
+    Tool(ToolRequest),
+    Finish(FinishIntent),
+}
+
 pub fn parse_intent(raw: &str) -> Result<Intent, String> {
-    let json = extract_json_object(raw)
-        .ok_or_else(|| "no JSON object found in model output".to_string())?;
-    let val: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
-    let obj = val
-        .as_object()
-        .ok_or_else(|| "top-level JSON must be an object".to_string())?;
-
-    // intent จบงาน: {"done": true, "summary": ...}
-    if let Some(done) = obj.get("done") {
-        match done.as_bool() {
-            Some(true) => {
-                let summary = obj
-                    .get("summary")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                return Ok(Intent::Finish(summary));
+    // serde ตรวจ duplicate fields ด้วย ไม่ผ่าน Value ที่จะทับค่าซ้ำเงียบ ๆ
+    match serde_json::from_str::<ParsedIntent>(raw.trim())
+        .map_err(|e| format!("invalid intent JSON: {e}"))?
+    {
+        ParsedIntent::Tool(request) => {
+            if !KNOWN_TOOLS.contains(&request.tool.as_str()) {
+                return Err(format!("unknown tool: {}", request.tool));
             }
-            Some(false) => {}
-            None => return Err("`done` must be a boolean".to_string()),
+            Ok(Intent::Tool(request))
         }
+        ParsedIntent::Finish(finish) if finish.done => Ok(Intent::Finish(finish.summary)),
+        ParsedIntent::Finish(_) => Err("done must be true".into()),
     }
-
-    let tool = obj
-        .get("tool")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "missing `tool` (or `done`) field".to_string())?;
-    if !KNOWN_TOOLS.contains(&tool) {
-        return Err(format!("unknown tool: {tool}"));
-    }
-    let path = obj
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "missing `path` field".to_string())?
-        .to_string();
-    // content เป็นสตริงตามสัญญา แต่ยอมรับค่าอื่นโดย serialize ให้ (เช่น argv array)
-    let content = obj.get("content").map(|v| match v {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    });
-
-    Ok(Intent::Tool(ToolRequest {
-        tool: tool.to_string(),
-        path,
-        content,
-    }))
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -307,7 +215,9 @@ pub fn run_loop(
             }
             Err(reason) => {
                 // fail-closed: ไม่รันอะไร และต้องมี audit (I-7)
-                gateway.audit_intent_deny(cube, &reason, &clip(&raw, MAX_RAW_CHARS));
+                gateway
+                    .audit_intent_deny(cube, &reason, &clip(&raw, MAX_RAW_CHARS))
+                    .map_err(|e| RuntimeError::Io(e.to_string()))?;
                 let outcome = format!("ERROR invalid intent: {reason}");
                 observations.push(outcome.clone());
                 steps.push(AgentStep {
@@ -506,24 +416,15 @@ mod tests {
     }
 
     #[test]
-    fn fenced_json_is_parsed() {
-        let i = parse_intent("```json\n{\"tool\": \"code.search\", \"path\": \"fn main\"}\n```")
-            .unwrap();
-        match i {
-            Intent::Tool(req) => {
-                assert_eq!(req.tool, "code.search");
-                assert_eq!(req.path, "fn main");
-            }
-            other => panic!("expected tool intent, got {other:?}"),
-        }
+    fn fenced_json_is_denied() {
+        let i = parse_intent("```json\n{\"tool\": \"code.search\", \"path\": \"fn main\"}\n```");
+        assert!(i.is_err());
     }
 
     #[test]
     fn braces_inside_strings_do_not_break_extraction() {
-        let i = parse_intent(
-            r#"here: {"tool":"filesystem.write","path":"a.rs","content":"fn f() {}"}"#,
-        )
-        .unwrap();
+        let i = parse_intent(r#"{"tool":"filesystem.write","path":"a.rs","content":"fn f() {}"}"#)
+            .unwrap();
         match i {
             Intent::Tool(req) => assert_eq!(req.content.as_deref(), Some("fn f() {}")),
             other => panic!("expected tool intent, got {other:?}"),
@@ -640,5 +541,18 @@ mod tests {
         let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "try harder", 2, None).unwrap();
         assert!(run.steps[0].outcome.starts_with("DENY filesystem.read"));
         assert!(run.steps[1].outcome.starts_with("DENY filesystem.write"));
+    }
+
+    #[test]
+    fn intent_rejects_prose_unknown_fields_and_multiple_objects() {
+        for raw in [
+            r#"prefix {"tool":"code.search","path":"x"}"#,
+            r#"{"tool":"code.search","path":"x"} trailing"#,
+            r#"{"tool":"code.search","path":"x","extra":true}"#,
+            r#"{"done":true,"tool":"filesystem.write","path":"x"}"#,
+            r#"{"done":true} {"done":true}"#,
+        ] {
+            assert!(parse_intent(raw).is_err(), "accepted invalid intent: {raw}");
+        }
     }
 }

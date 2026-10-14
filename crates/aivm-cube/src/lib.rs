@@ -182,7 +182,12 @@ impl Cube {
         }
         match (self.state, next) {
             (AgentState::Analyze, AgentState::Modify) => {
-                if guards.confidence < guards.confidence_threshold {
+                if !guards.confidence.is_finite()
+                    || !guards.confidence_threshold.is_finite()
+                    || !(0.0..=1.0).contains(&guards.confidence)
+                    || !(0.0..=1.0).contains(&guards.confidence_threshold)
+                    || guards.confidence < guards.confidence_threshold
+                {
                     return Err(CubeError::GuardFailed(format!(
                         "confidence {} < threshold {}",
                         guards.confidence, guards.confidence_threshold
@@ -940,5 +945,25 @@ mod tests {
         // modify should succeed with confidence 0.9
         let _ = engine.step(&workflow, &mut execution, &mut cube).unwrap();
         assert_eq!(execution.current_node, "validate");
+    }
+
+    #[test]
+    fn invalid_confidence_never_grants_modify() {
+        for confidence in [f64::NAN, f64::INFINITY, -1.0, 2.0] {
+            let mut cube = Cube::new("invalid-confidence");
+            cube.transition(AgentState::Analyze, &TransitionGuards::default())
+                .unwrap();
+            assert!(cube
+                .transition(
+                    AgentState::Modify,
+                    &TransitionGuards {
+                        confidence,
+                        confidence_threshold: 0.8,
+                        ..Default::default()
+                    }
+                )
+                .is_err());
+            assert_eq!(cube.current_state(), AgentState::Analyze);
+        }
     }
 }

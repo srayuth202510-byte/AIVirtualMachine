@@ -124,7 +124,7 @@ fn default_model() -> String {
     "echo".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceBlock {
     #[serde(default = "default_cpu")]
     pub cpu: u32,
@@ -132,6 +132,15 @@ pub struct ResourceBlock {
     pub memory: String,
     #[serde(default = "default_storage")]
     pub storage: String,
+}
+impl Default for ResourceBlock {
+    fn default() -> Self {
+        Self {
+            cpu: default_cpu(),
+            memory: default_mem(),
+            storage: default_storage(),
+        }
+    }
 }
 fn default_cpu() -> u32 {
     2
@@ -299,7 +308,11 @@ impl Runtime {
                     "filesystem",
                     &format!("{ws_str}/src"),
                 )),
-                _ => {}
+                _ => {
+                    return Err(RuntimeError::Config(format!(
+                        "unknown initial capability: {c}"
+                    )))
+                }
             }
         }
         if caps.is_empty() {
@@ -345,6 +358,8 @@ impl Runtime {
         let level = SandboxLevel::from_str(&config.runtime.isolation)
             .map_err(|e| RuntimeError::Config(e.to_string()))?;
         gateway.level = level;
+        gateway.limits = resource_limits(&config.resources)?;
+        gateway.state_path = Some(base_dir.join(STATE_FILE));
         // ส่ง config MicroVM ลง gateway (เฉพาะบิลด์ที่เปิดฟีเจอร์)
         // ไม่มีบล็อก `microvm:` ใน yaml (= `None`) gateway จะใช้ค่า default
         // ที่ deny ตั้งแต่ artifact หาย — ไม่มีทางรันโดยไม่ตั้งใจ
@@ -352,7 +367,7 @@ impl Runtime {
         {
             gateway.microvm_cfg = config.microvm.clone();
         }
-        let sandbox = Sandbox::new(level, ResourceLimits::default());
+        let sandbox = Sandbox::new(level, gateway.limits.clone());
         let model_cfg = ModelConfig {
             provider: config.model.provider.clone(),
             name: config.model.name.clone(),
@@ -391,15 +406,13 @@ impl Runtime {
         next: AgentState,
         guards: &TransitionGuards,
     ) -> Result<(usize, usize), RuntimeError> {
-        self.cube
+        let mut next_cube = self.cube.clone();
+        next_cube
             .transition(next, guards)
             .map_err(|e| RuntimeError::Transition(e.to_string()))?;
         let state = next.to_string();
-        // G1: transition มาจาก operator (guards เป็นหลักฐานฝั่งคน) = มีคนดู
-        // แล้ว ล้าง quarantine/counter probing ให้เริ่มนับใหม่
-        self.gateway.clear_quarantine();
-
-        let revoked = self.gateway.caps.revoke_stale(&state);
+        let mut next_caps = self.gateway.caps.clone();
+        let revoked = next_caps.revoke_stale(&state);
         if revoked > 0 {
             self.audit_op(
                 "revoke",
@@ -408,7 +421,6 @@ impl Runtime {
                 &state,
             )?;
         }
-
         let mut granted = 0;
         for cap in state_grants(
             next,
@@ -417,11 +429,21 @@ impl Runtime {
             &self.policy.process.allow,
         ) {
             let label = format!("{}:{}", cap.action, cap.scope);
-            if self.gateway.caps.grant(cap) {
-                granted += 1;
+            if next_caps.grant(cap) {
                 self.audit_op("grant", &label, "lease issued", &state)?;
+                granted += 1;
             }
         }
+        // ติดตั้งสิทธิ์หลัง audit ครบเท่านั้น; error ไม่เปลี่ยน state ในหน่วยความจำ
+        self.audit_op("transition", &state, "validated", &state)?;
+        let previous_cube = std::mem::replace(&mut self.cube, next_cube);
+        let previous_caps = std::mem::replace(&mut self.gateway.caps, next_caps);
+        if let Err(error) = self.persist() {
+            self.cube = previous_cube;
+            self.gateway.caps = previous_caps;
+            return Err(error);
+        }
+        self.gateway.clear_quarantine();
         Ok((granted, revoked))
     }
 
@@ -441,7 +463,19 @@ impl Runtime {
             .approve_lease(lease_id, approved_by)
             .map_err(|e| RuntimeError::Secret(e.to_string()))?;
         let state = self.cube.current_state().to_string();
-        self.audit_op("secret-approve", &lease.id, approved_by, &state)?;
+        if let Err(error) = self.audit_op("secret-approve", &lease.id, approved_by, &state) {
+            // audit ล้มต้องเพิกถอนสิทธิ์ที่เพิ่งอนุมัติในหน่วยความจำ
+            if let Some(broker) = self.gateway.secret_broker_mut() {
+                let _ = broker.revoke_lease(&lease.id);
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.persist() {
+            if let Some(broker) = self.gateway.secret_broker_mut() {
+                let _ = broker.revoke_lease(&lease.id);
+            }
+            return Err(error);
+        }
         Ok(aivm_secrets::LeaseSummary {
             id: lease.id.clone(),
             tool: lease.request.tool.clone(),
@@ -467,17 +501,8 @@ impl Runtime {
         let text =
             serde_json::to_string_pretty(&saved).map_err(|e| RuntimeError::Io(e.to_string()))?;
         let path = self.base_dir.join(STATE_FILE);
-        std::fs::write(&path, text).map_err(|e| RuntimeError::Io(e.to_string()))?;
-        // lease ที่ persist มีความอ่อนไหวเหมือน audit: เจ้าของอ่านได้อย่างเดียว
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perm = std::fs::metadata(&path)
-                .map_err(|e| RuntimeError::Io(e.to_string()))?
-                .permissions();
-            perm.set_mode(0o600);
-            std::fs::set_permissions(&path, perm).map_err(|e| RuntimeError::Io(e.to_string()))?;
-        }
+        aivm_tools::state_store::write_private(&path, &text)
+            .map_err(|e| RuntimeError::Io(e.to_string()))?;
         Ok(())
     }
 
@@ -541,8 +566,15 @@ impl Runtime {
         max_steps: usize,
         workspace: Option<&std::path::Path>,
     ) -> Result<agent::AgentRun, RuntimeError> {
-        let rag_index =
-            workspace.map(|ws| agent::build_workspace_index(ws, self.cube.current_state() as u32));
+        // RAG อ่านจาก gateway workspace ที่ runtime เป็นเจ้าของเท่านั้น
+        let rag_index = if workspace.is_some() {
+            Some(
+                agent::build_workspace_index(&mut self.gateway, &mut self.cube)
+                    .map_err(|e| RuntimeError::Io(e.to_string()))?,
+            )
+        } else {
+            None
+        };
         agent::run_loop(
             &*self.model,
             &mut self.gateway,
@@ -602,17 +634,63 @@ fn state_grants(
     }
     if next == AgentState::Validate {
         for host in network_allow {
-            let mut net = Capability::new("network", "network", host);
-            net.condition = Some(Condition {
-                protocol: Some("https".to_string()),
-                require_state: None,
-                valid_states: vec!["VALIDATE".to_string()],
-            });
-            net.expiration = Some(aivm_capability::now_secs() + NETWORK_LEASE_SECS);
-            out.push(net);
+            let scope = if host.contains(':') {
+                host.clone()
+            } else {
+                format!("{host}:443")
+            };
+            for action in ["network:fetch", "network:connect"] {
+                let mut net = Capability::new(action, "network", &scope);
+                net.condition = Some(Condition {
+                    protocol: Some("https".into()),
+                    require_state: None,
+                    valid_states: vec!["VALIDATE".into()],
+                });
+                net.constraints.require_tls = true;
+                net.constraints.allowed_ports = vec![scope
+                    .rsplit(':')
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(443)];
+                net.expiration = Some(aivm_capability::now_secs() + NETWORK_LEASE_SECS);
+                out.push(net);
+            }
         }
     }
     out
+}
+
+fn resource_limits(resources: &ResourceBlock) -> Result<ResourceLimits, RuntimeError> {
+    fn megabytes(value: &str) -> Result<u64, RuntimeError> {
+        let value = value.trim().to_ascii_uppercase();
+        let (digits, factor) = if let Some(v) = value.strip_suffix("GB") {
+            (v, 1024)
+        } else if let Some(v) = value.strip_suffix("MB") {
+            (v, 1)
+        } else {
+            return Err(RuntimeError::Config(
+                "resource size must use MB or GB".into(),
+            ));
+        };
+        digits
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(factor))
+            .filter(|n| *n > 0)
+            .ok_or_else(|| RuntimeError::Config("invalid resource size".into()))
+    }
+    if resources.cpu == 0 {
+        return Err(RuntimeError::Config("CPU must be positive".into()));
+    }
+    let memory_mb = megabytes(&resources.memory)?;
+    let storage_mb = megabytes(&resources.storage)?;
+    Ok(ResourceLimits {
+        cpu: resources.cpu,
+        memory_mb,
+        pids_max: 64,
+        storage_mb,
+    })
 }
 
 /// แปลงรายการ tools.allow ใน config เป็น absolute canonical path
@@ -1202,6 +1280,7 @@ runtime:
   isolation: sandbox
 secrets:
   allow: ["test_tok:read"]
+  low_risk_allow: ["test_tok:read"]
   hitl_required_for: ["high"]
 "#,
         )
@@ -1360,7 +1439,7 @@ secrets:
             )
             .unwrap();
         assert!(r.ok);
-        assert!(r.output.contains("ROUNDTRIP-VALUE"));
+        assert_eq!(r.output, "[REDACTED]");
         // 4. audit มีรอย approve ระบุคน + ไม่มี value หลุด
         let log = std::fs::read_to_string(base.join("audit.jsonl")).unwrap();
         assert!(log.contains("secret-approve"));
@@ -1368,5 +1447,90 @@ secrets:
         assert!(!log.contains("ROUNDTRIP-VALUE"));
         aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);
+    }
+    #[test]
+    fn rag_never_reads_vm_secrets_even_when_given_the_vm_root() {
+        struct Recorder(std::sync::Arc<std::sync::Mutex<String>>);
+        impl aivm_model::Model for Recorder {
+            fn reason(&self, context: &str) -> Result<String, aivm_model::ModelError> {
+                *self.0.lock().unwrap() = context.into();
+                Ok(r#"{"done":true,"summary":"done"}"#.into())
+            }
+            fn token_count(&self, _: &str) -> usize {
+                0
+            }
+            fn max_context(&self) -> usize {
+                4096
+            }
+        }
+        let (mut rt, base) = test_runtime("rag-secret");
+        std::fs::create_dir_all(rt.workspace.join("src")).unwrap();
+        std::fs::write(
+            rt.workspace.join("src/safe.txt"),
+            "credential source is safe",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("secrets.yaml"),
+            "credential: RAG-VALUE-DO-NOT-SEND\n",
+        )
+        .unwrap();
+        std::fs::write(rt.workspace.join("private.txt"), "credential PRIVATE-VALUE").unwrap();
+        rt.gateway
+            .policy
+            .filesystem
+            .deny
+            .push(rt.workspace.join("private.txt").display().to_string());
+        let prompt = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        rt.model = Box::new(Recorder(prompt.clone()));
+        rt.run_agent("credential", 1, Some(&base)).unwrap();
+        let prompt = prompt.lock().unwrap();
+        assert!(prompt.contains("source is safe"));
+        assert!(!prompt.contains("RAG-VALUE-DO-NOT-SEND"));
+        assert!(!prompt.contains("PRIVATE-VALUE"));
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn consumed_quota_is_checkpointed_before_restart() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut rt, base) = test_runtime("quota-restart");
+        std::fs::create_dir_all(rt.workspace.join("src")).unwrap();
+        std::fs::write(rt.workspace.join("src/seed.txt"), "seed").unwrap();
+        rt.gateway.caps = CapabilitySet::new(vec![Capability::new(
+            "read",
+            "filesystem",
+            &rt.workspace.display().to_string(),
+        )
+        .with_max_uses(1)]);
+        rt.gateway.read(&mut rt.cube, "src/seed.txt").unwrap();
+        let mode = std::fs::metadata(base.join(STATE_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let cfg = rt.config.clone();
+        drop(rt);
+        let mut restored = Runtime::init(cfg, base.clone()).unwrap();
+        assert!(restored
+            .gateway
+            .read(&mut restored.cube, "src/seed.txt")
+            .is_err());
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn validate_grants_network_actions_with_tls_and_matching_ports() {
+        let ws = std::path::Path::new("/workspace");
+        let caps = state_grants(AgentState::Validate, ws, &["api.example.com".into()], &[]);
+        for action in ["network:fetch", "network:connect"] {
+            let cap = caps.iter().find(|c| c.action == action).unwrap();
+            assert_eq!(cap.scope, "api.example.com:443");
+            assert!(cap.constraints.require_tls);
+            assert_eq!(cap.constraints.allowed_ports, vec![443]);
+        }
     }
 }

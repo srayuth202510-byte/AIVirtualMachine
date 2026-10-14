@@ -24,6 +24,8 @@ AIVM คือ runtime สำหรับรัน AI Agent โดยเฉพ�
 
 กฎเหล็ก: **fail-closed** — parse/eval/context error ใด ๆ → `DENY` เสมอ ไม่มี default-allow
 
+รายละเอียดการบังคับใช้และพฤติกรรมที่เปลี่ยนหลัง security review: [`docs/security-hardening.md`](./docs/security-hardening.md)
+
 ## เริ่มใช้ใน 5 นาที
 
 ```bash

@@ -187,7 +187,7 @@ fn main() -> Result<(), AnyErr> {
                 eprintln!("vm '{name}' not registered under this --root; `create` it first");
                 std::process::exit(2);
             }
-            let ws = root.join(&name);
+            let ws = root.join(&name).join("workspace");
             let run = sup
                 .run_agent(&name, &task, max_steps, Some(&ws))
                 .map_err(err)?;

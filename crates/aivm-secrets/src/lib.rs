@@ -98,11 +98,14 @@ pub struct SecretCapability {
 }
 
 /// Secret Policy — policy สำหรับ secrets
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretPolicy {
     /// Allow list: resource:scope patterns ที่อนุญาต
     #[serde(default)]
     pub allow: Vec<String>,
+    /// scope ที่ operator อนุญาตให้เป็น Low-risk (ค่าเริ่มต้นไม่มี)
+    #[serde(default)]
+    pub low_risk_allow: Vec<String>,
     /// Deny list: resource:scope patterns ที่ห้าม
     #[serde(default)]
     pub deny: Vec<String>,
@@ -115,6 +118,19 @@ pub struct SecretPolicy {
     /// Max uses ที่อนุญาต (0 = unlimited)
     #[serde(default)]
     pub max_uses_allowed: u32,
+}
+
+impl Default for SecretPolicy {
+    fn default() -> Self {
+        Self {
+            allow: vec![],
+            low_risk_allow: vec![],
+            deny: vec![],
+            hitl_required_for: default_hitl(),
+            max_ttl_seconds: 0,
+            max_uses_allowed: 0,
+        }
+    }
 }
 
 fn default_hitl() -> Vec<RiskLevel> {
@@ -193,12 +209,21 @@ impl SecretBroker {
     /// Request a secret lease (AI-initiated, goes through capability/policy/HITL)
     pub fn request_lease(
         &mut self,
-        request: SecretRequest,
+        mut request: SecretRequest,
         _cube: &aivm_cube::Cube,
         caps: &mut aivm_capability::CapabilitySet,
         hitl_approved: bool,
         approved_by: Option<String>,
     ) -> Result<SecretLease, SecretError> {
+        if request.max_uses == 0
+            || request.max_uses > 1000
+            || request.ttl_seconds == 0
+            || request.ttl_seconds > 86400
+        {
+            return Err(SecretError::InvalidRequest(
+                "invalid lease lifetime or usage limit".into(),
+            ));
+        }
         // 1. Capability check
         let scope = format!("{}:{}", request.resource, request.scope);
         caps.authorize("use", "secret", &scope)
@@ -210,6 +235,15 @@ impl SecretBroker {
         // 3. Risk evaluation + HITL (G4b): High-risk ที่ไม่มี approval ไม่ทิ้ง
         // แต่เก็บเป็น PENDING lease ให้ operator approve ต่อได้ (lease id
         // อยู่ใน error — ไม่ใช่ secret จึงบอกได้)
+        if request.risk == RiskLevel::Low
+            && !self
+                .policy
+                .low_risk_allow
+                .iter()
+                .any(|pattern| Self::match_pattern(pattern, &scope))
+        {
+            request.risk = RiskLevel::High;
+        }
         let requires_hitl = self.policy.hitl_required_for.contains(&request.risk);
         let pre_approved = hitl_approved;
 
@@ -415,11 +449,25 @@ impl SecretBroker {
             if l.uses >= l.request.max_uses {
                 continue;
             }
-            l.status = if l.hitl_approved {
-                LeaseStatus::Active
-            } else {
-                LeaseStatus::Pending
-            };
+            if self.check_policy(&l.request).is_err() {
+                continue;
+            }
+            let scope = format!("{}:{}", l.request.resource, l.request.scope);
+            if l.request.risk == RiskLevel::Low
+                && !self
+                    .policy
+                    .low_risk_allow
+                    .iter()
+                    .any(|p| Self::match_pattern(p, &scope))
+            {
+                l.request.risk = RiskLevel::High;
+            }
+            l.status =
+                if l.hitl_approved || !self.policy.hitl_required_for.contains(&l.request.risk) {
+                    LeaseStatus::Active
+                } else {
+                    LeaseStatus::Pending
+                };
             self.leases.insert(l.id.clone(), l);
             kept += 1;
         }
@@ -563,6 +611,7 @@ mod tests {
     fn test_broker() -> SecretBroker {
         let mut broker = SecretBroker::new(
             SecretPolicy {
+                low_risk_allow: vec!["*".into()],
                 allow: vec!["github_token:*".into()],
                 deny: vec!["github_token:admin".into()],
                 hitl_required_for: vec![RiskLevel::High],
@@ -661,6 +710,7 @@ mod tests {
         // policy ตรง ๆ สำหรับเคสนี้ (test_broker allow แค่ read)
         let mut broker = SecretBroker::new(
             SecretPolicy {
+                low_risk_allow: vec!["*".into()],
                 allow: vec!["github_token:write".into()],
                 deny: vec![],
                 hitl_required_for: vec![RiskLevel::High],
@@ -808,5 +858,39 @@ mod tests {
 
         let result = broker.request_lease(request, &cube, &mut caps, true, Some("operator".into()));
         assert!(matches!(result, Err(SecretError::PolicyDenied(_))));
+    }
+
+    #[test]
+    fn caller_cannot_downgrade_secret_risk() {
+        let policy = SecretPolicy {
+            allow: vec!["credential:read".into()],
+            ..Default::default()
+        };
+        let mut broker = SecretBroker::new(policy, None);
+        broker.register_secret("credential".into(), "VALUE".into());
+        let mut caps = aivm_capability::CapabilitySet::new(vec![aivm_capability::Capability::new(
+            "use",
+            "secret",
+            "credential:read",
+        )]);
+        let request = SecretRequest {
+            tool: "process.exec".into(),
+            resource: "credential".into(),
+            scope: "read".into(),
+            purpose: "test".into(),
+            risk: RiskLevel::Low,
+            max_uses: 1,
+            ttl_seconds: 300,
+        };
+        assert!(matches!(
+            broker.request_lease(
+                request,
+                &aivm_cube::Cube::new("test"),
+                &mut caps,
+                false,
+                None
+            ),
+            Err(SecretError::HitlRequired(_))
+        ));
     }
 }
