@@ -27,6 +27,7 @@ dependencies = [
  "aivm-policy",
  "aivm-runtime",
  "aivm-sandbox",
+ "aivm-secrets",
  "aivm-tools",
  "serde_json",
 ]
@@ -127,6 +128,7 @@ dependencies = [
  "aivm-network",
  "aivm-policy",
  "aivm-sandbox",
+ "aivm-secrets",
  "aivm-tools",
  "serde",
  "serde_json",
@@ -184,6 +186,7 @@ dependencies = [
  "aivm-cube",
  "aivm-policy",
  "aivm-sandbox",
+ "aivm-secrets",
  "serde",
  "serde_json",
  "sha2",
