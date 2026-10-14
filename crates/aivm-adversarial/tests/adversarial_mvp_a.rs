@@ -499,3 +499,201 @@ fn agent_loop_denies_non_json_model_output() {
     );
     adv_clean(&dir);
 }
+
+// ---- G4 Secret Abuse (§38 Secret Abuse + §26) ----
+
+fn secret_harness_adv(tag: &str) -> (ToolGateway, Cube, std::path::PathBuf) {
+    let real = std::fs::canonicalize("/bin/true")
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let (gw, cube, dir) = exec_harness(tag, std::slice::from_ref(&real), &[], true);
+    let mut broker = aivm_secrets::SecretBroker::new(
+        aivm_secrets::SecretPolicy {
+            allow: vec!["tok:read".into()],
+            deny: vec![],
+            hitl_required_for: vec![aivm_secrets::RiskLevel::High],
+            max_ttl_seconds: 3600,
+            max_uses_allowed: 5,
+        },
+        None,
+    );
+    broker.register_secret("tok".into(), "ADV-SECRET-VALUE".into());
+    let mut gw = gw.with_secret_broker(broker);
+    gw.caps.grant(Capability::new("use", "secret", "tok:read"));
+    (gw, cube, dir)
+}
+
+fn secret_req(body: serde_json::Value) -> aivm_tools::ToolRequest {
+    aivm_tools::ToolRequest {
+        tool: "secret.request".into(),
+        path: "-".into(),
+        content: Some(body.to_string()),
+    }
+}
+
+fn secret_body_adv(resource: &str, scope: &str, risk: &str) -> serde_json::Value {
+    serde_json::json!({
+        "tool": "process.exec",
+        "resource": resource,
+        "scope": scope,
+        "purpose": "adv",
+        "risk": risk,
+    })
+}
+
+// Secret Abuse: scope escalation (มี read ขอ write) ต้อง DENY
+#[test]
+fn secret_scope_escalation_must_deny() {
+    let (mut gw, mut cube, dir) = secret_harness_adv("scope");
+    let r = gw.dispatch(
+        &mut cube,
+        &secret_req(secret_body_adv("tok", "write", "low")),
+    );
+    assert!(r.is_err(), "scope escalation ต้อง DENY");
+    let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+    assert!(log.contains("\"decision\":\"deny\""));
+    assert!(!log.contains("ADV-SECRET-VALUE"));
+    adv_clean(&dir);
+}
+
+// Secret Abuse: resource ที่ไม่รู้จักต้อง DENY (ไม่บอกว่ามีอะไรบ้าง)
+// ชั้น policy ปฏิเสธก่อน (secret-policy) ส่วน pattern ที่ policy เปิดแต่
+// broker ไม่มีค่า ตายชั้นถัดไปด้วย secret-unknown
+#[test]
+fn secret_unknown_resource_must_deny() {
+    let (mut gw, mut cube, dir) = secret_harness_adv("unknown");
+    // grant cap ตรง resource ปลอมเพื่อให้ถึงขั้น broker (พิสูจน์ว่า broker ปฏิเสธเอง)
+    gw.caps
+        .grant(Capability::new("use", "secret", "ghost:read"));
+    let r = gw.dispatch(
+        &mut cube,
+        &secret_req(secret_body_adv("ghost", "read", "low")),
+    );
+    assert!(r.is_err(), "resource ปลอมต้อง DENY");
+    let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+    assert!(log.contains("secret-policy") || log.contains("secret-unknown"));
+    assert!(!log.contains("ADV-SECRET-VALUE"));
+
+    // pattern เปิดแต่ไม่มีค่าใน broker → secret-unknown
+    let real = std::fs::canonicalize("/bin/true")
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let (gw, cube, dir2) = exec_harness("unknown2", std::slice::from_ref(&real), &[], true);
+    let mut broker = aivm_secrets::SecretBroker::new(
+        aivm_secrets::SecretPolicy {
+            allow: vec!["ghost:read".into()],
+            deny: vec![],
+            hitl_required_for: vec![],
+            max_ttl_seconds: 3600,
+            max_uses_allowed: 5,
+        },
+        None,
+    );
+    broker.register_secret("tok".into(), "ADV-SECRET-VALUE".into());
+    let mut gw = gw.with_secret_broker(broker);
+    gw.caps
+        .grant(Capability::new("use", "secret", "ghost:read"));
+    let mut cube = cube;
+    let r = gw.dispatch(
+        &mut cube,
+        &secret_req(secret_body_adv("ghost", "read", "low")),
+    );
+    assert!(r.is_err());
+    let log = std::fs::read_to_string(dir2.join("audit.jsonl")).unwrap();
+    assert!(log.contains("secret-unknown"));
+    adv_clean(&dir);
+    adv_clean(&dir2);
+}
+
+// Secret Abuse: high-risk ไม่มี approval ต้อง DENY (default require HITL)
+// ผ่าน gateway จริง (broker allow write + cap ครบ — เหลือแค่ HITL ที่ขาด)
+#[test]
+fn secret_high_risk_without_hitl_must_deny() {
+    let real = std::fs::canonicalize("/bin/true")
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let (gw, cube, dir) = exec_harness("hitl", std::slice::from_ref(&real), &[], true);
+    let mut broker = aivm_secrets::SecretBroker::new(
+        aivm_secrets::SecretPolicy {
+            allow: vec!["tok:write".into()],
+            deny: vec![],
+            hitl_required_for: vec![aivm_secrets::RiskLevel::High],
+            max_ttl_seconds: 3600,
+            max_uses_allowed: 5,
+        },
+        None,
+    );
+    broker.register_secret("tok".into(), "ADV-SECRET-VALUE".into());
+    let mut gw = gw.with_secret_broker(broker);
+    gw.caps.grant(Capability::new("use", "secret", "tok:write"));
+    let mut cube = cube;
+    let r = gw.dispatch(
+        &mut cube,
+        &secret_req(secret_body_adv("tok", "write", "high")),
+    );
+    assert!(r.is_err(), "high-risk ไม่มี approval ต้อง DENY");
+    let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+    assert!(log.contains("hitl-required"));
+    assert!(!log.contains("ADV-SECRET-VALUE"));
+    adv_clean(&dir);
+}
+
+// Secret Abuse: lease ใช้แล้วหมดอายุการใช้ซ้ำต้อง DENY (one-time)
+#[test]
+fn secret_lease_reuse_must_deny() {
+    let (mut gw, mut cube, dir) = secret_harness_adv("reuse");
+    let r = gw
+        .dispatch(
+            &mut cube,
+            &secret_req(secret_body_adv("tok", "read", "low")),
+        )
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&r.output).unwrap();
+    let lease_id = v["lease_id"].as_str().unwrap().to_string();
+    let exec_with = |gw: &mut ToolGateway, cube: &mut Cube, lease: Option<String>| {
+        gw.dispatch(
+            cube,
+            &aivm_tools::ToolRequest {
+                tool: "process.exec".into(),
+                path: "/bin/true".into(),
+                content: Some(serde_json::json!({"argv": [], "secret": lease}).to_string()),
+            },
+        )
+    };
+    assert!(exec_with(&mut gw, &mut cube, Some(lease_id.clone())).is_ok());
+    let r = exec_with(&mut gw, &mut cube, Some(lease_id));
+    assert!(r.is_err(), "lease ใช้ซ้ำต้อง DENY");
+    let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+    assert!(log.contains("lease-exhausted"));
+    assert!(!log.contains("ADV-SECRET-VALUE"), "value ห้ามหลุดลง audit");
+    adv_clean(&dir);
+}
+
+// Secret Abuse: schema ผิดรูปต้อง DENY (non-JSON + ฟิลด์เกิน)
+#[test]
+fn secret_malformed_request_must_deny() {
+    let (mut gw, mut cube, dir) = secret_harness_adv("malformed");
+    for body in [
+        "not json".to_string(),
+        serde_json::json!({"tool": "process.exec"}).to_string(),
+        serde_json::json!({
+            "tool": "process.exec", "resource": "tok", "scope": "read",
+            "purpose": "x", "risk": "low", "smuggle": "value",
+        })
+        .to_string(),
+    ] {
+        let r = gw.dispatch(
+            &mut cube,
+            &aivm_tools::ToolRequest {
+                tool: "secret.request".into(),
+                path: "-".into(),
+                content: Some(body),
+            },
+        );
+        assert!(r.is_err(), "schema ผิดต้อง DENY");
+    }
+    adv_clean(&dir);
+}

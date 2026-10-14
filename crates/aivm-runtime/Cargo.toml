@@ -16,6 +16,7 @@ aivm-audit = { path = "../aivm-audit" }
 aivm-tools = { path = "../aivm-tools" }
 aivm-memory = { path = "../aivm-memory" }
 aivm-network = { path = "../aivm-network" }
+aivm-secrets = { path = "../aivm-secrets" }
 aivm-sandbox = { path = "../aivm-sandbox" }
 aivm-model = { path = "../aivm-model" }
 

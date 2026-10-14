@@ -374,7 +374,27 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
         );
     }
 
-    // 13. hash chain ของ audit ต้องตรวจผ่าน
+    // 13. secret.request ไม่มี broker ต้องถูกปฏิเสธ (G4: fail-closed)
+    case(
+        &mut cases,
+        "secret.request without broker",
+        Expect::Deny,
+        gw.dispatch(
+            &mut cube,
+            &ToolRequest {
+                tool: "secret.request".into(),
+                path: "-".into(),
+                content: Some(
+                    "{\"tool\":\"process.exec\",\"resource\":\"t\",\"scope\":\"r\",\"purpose\":\"d\"}"
+                        .into(),
+                ),
+            },
+        )
+        .map(|r| r.output)
+        .map_err(|e| e.to_string()),
+    );
+
+    // 14. hash chain ของ audit ต้องตรวจผ่าน
     let audit_entries =
         AuditWriter::verify(&audit_path).map_err(|e| RuntimeError::Io(e.to_string()))?;
     let audit_verified = audit_entries > 0;

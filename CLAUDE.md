@@ -150,7 +150,7 @@ make verify        # full gate: fmt-check + clippy(-D warnings) + tests + demo
 make ci            # เหมือน CI บน GitHub ทุกอย่าง (= verify + e2e + microvm)
 make test-adv      # adversarial must-deny suite only (spec §38)
 make test-microvm  # MicroVM ทั้งสาย (sandbox/tools/runtime + บูตจริงถ้ามี AIVM_MICROVM_PINS)
-make demo          # 12-case ALLOW/DENY self-test, throwaway temp dir (~1s)
+make demo          # 13-case ALLOW/DENY self-test, throwaway temp dir (~1s)
 cargo adv          # alias for the adversarial suite
 cargo lint         # alias for strict clippy
 ```

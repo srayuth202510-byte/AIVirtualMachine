@@ -99,15 +99,24 @@ pub struct SecretCapability {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SecretPolicy {
     /// Allow list: resource:scope patterns ที่อนุญาต
+    #[serde(default)]
     pub allow: Vec<String>,
     /// Deny list: resource:scope patterns ที่ห้าม
+    #[serde(default)]
     pub deny: Vec<String>,
     /// Require HITL สำหรับ risk level (default: High)
+    #[serde(default = "default_hitl")]
     pub hitl_required_for: Vec<RiskLevel>,
     /// Max TTL ที่อนุญาต (seconds, 0 = unlimited)
+    #[serde(default)]
     pub max_ttl_seconds: u64,
     /// Max uses ที่อนุญาต (0 = unlimited)
+    #[serde(default)]
     pub max_uses_allowed: u32,
+}
+
+fn default_hitl() -> Vec<RiskLevel> {
+    vec![RiskLevel::High]
 }
 
 #[derive(Error, Debug)]
@@ -244,6 +253,12 @@ impl SecretBroker {
         }
 
         Ok(lease)
+    }
+
+    /// Inspect a lease without consuming a use (gateway ตรวจ tool-binding
+    /// ก่อน inject; การนับ use เกิดใน `use_lease` เท่านั้น)
+    pub fn get_lease(&self, lease_id: &str) -> Option<&SecretLease> {
+        self.leases.get(lease_id)
     }
 
     /// Use a lease to get secret value (tool executor calls this)

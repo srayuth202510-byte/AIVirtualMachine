@@ -50,6 +50,15 @@ capabilities:
 policy:
   require_test_before_network: true        # false = เตือนตอน create (network ไม่ต้องมีเทสต์ก่อน)
 
+# นโยบาย secrets (G4 §26): มีแค่ patterns — values อยู่ใน secrets.yaml
+# ของ operator (ข้างบ้าน VM, 0600 เท่านั้น) ไม่มีไฟล์ = deny หมด
+# secrets:
+#   allow: ["github_token:read"]
+#   deny: ["github_token:admin"]
+#   hitl_required_for: ["high"]   # low-risk ออก lease ให้เลย high ต้อง approve
+#   max_ttl_seconds: 3600         # 0 = ไม่จำกัด
+#   max_uses_allowed: 5           # 0 = ไม่จำกัด
+
 # บล็อก microvm: (ใช้เมื่อเปิดฟีเจอร์ microvm เท่านั้น บิลด์ปกติเมินทิ้ง)
 # ดูวิธีเตรียม pins ใน docs/microvm.md
 # microvm:

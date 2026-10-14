@@ -24,6 +24,15 @@ deny burst (20 ครั้ง/60 วิ) = quarantine ทั้ง gateway 60 �
 กัน runaway loop — เรียก method ตรงโดยไม่ผ่าน dispatch ก็หนีไม่พ้น,
 operator transition ล้างได้, ไม่ยืดเวลาเอง)
 
+## Secrets (G4 §26)
+
+`secret.request` (structured schema เข้ม) → broker ตรวจ capability + policy →
+Low-risk ออก one-time lease (คืนแต่ lease_id) / High-risk ไม่มี approval =
+DENY + audit `hitl-required` → `process.exec` แนบ `{"argv":[…],"secret":id}`
+ฉีดค่าเข้า child env (`env_extra` ช่องเดียว) แล้ว zeroize — value ไม่มีทาง
+อยู่ AI context/memory/audit (redaction โดย construction) ระดับ microvm
+inject ไม่ได้ = DENY ตรง ๆ ไม่เงียบทิ้ง
+
 ## Isolation levels (`runtime.isolation`)
 
 | ค่า | backend | สถานะ |

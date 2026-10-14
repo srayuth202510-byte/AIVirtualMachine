@@ -16,6 +16,7 @@ aivm-policy = { path = "../aivm-policy" }
 aivm-audit = { path = "../aivm-audit" }
 aivm-cube = { path = "../aivm-cube" }
 aivm-sandbox = { path = "../aivm-sandbox" }
+aivm-secrets = { path = "../aivm-secrets" }
 
 [features]
 default = []

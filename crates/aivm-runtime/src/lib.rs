@@ -13,6 +13,7 @@ use aivm_policy::Policy;
 use aivm_sandbox::{ResourceLimits, Sandbox, SandboxLevel};
 use aivm_tools::{ToolGateway, ToolRequest};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
@@ -26,6 +27,9 @@ pub const CONFIDENCE_THRESHOLD: f64 = 0.8;
 pub const NETWORK_LEASE_SECS: u64 = 300;
 /// cube + ชุด capability ที่ persist ไว้ เพื่อให้สิทธิ์แบบ dynamic รอดข้าม restart
 const STATE_FILE: &str = "state.json";
+/// ไฟล์ค่า secrets ของ operator (G4 §26) — values อยู่ที่นี่ที่เดียว
+/// ห้ามอยู่ใน `aivm.yaml` เด็ดขาด (ดู `load_secrets_file`)
+const SECRETS_FILE: &str = "secrets.yaml";
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -58,6 +62,10 @@ pub struct VmConfig {
     pub capabilities: CapabilitiesBlock,
     #[serde(default)]
     pub policy: PolicyExtra,
+    /// นโยบาย secrets (G4 §26): มีแค่ patterns (allow/deny/HITL/quota) —
+    /// values อยู่ใน `secrets.yaml` ของ operator เท่านั้น
+    #[serde(default)]
+    pub secrets: aivm_secrets::SecretPolicy,
     /// บล็อก `microvm:` (kernel/rootfs pin + quota) ใช้เมื่อเปิดฟีเจอร์
     /// `microvm` เท่านั้น — บิลด์ปกติไม่รู้จักฟิลด์นี้และเมินบล็อกทิ้ง
     /// (serde เมิน unknown fields) พฤติกรรมจึงคงเดิมทุกประการ
@@ -304,6 +312,11 @@ impl Runtime {
             &config.name,
             &format!("sess_{}", config.name),
         );
+        // G4 §26: secret broker (patterns จาก yaml + values จาก secrets.yaml
+        // ของ operator) — ไม่มีไฟล์ = broker ว่าง = deny หมด (fail-closed)
+        let mut broker = aivm_secrets::SecretBroker::new(config.secrets.clone(), None);
+        load_secrets_file(&base_dir.join(SECRETS_FILE), &mut broker)?;
+        gateway = gateway.with_secret_broker(broker);
         let mut cube = Cube::new(&format!("task_{}", config.name));
         // กู้ state แบบ dynamic (transition ที่ validate แล้ว + lease ที่ยังใช้ได้)
         // ไฟล์ state ที่เสีย/แปลกปลอมจะถูกเมินแบบ fail-closed: VM จะ
@@ -580,6 +593,43 @@ fn resolve_tool(name: &str) -> Option<String> {
         return None;
     }
     Some(real.to_string_lossy().to_string())
+}
+
+/// โหลดค่า secrets ของ operator (G4 §26): ไฟล์ `{base}/secrets.yaml` รูป
+/// `{resource: value}` — ไม่มีไฟล์ = broker ว่าง (deny หมด) ไม่ใช่ error
+/// สิทธิ์ต้อง owner-only (0600) ไม่งั้นปฏิเสธทั้งไฟล์ (fail-closed:
+/// secret ที่คนอื่นอ่านได้ = ไม่น่าไว้ใจแล้ว)
+fn load_secrets_file(
+    path: &Path,
+    broker: &mut aivm_secrets::SecretBroker,
+) -> Result<(), RuntimeError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(RuntimeError::Io(e.to_string())),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|e| RuntimeError::Io(e.to_string()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(RuntimeError::Config(
+                "secrets.yaml must be owner-only (0600)".into(),
+            ));
+        }
+    }
+    let map: HashMap<String, String> =
+        serde_yaml::from_str(&text).map_err(|e| RuntimeError::Config(e.to_string()))?;
+    for (k, v) in map {
+        if k.is_empty() || k.len() > 128 || v.is_empty() || v.len() > 8192 {
+            return Err(RuntimeError::Config("bad secrets.yaml entry".into()));
+        }
+        broker.register_secret(k, v);
+    }
+    Ok(())
 }
 
 fn absolutize(p: &Path) -> PathBuf {
@@ -1087,6 +1137,85 @@ microvm:
             .unwrap();
         let r = rt.gateway.exec(&mut rt.cube, "/bin/true", &[]);
         assert!(r.is_ok(), "หลัง transition ต้องกลับมาปกติ");
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // G4: secrets.yaml 0600 โหลดเข้า broker (allow ตาม policy) ส่วน 0644
+    // ถูกปฏิเสธทั้งไฟล์ (fail-closed) — ไม่มีไฟล์เลยก็บูตได้ (deny หมด)
+    #[test]
+    fn secrets_yaml_loads_with_owner_only_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!(
+            "aivm-rt-secrets-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cfg = VmConfig::from_yaml(
+            r#"
+name: t
+runtime:
+  isolation: sandbox
+secrets:
+  allow: ["test_tok:read"]
+  hitl_required_for: ["high"]
+"#,
+        )
+        .unwrap();
+        // ไม่มีไฟล์ = บูตได้ แต่ secret.request ถูก deny (broker ต่อสายแล้ว
+        // แต่ว่าง — resource ไม่รู้จัก ไม่ใช่ unconfigured)
+        let mut rt = Runtime::init(cfg.clone(), base.clone()).unwrap();
+        rt.gateway.caps.grant(aivm_capability::Capability::new(
+            "use",
+            "secret",
+            "test_tok:read",
+        ));
+        let body = serde_json::json!({
+            "tool": "process.exec",
+            "resource": "test_tok",
+            "scope": "read",
+            "purpose": "test",
+            "risk": "low",
+        })
+        .to_string();
+        let r = rt.gateway.secret_request(&mut rt.cube, Some(body.as_str()));
+        assert!(r.is_err());
+        let log = std::fs::read_to_string(base.join("audit.jsonl")).unwrap();
+        assert!(log.contains("secret-unknown"));
+        // 0644 = ปฏิเสธ (fail-closed)
+        std::fs::write(base.join("secrets.yaml"), "test_tok: VALUE\n").unwrap();
+        std::fs::set_permissions(
+            base.join("secrets.yaml"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(Runtime::init(cfg.clone(), base.clone()).is_err());
+        // 0600 = โหลดได้ request ผ่าน
+        std::fs::set_permissions(
+            base.join("secrets.yaml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let mut rt = Runtime::init(cfg, base.clone()).unwrap();
+        rt.gateway.caps.grant(aivm_capability::Capability::new(
+            "use",
+            "secret",
+            "test_tok:read",
+        ));
+        let body = serde_json::json!({
+            "tool": "process.exec",
+            "resource": "test_tok",
+            "scope": "read",
+            "purpose": "test",
+            "risk": "low",
+        })
+        .to_string();
+        let r = rt.gateway.secret_request(&mut rt.cube, Some(body.as_str()));
+        let r = r.unwrap();
+        assert!(r.ok);
+        assert!(!r.output.contains("VALUE"));
         aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);
     }

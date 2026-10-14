@@ -19,6 +19,10 @@ use aivm_capability::CapabilitySet;
 use aivm_cube::{AgentState, Cube};
 use aivm_policy::{Decision, EvalContext, Policy};
 use aivm_sandbox::{ExecSpec, ResourceLimits, SandboxLevel};
+use aivm_secrets::{
+    zeroize_secret, RiskLevel, SecretBroker, SecretError, SecretInjector, SecretLease,
+    SecretRequest,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -53,6 +57,44 @@ pub struct ToolResult {
     pub output: String,
 }
 
+/// body ของ `process.exec` รูป object (G4): ใช้แทน argv array ล้วนเมื่อต้อง
+/// แนบ secret lease — strict schema (`deny_unknown_fields` + parse ไม่ได้
+/// = DENY) ฟิลด์อื่นนอกจากสองตัวนี้ = DENY ทันที
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecContent {
+    pub argv: Vec<String>,
+    /// lease id จาก `secret.request` (ไม่มี = รันปกติไม่มี secret)
+    #[serde(default)]
+    pub secret: Option<String>,
+}
+
+/// body ของ `secret.request` (G4 §26 — structured schema เท่านั้น):
+/// ฟิลด์ขาด/เกิน/type ผิด = DENY (fail-closed ไม่เดา)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretRequestBody {
+    /// tool ที่จะใช้ secret (MVP: `"process.exec"` เท่านั้น อย่างอื่น = DENY)
+    pub tool: String,
+    /// resource ที่ขอ (เช่น `"github_token"`)
+    pub resource: String,
+    /// scope ที่ขอ (เช่น `"read"`)
+    pub scope: String,
+    /// เป้าหมาย (metadata ลง audit เท่านั้น ไม่ใช่ trust signal)
+    pub purpose: String,
+    /// ใช้ได้กี่ครั้ง (default 1 = one-time lease)
+    pub max_uses: Option<u32>,
+    /// อายุวินาที (default 300)
+    pub ttl_seconds: Option<u64>,
+    /// `"low"` | `"high"` (default `"high"` = conservative)
+    pub risk: Option<String>,
+}
+
+/// เพดานความยาวฟิลด์คำขอ secret (กัน log บวม — secret value ไม่มีทางผ่านช่องนี้)
+const MAX_SECRET_FIELD: usize = 256;
+/// เพดานความยาว lease id (uuid ~36 ตัวอักษร)
+const MAX_LEASE_ID: usize = 128;
+
 pub struct ToolGateway {
     pub workspace: PathBuf,
     pub policy: Policy,
@@ -71,6 +113,9 @@ pub struct ToolGateway {
     pub microvm_cfg: Option<aivm_sandbox::microvm::MicroVmConfig>,
     req_counter: u64,
     deny_tracker: DenyTracker,
+    /// Secret broker (G4 §26): `None` = ไม่ตั้งค่า → `secret.request` และ
+    /// exec แบบแนบ secret ถูก DENY (fail-closed ไม่มีทางเงียบผ่าน)
+    secret_broker: Option<SecretBroker>,
 }
 
 /// ตัวตัดวงจร deny-storm (G1 — `docs/threat-model.md`): agent ที่โดนยึดแล้ว
@@ -178,7 +223,15 @@ impl ToolGateway {
             microvm_cfg: None,
             req_counter: 0,
             deny_tracker: DenyTracker::default(),
+            secret_broker: None,
         }
+    }
+
+    /// ติด secret broker แบบ builder (operator ประกอบที่ runtime — ดู
+    /// `Runtime::init`: broker เปล่า = deny หมด, มี secrets = ตาม policy)
+    pub fn with_secret_broker(mut self, broker: SecretBroker) -> Self {
+        self.secret_broker = Some(broker);
+        self
     }
 
     /// ตั้งระดับ isolation แบบ builder (ใช้ในเทสต์/อนาคตที่ backend พร้อม)
@@ -498,14 +551,46 @@ impl ToolGateway {
     /// capability (action=execute resource=process scope=exe canonical) ->
     /// `run_checked` (ตรวจประตูซ้ำข้างใน = defense in depth + บีบ TOCTOU) ->
     /// audit พร้อม exit code ไม่ผ่านขั้นไหนเลยคือ DENY และไม่ spawn
+    ///
+    /// ไม่มี secret (ใช้กับ secret ผ่าน dispatch `process.exec` รูป object
+    /// หรือ `exec_inner` โดยตรง)
     pub fn exec(
         &mut self,
         cube: &mut Cube,
         exe: &str,
         args: &[String],
     ) -> Result<ToolResult, ToolError> {
+        self.exec_inner(cube, exe, args, None)
+    }
+
+    /// `process.exec` แบบแนบ secret lease (G4 §26): lease มาจาก
+    /// `secret.request` (lease_id เท่านั้น — value ไม่มีทางผ่านช่องนี้)
+    /// value ถูก inject เข้า child env แล้ว zeroize ทันทีหลังรัน
+    /// (`secret.request` คืนแต่ id; ใครไม่มี lease ที่ใช้ได้ = DENY)
+    fn exec_inner(
+        &mut self,
+        cube: &mut Cube,
+        exe: &str,
+        args: &[String],
+        lease_id: Option<&str>,
+    ) -> Result<ToolResult, ToolError> {
         self.check_quarantine(cube, "execute", exe)?;
-        let spec = ExecSpec {
+        // secret ระดับ microvm ยัง inject ไม่ได้ (guest ไม่รับ env_extra) —
+        // fail-closed ตั้งแต่ต้น ไม่เงียบทิ้ง (G4)
+        if lease_id.is_some() && self.level == SandboxLevel::MicroVm {
+            self.audit_decision(
+                cube,
+                "execute",
+                exe,
+                "deny",
+                "secret-unsupported-microvm",
+                "error",
+            );
+            return Err(ToolError::Denied(
+                "secret injection not supported at microvm level".into(),
+            ));
+        }
+        let mut spec = ExecSpec {
             exe: PathBuf::from(exe),
             args: args.to_vec(),
             cwd: self.workspace.clone(),
@@ -524,6 +609,82 @@ impl ToolGateway {
             self.audit_decision(cube, "execute", &scope, "deny", "no-capability", "error");
             return Err(ToolError::Denied("no capability".into()));
         }
+        // secret lease (G4): resolve หลัง validate+caps (deny ก่อนหน้าไม่เผา
+        // one-time lease) — value เข้า env_extra ช่องเดียว ไม่มีทางอื่น
+        // หมายเหตุ borrow: คุยกับ broker ให้จบใน block เดียว (owned ออกมา)
+        // แล้วค่อย audit — ไม่ถือ borrow ข้าม audit call เด็ดขาด
+        let mut lease_tag = "-".to_string();
+        let mut secret_env: Vec<(String, String)> = vec![];
+        if let Some(lid) = lease_id {
+            if lid.is_empty() || lid.len() > MAX_LEASE_ID {
+                self.audit_decision(cube, "execute", &scope, "deny", "bad-lease-id", "error");
+                return Err(ToolError::Denied("bad secret lease id".into()));
+            }
+            enum Resolve {
+                Ready {
+                    id: String,
+                    env: Vec<(String, String)>,
+                },
+                Deny {
+                    rule: &'static str,
+                    msg: String,
+                },
+            }
+            let resolved = match self.secret_broker.as_mut() {
+                None => Resolve::Deny {
+                    rule: "secret-unconfigured",
+                    msg: "secret broker not configured".into(),
+                },
+                Some(broker) => match broker.get_lease(lid) {
+                    // tool-binding: lease ผูกกับ consumer ตั้งแต่ขอ (กันสลับใช้ข้าม tool)
+                    None => Resolve::Deny {
+                        rule: "lease-not-found",
+                        msg: "unknown secret lease".into(),
+                    },
+                    Some(l) if l.request.tool != "process.exec" => Resolve::Deny {
+                        rule: "secret-tool-mismatch",
+                        msg: "lease bound to another tool".into(),
+                    },
+                    Some(l) => {
+                        let id = l.id.clone();
+                        let env = SecretInjector::inject_env(l);
+                        // เผา one use (status/expiry/uses ตรวจตรงนี้) ค่าที่คืน
+                        // มาล้างทันที (ค่าจริงอยู่ใน env แล้ว — ช่องเดียวที่ส่งต่อ)
+                        match broker.use_lease(lid) {
+                            Ok(mut v) => {
+                                zeroize_secret(&mut v);
+                                Resolve::Ready { id, env }
+                            }
+                            Err(e) => {
+                                let rule = match e {
+                                    SecretError::LeaseExhausted => "lease-exhausted",
+                                    SecretError::LeaseExpired => "lease-expired",
+                                    SecretError::LeaseRevoked => "lease-revoked",
+                                    _ => "secret-error",
+                                };
+                                let mut env = env;
+                                zeroize_env(&mut env);
+                                Resolve::Deny {
+                                    rule,
+                                    msg: "secret lease unusable".into(),
+                                }
+                            }
+                        }
+                    }
+                },
+            };
+            match resolved {
+                Resolve::Ready { id, env } => {
+                    lease_tag = id;
+                    secret_env = env;
+                }
+                Resolve::Deny { rule, msg } => {
+                    self.audit_decision(cube, "execute", &scope, "deny", rule, "error");
+                    return Err(ToolError::Denied(msg));
+                }
+            }
+        }
+        spec.env_extra = secret_env;
         // เปิดฟีเจอร์ `microvm` + มี config: ระดับ MicroVm เดินประตู
         // skeleton ด้วย config จริง (pin hash + quota จาก `aivm.yaml`)
         // ไม่มี config (= `None`) ตกไปใช้ค่า default ที่ deny อยู่ดี
@@ -536,6 +697,11 @@ impl ToolGateway {
         };
         #[cfg(not(feature = "microvm"))]
         let run_result = aivm_sandbox::run_checked_with_level(&spec, &self.policy, self.level);
+        // value ใน env ล้างทันทีที่ spawn เสร็จ (child ได้สำเนาของตัวเองไปแล้ว
+        // broker เก็บต้นฉบับตาม max_uses — gateway ไม่ถือค้าง)
+        for (_, v) in spec.env_extra.iter_mut() {
+            zeroize_secret(v);
+        }
         // verdict ลง audit ทุก decision (G3): allow = verdict:clean เสมอ
         // (จบบริบูรณ์ถึง allow ได้) deny = verdict ที่แนบมากับ error
         let outcome = match run_result {
@@ -574,13 +740,14 @@ impl ToolGateway {
             &scope,
             "allow",
             &format!(
-                "exit:{} verdict:clean dna:{}",
+                "exit:{} verdict:clean dna:{} secret:{}",
                 outcome.code.unwrap_or(-1),
                 if outcome.dna.is_empty() {
                     "-"
                 } else {
                     &outcome.dna
-                }
+                },
+                lease_tag,
             ),
             "success",
         );
@@ -871,19 +1038,32 @@ impl ToolGateway {
             }
             "code.search" => self.search(cube, &req.path),
             "process.exec" => {
-                // argv มาจาก JSON array เท่านั้น parse ไม่ได้ = DENY
-                // (กัน shell interpolation: ไม่มีจุดไหนต่อสตริงเป็นคำสั่งเลย)
-                let args: Vec<String> = match req.content.as_deref() {
-                    Some(s) => serde_json::from_str(s).map_err(|_| {
-                        self.audit_decision(
-                            cube, "execute", &req.path, "deny", "bad-argv", "error",
-                        );
-                        ToolError::Denied("argv must be a JSON array of strings".into())
-                    })?,
-                    None => vec![],
+                // argv มาจาก JSON array ล้วน (เดิม) หรือ object {argv, secret?}
+                // (G4) — parse ไม่ได้เลย = DENY (กัน shell interpolation:
+                // ไม่มีจุดไหนต่อสตริงเป็นคำสั่งเลย)
+                let (args, lease): (Vec<String>, Option<String>) = match req.content.as_deref() {
+                    Some(s) => {
+                        if let Ok(a) = serde_json::from_str::<Vec<String>>(s) {
+                            (a, None)
+                        } else {
+                            match serde_json::from_str::<ExecContent>(s) {
+                                Ok(c) => (c.argv, c.secret),
+                                Err(_) => {
+                                    self.audit_decision(
+                                        cube, "execute", &req.path, "deny", "bad-argv", "error",
+                                    );
+                                    return Err(ToolError::Denied(
+                                        "argv must be a JSON array of strings".into(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    None => (vec![], None),
                 };
-                self.exec(cube, &req.path, &args)
+                self.exec_inner(cube, &req.path, &args, lease.as_deref())
             }
+            "secret.request" => self.secret_request(cube, req.content.as_deref()),
             "network.fetch" => {
                 // content: JSON { "method": "GET", "headers": {}, "body": null }
                 self.network_fetch(cube, &req.path, req.content.as_deref())
@@ -903,6 +1083,155 @@ impl ToolGateway {
     pub fn _state_label(cube: &Cube) -> String {
         let _: AgentState = cube.current_state();
         cube.current_state().to_string()
+    }
+
+    /// `secret.request`: ขอ one-time lease สำหรับ secret (G4 §26)
+    ///
+    /// สายบังคับใช้: structured schema เข้ม (ขาด/เกิน/type ผิด = DENY) ->
+    /// broker ตรวจ capability + policy -> Low ออก lease ให้เลย, High ที่ไม่มี
+    /// approval = DENY + audit `hitl-required` (approve flow แยกต่างหาก)
+    ///
+    /// คืนเฉพาะ lease_id + metadata — **secret value ไม่มีทางกลับไป
+    /// AI context** (I-2/tool-scoped: ค่าถูก inject เข้า child env ตอน exec
+    /// เท่านั้น แล้ว zeroize)
+    pub fn secret_request(
+        &mut self,
+        cube: &mut Cube,
+        content: Option<&str>,
+    ) -> Result<ToolResult, ToolError> {
+        self.check_quarantine(cube, "secret.request", "-")?;
+        let body: SecretRequestBody = match content {
+            Some(s) => serde_json::from_str(s).map_err(|_| {
+                self.deny_secret(
+                    cube,
+                    "bad-secret-request",
+                    "secret.request needs a JSON object",
+                )
+            })?,
+            None => {
+                return Err(self.deny_secret(
+                    cube,
+                    "bad-secret-request",
+                    "secret.request needs a JSON object",
+                ));
+            }
+        };
+        // ฟิลด์ต้องไม่ว่างและไม่ยาวเกิน (กัน log บวม — value ไม่มีทางผ่านช่องนี้)
+        for (name, v) in [
+            ("tool", &body.tool),
+            ("resource", &body.resource),
+            ("scope", &body.scope),
+            ("purpose", &body.purpose),
+        ] {
+            if v.is_empty() || v.len() > MAX_SECRET_FIELD {
+                return Err(self.deny_secret(
+                    cube,
+                    "bad-secret-request",
+                    &format!("bad secret.request field: {name}"),
+                ));
+            }
+        }
+        // consumer binding: MVP มีผู้ใช้แค่ process.exec (อย่างอื่น = DENY)
+        if body.tool != "process.exec" {
+            return Err(self.deny_secret(
+                cube,
+                "secret-tool-unknown",
+                "secret consumer must be process.exec",
+            ));
+        }
+        let risk = match body.risk.as_deref() {
+            None | Some("high") => RiskLevel::High,
+            Some("low") => RiskLevel::Low,
+            Some(_) => {
+                return Err(self.deny_secret(
+                    cube,
+                    "bad-secret-request",
+                    "risk must be low or high",
+                ));
+            }
+        };
+        let req = SecretRequest {
+            tool: body.tool.clone(),
+            resource: body.resource.clone(),
+            scope: body.scope.clone(),
+            purpose: body.purpose.clone(),
+            max_uses: body.max_uses.unwrap_or(1),
+            ttl_seconds: body.ttl_seconds.unwrap_or(300),
+            risk,
+        };
+        let scope = format!("{}:{}", req.resource, req.scope);
+        let broker = match self.secret_broker.as_mut() {
+            Some(b) => b,
+            None => {
+                return Err(self.deny_secret(
+                    cube,
+                    "secret-unconfigured",
+                    "secret broker not configured",
+                ));
+            }
+        };
+        // borrow broker จบใน match นี้ (owned ออกมา) แล้วค่อย audit
+        enum Outcome {
+            Allow(SecretLease),
+            Deny { rule: &'static str, msg: String },
+        }
+        let outcome = match broker.request_lease(req, cube, &mut self.caps, false, None) {
+            Ok(lease) => Outcome::Allow(lease),
+            Err(e) => {
+                let (rule, msg) = match &e {
+                    SecretError::HitlRequired => (
+                        "hitl-required",
+                        "high-risk secret requires operator approval".to_string(),
+                    ),
+                    SecretError::CapabilityDenied(_) => ("no-capability", "no capability".into()),
+                    SecretError::PolicyDenied(_) => {
+                        ("secret-policy", "secret denied by policy".into())
+                    }
+                    // ไม่บอกว่ามี resource อะไรบ้าง (กัน enumerate)
+                    SecretError::SecretNotFound(_) => {
+                        ("secret-unknown", "unknown secret resource".into())
+                    }
+                    SecretError::InvalidRequest(_) => {
+                        ("bad-secret-request", "bad secret request".into())
+                    }
+                    _ => ("secret-error", "secret request failed".into()),
+                };
+                Outcome::Deny { rule, msg }
+            }
+        };
+        match outcome {
+            Outcome::Allow(lease) => {
+                let out = serde_json::json!({
+                    "lease_id": lease.id,
+                    "resource": lease.request.resource,
+                    "scope": lease.request.scope,
+                    "max_uses": lease.request.max_uses,
+                    "hitl_approved": lease.hitl_approved,
+                })
+                .to_string();
+                self.audit_decision(
+                    cube,
+                    "secret.request",
+                    &scope,
+                    "allow",
+                    "lease-issued",
+                    "success",
+                );
+                Ok(ToolResult {
+                    ok: true,
+                    decision: "allow".into(),
+                    output: out,
+                })
+            }
+            Outcome::Deny { rule, msg } => Err(self.deny_secret(cube, rule, &msg)),
+        }
+    }
+
+    /// deny  helper ของ `secret.request` (audit + Err ในรูปเดียว — resource
+    /// ยังไม่รู้ตอน parse จึงใช้ "-")
+    fn deny_secret(&mut self, cube: &mut Cube, rule: &str, msg: &str) -> ToolError {
+        self.audit_decision(cube, "secret.request", "-", "deny", rule, "error");
+        ToolError::Denied(msg.to_string())
     }
 
     /// บันทึกการปฏิเสธที่ระดับ intent (parse ไม่ผ่าน หรืออ้าง tool ที่ไม่รู้จัก)
@@ -1149,6 +1478,14 @@ fn parse_host_port(host_port: &str) -> Result<(String, u16), ToolError> {
     Ok((host, port))
 }
 
+/// ล้างค่า secret ใน env pairs (best-effort zeroize — เรียกทุกทางออก
+/// หลัง secret เข้าสู่มือ gateway แล้ว)
+fn zeroize_env(env: &mut [(String, String)]) {
+    for (_, v) in env.iter_mut() {
+        zeroize_secret(v);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1241,6 +1578,49 @@ network: {{allow: [], deny: []}}
                 .grant(aivm_capability::Capability::new("execute", "process", exe));
         }
         (gw, cube, dir)
+    }
+
+    // harness สำหรับ secrets: broker + นโยบาย allow แคบ + secret ค่าปลอม
+    // (+ execute cap สำหรับ /usr/bin/printenv ไว้พิสูจน์ injection —
+    // `env` ตรง ๆ โดน interpreter denylist ถูกต้องแล้ว)
+    fn secret_harness() -> (ToolGateway, Cube, PathBuf) {
+        let (mut gw, cube, dir) = exec_harness();
+        let env_real = std::fs::canonicalize("/usr/bin/printenv")
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        gw.policy.process.allow.push(env_real.clone());
+        gw.caps.grant(aivm_capability::Capability::new(
+            "execute", "process", &env_real,
+        ));
+        let mut broker = aivm_secrets::SecretBroker::new(
+            aivm_secrets::SecretPolicy {
+                allow: vec!["test_token:read".into(), "test_token:write".into()],
+                deny: vec![],
+                hitl_required_for: vec![aivm_secrets::RiskLevel::High],
+                max_ttl_seconds: 3600,
+                max_uses_allowed: 5,
+            },
+            None,
+        );
+        broker.register_secret("test_token".into(), "TOP-SECRET-XYZ".into());
+        let mut gw = gw.with_secret_broker(broker);
+        for scope in ["test_token:read", "test_token:write"] {
+            gw.caps
+                .grant(aivm_capability::Capability::new("use", "secret", scope));
+        }
+        (gw, cube, dir)
+    }
+
+    fn secret_body(tool: &str, resource: &str, scope: &str, risk: &str) -> String {
+        serde_json::json!({
+            "tool": tool,
+            "resource": resource,
+            "scope": scope,
+            "purpose": "test",
+            "risk": risk,
+        })
+        .to_string()
     }
 
     #[test]
@@ -1483,5 +1863,178 @@ network: {{allow: [], deny: []}}
             log.contains("quarantine-probing"),
             "ต้องมีรอย deny ระหว่าง quarantine"
         );
+    }
+
+    // G4: secret.request low-risk ออก lease ให้ (คืนแต่ id + metadata —
+    // value ห้ามปรากฏทั้งใน output และ audit)
+    #[test]
+    fn secret_request_issues_lease_without_value() {
+        let (mut gw, mut cube, dir) = secret_harness();
+        let r = gw
+            .dispatch(
+                &mut cube,
+                &ToolRequest {
+                    tool: "secret.request".into(),
+                    path: "-".into(),
+                    content: Some(secret_body("process.exec", "test_token", "read", "low")),
+                },
+            )
+            .unwrap();
+        assert!(r.ok);
+        assert_eq!(r.decision, "allow");
+        let v: serde_json::Value = serde_json::from_str(&r.output).unwrap();
+        let lease_id = v["lease_id"].as_str().expect("ต้องมี lease_id");
+        assert!(!lease_id.is_empty());
+        assert!(
+            !r.output.contains("TOP-SECRET-XYZ"),
+            "value ห้ามกลับไป AI context"
+        );
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(log.contains("lease-issued"));
+        assert!(!log.contains("TOP-SECRET-XYZ"), "value ห้ามลง audit");
+    }
+
+    // G4: high-risk ไม่มี approval = DENY + audit hitl-required
+    #[test]
+    fn secret_request_high_risk_denies_hitl() {
+        let (mut gw, mut cube, dir) = secret_harness();
+        let r = gw.dispatch(
+            &mut cube,
+            &ToolRequest {
+                tool: "secret.request".into(),
+                path: "-".into(),
+                content: Some(secret_body("process.exec", "test_token", "write", "high")),
+            },
+        );
+        assert!(matches!(r, Err(ToolError::Denied(_))));
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(log.contains("hitl-required"));
+    }
+
+    // G4: schema ผิด = DENY (non-JSON, ขาดฟิลด์, เกินฟิลด์, tool ผิด)
+    #[test]
+    fn secret_request_malformed_denies() {
+        let (mut gw, mut cube, dir) = secret_harness();
+        let bad = vec![
+            "not json".to_string(),
+            serde_json::json!({"tool": "process.exec"}).to_string(),
+            serde_json::json!({
+                "tool": "process.exec", "resource": "test_token", "scope": "read",
+                "purpose": "t", "risk": "low", "extra": 1,
+            })
+            .to_string(),
+            secret_body("network.fetch", "test_token", "read", "low"),
+        ];
+        for b in &bad {
+            let r = gw.dispatch(
+                &mut cube,
+                &ToolRequest {
+                    tool: "secret.request".into(),
+                    path: "-".into(),
+                    content: Some(b.clone()),
+                },
+            );
+            assert!(matches!(r, Err(ToolError::Denied(_))), "ต้อง deny: {b}");
+        }
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(log.contains("\"decision\":\"deny\""));
+    }
+
+    // G4: ไม่มี broker = DENY (fail-closed ไม่มีทางเงียบผ่าน)
+    #[test]
+    fn secret_request_unconfigured_denies() {
+        let (mut gw, mut cube, dir) = exec_harness();
+        let r = gw.dispatch(
+            &mut cube,
+            &ToolRequest {
+                tool: "secret.request".into(),
+                path: "-".into(),
+                content: Some(secret_body("process.exec", "test_token", "read", "low")),
+            },
+        );
+        assert!(matches!(r, Err(ToolError::Denied(_))));
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(log.contains("secret-unconfigured"));
+    }
+
+    // G4: exec แนบ lease ฉีด secret เข้า child env (อ่านค่าผ่าน printenv)
+    // แต่ audit ต้องไม่มีค่า + lease ใช้ซ้ำไม่ได้ (one-time)
+    #[test]
+    fn secret_exec_injects_and_redacts_and_burns() {
+        let (mut gw, mut cube, dir) = secret_harness();
+        let r = gw
+            .dispatch(
+                &mut cube,
+                &ToolRequest {
+                    tool: "secret.request".into(),
+                    path: "-".into(),
+                    content: Some(secret_body("process.exec", "test_token", "read", "low")),
+                },
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&r.output).unwrap();
+        let lease_id = v["lease_id"].as_str().unwrap().to_string();
+        // คีย์ env ตาม SecretInjector (resource/scope ตัวใหญ่ _ แทน -/:)
+        let key = "AIVM_SECRET_TEST_TOKEN_READ";
+        let run = |gw: &mut ToolGateway, cube: &mut Cube, lease: Option<String>| {
+            gw.dispatch(
+                cube,
+                &ToolRequest {
+                    tool: "process.exec".into(),
+                    path: "/usr/bin/printenv".into(),
+                    content: Some(serde_json::json!({"argv": [key], "secret": lease}).to_string()),
+                },
+            )
+        };
+        // ครั้งแรก: inject สำเร็จ เห็นค่าใน stdout
+        let r = run(&mut gw, &mut cube, Some(lease_id.clone())).unwrap();
+        assert!(r.ok);
+        assert!(r.output.contains("TOP-SECRET-XYZ"), "child env ต้องมี secret");
+        // ใช้ซ้ำ: one-time lease หมดแล้ว
+        let r = run(&mut gw, &mut cube, Some(lease_id));
+        assert!(matches!(r, Err(ToolError::Denied(_))));
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(log.contains("lease-exhausted"));
+        // audit ทั้งไฟล์ต้องไม่มีค่า secret เลย
+        assert!(!log.contains("TOP-SECRET-XYZ"), "value ห้ามลง audit เด็ดขาด");
+    }
+
+    // G4: exec ไม่แนบ lease = ไม่มี secret ใน env (ไม่รั่วข้าม run)
+    // (printenv ตัวแปรที่ไม่มี exit 1 — decision ต้อง allow แต่ output ว่าง)
+    #[test]
+    fn secret_exec_without_lease_has_no_secret() {
+        let (mut gw, mut cube, _d) = secret_harness();
+        let r = gw
+            .dispatch(
+                &mut cube,
+                &ToolRequest {
+                    tool: "process.exec".into(),
+                    path: "/usr/bin/printenv".into(),
+                    content: Some(
+                        serde_json::json!({"argv": ["AIVM_SECRET_TEST_TOKEN_READ"]}).to_string(),
+                    ),
+                },
+            )
+            .unwrap();
+        assert_eq!(r.decision, "allow");
+        assert!(!r.output.contains("TOP-SECRET-XYZ"));
+    }
+
+    // G4: exec แนบ secret ระดับ microvm = DENY (inject ไม่ได้ — ไม่เงียบทิ้ง)
+    #[test]
+    fn secret_exec_microvm_level_denies() {
+        let (mut gw, mut cube, dir) = secret_harness();
+        gw.level = SandboxLevel::MicroVm;
+        let r = gw.dispatch(
+            &mut cube,
+            &ToolRequest {
+                tool: "process.exec".into(),
+                path: "/bin/true".into(),
+                content: Some(serde_json::json!({"argv": [], "secret": "lease-xyz"}).to_string()),
+            },
+        );
+        assert!(matches!(r, Err(ToolError::Denied(_))));
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(log.contains("secret-unsupported-microvm"));
     }
 }

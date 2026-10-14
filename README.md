@@ -30,7 +30,7 @@ AIVM คือ runtime สำหรับรัน AI Agent โดยเฉพ�
 # 1. ติดตั้งของที่ต้องใช้ (ดูรายละเอียดใน docs/setup.md)
 #    Rust stable + clippy + rustfmt
 
-# 2. build + พิสูจน์เส้น enforcement (12 เคส ALLOW/DENY, ~1 วินาที)
+# 2. build + พิสูจน์เส้น enforcement (13 เคส ALLOW/DENY, ~1 วินาที)
 cargo build -p aivm-cli
 cargo run -q -p aivm-cli -- demo
 
@@ -65,7 +65,7 @@ cargo run -q -p aivm-cli -- audit coder
 | `logs` / `audit` | ท้าย audit log / ตรวจ hash chain |
 | `index` / `search` | สร้าง/ค้น RAG index (Phase 6) |
 | `probe` | ตรวจความพร้อม isolation ของเครื่อง (KVM/firecracker รายงานซื่อสัตย์) |
-| `demo` | self-test 12 เคส ไม่ต้องมี VM |
+| `demo` | self-test 13 เคส ไม่ต้องมี VM |
 | `pause` / `stop` / `kill` | จัดการ lifecycle |
 
 config เขียนยังไงดู [`docs/configuration.md`](./docs/configuration.md) (มีตัวอย่าง `microvm:` สำหรับ isolation ระดับ MicroVM)

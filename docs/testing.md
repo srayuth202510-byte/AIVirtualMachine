@@ -4,7 +4,7 @@
 
 | คำสั่ง | วิ่งอะไร | เมื่อไหร่ที่ใช้ |
 |---|---|---|
-| `make demo` | self-test 12 เคส ALLOW/DENY ใน temp dir (~1 วินาที) | ดีบักเส้น enforcement — เร็วสุด พิมพ์ decision/reason ต่อเคส |
+| `make demo` | self-test 13 เคส ALLOW/DENY ใน temp dir (~1 วินาที) | ดีบักเส้น enforcement — เร็วสุด พิมพ์ decision/reason ต่อเคส |
 | `make verify` | `fmt-check` + `clippy(-D warnings)` + `cargo test --workspace` + `demo` | gate ก่อน commit ทุกครั้ง |
 | `make ci` | `verify` + `e2e` + `check-microvm` + `test-microvm` | เท่า CI บน GitHub ทุกอย่าง |
 | `make e2e` | `scripts/smoke.sh` (create/inspect/run/agent/transition/logs/audit/kill + demo + adversarial) | ตรวจวงจร CLI ครบ |

@@ -113,7 +113,15 @@ DNA ทุกครั้งต้องลง audit (ไม่รวม secret)
 | G1 | A1 probing | ✅ เสร็จ: `DenyTracker` (20 denies / 60s → quarantine 60s ทั้ง gateway ทุก method รวมเรียกตรง + audit `quarantine-started`/`quarantine-probing` + ไม่ยืดเวลาเอง + operator transition ล้าง) — เป็น circuit breaker กัน runaway loop/burst ไม่ใช่ตัวจับ slow probing | เสร็จ |
 | G2 | A2 poisoned input | test ป้อน payload ปนเปื้อนผ่าน read → intent ต้องไม่ escalate | กลาง — design กันอยู่ แต่ไม่มี test ผูก |
 | G3 | A3 escape signal | ✅ เสร็จ: `RunVerdict` (`Clean`/`Suspect`/`Compromise` + reason ตายตัว) แนบคู่ error ทุกขั้นบูตแบบ explicit + ลง audit ทุก decision — VMM ตายก่อน marker / สำเนาถูกสลับ = `Compromise`, timeout / marker หาย / exit parse ไม่ได้ = `Suspect`, deny ตั้งแต่ประตู / infra ล้ม = `Clean` | เสร็จ |
-| G4 | A4 gateway wiring | ต่อ secrets crate เข้า gateway (`secret.request` tool + injection + audit) + adversarial | สูง — ของมีแต่ยังไม่ต่อสาย |
+| G4 | A4 gateway wiring | ✅ เสร็จ: `secret.request` tool (strict schema) + broker ตรวจ capability/policy + Low ออก lease (คืนแต่ id) / High deny `hitl-required` + `process.exec` ฉีดเข้า child env ช่องเดียว + zeroize + audit ไม่มี value + microvm deny ตรง | เสร็จ (เหลือ G4b: approve flow สำหรับ High-risk — ดูข้างล่าง) |
 | G5 | A3/A4 DNA | ✅ เสร็จ: DNA ต่อบูต (marker scheme V0/V1 + init tmp layout + เลือก image จากชุดที่ verify แล้ว + jitter resource opt-in + secret lease ไม่ซ้ำ) + dna id ลง audit (`dna:s…`) | เสร็จ |
 
-ลำดับแนะนำ: ~~G3 → G5 → G1 →~~ G4 → G2 (G4 ใหญ่สุด แยกงานต่างหากได้)
+ลำดับแนะนำ: ~~G3 → G5 → G1 → G4 →~~ G2
+
+## 6. งานค้างหลัง G4 (G4b — approve flow สำหรับ High-risk)
+
+G4 ที่เสร็จครอบคลุม: request → lease (low) / deny (high) → inject → audit
+ส่วนที่ยังไม่มี: pending lease + operator approve (`aivm approve-secret`
+หรือเทียบเท่า) + lease persistence ข้าม restart (ตอนนี้ approve หายเมื่อ restart
+= fail-closed ปลอดภัย) — ออกแบบก่อนลงมือ (threat: approval phishing /
+confused deputy ผ่าน lease id เดา)
