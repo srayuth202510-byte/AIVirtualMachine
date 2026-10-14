@@ -107,6 +107,7 @@ crates/
 - [`docs/microvm.md`](./docs/microvm.md) — เตรียม pins, บูตจริง, ข้อจำกัดที่รู้ตัว
 - [`docs/testing.md`](./docs/testing.md) — matrix คำสั่งทดสอบ, feature flags, CI
 - [`docs/architecture.md`](./docs/architecture.md) — เส้นทาง request, isolation levels, audit, invariants
+- [`docs/threat-model.md`](./docs/threat-model.md) — attacker positions, signals, DNA, non-goals, ช่องว่าง G1–G5
 - [`CLAUDE.md`](./CLAUDE.md) — workflow สำหรับ agent (ไม่ใช่คู่มือผู้ใช้)
 
 ## License
