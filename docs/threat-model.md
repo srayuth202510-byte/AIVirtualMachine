@@ -112,8 +112,8 @@ DNA ทุกครั้งต้องลง audit (ไม่รวม secret)
 |---|---|---|---|
 | G1 | A1 probing | rate-limit / quarantine เมื่อ DENY ซ้ำ + test | สูง — วันนี้เห็น probing ใน audit แต่ไม่มี action อัตโนมัติ |
 | G2 | A2 poisoned input | test ป้อน payload ปนเปื้อนผ่าน read → intent ต้องไม่ escalate | กลาง — design กันอยู่ แต่ไม่มี test ผูก |
-| G3 | A3 escape signal | suspect classifier หลัง run (VMM ตายก่อน marker / timeout / marker ผิด → verdict + audit) + test | สูง — signal มีแล้ว แต่ยังไม่ติดป้าย |
+| G3 | A3 escape signal | ✅ เสร็จ: `RunVerdict` (`Clean`/`Suspect`/`Compromise` + reason ตายตัว) แนบคู่ error ทุกขั้นบูตแบบ explicit + ลง audit ทุก decision — VMM ตายก่อน marker / สำเนาถูกสลับ = `Compromise`, timeout / marker หาย / exit parse ไม่ได้ = `Suspect`, deny ตั้งแต่ประตู / infra ล้ม = `Clean` | เสร็จ |
 | G4 | A4 gateway wiring | ต่อ secrets crate เข้า gateway (`secret.request` tool + injection + audit) + adversarial | สูง — ของมีแต่ยังไม่ต่อสาย |
 | G5 | A3/A4 DNA | instance DNA randomization (สุ่มตาม §3 + ลง audit) + test | กลาง — ทำหลัง G3 (ต้องมี verdict ก่อนค่อยสุ่มอย่างมีความหมาย) |
 
-ลำดับแนะนำ: G3 → G5 → G1 → G4 → G2 (G4 ใหญ่สุด แยกงานต่างหากได้)
+ลำดับแนะนำ: ~~G3 →~~ G5 → G1 → G4 → G2 (G4 ใหญ่สุด แยกงานต่างหากได้)

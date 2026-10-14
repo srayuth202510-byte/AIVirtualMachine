@@ -517,8 +517,40 @@ pub fn revalidate_exe(canon: &Path, policy: &Policy) -> Result<(), SandboxError>
     }
 }
 
+/// คำตัดสินหลังพยายามรัน (G3 — `docs/threat-model.md`): ตอบว่า "มีหลักฐาน
+/// ว่า boundary ถูกละเมิดหรือไม่" ไม่ใช่ "รันสำเร็จหรือไม่" ดูเฉพาะ signal
+/// ฝั่ง host ไม่เดาเจตนา agent
+/// - `Clean`: จบบริบูรณ์ หรือไม่เกิด run (deny ตั้งแต่ประตู / infra ล้มแบบ
+///   ไม่มีร่องรอยแทรกแซง)
+/// - `Suspect`: ผิดปกติแบบอธิบายได้ (timeout, marker หาย/parse ไม่ได้) — ต้องสืบต่อ
+/// - `Compromise`: หลักฐานละเมิด boundary (VMM ตายก่อน marker, ไฟล์ถูกสลับกลางบูต)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunVerdict {
+    Clean,
+    Suspect(&'static str),
+    Compromise(&'static str),
+}
+
+impl RunVerdict {
+    /// ป้ายสั้นสำหรับ audit (`clean`/`suspect`/`compromise`)
+    pub fn label(&self) -> &'static str {
+        match self {
+            RunVerdict::Clean => "clean",
+            RunVerdict::Suspect(_) => "suspect",
+            RunVerdict::Compromise(_) => "compromise",
+        }
+    }
+    /// เหตุผลแบบตายตัว (ไว้สืบย้อน ไม่ใช่ข้อความอิสระ)
+    pub fn reason(&self) -> &'static str {
+        match self {
+            RunVerdict::Clean => "no-interference-evidence",
+            RunVerdict::Suspect(r) | RunVerdict::Compromise(r) => r,
+        }
+    }
+}
+
 /// จุดแยก backend ตาม `SandboxLevel` (seam ของ Phase 7)
-///
+/// คืน verdict คู่กับ error เสมอ (G3): gateway เอาไปลง audit โดยไม่ต้องเดาเอง
 /// - `Process` = พฤติกรรม MVP-B เดิม (`run_checked`) ไม่เปลี่ยน
 /// - `MicroVm` = เปิดฟีเจอร์ `microvm` แล้วเดินประตู skeleton
 ///   (spec → shape → supply chain → host readiness → `Disabled` จนกว่า
@@ -530,20 +562,25 @@ pub fn run_checked_with_level(
     spec: &ExecSpec,
     policy: &Policy,
     level: SandboxLevel,
-) -> Result<ExecOutcome, SandboxError> {
+) -> Result<ExecOutcome, (SandboxError, RunVerdict)> {
     match level {
-        SandboxLevel::Process => run_checked(spec, policy),
-        SandboxLevel::Container => Err(SandboxError::Disabled(
-            "container backend not implemented; use Process level".into(),
+        SandboxLevel::Process => run_checked(spec, policy).map_err(|e| (e, RunVerdict::Clean)),
+        SandboxLevel::Container => Err((
+            SandboxError::Disabled("container backend not implemented; use Process level".into()),
+            RunVerdict::Clean,
         )),
         #[cfg(feature = "microvm")]
         SandboxLevel::MicroVm => microvm::run_in_microvm(spec, policy, &microvm::MicroVmConfig::default()),
         #[cfg(not(feature = "microvm"))]
-        SandboxLevel::MicroVm => Err(SandboxError::Disabled(
-            "microvm backend not implemented (needs KVM + firecracker + verified image); use Process level".into(),
+        SandboxLevel::MicroVm => Err((
+            SandboxError::Disabled(
+                "microvm backend not implemented (needs KVM + firecracker + verified image); use Process level".into(),
+            ),
+            RunVerdict::Clean,
         )),
-        SandboxLevel::Hardware => Err(SandboxError::Disabled(
-            "hardware backend not implemented; use Process level".into(),
+        SandboxLevel::Hardware => Err((
+            SandboxError::Disabled("hardware backend not implemented; use Process level".into()),
+            RunVerdict::Clean,
         )),
     }
 }
@@ -559,7 +596,7 @@ pub fn run_checked_with_level_and_cfg(
     policy: &Policy,
     level: SandboxLevel,
     cfg: &microvm::MicroVmConfig,
-) -> Result<ExecOutcome, SandboxError> {
+) -> Result<ExecOutcome, (SandboxError, RunVerdict)> {
     match level {
         SandboxLevel::MicroVm => microvm::run_in_microvm(spec, policy, cfg),
         _ => run_checked_with_level(spec, policy, level),
@@ -1521,14 +1558,14 @@ mod tests {
         for level in [SandboxLevel::Container, SandboxLevel::Hardware] {
             let r = run_checked_with_level(&s, &pol, level);
             assert!(
-                matches!(r, Err(SandboxError::Disabled(_))),
+                matches!(r, Err((SandboxError::Disabled(_), _))),
                 "level {level:?} ต้อง Disabled"
             );
         }
         #[cfg(not(feature = "microvm"))]
         {
             let r = run_checked_with_level(&s, &pol, SandboxLevel::MicroVm);
-            assert!(matches!(r, Err(SandboxError::Disabled(_))));
+            assert!(matches!(r, Err((SandboxError::Disabled(_), _))));
         }
         #[cfg(feature = "microvm")]
         assert!(

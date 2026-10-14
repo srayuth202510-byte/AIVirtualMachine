@@ -158,40 +158,54 @@ impl MicroVmConfig {
 /// ทุกขั้นไม่ผ่านคือไม่คืนผลสำเร็จเด็ดขาด (`Invalid` สำหรับ spec/artifact/
 /// shape ปลอม, `Disabled` สำหรับ host ไม่พร้อม, `Spawn` สำหรับ boot ล้ม
 /// หรือเกินเส้นตาย) gateway แปลงเป็น DENY ทั้งหมด
+///
+/// คืน verdict คู่กับ error เสมอ (G3): ประตู spec/shape/supply-chain/host
+/// (ยังไม่เกิด run) = `Clean` ส่วนขั้น boot แนบ verdict ตามหลักฐานที่เจอ
 pub fn run_in_microvm(
     spec: &ExecSpec,
     policy: &Policy,
     cfg: &MicroVmConfig,
-) -> Result<ExecOutcome, SandboxError> {
+) -> Result<ExecOutcome, (SandboxError, super::RunVerdict)> {
+    use super::RunVerdict;
     // 1. ประตูสเปกเดียวกับ Process (exe/policy/arg/env/cwd)
-    let canon = super::validate(spec, policy)?;
+    let canon = super::validate(spec, policy).map_err(|e| (e, RunVerdict::Clean))?;
     // 2. ตัวเลข config ต้องสมเหตุก่อน (ถูกกว่าแตะไฟล์)
-    cfg.validate_shape()?;
+    cfg.validate_shape().map_err(|e| (e, RunVerdict::Clean))?;
     // 3. supply chain: kernel + rootfs ต้องตรง hash ที่ pin ไว้
-    verify_artifact(&cfg.kernel_path, &cfg.kernel_sha256, cfg.max_artifact_bytes)?;
-    verify_artifact(&cfg.rootfs_path, &cfg.rootfs_sha256, cfg.max_artifact_bytes)?;
+    verify_artifact(&cfg.kernel_path, &cfg.kernel_sha256, cfg.max_artifact_bytes)
+        .map_err(|e| (e, RunVerdict::Clean))?;
+    verify_artifact(&cfg.rootfs_path, &cfg.rootfs_sha256, cfg.max_artifact_bytes)
+        .map_err(|e| (e, RunVerdict::Clean))?;
     // 4. host readiness (Linux + KVM + binary) — ไม่พร้อมคือ Disabled
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (spec, policy, cfg);
-        return Err(SandboxError::Disabled(
-            "microvm backend is Linux-only".into(),
+        return Err((
+            SandboxError::Disabled("microvm backend is Linux-only".into()),
+            RunVerdict::Clean,
         ));
     }
     #[cfg(target_os = "linux")]
     {
         if !super::kvm_available() {
-            return Err(SandboxError::Disabled(
-                "microvm needs /dev/kvm (KVM not available on this host)".into(),
+            return Err((
+                SandboxError::Disabled(
+                    "microvm needs /dev/kvm (KVM not available on this host)".into(),
+                ),
+                RunVerdict::Clean,
             ));
         }
         let fc = super::find_firecracker().ok_or_else(|| {
-            SandboxError::Disabled("microvm needs the firecracker binary in PATH".into())
+            (
+                SandboxError::Disabled("microvm needs the firecracker binary in PATH".into()),
+                RunVerdict::Clean,
+            )
         })?;
         // supply chain ของ VMM เอง: pin ไว้ก็ต้องตรง (ไม่ pin = ยอมรับตาม
         // PATH ของ operator แล้วรายงานใน `degraded` ให้รู้ตัว)
         if !cfg.fc_sha256.is_empty() {
-            verify_artifact(&fc, &cfg.fc_sha256, cfg.max_artifact_bytes)?;
+            verify_artifact(&fc, &cfg.fc_sha256, cfg.max_artifact_bytes)
+                .map_err(|e| (e, RunVerdict::Clean))?;
         }
         boot::boot_and_run(spec, &canon, cfg, &fc)
     }
@@ -203,7 +217,7 @@ mod boot;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ResourceLimits, SandboxError};
+    use crate::{ResourceLimits, RunVerdict, SandboxError};
     use sha2::{Digest, Sha256};
 
     fn test_ws(tag: &str) -> PathBuf {
@@ -259,7 +273,7 @@ mod tests {
         cfg.vcpu_count = 0;
         assert!(matches!(
             run_in_microvm(&spec, &policy, &cfg),
-            Err(SandboxError::Invalid(_))
+            Err((SandboxError::Invalid(_), _))
         ));
         let _ = std::fs::remove_dir_all(&ws);
     }
@@ -271,12 +285,12 @@ mod tests {
         cfg.boot_timeout_secs = 0;
         assert!(matches!(
             run_in_microvm(&spec, &policy, &cfg),
-            Err(SandboxError::Invalid(_))
+            Err((SandboxError::Invalid(_), _))
         ));
         cfg.boot_timeout_secs = 601;
         assert!(matches!(
             run_in_microvm(&spec, &policy, &cfg),
-            Err(SandboxError::Invalid(_))
+            Err((SandboxError::Invalid(_), _))
         ));
         let _ = std::fs::remove_dir_all(&ws);
     }
@@ -293,7 +307,20 @@ mod tests {
         cfg.fc_sha256 = "00".repeat(32);
         assert!(matches!(
             run_in_microvm(&spec, &policy, &cfg),
-            Err(SandboxError::Invalid(_))
+            Err((SandboxError::Invalid(_), _))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // deny ตั้งแต่ประตู (ยังไม่เกิด run) verdict ต้อง Clean — verdict ตอบแค่
+    // "มีหลักฐานละเมิด boundary หรือไม่" ไม่ใช่ "รันสำเร็จหรือไม่"
+    #[test]
+    fn preboot_denial_carries_clean_verdict() {
+        let (spec, policy, mut cfg, ws) = fixture("vcode");
+        cfg.kernel_sha256 = hex_of(b"something-else");
+        assert!(matches!(
+            run_in_microvm(&spec, &policy, &cfg),
+            Err((SandboxError::Invalid(_), RunVerdict::Clean))
         ));
         let _ = std::fs::remove_dir_all(&ws);
     }
@@ -305,7 +332,7 @@ mod tests {
         cfg.kernel_sha256 = hex_of(b"something-else");
         assert!(matches!(
             run_in_microvm(&spec, &policy, &cfg),
-            Err(SandboxError::Invalid(_))
+            Err((SandboxError::Invalid(_), _))
         ));
         let _ = std::fs::remove_dir_all(&ws);
     }
@@ -317,7 +344,7 @@ mod tests {
         cfg.rootfs_path = ws.join("no-such-file");
         assert!(matches!(
             run_in_microvm(&spec, &policy, &cfg),
-            Err(SandboxError::Invalid(_))
+            Err((SandboxError::Invalid(_), _))
         ));
         let _ = std::fs::remove_dir_all(&ws);
     }
@@ -376,7 +403,7 @@ mod tests {
                 ..MicroVmConfig::default()
             };
             let out = run_in_microvm(&spec, &policy, &cfg)
-                .unwrap_or_else(|e| panic!("บูตจริงต้องผ่าน {exe}: {e}"));
+                .unwrap_or_else(|e| panic!("บูตจริงต้องผ่าน {exe}: {e:?}"));
             assert_eq!(out.code, Some(want), "{exe} ต้อง exit {want}");
             assert!(out.applied.contains(&"microvm-boot".to_string()));
             let _ = std::fs::remove_dir_all(&ws);

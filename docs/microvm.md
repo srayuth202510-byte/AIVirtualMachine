@@ -88,6 +88,20 @@ AIVM_MICROVM_KEEP_SCRATCH=1 ...   # เก็บ scratch (รวม serial.log) 
 (อะไรยังหย่อน: `env_extra` ถูกเมิน, cwd ใน guest คือ `/`, `pids_max` ไม่ enforce,
 output ไม่ใช่ UTF-8 ถูกแทนด้วย U+FFFD, VMM ไม่ pin ถ้าไม่ตั้ง `fc_sha256`)
 
+## 4b. Run verdict (G3 — `docs/threat-model.md`)
+
+ทุกครั้งที่พยายามรันมีคำตัดสิน `RunVerdict` ติดไปกับผล/audit
+(`verdict:<clean|suspect|compromise>:<reason>`):
+
+- `clean` — จบบริบูรณ์ หรือ deny ตั้งแต่ประตู/infra ล้มแบบไม่มีร่องรอยแทรกแซง
+- `suspect:deadline-exceeded` — เกินเส้นตาย; `suspect:exit-marker-missing` /
+  `suspect:exit-code-unparsable` — serial ถูกป่วน/ไม่สมบูรณ์
+- `compromise:vmm-died-before-marker` — VMM ตายก่อน marker;
+  `compromise:rootfs-copy-reverify-failed` — สำเนาถูกสลับกลางบูต
+
+verdict ตอบแค่ "มีหลักฐานละเมิด boundary หรือไม่" ไม่ใช่ "รันสำเร็จหรือไม่"
+`suspect`/`compromise` ต้องสืบต่อเสมอ แม้ decision จะเป็น deny อยู่แล้ว
+
 ## 5. แก้ปัญหา
 
 | อาการ | สาเหตุที่เป็นไปได้ |

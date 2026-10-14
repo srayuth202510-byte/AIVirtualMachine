@@ -3,27 +3,22 @@
 //! สเปก §26: Secret Request → Capability Check → Policy Check → Risk Evaluation
 //! → HITL Gate (High-Risk) → Secret Broker → Tool Executor (Injection) → Zeroize
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
-use chrono::{DateTime, Utc};
 
 /// ระดับความเสี่ยงของ Secret (ใช้ตัดสิน HITL)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RiskLevel {
     /// Low-risk: read-only, scoped แคบ (อาจ auto-allow ตาม policy)
     Low,
     /// High-risk: write/deploy, production access, destructive ops (default: require HITL)
+    #[default]
     High,
-}
-
-impl Default for RiskLevel {
-    fn default() -> Self {
-        RiskLevel::High // default conservative
-    }
 }
 
 /// Secret Request Schema (สเปก §26.2 จุด 3)
@@ -82,19 +77,19 @@ pub struct SecretLease {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LeaseStatus {
-    Pending,    // รอ HITL approval
-    Active,     // พร้อมใช้งาน
-    Exhausted,  // ใช้ครบ max_uses แล้ว
-    Expired,    // หมดอายุ
-    Revoked,    // ถูก revoke ก่อนเวลา
+    Pending,   // รอ HITL approval
+    Active,    // พร้อมใช้งาน
+    Exhausted, // ใช้ครบ max_uses แล้ว
+    Expired,   // หมดอายุ
+    Revoked,   // ถูก revoke ก่อนเวลา
 }
 
 /// Secret Capability — ขยาย capability model สำหรับ secrets
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretCapability {
-    pub action: String,      // "read" | "use"
-    pub resource: String,    // "secret"
-    pub scope: String,       // resource:scope pattern
+    pub action: String,   // "read" | "use"
+    pub resource: String, // "secret"
+    pub scope: String,    // resource:scope pattern
     pub risk_level: RiskLevel,
     pub max_uses: u32,
     pub ttl_seconds: u64,
@@ -141,8 +136,8 @@ pub enum SecretError {
 
 /// Secret Broker — trusted component outside sandbox that manages secrets
 pub struct SecretBroker {
-    secrets: HashMap<String, String>,           // resource -> secret value
-    leases: HashMap<String, SecretLease>,       // lease_id -> lease
+    secrets: HashMap<String, String>,     // resource -> secret value
+    leases: HashMap<String, SecretLease>, // lease_id -> lease
     policy: SecretPolicy,
     audit: Option<aivm_audit::AuditWriter>,
 }
@@ -205,7 +200,9 @@ impl SecretBroker {
         }
 
         // 5. Get secret value
-        let value = self.secrets.get(&request.resource)
+        let value = self
+            .secrets
+            .get(&request.resource)
             .ok_or_else(|| SecretError::SecretNotFound(request.resource.clone()))?
             .clone();
 
@@ -251,7 +248,9 @@ impl SecretBroker {
 
     /// Use a lease to get secret value (tool executor calls this)
     pub fn use_lease(&mut self, lease_id: &str) -> Result<String, SecretError> {
-        let lease = self.leases.get_mut(lease_id)
+        let lease = self
+            .leases
+            .get_mut(lease_id)
             .ok_or(SecretError::LeaseNotFound(lease_id.to_string()))?;
 
         // Check status
@@ -260,7 +259,9 @@ impl SecretBroker {
             LeaseStatus::Exhausted => return Err(SecretError::LeaseExhausted),
             LeaseStatus::Expired => return Err(SecretError::LeaseExpired),
             LeaseStatus::Revoked => return Err(SecretError::LeaseRevoked),
-            LeaseStatus::Pending => return Err(SecretError::InvalidRequest("lease not approved".into())),
+            LeaseStatus::Pending => {
+                return Err(SecretError::InvalidRequest("lease not approved".into()))
+            }
         }
 
         // Check expiration
@@ -287,7 +288,9 @@ impl SecretBroker {
 
     /// Revoke a lease early
     pub fn revoke_lease(&mut self, lease_id: &str) -> Result<(), SecretError> {
-        let lease = self.leases.get_mut(lease_id)
+        let lease = self
+            .leases
+            .get_mut(lease_id)
             .ok_or(SecretError::LeaseNotFound(lease_id.to_string()))?;
         lease.status = LeaseStatus::Revoked;
         Ok(())
@@ -300,24 +303,28 @@ impl SecretBroker {
             if lease.status == LeaseStatus::Active && now > lease.expires_at {
                 lease.status = LeaseStatus::Expired;
                 false
-            } else if lease.status == LeaseStatus::Exhausted || lease.status == LeaseStatus::Revoked || lease.status == LeaseStatus::Expired {
-                false
             } else {
-                true
+                !matches!(
+                    lease.status,
+                    LeaseStatus::Exhausted | LeaseStatus::Revoked | LeaseStatus::Expired
+                )
             }
         });
     }
 
     fn check_policy(&self, request: &SecretRequest) -> Result<(), SecretError> {
         let scope = format!("{}:{}", request.resource, request.scope);
-        
+
         // Check deny list first (deny overrides)
         for pattern in &self.policy.deny {
             if Self::match_pattern(pattern, &scope) {
-                return Err(SecretError::PolicyDenied(format!("denied by pattern: {}", pattern)));
+                return Err(SecretError::PolicyDenied(format!(
+                    "denied by pattern: {}",
+                    pattern
+                )));
             }
         }
-        
+
         // Check allow list
         if !self.policy.allow.is_empty() {
             let mut allowed = false;
@@ -331,7 +338,7 @@ impl SecretBroker {
                 return Err(SecretError::PolicyDenied("not in allow list".into()));
             }
         }
-        
+
         Ok(())
     }
 
@@ -340,8 +347,7 @@ impl SecretBroker {
         if pattern == "*" {
             return true;
         }
-        if pattern.ends_with('*') {
-            let prefix = &pattern[..pattern.len()-1];
+        if let Some(prefix) = pattern.strip_suffix('*') {
             return scope.starts_with(prefix);
         }
         pattern == scope
@@ -356,19 +362,20 @@ impl SecretInjector {
     /// Returns env vars to set for the tool process
     pub fn inject_env(lease: &SecretLease) -> Vec<(String, String)> {
         let mut env = Vec::new();
-        
+
         // Inject as environment variable with standardized naming
         // Format: AIVM_SECRET_{RESOURCE}_{SCOPE}
-        let key = format!("AIVM_SECRET_{}_{}", 
+        let key = format!(
+            "AIVM_SECRET_{}_{}",
             lease.request.resource.to_uppercase().replace('-', "_"),
-            lease.request.scope.to_uppercase().replace(':', "_").replace('-', "_")
+            lease.request.scope.to_uppercase().replace([':', '-'], "_")
         );
         env.push((key, lease.value.clone()));
-        
+
         // Also inject lease metadata for audit trail
         env.push(("AIVM_SECRET_LEASE_ID".into(), lease.id.clone()));
         env.push(("AIVM_SECRET_PURPOSE".into(), lease.request.purpose.clone()));
-        
+
         env
     }
 
@@ -377,19 +384,22 @@ impl SecretInjector {
     pub fn inject_file(lease: &SecretLease) -> Result<PathBuf, SecretError> {
         let mut path = std::env::temp_dir();
         path.push(format!("aivm-secret-{}.tmp", lease.id));
-        
+
         std::fs::write(&path, &lease.value)
             .map_err(|e| SecretError::AuditError(format!("failed to write secret file: {}", e)))?;
-        
+
         // Make file readable only by owner
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path).map_err(|e| SecretError::AuditError(e.to_string()))?.permissions();
+            let mut perms = std::fs::metadata(&path)
+                .map_err(|e| SecretError::AuditError(e.to_string()))?
+                .permissions();
             perms.set_mode(0o600);
-            std::fs::set_permissions(&path, perms).map_err(|e| SecretError::AuditError(e.to_string()))?;
+            std::fs::set_permissions(&path, perms)
+                .map_err(|e| SecretError::AuditError(e.to_string()))?;
         }
-        
+
         Ok(path)
     }
 }
@@ -412,14 +422,17 @@ mod tests {
     use aivm_cube::Cube;
 
     fn test_broker() -> SecretBroker {
-        let mut broker = SecretBroker::new(SecretPolicy {
-            allow: vec!["github_token:*".into()],
-            deny: vec!["github_token:admin".into()],
-            hitl_required_for: vec![RiskLevel::High],
-            max_ttl_seconds: 3600,
-            max_uses_allowed: 5,
-        }, None);
-        
+        let mut broker = SecretBroker::new(
+            SecretPolicy {
+                allow: vec!["github_token:*".into()],
+                deny: vec!["github_token:admin".into()],
+                hitl_required_for: vec![RiskLevel::High],
+                max_ttl_seconds: 3600,
+                max_uses_allowed: 5,
+            },
+            None,
+        );
+
         broker.register_secret("github_token".into(), "ghp_test123".into());
         broker
     }
@@ -427,11 +440,13 @@ mod tests {
     #[test]
     fn test_lease_creation_low_risk_auto_allow() {
         let mut broker = test_broker();
-        let mut caps = CapabilitySet::new(vec![
-            aivm_capability::Capability::new("use", "secret", "github_token:read"),
-        ]);
+        let mut caps = CapabilitySet::new(vec![aivm_capability::Capability::new(
+            "use",
+            "secret",
+            "github_token:read",
+        )]);
         let cube = Cube::new("test");
-        
+
         let request = SecretRequest {
             tool: "git.push".into(),
             resource: "github_token".into(),
@@ -441,8 +456,10 @@ mod tests {
             ttl_seconds: 300,
             risk: RiskLevel::Low,
         };
-        
-        let lease = broker.request_lease(request, &cube, &mut caps, true, Some("operator".into())).unwrap();
+
+        let lease = broker
+            .request_lease(request, &cube, &mut caps, true, Some("operator".into()))
+            .unwrap();
         assert_eq!(lease.status, LeaseStatus::Active);
         assert_eq!(lease.request.risk, RiskLevel::Low);
     }
@@ -450,11 +467,13 @@ mod tests {
     #[test]
     fn test_lease_creation_high_risk_requires_hitl() {
         let mut broker = test_broker();
-        let mut caps = CapabilitySet::new(vec![
-            aivm_capability::Capability::new("use", "secret", "github_token:write"),
-        ]);
+        let mut caps = CapabilitySet::new(vec![aivm_capability::Capability::new(
+            "use",
+            "secret",
+            "github_token:write",
+        )]);
         let cube = Cube::new("test");
-        
+
         let request = SecretRequest {
             tool: "git.push".into(),
             resource: "github_token".into(),
@@ -464,13 +483,15 @@ mod tests {
             ttl_seconds: 300,
             risk: RiskLevel::High,
         };
-        
+
         // Without HITL should fail
         let result = broker.request_lease(request.clone(), &cube, &mut caps, false, None);
         assert!(matches!(result, Err(SecretError::HitlRequired)));
-        
+
         // With HITL should succeed
-        let lease = broker.request_lease(request, &cube, &mut caps, true, Some("operator".into())).unwrap();
+        let lease = broker
+            .request_lease(request, &cube, &mut caps, true, Some("operator".into()))
+            .unwrap();
         assert_eq!(lease.status, LeaseStatus::Active);
         assert!(lease.hitl_approved);
     }
@@ -478,11 +499,13 @@ mod tests {
     #[test]
     fn test_lease_use_and_exhaustion() {
         let mut broker = test_broker();
-        let mut caps = CapabilitySet::new(vec![
-            aivm_capability::Capability::new("use", "secret", "github_token:read"),
-        ]);
+        let mut caps = CapabilitySet::new(vec![aivm_capability::Capability::new(
+            "use",
+            "secret",
+            "github_token:read",
+        )]);
         let cube = Cube::new("test");
-        
+
         let request = SecretRequest {
             tool: "git.push".into(),
             resource: "github_token".into(),
@@ -492,18 +515,20 @@ mod tests {
             ttl_seconds: 300,
             risk: RiskLevel::Low,
         };
-        
-        let lease = broker.request_lease(request, &cube, &mut caps, true, Some("operator".into())).unwrap();
+
+        let lease = broker
+            .request_lease(request, &cube, &mut caps, true, Some("operator".into()))
+            .unwrap();
         let lease_id = lease.id.clone();
-        
+
         // First use
         let value = broker.use_lease(&lease_id).unwrap();
         assert_eq!(value, "ghp_test123");
-        
+
         // Second use (max_uses=2)
         let value = broker.use_lease(&lease_id).unwrap();
         assert_eq!(value, "ghp_test123");
-        
+
         // Third use should fail
         let result = broker.use_lease(&lease_id);
         assert!(matches!(result, Err(SecretError::LeaseExhausted)));
@@ -512,11 +537,13 @@ mod tests {
     #[test]
     fn test_deny_pattern_overrides() {
         let mut broker = test_broker();
-        let mut caps = CapabilitySet::new(vec![
-            aivm_capability::Capability::new("use", "secret", "github_token:admin"),
-        ]);
+        let mut caps = CapabilitySet::new(vec![aivm_capability::Capability::new(
+            "use",
+            "secret",
+            "github_token:admin",
+        )]);
         let cube = Cube::new("test");
-        
+
         let request = SecretRequest {
             tool: "git.push".into(),
             resource: "github_token".into(),
@@ -526,7 +553,7 @@ mod tests {
             ttl_seconds: 300,
             risk: RiskLevel::High,
         };
-        
+
         let result = broker.request_lease(request, &cube, &mut caps, true, Some("operator".into()));
         assert!(matches!(result, Err(SecretError::PolicyDenied(_))));
     }

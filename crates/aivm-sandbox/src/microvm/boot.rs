@@ -11,7 +11,7 @@
 //! ยกเว้น path ที่ผ่าน validate/verify มาแล้ว — agent ปนคำสั่งไม่ได้
 
 use super::{ExecOutcome, ExecSpec, MicroVmConfig};
-use crate::{verify_artifact, SandboxError};
+use crate::{verify_artifact, RunVerdict, SandboxError};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -66,8 +66,12 @@ struct Closure {
     libs: Vec<PathBuf>,
 }
 
-fn ldd_closure(exe: &Path) -> Result<Closure, SandboxError> {
-    let spawn_err = |e: std::io::Error| SandboxError::Spawn(format!("ldd failed: {e}"));
+fn clean_err(e: SandboxError) -> (SandboxError, RunVerdict) {
+    (e, RunVerdict::Clean)
+}
+
+fn ldd_closure(exe: &Path) -> BootResult<Closure> {
+    let spawn_err = |e: std::io::Error| clean_err(SandboxError::Spawn(format!("ldd failed: {e}")));
     let out = Command::new("ldd")
         .arg(exe)
         .stdin(Stdio::null())
@@ -82,10 +86,10 @@ fn ldd_closure(exe: &Path) -> Result<Closure, SandboxError> {
         });
     }
     if !out.status.success() {
-        return Err(SandboxError::Spawn(format!(
+        return Err(clean_err(SandboxError::Spawn(format!(
             "ldd rejected {}",
             exe.display()
-        )));
+        ))));
     }
     let mut libs = vec![];
     for line in text.lines() {
@@ -118,27 +122,33 @@ fn ldd_closure(exe: &Path) -> Result<Closure, SandboxError> {
 
 /// ก็อปไฟล์ไป staging โดยคงโครง absolute path + mode (ตาม symlink ไป
 /// เอาเนื้อหาจริง — ldd ให้ path ที่ resolve แล้วเป็นส่วนใหญ่)
-fn stage_file(staging: &Path, abs: &Path) -> Result<(), SandboxError> {
-    let rel = abs
-        .strip_prefix("/")
-        .map_err(|_| SandboxError::Invalid("closure path must be absolute".into()))?;
+fn stage_file(staging: &Path, abs: &Path) -> BootResult<()> {
+    let rel = abs.strip_prefix("/").map_err(|_| {
+        clean_err(SandboxError::Invalid(
+            "closure path must be absolute".into(),
+        ))
+    })?;
     let dst = staging.join(rel);
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| SandboxError::Spawn(format!("staging mkdir failed: {e}")))?;
+            .map_err(|e| clean_err(SandboxError::Spawn(format!("staging mkdir failed: {e}"))))?;
     }
-    let meta = std::fs::metadata(abs)
-        .map_err(|e| SandboxError::Spawn(format!("closure stat failed {}: {e}", abs.display())))?;
+    let meta = std::fs::metadata(abs).map_err(|e| {
+        clean_err(SandboxError::Spawn(format!(
+            "closure stat failed {}: {e}",
+            abs.display()
+        )))
+    })?;
     if !meta.is_file() {
-        return Err(SandboxError::Spawn(format!(
+        return Err(clean_err(SandboxError::Spawn(format!(
             "closure not a file: {}",
             abs.display()
-        )));
+        ))));
     }
     std::fs::copy(abs, &dst)
-        .map_err(|e| SandboxError::Spawn(format!("staging copy failed: {e}")))?;
+        .map_err(|e| clean_err(SandboxError::Spawn(format!("staging copy failed: {e}"))))?;
     std::fs::set_permissions(&dst, meta.permissions())
-        .map_err(|e| SandboxError::Spawn(format!("staging chmod failed: {e}")))?;
+        .map_err(|e| clean_err(SandboxError::Spawn(format!("staging chmod failed: {e}"))))?;
     Ok(())
 }
 
@@ -162,22 +172,28 @@ fn dir_size_bytes(dir: &Path) -> u64 {
     total
 }
 
+/// helper ทุกตัวในไฟล์นี้คืน pair `(SandboxError, RunVerdict)` โดย infra
+/// ล้มแบบไม่มีร่องรอยแทรกแซง = `Clean` (verdict ตอบแค่ "มีหลักฐานละเมิด
+/// boundary หรือไม่" ไม่ใช่ "รันสำเร็จหรือไม่") ส่วนจุดที่มีหลักฐาน
+/// แนบ `Suspect`/`Compromise` เองตรงจุดเกิดเหตุ (ดู `boot_and_run_inner`)
+type BootResult<T> = Result<T, (SandboxError, RunVerdict)>;
+
 /// เรียก host tool แบบตายตัว (argv คงที่ยกเว้น path ที่ validate แล้ว)
 /// ล้ม = `Spawn` (infra พร้อมไม่พอ ไม่ใช่ spec ผิด)
-fn host_tool(prog: &str, args: &[&str]) -> Result<String, SandboxError> {
+fn host_tool(prog: &str, args: &[&str]) -> BootResult<String> {
     let out = Command::new(prog)
         .args(args)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| SandboxError::Spawn(format!("{prog} spawn failed: {e}")))?;
+        .map_err(|e| clean_err(SandboxError::Spawn(format!("{prog} spawn failed: {e}"))))?;
     if !out.status.success() {
-        return Err(SandboxError::Spawn(format!(
+        return Err(clean_err(SandboxError::Spawn(format!(
             "{prog} failed: {}",
             String::from_utf8_lossy(&out.stderr)
                 .chars()
                 .take(300)
                 .collect::<String>()
-        )));
+        ))));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -188,9 +204,10 @@ fn host_tool(prog: &str, args: &[&str]) -> Result<String, SandboxError> {
 /// หมายเหตุ: server ตอบ `Connection: keep-alive` เสมอ (เมิน `close` ของเรา)
 /// จึงห้าม `read_to_end` — ต้อง parse header หา Content-Length แล้วอ่าน
 /// แค่ body ตามนั้น ไม่งั้นค้างจน timeout
-fn fc_put(sock: &Path, route: &str, body: &str) -> Result<(), SandboxError> {
-    let mut s = UnixStream::connect(sock)
-        .map_err(|e| SandboxError::Spawn(format!("microvm api connect failed: {e}")))?;
+fn fc_put(sock: &Path, route: &str, body: &str) -> BootResult<()> {
+    let spawn = |m: String| clean_err(SandboxError::Spawn(m));
+    let mut s =
+        UnixStream::connect(sock).map_err(|e| spawn(format!("microvm api connect failed: {e}")))?;
     s.set_read_timeout(Some(Duration::from_secs(10))).ok();
     s.set_write_timeout(Some(Duration::from_secs(10))).ok();
     let req = format!(
@@ -198,23 +215,23 @@ fn fc_put(sock: &Path, route: &str, body: &str) -> Result<(), SandboxError> {
         body.len()
     );
     s.write_all(req.as_bytes())
-        .map_err(|e| SandboxError::Spawn(format!("microvm api write failed: {e}")))?;
+        .map_err(|e| spawn(format!("microvm api write failed: {e}")))?;
     // อ่านจนจบ header ก่อน (เพดานกันบวม)
     let mut raw = vec![];
     let mut buf = [0u8; 4096];
     let header_len = loop {
         let n = s
             .read(&mut buf)
-            .map_err(|e| SandboxError::Spawn(format!("microvm api read failed: {e}")))?;
+            .map_err(|e| spawn(format!("microvm api read failed: {e}")))?;
         if n == 0 {
-            return Err(SandboxError::Spawn("microvm api closed early".into()));
+            return Err(spawn("microvm api closed early".into()));
         }
         raw.extend_from_slice(&buf[..n]);
         if let Some(p) = find_sub(&raw, b"\r\n\r\n") {
             break p + 4;
         }
         if raw.len() > 64 * 1024 {
-            return Err(SandboxError::Spawn("microvm api headers too large".into()));
+            return Err(spawn("microvm api headers too large".into()));
         }
     };
     let head = String::from_utf8_lossy(&raw[..header_len]);
@@ -222,7 +239,7 @@ fn fc_put(sock: &Path, route: &str, body: &str) -> Result<(), SandboxError> {
         .split_whitespace()
         .nth(1)
         .and_then(|c| c.parse().ok())
-        .ok_or_else(|| SandboxError::Spawn("microvm api bad response".into()))?;
+        .ok_or_else(|| spawn("microvm api bad response".into()))?;
     // อ่าน body ตาม Content-Length (204 ไม่มี body = 0)
     let mut content_len = 0usize;
     for line in head.lines().skip(1) {
@@ -236,7 +253,7 @@ fn fc_put(sock: &Path, route: &str, body: &str) -> Result<(), SandboxError> {
     while body_got < content_len {
         let n = s
             .read(&mut buf)
-            .map_err(|e| SandboxError::Spawn(format!("microvm api read failed: {e}")))?;
+            .map_err(|e| spawn(format!("microvm api read failed: {e}")))?;
         if n == 0 {
             break;
         }
@@ -244,9 +261,7 @@ fn fc_put(sock: &Path, route: &str, body: &str) -> Result<(), SandboxError> {
     }
     if !(200..300).contains(&code) {
         let snippet: String = head.chars().take(300).collect();
-        return Err(SandboxError::Spawn(format!(
-            "microvm api {route} -> {code}: {snippet}"
-        )));
+        return Err(spawn(format!("microvm api {route} -> {code}: {snippet}")));
     }
     Ok(())
 }
@@ -257,7 +272,7 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// รอไฟล์ socket ปรากฏ (firecracker bind ช้าได้)
-fn wait_socket(sock: &Path, timeout: Duration) -> Result<(), SandboxError> {
+fn wait_socket(sock: &Path, timeout: Duration) -> BootResult<()> {
     let start = Instant::now();
     while start.elapsed() < timeout {
         if UnixStream::connect(sock).is_ok() {
@@ -265,9 +280,9 @@ fn wait_socket(sock: &Path, timeout: Duration) -> Result<(), SandboxError> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    Err(SandboxError::Spawn(
+    Err(clean_err(SandboxError::Spawn(
         "microvm api socket never appeared".into(),
-    ))
+    )))
 }
 
 /// ข้อความระหว่าง marker คู่สุดท้ายที่เจอ (payload อาจมีบรรทัดอื่นปนได้
@@ -290,9 +305,10 @@ pub(super) fn boot_and_run(
     canon: &Path,
     cfg: &MicroVmConfig,
     fc_bin: &Path,
-) -> Result<ExecOutcome, SandboxError> {
-    let spawn_err =
-        |what: &str, e: std::io::Error| SandboxError::Spawn(format!("microvm {what} failed: {e}"));
+) -> BootResult<ExecOutcome> {
+    let spawn_err = |what: &str, e: std::io::Error| {
+        clean_err(SandboxError::Spawn(format!("microvm {what} failed: {e}")))
+    };
     // nonce ต่อรันกัน marker ชนกับ output ของ payload
     let nonce = format!(
         "{:x}{:x}",
@@ -323,19 +339,23 @@ fn boot_and_run_inner(
     fc_bin: &Path,
     scratch: &Path,
     nonce: &str,
-) -> Result<ExecOutcome, SandboxError> {
-    let spawn_err =
-        |what: &str, e: std::io::Error| SandboxError::Spawn(format!("microvm {what} failed: {e}"));
+) -> BootResult<ExecOutcome> {
+    let spawn_err = |what: &str, e: std::io::Error| {
+        clean_err(SandboxError::Spawn(format!("microvm {what} failed: {e}")))
+    };
     // 1. ก็อป rootfs ที่ verify แล้วไป scratch (ห้ามเขียนไฟล์ pin ต้นฉบับ)
     // แล้ว verify สำเนาซ้ำ (กันไฟล์ถูกสลับระหว่าง verify กับก็อป/ก็อปเสีย —
     // แพทเทิร์นเดียวกับ `revalidate_exe` ของ path Process)
+    // สำเนาไม่ตรง = หลักฐานแทรกแซงกลางบูต → `Compromise` (G3)
     let guest_root = scratch.join("root.img");
     std::fs::copy(&cfg.rootfs_path, &guest_root).map_err(|e| spawn_err("rootfs copy", e))?;
-    verify_artifact(&guest_root, &cfg.rootfs_sha256, cfg.max_artifact_bytes)?;
-    let kernel_abs = cfg
-        .kernel_path
-        .canonicalize()
-        .map_err(|e| SandboxError::Spawn(format!("microvm kernel path failed: {e}")))?;
+    verify_artifact(&guest_root, &cfg.rootfs_sha256, cfg.max_artifact_bytes)
+        .map_err(|e| (e, RunVerdict::Compromise("rootfs-copy-reverify-failed")))?;
+    let kernel_abs = cfg.kernel_path.canonicalize().map_err(|e| {
+        clean_err(SandboxError::Spawn(format!(
+            "microvm kernel path failed: {e}"
+        )))
+    })?;
 
     // 2. staging: exe + loader + libs คงโครง absolute path
     let closure = ldd_closure(canon)?;
@@ -400,9 +420,9 @@ fn boot_and_run_inner(
             "-w",
             "-R",
             &format!("write {} /sbin/aivm-init", init_host.display()),
-            guest_root
-                .to_str()
-                .ok_or_else(|| SandboxError::Spawn("microvm scratch path not utf-8".into()))?,
+            guest_root.to_str().ok_or_else(|| {
+                clean_err(SandboxError::Spawn("microvm scratch path not utf-8".into()))
+            })?,
         ],
     )?;
     host_tool(
@@ -411,9 +431,9 @@ fn boot_and_run_inner(
             "-w",
             "-R",
             "set_inode_field /sbin/aivm-init mode 0100755",
-            guest_root
-                .to_str()
-                .ok_or_else(|| SandboxError::Spawn("microvm scratch path not utf-8".into()))?,
+            guest_root.to_str().ok_or_else(|| {
+                clean_err(SandboxError::Spawn("microvm scratch path not utf-8".into()))
+            })?,
         ],
     )?;
 
@@ -426,31 +446,29 @@ fn boot_and_run_inner(
         &[
             "-q",
             "-d",
-            staging
-                .to_str()
-                .ok_or_else(|| SandboxError::Spawn("microvm scratch path not utf-8".into()))?,
-            data_img
-                .to_str()
-                .ok_or_else(|| SandboxError::Spawn("microvm scratch path not utf-8".into()))?,
+            staging.to_str().ok_or_else(|| {
+                clean_err(SandboxError::Spawn("microvm scratch path not utf-8".into()))
+            })?,
+            data_img.to_str().ok_or_else(|| {
+                clean_err(SandboxError::Spawn("microvm scratch path not utf-8".into()))
+            })?,
             &format!("{size_mb}M"),
         ],
     )?;
 
     // 5. spawn firecracker (serial → ไฟล์, ไม่มีเน็ตเวิร์กเลย)
-// รองรับ Jailer (optional, requires root) — จะ wrap firecracker ด้วย isolation เพิ่มเติม
+    // รองรับ Jailer (optional, requires root) — จะ wrap firecracker ด้วย isolation เพิ่มเติม
     let use_jailer = cfg.jailer.is_some();
     let sock = scratch.join("api.sock");
     let serial_log = scratch.join("serial.log");
     let serial_file = std::fs::File::create(&serial_log).map_err(|e| spawn_err("serial log", e))?;
     let err_log = scratch.join("stderr.log");
     let err_file = std::fs::File::create(&err_log).map_err(|e| spawn_err("stderr log", e))?;
-    let mut guard = KillOnDrop(Some(
-        if use_jailer {
-            spawn_jailer(cfg, fc_bin, &sock, serial_file, err_file, &scratch)?
-        } else {
-            spawn_firecracker_direct(fc_bin, &sock, serial_file, err_file)?
-        }
-    ));
+    let mut guard = KillOnDrop(Some(if use_jailer {
+        spawn_jailer(cfg, fc_bin, &sock, serial_file, err_file, scratch)?
+    } else {
+        spawn_firecracker_direct(fc_bin, &sock, serial_file, err_file)?
+    }));
     let child = guard.0.as_mut().expect("guard holds child");
 
     // 6. configure ผ่าน API (ล้มขั้นไหนก็ fail-closed ไม่ boot)
@@ -489,6 +507,8 @@ fn boot_and_run_inner(
     fc_put(&sock, "/actions", "{\"action_type\":\"InstanceStart\"}")?;
 
     // 7. รอ marker (เส้นตายรวมจาก config) ระหว่างนั้นถ้า VMM ตายก่อน = ล้มแบบดัง
+    // verdict (G3): VMM ตายก่อน marker = หลักฐานละเมิด boundary → `Compromise`
+    // เกินเส้นตาย = ผิดปกติแบบอธิบายได้ → `Suspect`
     let deadline = Instant::now() + Duration::from_secs(cfg.boot_timeout_secs);
     let exit_mark = format!("AIVM-{nonce}-EXIT:");
     loop {
@@ -497,12 +517,16 @@ fn boot_and_run_inner(
         }
         if let Some(st) = child.try_wait().map_err(|e| spawn_err("wait", e))? {
             let tail = read_tail(&serial_log, 2000);
-            return Err(SandboxError::Spawn(format!(
-                "microvm exited before completion ({st}): {tail}"
-            )));
+            return Err((
+                SandboxError::Spawn(format!("microvm exited before completion ({st}): {tail}")),
+                RunVerdict::Compromise("vmm-died-before-marker"),
+            ));
         }
         if Instant::now() > deadline {
-            return Err(SandboxError::Spawn("microvm run timed out".into()));
+            return Err((
+                SandboxError::Spawn("microvm run timed out".into()),
+                RunVerdict::Suspect("deadline-exceeded"),
+            ));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -599,13 +623,21 @@ fn read_tail(path: &Path, n: usize) -> String {
 }
 
 /// รหัสออกหลัง marker (parse ไม่ได้ = Spawn ดัง ไม่เดา)
-fn parse_exit(log: &str, mark: &str) -> Result<i32, SandboxError> {
+/// verdict `Suspect`: serial ถูกป่วน/ไม่สมบูรณ์ — สืบต่อ ไม่ใช่แค่ infra ล้ม
+fn parse_exit(log: &str, mark: &str) -> BootResult<i32> {
     let Some(pos) = log.rfind(mark) else {
-        return Err(SandboxError::Spawn("microvm exit marker missing".into()));
+        return Err((
+            SandboxError::Spawn("microvm exit marker missing".into()),
+            RunVerdict::Suspect("exit-marker-missing"),
+        ));
     };
     let rest = log[pos + mark.len()..].lines().next().unwrap_or("").trim();
-    rest.parse::<i32>()
-        .map_err(|_| SandboxError::Spawn("microvm exit code unparsable".into()))
+    rest.parse::<i32>().map_err(|_| {
+        (
+            SandboxError::Spawn("microvm exit code unparsable".into()),
+            RunVerdict::Suspect("exit-code-unparsable"),
+        )
+    })
 }
 
 /// จุดเข้าสำหรับการ spawn firecracker โดยตรง (ไม่ใช้ jailer)
@@ -614,7 +646,7 @@ fn spawn_firecracker_direct(
     sock: &Path,
     serial_file: std::fs::File,
     err_file: std::fs::File,
-) -> Result<Child, SandboxError> {
+) -> BootResult<Child> {
     Command::new(fc_bin)
         .arg("--api-sock")
         .arg(sock)
@@ -623,7 +655,11 @@ fn spawn_firecracker_direct(
         .stderr(err_file)
         .env_clear()
         .spawn()
-        .map_err(|e| SandboxError::Spawn(format!("firecracker spawn failed: {e}")))
+        .map_err(|e| {
+            clean_err(SandboxError::Spawn(format!(
+                "firecracker spawn failed: {e}"
+            )))
+        })
 }
 
 /// Spawn firecracker through Jailer for additional isolation (requires root)
@@ -634,46 +670,58 @@ fn spawn_jailer(
     serial_file: std::fs::File,
     err_file: std::fs::File,
     scratch: &Path,
-) -> Result<Child, SandboxError> {
+) -> BootResult<Child> {
     let jailer_cfg = cfg.jailer.as_ref().expect("use_jailer guard");
-    
+
     // Find jailer binary
     let jailer_bin = if jailer_cfg.jailer_path.as_os_str().is_empty() {
-        which::which("jailer").map_err(|_| SandboxError::Spawn(
-            "jailer binary not found in PATH (install jailer or set jailer_path)".into()
-        ))?
+        which::which("jailer").map_err(|_| {
+            clean_err(SandboxError::Spawn(
+                "jailer binary not found in PATH (install jailer or set jailer_path)".into(),
+            ))
+        })?
     } else {
         jailer_cfg.jailer_path.clone()
     };
-    
+
     let jailer_id = if jailer_cfg.jailer_id.is_empty() {
         format!("aivm-{}", std::process::id())
     } else {
         jailer_cfg.jailer_id.clone()
     };
-    
+
     // Create chroot directory for jailer
     let chroot_base = std::env::temp_dir().join(format!("aivm-jailer-{}-chroot", jailer_id));
-    std::fs::create_dir_all(&chroot_base).map_err(|e| SandboxError::Spawn(format!("jailer chroot dir create failed: {e}")))?;
-    
+    std::fs::create_dir_all(&chroot_base).map_err(|e| {
+        clean_err(SandboxError::Spawn(format!(
+            "jailer chroot dir create failed: {e}"
+        )))
+    })?;
+
     // Copy firecracker binary into chroot
     let fc_in_chroot = chroot_base.join("firecracker");
-    std::fs::copy(fc_bin, &fc_in_chroot).map_err(|e| SandboxError::Spawn(format!("jailer fc copy failed: {e}")))?;
-    
+    std::fs::copy(fc_bin, &fc_in_chroot)
+        .map_err(|e| clean_err(SandboxError::Spawn(format!("jailer fc copy failed: {e}"))))?;
+
     // Make it executable
     let mut perms = std::fs::metadata(&fc_in_chroot)
-        .map_err(|e| SandboxError::Spawn(format!("jailer fc stat failed: {e}")))?
+        .map_err(|e| clean_err(SandboxError::Spawn(format!("jailer fc stat failed: {e}"))))?
         .permissions();
     perms.set_mode(0o755);
-    std::fs::set_permissions(&fc_in_chroot, perms).map_err(|e| SandboxError::Spawn(format!("jailer fc chmod failed: {e}")))?;
-    
+    std::fs::set_permissions(&fc_in_chroot, perms)
+        .map_err(|e| clean_err(SandboxError::Spawn(format!("jailer fc chmod failed: {e}"))))?;
+
     // Build jailer command
     let mut cmd = Command::new(&jailer_bin);
-    cmd.arg("--id").arg(&jailer_id)
-       .arg("--firecracker-binary").arg("/firecracker")
-       .arg("--chroot-base-dir").arg(&chroot_base)
-       .arg("--api-sock").arg(sock);
-    
+    cmd.arg("--id")
+        .arg(&jailer_id)
+        .arg("--firecracker-binary")
+        .arg("/firecracker")
+        .arg("--chroot-base-dir")
+        .arg(&chroot_base)
+        .arg("--api-sock")
+        .arg(sock);
+
     if jailer_cfg.chroot {
         cmd.arg("--chroot");
     }
@@ -689,24 +737,34 @@ fn spawn_jailer(
     if jailer_cfg.no_new_privs {
         cmd.arg("--no-new-privs");
     }
-    
+
     // Copy images to chroot for jailer
     let rootfs_in_chroot = chroot_base.join("root.img");
-    std::fs::copy(&scratch.join("root.img"), &rootfs_in_chroot).map_err(|e| SandboxError::Spawn(format!("jailer rootfs copy failed: {e}")))?;
-    
+    std::fs::copy(scratch.join("root.img"), &rootfs_in_chroot).map_err(|e| {
+        clean_err(SandboxError::Spawn(format!(
+            "jailer rootfs copy failed: {e}"
+        )))
+    })?;
+
     let data_in_chroot = chroot_base.join("data.img");
-    std::fs::copy(&scratch.join("data.img"), &data_in_chroot).map_err(|e| SandboxError::Spawn(format!("jailer data copy failed: {e}")))?;
-    
+    std::fs::copy(scratch.join("data.img"), &data_in_chroot)
+        .map_err(|e| clean_err(SandboxError::Spawn(format!("jailer data copy failed: {e}"))))?;
+
     // Copy kernel to chroot
     let kernel_in_chroot = chroot_base.join("vmlinux.bin");
-    std::fs::copy(&scratch.join("vmlinux.bin"), &kernel_in_chroot).map_err(|e| SandboxError::Spawn(format!("jailer kernel copy failed: {e}")))?;
-    
+    std::fs::copy(scratch.join("vmlinux.bin"), &kernel_in_chroot).map_err(|e| {
+        clean_err(SandboxError::Spawn(format!(
+            "jailer kernel copy failed: {e}"
+        )))
+    })?;
+
     cmd.stdin(Stdio::null())
-       .stdout(serial_file)
-       .stderr(err_file)
-       .env_clear();
-    
-    cmd.spawn().map_err(|e| SandboxError::Spawn(format!("jailer spawn failed: {e}")))
+        .stdout(serial_file)
+        .stderr(err_file)
+        .env_clear();
+
+    cmd.spawn()
+        .map_err(|e| clean_err(SandboxError::Spawn(format!("jailer spawn failed: {e}"))))
 }
 
 #[cfg(test)]
@@ -764,12 +822,37 @@ mod tests {
         assert_eq!(parse_exit(log, "N-EXIT:").unwrap(), 7);
     }
 
-    // marker หาย = Spawn (fail-closed ดัง ไม่เดาค่า)
+    // marker หาย = Spawn + Suspect (serial ถูกป่วน/ไม่สมบูรณ์ — สืบต่อ)
     #[test]
-    fn parse_exit_missing_marker_is_spawn() {
+    fn parse_exit_missing_marker_is_spawn_suspect() {
         assert!(matches!(
             parse_exit("no marker here", "N-EXIT:"),
-            Err(SandboxError::Spawn(_))
+            Err((
+                SandboxError::Spawn(_),
+                RunVerdict::Suspect("exit-marker-missing")
+            ))
         ));
+    }
+
+    // exit code parse ไม่ได้ = Spawn + Suspect (คนละเหตุผลกับ marker หาย)
+    #[test]
+    fn parse_exit_unparsable_code_is_spawn_suspect() {
+        assert!(matches!(
+            parse_exit("N-EXIT:abc\n", "N-EXIT:"),
+            Err((
+                SandboxError::Spawn(_),
+                RunVerdict::Suspect("exit-code-unparsable")
+            ))
+        ));
+    }
+
+    // verdict labels ต้องตรงกับที่ gateway ลง audit (กันแก้ label แล้ว audit เพี้ยน)
+    #[test]
+    fn verdict_labels_for_audit() {
+        assert_eq!(RunVerdict::Clean.label(), "clean");
+        assert_eq!(RunVerdict::Suspect("x").label(), "suspect");
+        assert_eq!(RunVerdict::Compromise("y").label(), "compromise");
+        assert_eq!(RunVerdict::Clean.reason(), "no-interference-evidence");
+        assert_eq!(RunVerdict::Suspect("r").reason(), "r");
     }
 }

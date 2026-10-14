@@ -1045,6 +1045,9 @@ microvm:
         let r = rt.gateway.exec(&mut rt.cube, "/bin/false", &[]).unwrap();
         assert!(!r.ok);
         assert_eq!(r.decision, "allow");
+        // G3: run ที่จบบริบูรณ์ต้องลง verdict:clean ใน audit ทั้งสองครั้ง
+        let log = std::fs::read_to_string(base.join("audit.jsonl")).unwrap();
+        assert!(log.matches("verdict:clean").count() >= 2);
         aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);
     }

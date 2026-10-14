@@ -393,28 +393,44 @@ impl ToolGateway {
         };
         #[cfg(not(feature = "microvm"))]
         let run_result = aivm_sandbox::run_checked_with_level(&spec, &self.policy, self.level);
+        // verdict ลง audit ทุก decision (G3): allow = verdict:clean เสมอ
+        // (จบบริบูรณ์ถึง allow ได้) deny = verdict ที่แนบมากับ error
         let outcome = match run_result {
             Ok(o) => o,
             // ระดับที่ยังไม่มี backend ต้อง DENY พร้อม audit (I-7) ไม่ใช่เงียบหาย
-            Err(aivm_sandbox::SandboxError::Disabled(msg)) => {
-                self.audit_decision(cube, "execute", &scope, "deny", "level-disabled", "error");
+            Err((aivm_sandbox::SandboxError::Disabled(msg), v)) => {
+                self.audit_decision(
+                    cube,
+                    "execute",
+                    &scope,
+                    "deny",
+                    "level-disabled",
+                    &format!("verdict:{}:{}", v.label(), v.reason()),
+                );
                 return Err(ToolError::Denied(msg));
             }
             // ระดับ non-Process ที่ตายด้วย Invalid (เช่น artifact ไม่ผ่าน
             // supply chain) ก็เป็น decision ด้านความปลอดภัย ต้อง audit เช่นกัน
             // (Process คงพฤติกรรมเดิมทุกประการเพื่อไม่ให้เทสต์เก่าขยับ)
-            Err(e) if self.level != SandboxLevel::Process => {
-                self.audit_decision(cube, "execute", &scope, "deny", "level-invalid", "error");
+            Err((e, v)) if self.level != SandboxLevel::Process => {
+                self.audit_decision(
+                    cube,
+                    "execute",
+                    &scope,
+                    "deny",
+                    "level-invalid",
+                    &format!("verdict:{}:{}", v.label(), v.reason()),
+                );
                 return Err(ToolError::Denied(e.to_string()));
             }
-            Err(e) => return Err(ToolError::Denied(e.to_string())),
+            Err((e, _)) => return Err(ToolError::Denied(e.to_string())),
         };
         self.audit_decision(
             cube,
             "execute",
             &scope,
             "allow",
-            &format!("exit:{}", outcome.code.unwrap_or(-1)),
+            &format!("exit:{} verdict:clean", outcome.code.unwrap_or(-1)),
             "success",
         );
         Ok(ToolResult {
@@ -1162,6 +1178,41 @@ network: {{allow: [], deny: []}}
         let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
         assert!(log.contains("level-invalid"));
         assert!(log.contains("\"decision\":\"deny\""));
+    }
+
+    // Phase 7 + G3 (ฟีเจอร์ microvm): deny ตั้งแต่ประตูต้องมี verdict ใน audit
+    // (deterministic ทุกเครื่อง — ยังไม่เกิด run = verdict:clean + เหตุผล)
+    #[cfg(feature = "microvm")]
+    #[test]
+    fn exec_denied_at_gate_audits_verdict() {
+        let (mut gw, mut cube, dir) = exec_harness();
+        let kern = dir.join("vmlinux");
+        let rootfs = dir.join("rootfs.ext4");
+        std::fs::write(&kern, b"k").unwrap();
+        std::fs::write(&rootfs, b"r").unwrap();
+        gw.level = SandboxLevel::MicroVm;
+        gw.microvm_cfg = Some(aivm_sandbox::microvm::MicroVmConfig {
+            kernel_path: kern,
+            kernel_sha256: "00".repeat(32),
+            rootfs_path: rootfs,
+            rootfs_sha256: "11".repeat(32),
+            ..aivm_sandbox::microvm::MicroVmConfig::default()
+        });
+        let r = gw.dispatch(
+            &mut cube,
+            &ToolRequest {
+                tool: "process.exec".into(),
+                path: "/bin/true".into(),
+                content: Some("[]".into()),
+            },
+        );
+        assert!(matches!(r, Err(ToolError::Denied(_))));
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(log.contains("\"decision\":\"deny\""));
+        assert!(
+            log.contains("verdict:clean:no-interference-evidence"),
+            "deny ตั้งแต่ประตูต้องลง verdict: {log}"
+        );
     }
 
     // Phase 7 (ฟีเจอร์ microvm): pin ของไบนารี VMM ไม่ตรงต้อง DENY พร้อม
