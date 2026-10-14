@@ -58,6 +58,7 @@ path means: a workspace-relative file path (read/write), a search string (code.s
 an absolute executable or build:<artifact> (process.exec), or a URL (network.fetch).\n\
 For builds, process.exec content may be a JSON string or object with an argv array and optional outputs array; outputs require an operator-enabled build profile.\n\
 Use observations to advance the task. After a successful edit, compile and run the requested tests; do not repeat a successful tool action. If tests fail, inspect the result, edit the source, then rebuild and rerun.\n\
+Remember workspace state across steps: retain each file's contents from filesystem.read in the conversation observations, and reuse those contents when reasoning or editing. Never reread a file already loaded during this run unless a later write or process.exec may have changed it, or the prior output was truncated and missing information is essential. Do not issue an identical read or write again.\n\
 Every request is mediated and may be DENIED; if denied, choose a different action.";
 
 /// เจตนาที่สกัดจากข้อความของโมเดล
@@ -275,7 +276,7 @@ impl CodingSubtask {
 
     fn system_contract(self) -> &'static str {
         match self {
-            Self::Inspect => "Prioritize filesystem.read and code.search to learn the relevant source and build/test commands.",
+            Self::Inspect => "Prioritize filesystem.read and code.search to learn the relevant source and build/test commands. Keep each file's contents in working context and do not read an already loaded file again unless it may have changed or essential content was truncated.",
             Self::Implement => "Focus on the smallest source edit that completes the requested change.",
             Self::Verify => "For this subtask, the next action must be process.exec. Set path to the absolute executable only (for example, /usr/bin/cc); put every flag and file name in content.argv as a JSON string array, and declare build outputs in content.outputs. Never put arguments in path.",
             Self::Repair => "For this subtask, use the latest failure to inspect or edit source, then use process.exec to verify the fix. For process.exec, path is only the absolute executable; put flags and file names in content.argv and build outputs in content.outputs.",
@@ -440,6 +441,7 @@ pub fn run_loop(
     max_steps: usize,
     rag_index: Option<&aivm_cube::rag::RagIndex>,
 ) -> Result<AgentRun, RuntimeError> {
+    gateway.clear_read_cache();
     let mut steps: Vec<AgentStep> = Vec::new();
     let mut observations: Vec<String> = Vec::new();
     let mut summary: Option<String> = None;

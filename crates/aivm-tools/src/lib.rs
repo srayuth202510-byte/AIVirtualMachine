@@ -124,6 +124,9 @@ pub struct ToolGateway {
     pub build: build::BuildConfig,
     req_counter: u64,
     deny_tracker: DenyTracker,
+    /// File contents read during the current agent run. Authorization and audit
+    /// still happen on every request; writes and process execution invalidate it.
+    read_cache: HashMap<PathBuf, String>,
     /// Secret broker (G4 §26): `None` = ไม่ตั้งค่า → `secret.request` และ
     /// exec แบบแนบ secret ถูก DENY (fail-closed ไม่มีทางเงียบผ่าน)
     secret_broker: Option<SecretBroker>,
@@ -237,8 +240,14 @@ impl ToolGateway {
             build: build::BuildConfig::default(),
             req_counter: 0,
             deny_tracker: DenyTracker::default(),
+            read_cache: HashMap::new(),
             secret_broker: None,
         }
+    }
+
+    /// Start a fresh agent run with no assumptions about workspace contents.
+    pub fn clear_read_cache(&mut self) {
+        self.read_cache.clear();
     }
 
     /// ติด secret broker แบบ builder (operator ประกอบที่ runtime — ดู
@@ -523,6 +532,14 @@ impl ToolGateway {
     pub fn read(&mut self, cube: &mut Cube, path: &str) -> Result<ToolResult, ToolError> {
         self.check_quarantine(cube, "read", path)?;
         let (canon, cap_index) = self.enforce(cube, "read", path)?;
+        if let Some(content) = self.read_cache.get(&canon).cloned() {
+            self.audit_decision(cube, "read", path, "allow", "cache-hit", "success")?;
+            return Ok(ToolResult {
+                ok: true,
+                decision: "allow".into(),
+                output: content,
+            });
+        }
         use std::io::Read;
         let result = (|| {
             let file = secure_fs::open(&self.workspace, &canon, false)?;
@@ -547,6 +564,7 @@ impl ToolGateway {
             if result.is_ok() { "success" } else { "error" },
         )?;
         let content = result?;
+        self.read_cache.insert(canon, content.clone());
         Ok(ToolResult {
             ok: true,
             decision: "allow".into(),
@@ -562,7 +580,34 @@ impl ToolGateway {
     ) -> Result<ToolResult, ToolError> {
         self.check_quarantine(cube, "write", path)?;
         let (canon, cap_index) = self.enforce(cube, "write", path)?;
-        use std::io::Write;
+        use std::io::{Read, Write};
+        if let Err(error) = self.check_file_size(cap_index, content.len() as u64) {
+            self.audit_decision(cube, "write", path, "deny", "size-constraint", "error")?;
+            return Err(error);
+        }
+        let unchanged = secure_fs::open(&self.workspace, &canon, false)
+            .ok()
+            .and_then(|file| {
+                let size = file.metadata().ok()?.len();
+                (size == content.len() as u64).then_some(file)
+            })
+            .and_then(|file| {
+                let mut existing = Vec::with_capacity(content.len());
+                file.take(content.len() as u64 + 1)
+                    .read_to_end(&mut existing)
+                    .ok()
+                    .map(|_| existing)
+            })
+            .is_some_and(|existing| existing == content.as_bytes());
+        if unchanged {
+            self.read_cache.insert(canon, content.to_string());
+            self.audit_decision(cube, "write", path, "allow", "unchanged", "success")?;
+            return Ok(ToolResult {
+                ok: true,
+                decision: "allow".into(),
+                output: "unchanged".into(),
+            });
+        }
         let result = (|| {
             self.check_file_size(cap_index, content.len() as u64)?;
             let used = walkdir::WalkDir::new(&self.workspace)
@@ -600,6 +645,7 @@ impl ToolGateway {
             if result.is_ok() { "success" } else { "error" },
         )?;
         result?;
+        self.read_cache.insert(canon, content.to_string());
         Ok(ToolResult {
             ok: true,
             decision: "allow".into(),
@@ -1262,6 +1308,8 @@ impl ToolGateway {
             }
             "code.search" => self.search(cube, &req.path),
             "process.exec" => {
+                // A build or test command can change any workspace file.
+                self.read_cache.clear();
                 // argv มาจาก JSON array ล้วน (เดิม) หรือ object {argv, secret?, outputs?}
                 // (G4) — parse ไม่ได้เลย = DENY (กัน shell interpolation:
                 // ไม่มีจุดไหนต่อสตริงเป็นคำสั่งเลย)
@@ -1843,6 +1891,38 @@ network: {{allow: [], deny: []}}
         let audit = AuditWriter::open(dir.join("audit.jsonl")).unwrap();
         let gw = ToolGateway::new(dir.clone(), policy, caps, audit, "coder", "sess");
         (gw, Cube::new("t"), dir)
+    }
+
+    #[test]
+    fn file_reads_are_cached_and_writes_are_idempotent() {
+        let (mut gw, mut cube, dir) = harness();
+        let path = dir.join("src/cache.txt");
+        std::fs::write(&path, "original").unwrap();
+
+        assert_eq!(
+            gw.read(&mut cube, "src/cache.txt").unwrap().output,
+            "original"
+        );
+        // An agent run reuses what it already loaded, even if an out-of-band
+        // change occurs. Mediated writes and process execution invalidate it.
+        std::fs::write(&path, "external change").unwrap();
+        assert_eq!(
+            gw.read(&mut cube, "src/cache.txt").unwrap().output,
+            "original"
+        );
+
+        let changed = gw.write(&mut cube, "src/cache.txt", "original").unwrap();
+        assert_eq!(changed.output, "written");
+        let unchanged = gw.write(&mut cube, "src/cache.txt", "original").unwrap();
+        assert_eq!(unchanged.output, "unchanged");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+
+        gw.write(&mut cube, "src/cache.txt", "updated").unwrap();
+        assert_eq!(
+            gw.read(&mut cube, "src/cache.txt").unwrap().output,
+            "updated"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
