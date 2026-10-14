@@ -15,7 +15,7 @@ use crate::RuntimeError;
 use aivm_cube::rag;
 use aivm_cube::Cube;
 use aivm_model::Model;
-use aivm_tools::{ToolGateway, ToolRequest};
+use aivm_tools::{ExecContent, ToolGateway, ToolRequest};
 use serde::{Deserialize, Serialize};
 
 /// สร้าง RAG ผ่าน gateway: ไม่มี API ให้เลือก root ที่ข้าม policy
@@ -55,7 +55,8 @@ To finish:        {\"done\": true, \"summary\": \"<short text>\"}\n\
 Allowed tools: filesystem.read, filesystem.write, code.search, process.exec, network.fetch, network.connect, secret.request.\n\
 path means: a workspace-relative file path (read/write), a search string (code.search), \
 an absolute executable or build:<artifact> (process.exec), or a URL (network.fetch).\n\
-For builds, process.exec content is a JSON string encoding {\"argv\":[...],\"outputs\":[\"main.o\"]}; outputs require an operator-enabled build profile.\n\
+For builds, process.exec content may be a JSON string or object with an argv array and optional outputs array; outputs require an operator-enabled build profile.\n\
+Use observations to advance the task. After a successful edit, compile and run the requested tests; do not repeat a successful tool action. If tests fail, inspect the result, edit the source, then rebuild and rerun.\n\
 Every request is mediated and may be DENIED; if denied, choose a different action.";
 
 /// เจตนาที่สกัดจากข้อความของโมเดล
@@ -99,21 +100,58 @@ struct FinishIntent {
 }
 #[derive(Deserialize)]
 #[serde(untagged)]
+enum IntentContent {
+    Text(String),
+    Exec(ExecContent),
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolIntent {
+    tool: String,
+    path: String,
+    #[serde(default)]
+    content: Option<IntentContent>,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
 enum ParsedIntent {
-    Tool(ToolRequest),
+    Tool(ToolIntent),
     Finish(FinishIntent),
 }
 
 pub fn parse_intent(raw: &str) -> Result<Intent, String> {
+    // Small local models often wrap an otherwise exact JSON response in a
+    // Markdown fence. Accept only a fence around the entire response; prose,
+    // extra fences, and unknown JSON fields remain rejected below.
+    let trimmed = raw.trim();
+    let json = trimmed
+        .strip_prefix("```json")
+        .and_then(|s| s.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
     // serde ตรวจ duplicate fields ด้วย ไม่ผ่าน Value ที่จะทับค่าซ้ำเงียบ ๆ
-    match serde_json::from_str::<ParsedIntent>(raw.trim())
+    match serde_json::from_str::<ParsedIntent>(json)
         .map_err(|e| format!("invalid intent JSON: {e}"))?
     {
         ParsedIntent::Tool(request) => {
             if !KNOWN_TOOLS.contains(&request.tool.as_str()) {
                 return Err(format!("unknown tool: {}", request.tool));
             }
-            Ok(Intent::Tool(request))
+            let content = match request.content {
+                None => None,
+                Some(IntentContent::Text(text)) => Some(text),
+                Some(IntentContent::Exec(body)) if request.tool == "process.exec" => {
+                    Some(serde_json::to_string(&body).expect("ExecContent is serializable"))
+                }
+                Some(IntentContent::Exec(_)) => {
+                    return Err("structured content is only valid for process.exec".into());
+                }
+            };
+            Ok(Intent::Tool(ToolRequest {
+                tool: request.tool,
+                path: request.path,
+                content,
+            }))
         }
         ParsedIntent::Finish(finish) if finish.done => Ok(Intent::Finish(finish.summary)),
         ParsedIntent::Finish(_) => Err("done must be true".into()),
@@ -131,8 +169,7 @@ fn clip(s: &str, max: usize) -> String {
 
 fn build_prompt(task: &str, observations: &[String], context_hint: Option<&str>) -> String {
     let mut p = String::new();
-    p.push_str(SYSTEM_PROMPT);
-    p.push_str("\n\nTask: ");
+    p.push_str("Task: ");
     p.push_str(task);
     if !observations.is_empty() {
         p.push_str("\n\nObservations:\n");
@@ -187,7 +224,7 @@ pub fn run_loop(
 
         let prompt = build_prompt(task, &observations, context_hint.as_deref());
         let raw = model
-            .reason(&prompt)
+            .reason_with_system(SYSTEM_PROMPT, &prompt)
             .map_err(|e| RuntimeError::Config(format!("model: {e}")))?;
 
         match parse_intent(&raw) {
@@ -418,9 +455,30 @@ mod tests {
     }
 
     #[test]
-    fn fenced_json_is_denied() {
-        let i = parse_intent("```json\n{\"tool\": \"code.search\", \"path\": \"fn main\"}\n```");
-        assert!(i.is_err());
+    fn exact_json_fence_is_accepted_but_fenced_prose_is_denied() {
+        let i = parse_intent("```json\n{\"tool\": \"code.search\", \"path\": \"fn main\"}\n```")
+            .unwrap();
+        assert!(matches!(i, Intent::Tool(_)));
+        assert!(parse_intent("Here is the JSON:\n```json\n{\"done\":true}\n```").is_err());
+    }
+
+    #[test]
+    fn structured_process_exec_content_is_normalized_for_gateway() {
+        let intent = parse_intent(
+            r#"{"tool":"process.exec","path":"cc","content":{"argv":["-pipe"],"outputs":["tests"]}}"#,
+        )
+        .unwrap();
+        let Intent::Tool(request) = intent else {
+            panic!("expected process.exec tool intent");
+        };
+        let body: serde_json::Value =
+            serde_json::from_str(request.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["argv"][0], "-pipe");
+        assert_eq!(body["outputs"][0], "tests");
+        assert!(
+            parse_intent(r#"{"tool":"filesystem.write","path":"a.c","content":{"argv":[]}}"#)
+                .is_err()
+        );
     }
 
     #[test]

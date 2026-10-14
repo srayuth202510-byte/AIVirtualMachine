@@ -146,6 +146,11 @@ impl Default for LocalModelConfig {
 
 pub trait Model: Send + Sync {
     fn reason(&self, context: &str) -> Result<String, ModelError>;
+    /// ส่ง system instruction แยกจาก user/context เมื่อ backend รองรับ
+    /// backend ทั่วไปคง compatibility ด้วยการต่อข้อความก่อนเรียก reason()
+    fn reason_with_system(&self, system: &str, context: &str) -> Result<String, ModelError> {
+        self.reason(&format!("{system}\n\n{context}"))
+    }
     fn token_count(&self, text: &str) -> usize;
     fn max_context(&self) -> usize;
 }
@@ -226,11 +231,33 @@ impl LocalLlamaModel {
     pub fn name(&self) -> &str {
         &self.name
     }
-}
 
-#[cfg(feature = "llama")]
-impl Model for LocalLlamaModel {
-    fn reason(&self, context: &str) -> Result<String, ModelError> {
+    fn reason_with_messages(&self, messages: &[(&str, &str)]) -> Result<String, ModelError> {
+        let prompt = if let Some(template) = &self.chat_template {
+            let messages = messages
+                .iter()
+                .map(|(role, content)| {
+                    llama_cpp_2::model::LlamaChatMessage::new(
+                        (*role).to_string(),
+                        (*content).to_string(),
+                    )
+                    .map_err(|e| ModelError::Tokenizer(e.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.model
+                .apply_chat_template(template, &messages, true)
+                .map_err(|e| ModelError::Tokenizer(e.to_string()))?
+        } else {
+            messages
+                .iter()
+                .map(|(_, content)| *content)
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        self.generate(&prompt)
+    }
+
+    fn generate(&self, prompt: &str) -> Result<String, ModelError> {
         let n_ctx = self.config.ctx_size as u32;
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx).or(NonZeroU32::new(512)))
@@ -241,16 +268,6 @@ impl Model for LocalLlamaModel {
             .new_context(&self.backend, ctx_params)
             .map_err(|e| ModelError::InferenceFailed(e.to_string()))?;
 
-        let prompt = if let Some(template) = &self.chat_template {
-            let message =
-                llama_cpp_2::model::LlamaChatMessage::new("user".into(), context.to_string())
-                    .map_err(|e| ModelError::Tokenizer(e.to_string()))?;
-            self.model
-                .apply_chat_template(template, &[message], true)
-                .map_err(|e| ModelError::Tokenizer(e.to_string()))?
-        } else {
-            context.to_string()
-        };
         let vocab = self.model.vocab();
         let tokens = vocab.tokenize(prompt.as_bytes(), true, true);
         if tokens.is_empty() {
@@ -271,7 +288,6 @@ impl Model for LocalLlamaModel {
         ctx.decode(&mut batch)
             .map_err(|e| ModelError::InferenceFailed(e.to_string()))?;
 
-        // ใช้ sampler chain ของ llama.cpp แทนการเขียนแซมเพิลเอง
         let mut sampler = LlamaSampler::chain_simple([
             LlamaSampler::temp(self.config.temperature),
             LlamaSampler::top_k(self.config.top_k),
@@ -300,6 +316,17 @@ impl Model for LocalLlamaModel {
 
         let bytes = vocab.detokenize(&generated, true, true);
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+#[cfg(feature = "llama")]
+impl Model for LocalLlamaModel {
+    fn reason(&self, context: &str) -> Result<String, ModelError> {
+        self.reason_with_messages(&[("user", context)])
+    }
+
+    fn reason_with_system(&self, system: &str, context: &str) -> Result<String, ModelError> {
+        self.reason_with_messages(&[("system", system), ("user", context)])
     }
 
     fn token_count(&self, text: &str) -> usize {
