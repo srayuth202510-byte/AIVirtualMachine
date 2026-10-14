@@ -102,6 +102,26 @@ output ไม่ใช่ UTF-8 ถูกแทนด้วย U+FFFD, VMM ไ�
 verdict ตอบแค่ "มีหลักฐานละเมิด boundary หรือไม่" ไม่ใช่ "รันสำเร็จหรือไม่"
 `suspect`/`compromise` ต้องสืบต่อเสมอ แม้ decision จะเป็น deny อยู่แล้ว
 
+## 4c. Instance DNA (G5 — `docs/threat-model.md`)
+
+ทุกบูตสุ่มเอกลักษณ์ของตัวเอง (ไม่ต้องตั้งอะไร — เกิดเอง ยกเว้น `dna_jitter`
+กับ alt images ที่ operator เลือกเปิด):
+
+- **marker scheme** (V0/V1) + ชื่อไฟล์ tmp ใน init — payload สำเร็จรูปที่
+  hardcode รูป marker ใช้ไม่ได้ทุกบูต
+- **image set** — ตั้ง `alt_kernel`/`alt_rootfs` แล้ว verify ทุกชุดตั้งแต่ประตู
+  สุ่มเลือกหนึ่งชุดต่อบูต (exploit ผูก image เดียวใช้ซ้ำไม่ได้)
+- **resource jitter** (`dna_jitter: true`) — vcpu/mem ลดไม่เกิน 25% จาก quota
+  (ไม่มีทางเกิน ไม่มีทางต่ำกว่า 1 vcpu / 64 MiB) แลก headroom กับ diversity
+- **secret lease ไม่ซ้ำข้าม run** (`max_uses=1` ต่อ boot — ดู secrets crate)
+
+dna id รูป `s{scheme}-k{0|1}-r{0|1}-{vcpu}x{mem}-{tmp}` ลง audit ทุกครั้ง
+(`applied` มีแค่ชื่อกลไก `instance-dna`)
+
+**ซื่อสัตย์**: DNA คือ diversity ไม่ใช่ความลับ — init อยู่ใน guest อ่าน scheme
+ได้เสมอ กัน payload สำเร็จรูปได้ แต่กันการปลอมแบบเห็นข้อความ (live forgery)
+ไม่ได้ (marker มี nonce + parse เข้มคุมอยู่แล้วอีกชั้น)
+
 ## 5. แก้ปัญหา
 
 | อาการ | สาเหตุที่เป็นไปได้ |

@@ -14,6 +14,9 @@ runtime:
 #   vcpu_count: 1      # 1..=32
 #   mem_mb: 256        # 64..=32768
 #   boot_timeout_secs: 60   # 5..=600
+#   alt_kernel: { path: /path/vmlinux2.bin, sha256: "<64 hex>" }  # G5 DNA (verify ทุกชุด สุ่มใช้ต่อบูต)
+#   alt_rootfs: { path: /path/rootfs2.ext4, sha256: "<64 hex>" }
+#   dna_jitter: false     # true = สุ่มลด vcpu/mem ไม่เกิน 25% ต่อบูต
 #   jailer:                  # Optional: ใช้ jailer wrap firecracker (ต้อง root)
 #     jailer_path: ""        # "" = หาใน PATH, หรือระบุ path เต็ม
 #     jailer_id: ""          # "" = auto-generate

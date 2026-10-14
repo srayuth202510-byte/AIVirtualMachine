@@ -1046,8 +1046,10 @@ microvm:
         assert!(!r.ok);
         assert_eq!(r.decision, "allow");
         // G3: run ที่จบบริบูรณ์ต้องลง verdict:clean ใน audit ทั้งสองครั้ง
+        // G5: ทุก run ต้องมี dna id ต่อท้าย (s{scheme}-k{0|1}-r{0|1}-…)
         let log = std::fs::read_to_string(base.join("audit.jsonl")).unwrap();
         assert!(log.matches("verdict:clean").count() >= 2);
+        assert!(log.matches("dna:s").count() >= 2, "ต้องมี dna id: {log}");
         aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -54,6 +54,124 @@ fn effective_guest_size(cfg: &MicroVmConfig, limits: &crate::ResourceLimits) -> 
     (vcpu, mem)
 }
 
+/// RNG เล็กสำหรับ DNA ต่อบูต (xorshift64* — ไม่เพิ่ม dependency)
+/// determinism ต่อ seed ทำให้ unit-test ได้ seed ต่อบูตมาจากเวลา+pid
+///
+/// หมายเหตุซื่อสัตย์: นี่คือ diversity ไม่ใช่ความลับ — init script อยู่ใน
+/// guest อ่าน marker/scheme ได้เสมอ DNA กัน payload สำเร็จรูป (pre-baked
+/// ที่ hardcode รูป marker) ไม่ได้กันการปลอมแบบเห็นข้อความ (live forgery)
+struct DnaRng(u64);
+
+impl DnaRng {
+    fn seed() -> Self {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0) as u64;
+        let p = std::process::id() as u64;
+        Self(
+            t.wrapping_mul(0x9E3779B97F4A7C15)
+                .wrapping_add(p.wrapping_mul(0xBF58476D1CE4E5B9))
+                .max(1),
+        )
+    }
+    #[cfg(test)]
+    fn seeded(v: u64) -> Self {
+        Self(v.max(1))
+    }
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+    /// สุ่ม `[0, n)` (`n == 0` คืน 0 — ไม่มีทางหารด้วยศูนย์)
+    fn below(&mut self, n: u64) -> u64 {
+        if n == 0 {
+            0
+        } else {
+            self.next() % n
+        }
+    }
+}
+
+/// รูป marker ต่อบูต (G5): host gen + parse เองทั้งคู่ (ดู `markers`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerScheme {
+    V0,
+    V1,
+}
+
+/// ชุด marker + ชื่อไฟล์ tmp + ทางเลือก image ของ instance นี้
+struct InstanceDna {
+    scheme: MarkerScheme,
+    out_b: String,
+    out_e: String,
+    err_b: String,
+    err_e: String,
+    exit: String,
+    fail_mount: String,
+    out_tmp: String,
+    err_tmp: String,
+    kernel_alt: bool,
+    rootfs_alt: bool,
+}
+
+impl InstanceDna {
+    /// เอกลักษณ์สั้นลง audit (ไม่มีช่องว่าง/อักขระพิเศษ — ปลอดภัยใน log)
+    fn id(&self, vcpu: u8, mem: u32) -> String {
+        let s = match self.scheme {
+            MarkerScheme::V0 => 0,
+            MarkerScheme::V1 => 1,
+        };
+        format!(
+            "s{}-k{}-r{}-{}x{}-{}",
+            s,
+            self.kernel_alt as u8,
+            self.rootfs_alt as u8,
+            vcpu,
+            mem,
+            self.out_tmp
+                .trim_start_matches("/tmp/aivm-")
+                .trim_end_matches('o')
+        )
+    }
+}
+
+/// สร้าง marker ทั้งชุดจาก nonce + scheme (V1 โครงต่างจาก V0 ชัดเจน —
+/// payload ที่ hardcode รูป V0 ใช้กับบูต V1 ไม่ได้)
+fn markers(nonce: &str, scheme: MarkerScheme) -> (String, String, String, String, String, String) {
+    match scheme {
+        MarkerScheme::V0 => (
+            format!("AIVM-{nonce}-OUT-BEGIN"),
+            format!("AIVM-{nonce}-OUT-END"),
+            format!("AIVM-{nonce}-ERR-BEGIN"),
+            format!("AIVM-{nonce}-ERR-END"),
+            format!("AIVM-{nonce}-EXIT:"),
+            format!("AIVM-{nonce}-FAIL-mount"),
+        ),
+        MarkerScheme::V1 => (
+            format!("BEGIN:AIVM-{nonce}:OUT"),
+            format!("END:AIVM-{nonce}:OUT"),
+            format!("BEGIN:AIVM-{nonce}:ERR"),
+            format!("END:AIVM-{nonce}:ERR"),
+            format!("RC:AIVM-{nonce}:"),
+            format!("FAIL:AIVM-{nonce}:mount"),
+        ),
+    }
+}
+
+/// jitter ขนาด guest ต่อบูต (G5, ใช้เมื่อเปิด `dna_jitter`): ลดไม่เกิน 25%
+/// จากค่าที่ clamp แล้ว — ไม่มีทางเกิน quota และไม่ต่ำกว่า floor
+/// (1 vcpu / 64 MiB) งาน legit ไม่มีทางได้ของเกิน แต่ headroom อาจลด
+fn apply_jitter(vcpu: u8, mem: u32, rng: &mut DnaRng) -> (u8, u32) {
+    let dv = rng.below(vcpu as u64 / 4 + 1) as u8;
+    let dm = rng.below(mem as u64 / 4 + 1) as u32;
+    ((vcpu - dv).max(1), (mem - dm).max(64))
+}
+
 /// ห่อข้อความให้เป็น single-quoted sh literal (กันทุกไบต์ยกเว้น NUL
 /// ซึ่ง validate ปฏิเสธไปแล้วตั้งแต่ประตูแรก)
 fn sh_escape(s: &str) -> String {
@@ -343,15 +461,56 @@ fn boot_and_run_inner(
     let spawn_err = |what: &str, e: std::io::Error| {
         clean_err(SandboxError::Spawn(format!("microvm {what} failed: {e}")))
     };
+    // 0. DNA ต่อบูต (G5): entropy ก้อนเดียวแตกเป็น scheme/image-pick/tmp/jitter
+    // image ทุกชุดผ่าน verify ที่ประตูแล้ว (verify ก่อนสุ่มเสมอ) — บูตนี้
+    // เลือกชุดไหนก็ปลอดภัยเท่ากัน ต่างกันแค่ exploit ผูกตายตัวใช้ซ้ำไม่ได้
+    let mut rng = DnaRng::seed();
+    let scheme = if rng.below(2) == 0 {
+        MarkerScheme::V0
+    } else {
+        MarkerScheme::V1
+    };
+    // kernel เลือกแล้วใช้เลย (verify ครบทุกชุดที่ประตูแล้ว) ส่วน rootfs
+    // ถูก verify ซ้ำหลังก็อปอีกชั้น (กันไฟล์ถูกสลับกลางบูต)
+    let (kpath, _ksha, k_alt) = match (&cfg.alt_kernel, rng.below(2)) {
+        (Some(a), 1) => (&a.path, &a.sha256, true),
+        _ => (&cfg.kernel_path, &cfg.kernel_sha256, false),
+    };
+    let (rpath, rsha, r_alt) = match (&cfg.alt_rootfs, rng.below(2)) {
+        (Some(a), 1) => (&a.path, &a.sha256, true),
+        _ => (&cfg.rootfs_path, &cfg.rootfs_sha256, false),
+    };
+    let tmp_tag = format!("{:x}", rng.next() & 0xffffff);
+    let (m_out_b, m_out_e, m_err_b, m_err_e, m_exit, m_fail) = markers(nonce, scheme);
+    let dna = InstanceDna {
+        scheme,
+        out_b: m_out_b,
+        out_e: m_out_e,
+        err_b: m_err_b,
+        err_e: m_err_e,
+        exit: m_exit,
+        fail_mount: m_fail,
+        out_tmp: format!("/tmp/aivm-{tmp_tag}o"),
+        err_tmp: format!("/tmp/aivm-{tmp_tag}e"),
+        kernel_alt: k_alt,
+        rootfs_alt: r_alt,
+    };
+    // ขนาด guest = clamp ด้วย quota ระดับ task ก่อน แล้ว jitter ลงถ้าเปิดไว้
+    let (eff_vcpu, eff_mem) = effective_guest_size(cfg, &spec.limits);
+    let (eff_vcpu, eff_mem) = if cfg.dna_jitter {
+        apply_jitter(eff_vcpu, eff_mem, &mut rng)
+    } else {
+        (eff_vcpu, eff_mem)
+    };
     // 1. ก็อป rootfs ที่ verify แล้วไป scratch (ห้ามเขียนไฟล์ pin ต้นฉบับ)
     // แล้ว verify สำเนาซ้ำ (กันไฟล์ถูกสลับระหว่าง verify กับก็อป/ก็อปเสีย —
     // แพทเทิร์นเดียวกับ `revalidate_exe` ของ path Process)
     // สำเนาไม่ตรง = หลักฐานแทรกแซงกลางบูต → `Compromise` (G3)
     let guest_root = scratch.join("root.img");
-    std::fs::copy(&cfg.rootfs_path, &guest_root).map_err(|e| spawn_err("rootfs copy", e))?;
-    verify_artifact(&guest_root, &cfg.rootfs_sha256, cfg.max_artifact_bytes)
+    std::fs::copy(rpath, &guest_root).map_err(|e| spawn_err("rootfs copy", e))?;
+    verify_artifact(&guest_root, rsha, cfg.max_artifact_bytes)
         .map_err(|e| (e, RunVerdict::Compromise("rootfs-copy-reverify-failed")))?;
-    let kernel_abs = cfg.kernel_path.canonicalize().map_err(|e| {
+    let kernel_abs = kpath.canonicalize().map_err(|e| {
         clean_err(SandboxError::Spawn(format!(
             "microvm kernel path failed: {e}"
         )))
@@ -401,15 +560,17 @@ fn boot_and_run_inner(
         invoke.push(' ');
         invoke.push_str(&sh_escape(a));
     }
-    let (m_out_b, m_out_e, m_err_b, m_err_e, m_exit) = (
-        format!("AIVM-{nonce}-OUT-BEGIN"),
-        format!("AIVM-{nonce}-OUT-END"),
-        format!("AIVM-{nonce}-ERR-BEGIN"),
-        format!("AIVM-{nonce}-ERR-END"),
-        format!("AIVM-{nonce}-EXIT:"),
-    );
+    // 3. init script (args ฝังแบบ escape แล้วทั้งก้อน, marker/tmp ตาม DNA)
     let init_sh = format!(
-        "#!/bin/sh\nmkdir -p /mnt/data\nmount -t tmpfs tmpfs /tmp 2>/dev/null\nmount -t ext4 -o ro /dev/vdb /mnt/data || {{ echo \"AIVM-{nonce}-FAIL-mount\"; poweroff -f; }}\n{invoke} >/tmp/o 2>/tmp/e\nCODE=$?\necho \"{m_out_b}\"; cat /tmp/o; echo \"{m_out_e}\"\necho \"{m_err_b}\"; cat /tmp/e; echo \"{m_err_e}\"\necho \"{m_exit}$CODE\"\npoweroff -f\n"
+        "#!/bin/sh\nmkdir -p /mnt/data\nmount -t tmpfs tmpfs /tmp 2>/dev/null\nmount -t ext4 -o ro /dev/vdb /mnt/data || {{ echo \"{fail}\"; poweroff -f; }}\n{invoke} >{out_tmp} 2>{err_tmp}\nCODE=$?\necho \"{out_b}\"; cat {out_tmp}; echo \"{out_e}\"\necho \"{err_b}\"; cat {err_tmp}; echo \"{err_e}\"\necho \"{exit}$CODE\"\npoweroff -f\n",
+        fail = dna.fail_mount,
+        out_tmp = dna.out_tmp,
+        err_tmp = dna.err_tmp,
+        out_b = dna.out_b,
+        out_e = dna.out_e,
+        err_b = dna.err_b,
+        err_e = dna.err_e,
+        exit = dna.exit,
     );
     let init_host = scratch.join("aivm-init");
     std::fs::write(&init_host, init_sh.as_bytes()).map_err(|e| spawn_err("init write", e))?;
@@ -472,8 +633,7 @@ fn boot_and_run_inner(
     let child = guard.0.as_mut().expect("guard holds child");
 
     // 6. configure ผ่าน API (ล้มขั้นไหนก็ fail-closed ไม่ boot)
-    // ขนาด guest ถูก clamp ด้วย quota ระดับ task แล้ว (ดู `effective_guest_size`)
-    let (eff_vcpu, eff_mem) = effective_guest_size(cfg, &spec.limits);
+    // ขนาด guest ถูก clamp (+ jitter ถ้าเปิด) ตั้งแต่ขั้น DNA แล้ว
     wait_socket(&sock, Duration::from_secs(5))?;
     fc_put(
         &sock,
@@ -510,7 +670,7 @@ fn boot_and_run_inner(
     // verdict (G3): VMM ตายก่อน marker = หลักฐานละเมิด boundary → `Compromise`
     // เกินเส้นตาย = ผิดปกติแบบอธิบายได้ → `Suspect`
     let deadline = Instant::now() + Duration::from_secs(cfg.boot_timeout_secs);
-    let exit_mark = format!("AIVM-{nonce}-EXIT:");
+    let exit_mark = dna.exit.clone();
     loop {
         if serial_file_contains(&serial_log, &exit_mark, MAX_SERIAL_BYTES) {
             break;
@@ -533,16 +693,18 @@ fn boot_and_run_inner(
     // 8. parse ผล (guard จะ kill/reap VMM ที่ halt ค้างให้)
     // nonce ต่อรันทำให้ marker ชนกับ output ของ payload แทบเป็นไปไม่ได้
     let log = read_capped(&serial_log, MAX_SERIAL_BYTES);
-    let stdout = between(&log, &m_out_b, &m_out_e);
-    let stderr = between(&log, &m_err_b, &m_err_e);
+    let stdout = between(&log, &dna.out_b, &dna.out_e);
+    let stderr = between(&log, &dna.err_b, &dna.err_e);
     let code = parse_exit(&log, &exit_mark)?;
     let _ = child;
     // รายงานซื่อสัตย์: อะไร enforce แล้วเข้า applied อะไรยังหย่อนเข้า degraded
+    // DNA id อยู่ใน `dna` (gateway ลง audit) ส่วน applied มีแค่ชื่อกลไก
     let mut applied = vec![
         "microvm-boot".into(),
         "image-pin-verify".into(),
         "rootfs-copy-reverify".into(),
         "task-quota-clamp".into(),
+        "instance-dna".into(),
         "exe-allowlist".into(),
         "arg-schema".into(),
         "kvm".into(),
@@ -567,6 +729,7 @@ fn boot_and_run_inner(
         stderr,
         applied,
         degraded,
+        dna: dna.id(eff_vcpu, eff_mem),
     })
 }
 
@@ -854,5 +1017,69 @@ mod tests {
         assert_eq!(RunVerdict::Compromise("y").label(), "compromise");
         assert_eq!(RunVerdict::Clean.reason(), "no-interference-evidence");
         assert_eq!(RunVerdict::Suspect("r").reason(), "r");
+    }
+
+    // DNA RNG: seed เดียวกันได้ stream เดียวกัน (test ได้) และมีขอบเขตถูก
+    #[test]
+    fn dna_rng_deterministic_and_bounded() {
+        let (mut a, mut b) = (DnaRng::seeded(42), DnaRng::seeded(42));
+        for _ in 0..100 {
+            assert_eq!(a.next(), b.next());
+        }
+        let mut r = DnaRng::seeded(7);
+        for _ in 0..1000 {
+            assert!(r.below(2) < 2);
+            assert!(r.below(65) < 65);
+        }
+        assert_eq!(r.below(0), 0);
+        assert_eq!(r.below(1), 0);
+    }
+
+    // ทั้งสอง marker scheme ต้อง parse กลับได้ด้วย parser ตัวเดียวกัน
+    #[test]
+    fn both_marker_schemes_roundtrip() {
+        for scheme in [MarkerScheme::V0, MarkerScheme::V1] {
+            let (ob, oe, eb, ee, ex, _fail) = markers("n9", scheme);
+            let log = format!("junk\n{ob}\nhello\n{oe}\n{eb}\nbad\n{ee}\n{ex}3\ntail\n");
+            assert_eq!(between(&log, &ob, &oe), "hello");
+            assert_eq!(between(&log, &eb, &ee), "bad");
+            assert_eq!(parse_exit(&log, &ex).unwrap(), 3);
+        }
+    }
+
+    // jitter ไม่มีทางเกิน quota และไม่ต่ำกว่า floor (สุ่มกี่ seed ก็ตาม)
+    #[test]
+    fn jitter_stays_within_quota_and_floor() {
+        for seed in 1..=200 {
+            let mut rng = DnaRng::seeded(seed);
+            let (v, m) = apply_jitter(4, 1024, &mut rng);
+            assert!((1..=4).contains(&v), "seed {seed}: vcpu {v}");
+            assert!((768..=1024).contains(&m), "seed {seed}: mem {m}");
+        }
+        // เคสเล็กสุด: ไม่ panic ไม่ต่ำ floor
+        let mut rng = DnaRng::seeded(1);
+        assert_eq!(apply_jitter(1, 64, &mut rng), (1, 64));
+    }
+
+    // dna id ไม่มีช่องว่าง/อักขระพิเศษ (ปลอดภัยใน audit log)
+    #[test]
+    fn dna_id_is_log_safe() {
+        let (ob, oe, eb, ee, ex, fail) = markers("abc", MarkerScheme::V1);
+        let dna = InstanceDna {
+            scheme: MarkerScheme::V1,
+            out_b: ob,
+            out_e: oe,
+            err_b: eb,
+            err_e: ee,
+            exit: ex,
+            fail_mount: fail,
+            out_tmp: "/tmp/aivm-1a2b3co".into(),
+            err_tmp: "/tmp/aivm-1a2b3ce".into(),
+            kernel_alt: true,
+            rootfs_alt: false,
+        };
+        let id = dna.id(2, 512);
+        assert_eq!(id, "s1-k1-r0-2x512-1a2b3c");
+        assert!(!id.chars().any(|c| c.is_whitespace()));
     }
 }

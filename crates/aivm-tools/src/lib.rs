@@ -430,7 +430,15 @@ impl ToolGateway {
             "execute",
             &scope,
             "allow",
-            &format!("exit:{} verdict:clean", outcome.code.unwrap_or(-1)),
+            &format!(
+                "exit:{} verdict:clean dna:{}",
+                outcome.code.unwrap_or(-1),
+                if outcome.dna.is_empty() {
+                    "-"
+                } else {
+                    &outcome.dna
+                }
+            ),
             "success",
         );
         Ok(ToolResult {

@@ -62,6 +62,10 @@ policy:
 #   mem_mb: 256             # 64..=32768 (default 256)
 #   max_artifact_bytes: 536870912   # เพดานไฟล์ artifact (default 512MiB, ต้อง > 0)
 #   boot_timeout_secs: 60   # 5..=600 (default 60)
+#   alt_kernel: { path: /path/vmlinux2.bin, sha256: "<64 hex>" }   # G5: verify ทุกชุด สุ่มใช้ต่อบูต
+#   alt_rootfs: { path: /path/rootfs2.ext4, sha256: "<64 hex>" }
+#   dna_jitter: false       # true = สุ่มลด vcpu/mem ≤25% ต่อบูต (ไม่เกิน quota)
+#   jailer: ...             # ดู examples/aivm.yaml (ต้อง root)
 ```
 
 ## หมายเหตุการบังคับใช้

@@ -130,6 +130,9 @@ pub struct ExecOutcome {
     pub applied: Vec<String>,
     /// สิ่งที่อยากทำแต่ทำไม่ได้ในเครื่องนี้ (ต้องดัง ไม่เงียบ)
     pub degraded: Vec<String>,
+    /// เอกลักษณ์ instance ต่อรัน (G5 DNA — ว่าง = ไม่มี เช่น path Process)
+    /// รูป `s{scheme}-k{0|1}-r{0|1}-{vcpu}x{mem}-{tmp}` gateway ลง audit
+    pub dna: String,
 }
 
 impl ExecOutcome {
@@ -1029,6 +1032,8 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
         stderr: err_s,
         applied,
         degraded,
+        // path Process ไม่มี DNA ต่อ instance (task วิ่งบน host ตรง ๆ)
+        dna: String::new(),
     })
 }
 

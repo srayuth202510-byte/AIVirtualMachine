@@ -71,6 +71,27 @@ pub struct MicroVmConfig {
     /// เพิ่ม isolation: chroot, cgroups, namespaces, no-new-privs, drop caps
     #[serde(default)]
     pub jailer: Option<JailerConfig>,
+    /// ชุด image สำรอง (G5 DNA): ถ้าตั้งไว้ จะ verify ทุกชุดตั้งแต่ประตู
+    /// แล้วสุ่มเลือกหนึ่งชุดต่อบูต — exploit ที่ผูกกับ image เดียวใช้ไม่ได้ทุกครั้ง
+    #[serde(default)]
+    pub alt_kernel: Option<ArtifactPin>,
+    /// rootfs สำรอง (คู่กับ alt_kernel ก็ได้ ไม่บังคับ)
+    #[serde(default)]
+    pub alt_rootfs: Option<ArtifactPin>,
+    /// สุ่มขนาด guest ต่อบูต (G5 DNA, default ปิด): เปิดแล้ว vcpu/mem ถูก
+    /// jitter ลงไม่เกิน 25% จากค่าที่ clamp แล้ว (ไม่มีทางเกิน quota และ
+    /// ไม่ต่ำกว่า floor 1 vcpu / 64 MiB) — operator ยอมแลก headroom กับ diversity
+    #[serde(default)]
+    pub dna_jitter: bool,
+}
+
+/// image หนึ่งชุดที่ pin ด้วย sha256 (primary ใช้ฟิลด์เดิม, alt ใช้ struct นี้)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactPin {
+    /// path ไฟล์ image
+    pub path: PathBuf,
+    /// sha256 hex (64 ตัว) ที่อนุญาต
+    pub sha256: String,
 }
 
 fn default_vcpu() -> u8 {
@@ -129,6 +150,9 @@ impl Default for MicroVmConfig {
             fc_sha256: String::new(),
             boot_timeout_secs: default_boot_timeout(),
             jailer: None,
+            alt_kernel: None,
+            alt_rootfs: None,
+            dna_jitter: false,
         }
     }
 }
@@ -201,6 +225,16 @@ pub fn run_in_microvm(
                 RunVerdict::Clean,
             )
         })?;
+        // 3b. alt images (G5 DNA, ถ้ามี): verify ทุกชุดตั้งแต่ประตู แล้วค่อย
+        // สุ่มเลือกหนึ่งชุดต่อบูตในขั้น boot (verify ก่อนสุ่มเสมอ)
+        if let Some(alt) = &cfg.alt_kernel {
+            verify_artifact(&alt.path, &alt.sha256, cfg.max_artifact_bytes)
+                .map_err(|e| (e, RunVerdict::Clean))?;
+        }
+        if let Some(alt) = &cfg.alt_rootfs {
+            verify_artifact(&alt.path, &alt.sha256, cfg.max_artifact_bytes)
+                .map_err(|e| (e, RunVerdict::Clean))?;
+        }
         // supply chain ของ VMM เอง: pin ไว้ก็ต้องตรง (ไม่ pin = ยอมรับตาม
         // PATH ของ operator แล้วรายงานใน `degraded` ให้รู้ตัว)
         if !cfg.fc_sha256.is_empty() {
@@ -318,6 +352,24 @@ mod tests {
     fn preboot_denial_carries_clean_verdict() {
         let (spec, policy, mut cfg, ws) = fixture("vcode");
         cfg.kernel_sha256 = hex_of(b"something-else");
+        assert!(matches!(
+            run_in_microvm(&spec, &policy, &cfg),
+            Err((SandboxError::Invalid(_), RunVerdict::Clean))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // alt image ปลอมต้องตายตั้งแต่ประตู (verify ทุกชุดก่อนสุ่ม — primary
+    // ถูกไม่ช่วยถ้า alt ปลอม) deterministic ทุกเครื่อง
+    #[test]
+    fn tampered_alt_artifact_fails_closed_as_invalid() {
+        let (spec, policy, mut cfg, ws) = fixture("alt");
+        let bad_kernel = ws.join("vmlinux-alt");
+        std::fs::write(&bad_kernel, b"fake-alt").unwrap();
+        cfg.alt_kernel = Some(ArtifactPin {
+            path: bad_kernel,
+            sha256: hex_of(b"something-else"),
+        });
         assert!(matches!(
             run_in_microvm(&spec, &policy, &cfg),
             Err((SandboxError::Invalid(_), RunVerdict::Clean))
