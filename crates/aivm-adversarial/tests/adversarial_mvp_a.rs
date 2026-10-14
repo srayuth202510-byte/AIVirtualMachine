@@ -8,7 +8,7 @@ use aivm_capability::{Capability, CapabilitySet};
 use aivm_cube::{AgentState, Cube, TransitionGuards};
 use aivm_policy::{Decision, EvalContext, Policy};
 use aivm_sandbox::SandboxLevel;
-use aivm_tools::ToolGateway;
+use aivm_tools::{ToolGateway, ToolRequest};
 
 fn test_policy() -> Policy {
     Policy::from_yaml(
@@ -830,5 +830,62 @@ fn secret_use_before_approve_must_deny() {
     assert!(r.is_err());
     let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
     assert!(log.contains("lease-not-approved"));
+    adv_clean(&dir);
+}
+
+#[test]
+fn build_outputs_without_profile_must_deny() {
+    let exe = std::fs::canonicalize("/bin/true")
+        .unwrap()
+        .display()
+        .to_string();
+    let (mut gateway, mut cube, dir) =
+        exec_harness("build-disabled", std::slice::from_ref(&exe), &[], true);
+    let req = ToolRequest {
+        tool: "process.exec".into(),
+        path: exe,
+        content: Some(serde_json::json!({"argv":[],"outputs":["new.o"]}).to_string()),
+    };
+    assert!(gateway.dispatch(&mut cube, &req).is_err());
+    assert!(!dir.join(".aivm-build").exists());
+    assert!(std::fs::read_to_string(dir.join("audit.jsonl"))
+        .unwrap()
+        .contains("build-output-denied"));
+    adv_clean(&dir);
+}
+
+#[test]
+fn build_traversal_and_unlisted_artifacts_must_deny() {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = std::fs::canonicalize("/bin/true")
+        .unwrap()
+        .display()
+        .to_string();
+    let (mut gateway, mut cube, dir) =
+        exec_harness("build-abuse", std::slice::from_ref(&exe), &[], true);
+    gateway.build.enabled = true;
+    for name in ["../../escape", "/tmp/escape", ".env", "state.json"] {
+        let req = ToolRequest {
+            tool: "process.exec".into(),
+            path: exe.clone(),
+            content: Some(serde_json::json!({"argv":[],"outputs":[name]}).to_string()),
+        };
+        assert!(gateway.dispatch(&mut cube, &req).is_err());
+    }
+    assert!(!dir.join(".aivm-build").exists());
+    std::fs::create_dir(dir.join(".aivm-build")).unwrap();
+    std::fs::copy(exe, dir.join(".aivm-build/unlisted")).unwrap();
+    std::fs::set_permissions(
+        dir.join(".aivm-build/unlisted"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let req = ToolRequest {
+        tool: "process.exec".into(),
+        path: "build:unlisted".into(),
+        content: Some("[]".into()),
+    };
+    assert!(gateway.dispatch(&mut cube, &req).is_err());
+    assert!(AuditWriter::verify(dir.join("audit.jsonl")).is_ok());
     adv_clean(&dir);
 }

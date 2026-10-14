@@ -193,6 +193,12 @@ pub fn run_in_microvm(
 ) -> Result<ExecOutcome, (SandboxError, super::RunVerdict)> {
     use super::RunVerdict;
     // 1. ประตูสเปกเดียวกับ Process (exe/policy/arg/env/cwd)
+    if spec.build.is_some() {
+        return Err((
+            SandboxError::Invalid("build output profiles are process-only".into()),
+            RunVerdict::Clean,
+        ));
+    }
     let canon = super::validate(spec, policy).map_err(|e| (e, RunVerdict::Clean))?;
     // 2. ตัวเลข config ต้องสมเหตุก่อน (ถูกกว่าแตะไฟล์)
     cfg.validate_shape().map_err(|e| (e, RunVerdict::Clean))?;
@@ -290,6 +296,7 @@ mod tests {
             workspace: ws.clone(),
             env_extra: vec![],
             timeout_ms: 30000,
+            build: None,
             limits: ResourceLimits::default(),
         };
         let cfg = MicroVmConfig {
@@ -448,6 +455,7 @@ mod tests {
                 workspace: ws.clone(),
                 env_extra: vec![],
                 timeout_ms: 30000,
+                build: None,
                 limits: crate::ResourceLimits::default(),
             };
             let cfg = MicroVmConfig {

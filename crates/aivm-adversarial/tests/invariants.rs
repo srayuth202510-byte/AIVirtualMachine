@@ -365,6 +365,7 @@ fn i10_structural_enforcement() {
     let out = aivm_sandbox::run_checked(
         &aivm_sandbox::ExecSpec {
             timeout_ms: 30000,
+            build: None,
             exe: std::path::PathBuf::from("/bin/true"),
             args: vec![],
             cwd: ws.clone(),

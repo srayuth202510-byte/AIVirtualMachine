@@ -1,5 +1,5 @@
 //! Landlock บังคับ filesystem scope กับทั้ง subprocess tree (ต้องมี ABI >= 3)
-use crate::SandboxError;
+use crate::{BuildSpec, SandboxError};
 use aivm_policy::{Decision, EvalContext, Policy};
 use std::ffi::CString;
 use std::fs::File;
@@ -57,6 +57,7 @@ pub fn prepare(
     exe: &Path,
     policy: &Policy,
     budget: u64,
+    build: Option<&BuildSpec>,
 ) -> Result<(File, u64), SandboxError> {
     let abi = unsafe {
         libc::syscall(
@@ -107,6 +108,16 @@ pub fn prepare(
         let path = Path::new(binary);
         if path.is_file() && policy.evaluate_process(binary).0 == Decision::Allow {
             add(&rules, path, EXECUTE | READ_FILE)?;
+        }
+    }
+    if build.is_some() {
+        for (path, access) in [
+            ("/usr/include", READ_FILE | READ_DIR),
+            ("/usr/libexec/gcc", READ_FILE | READ_DIR | EXECUTE),
+        ] {
+            if Path::new(path).is_dir() {
+                add(&rules, Path::new(path), access)?;
+            }
         }
     }
     // เดินรายการไฟล์จริงแล้ว grant เฉพาะที่ policy อนุญาต; ไม่ grant subtree
@@ -163,6 +174,9 @@ pub fn prepare(
         if !path.starts_with(workspace) || !path.exists() {
             continue;
         }
+        if path.starts_with(workspace.join(".aivm-build")) {
+            continue;
+        }
         if !path.is_dir() {
             let meta = std::fs::symlink_metadata(path)
                 .map_err(|e| SandboxError::Invalid(e.to_string()))?;
@@ -204,6 +218,9 @@ pub fn prepare(
                     continue;
                 }
                 if meta.is_dir() {
+                    if path.file_name().is_some_and(|name| name == ".aivm-build") {
+                        continue;
+                    }
                     grant_write(rules, &path, policy, writable)?;
                 } else if meta.is_file()
                     && meta.nlink() == 1
@@ -219,6 +236,34 @@ pub fn prepare(
             Ok(())
         }
         grant_write(&rules, &real, policy, &mut writable)?;
+    }
+    if let Some(build) = build {
+        let expected = workspace.join(".aivm-build");
+        let meta = std::fs::symlink_metadata(&build.root)
+            .map_err(|e| SandboxError::Invalid(e.to_string()))?;
+        if build.root != expected
+            || !meta.is_dir()
+            || meta.file_type().is_symlink()
+            || build
+                .root
+                .canonicalize()
+                .map_err(|e| SandboxError::Invalid(e.to_string()))?
+                != expected
+            || build.max_file_bytes == 0
+            || build.max_file_bytes > budget
+        {
+            return Err(SandboxError::Invalid("invalid build output profile".into()));
+        }
+        add(&rules, &build.root, READ_FILE | READ_DIR)?;
+        for path in &build.outputs {
+            let meta = std::fs::symlink_metadata(path)
+                .map_err(|e| SandboxError::Invalid(e.to_string()))?;
+            if path.parent() != Some(build.root.as_path()) || !meta.is_file() || meta.nlink() != 1 {
+                return Err(SandboxError::Invalid("unsafe build output slot".into()));
+            }
+            add(&rules, path, WRITE_FILE | (1 << 14))?;
+            writable.insert(path.clone(), meta.len());
+        }
     }
     fn usage(dir: &Path) -> Result<u64, SandboxError> {
         let mut bytes = 0u64;
@@ -245,5 +290,8 @@ pub fn prepare(
     let readonly = used.saturating_sub(writable.values().copied().sum::<u64>());
     // จำกัดแต่ละไฟล์แบบ conservative เพื่อให้ผลรวมไม่เกิน storage quota
     let per_file = budget.saturating_sub(readonly) / (writable.len() as u64).max(1);
+    let per_file = build
+        .map(|profile| per_file.min(profile.max_file_bytes))
+        .unwrap_or(per_file);
     Ok((rules, per_file.max(1)))
 }

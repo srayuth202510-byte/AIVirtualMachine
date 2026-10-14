@@ -1,0 +1,19 @@
+# Opt-in compiler profile; default model is echo. See docs/build-workflow.md.
+name: coder
+runtime:
+  isolation: sandbox
+resources:
+  cpu: 1
+  memory: 1GB
+  storage: 64MB
+build:
+  enabled: true
+  max_files: 4
+  max_bytes: 1048576
+filesystem:
+  read: [./workspace]
+  write: [./workspace/src]
+tools:
+  allow: [cc, as, ld, "build:tests"]
+capabilities:
+  initial: ["read:workspace", "search:code"]

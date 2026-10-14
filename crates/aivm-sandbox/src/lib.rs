@@ -111,6 +111,14 @@ impl Sandbox {
     }
 }
 
+/// ไฟล์ output ที่ trusted gateway เตรียมไว้ ไม่มีสิทธิ์สร้างไฟล์ใน child
+#[derive(Debug, Clone)]
+pub struct BuildSpec {
+    pub root: PathBuf,
+    pub outputs: Vec<PathBuf>,
+    pub max_file_bytes: u64,
+}
+
 /// สเปกงานที่ขอรัน: exe ตายตัว + argv ตาม schema ไม่มี shell มาต่อกลาง
 #[derive(Debug, Clone)]
 pub struct ExecSpec {
@@ -127,6 +135,7 @@ pub struct ExecSpec {
     pub limits: ResourceLimits,
     /// เส้นตายจริง (ms) นอกเหนือ CPU rlimit
     pub timeout_ms: u64,
+    pub build: Option<BuildSpec>,
 }
 
 impl ExecSpec {
@@ -195,6 +204,7 @@ const SANDBOX_PATH: &str = "/usr/bin:/bin";
 #[cfg(target_os = "linux")]
 const DANGEROUS_SYSCALLS: &[libc::c_long] = &[
     // process ที่ไม่ไว้วางใจห้ามส่งสัญญาณไปยัง host processes
+    libc::SYS_fallocate,
     libc::SYS_kill,
     libc::SYS_tkill,
     libc::SYS_tgkill,
@@ -323,6 +333,33 @@ unsafe fn build_dangerous_filter() -> Vec<libc::sock_filter> {
     });
     filter.push(ret(0x00000000));
 
+    // ioctl ที่ clone/เปลี่ยน filesystem metadata อาจหลบขอบเขต output/byte quota
+    // ยังคงให้ ioctl ปกติ (เช่น isatty) ผ่านเพื่อให้ compiler ทำงานได้
+    let blocked_ioctl = [
+        0x40049409u32,
+        0x4020940d,
+        0xc0189436,
+        0x40086602,
+        0x401c5820,
+    ];
+    filter.push(libc::sock_filter {
+        code: 0x15,
+        jt: 0,
+        jf: (blocked_ioctl.len() + 3) as u8,
+        k: libc::SYS_ioctl as u32,
+    });
+    filter.push(libc::sock_filter {
+        code: 0x20,
+        jt: 0,
+        jf: 0,
+        k: 24,
+    });
+    for (index, command) in blocked_ioctl.into_iter().enumerate() {
+        filter.push(jeq(command, (blocked_ioctl.len() - index) as u8));
+    }
+    filter.push(ret(0x7fff0000));
+    filter.push(ret(0x00000000));
+
     // เทียบ denylist: "ตรง" -> กระโดดไป ret KILL (jt = offset จาก i+1)
     // "ไม่ตรง" -> เทียบตัวถัดไป; ตัวสุดท้ายไม่ตรง -> ไหลไป ret ALLOW
     for (i, &nr) in DANGEROUS_SYSCALLS.iter().enumerate() {
@@ -388,6 +425,9 @@ pub fn validate(spec: &ExecSpec, policy: &Policy) -> Result<PathBuf, SandboxErro
         || spec.limits.pids_max == 0
     {
         return Err(bad("resource quotas must be positive"));
+    }
+    if spec.build.is_some() && !spec.env_extra.is_empty() {
+        return Err(bad("build outputs cannot receive injected environment"));
     }
     // 1. exe ต้อง absolute + มีอยู่จริง + เป็นไฟล์รันได้
     if !spec.exe.is_absolute() {
@@ -829,10 +869,16 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
     #[cfg(target_os = "linux")]
     let (filesystem_rules, filesystem_fsize_limit) = {
         let mut filesystem_policy = policy.clone();
-        if !env_extra.is_empty() {
+        if !env_extra.is_empty() || spec.build.is_some() {
             filesystem_policy.filesystem.write.clear();
         }
-        landlock::prepare(&ws, &canon, &filesystem_policy, storage_bytes)?
+        landlock::prepare(
+            &ws,
+            &canon,
+            &filesystem_policy,
+            storage_bytes,
+            spec.build.as_ref(),
+        )?
     };
     #[cfg(target_os = "linux")]
     let dangerous_filter = unsafe { build_dangerous_filter() };
@@ -1297,6 +1343,7 @@ mod tests {
             workspace: ws.to_path_buf(),
             env_extra: vec![],
             timeout_ms: 30000,
+            build: None,
             limits: ResourceLimits::default(),
         }
     }
@@ -1417,13 +1464,25 @@ mod tests {
     /// ตีความ subset ของ BPF ที่ builder ใช้: ld [k], jeq(jt/jf), ret
     /// คืนค่า k ของ ret สุดท้าย — ใช้พิสูจน์ว่า allow/deny ถูกต้องจริง
     fn bpf_verdict(filter: &[libc::sock_filter], arch: u32, nr: u32) -> u32 {
+        bpf_verdict_with_ioctl(filter, arch, nr, 0)
+    }
+    fn bpf_verdict_with_ioctl(
+        filter: &[libc::sock_filter],
+        arch: u32,
+        nr: u32,
+        command: u32,
+    ) -> u32 {
         let mut a: u32 = 0;
         let mut pc = 0usize;
         for _ in 0..4096 {
             let ins = &filter[pc];
             match ins.code {
                 0x20 => {
-                    a = if ins.k == 4 { arch } else { nr };
+                    a = match ins.k {
+                        4 => arch,
+                        24 => command,
+                        _ => nr,
+                    };
                     pc += 1;
                 }
                 0x15 => {
@@ -1756,6 +1815,20 @@ mod tests {
         assert_eq!(
             bpf_verdict(&filter, 0xc000003e, 0x40000000 | libc::SYS_read as u32),
             0
+        );
+    }
+    #[test]
+    fn filesystem_ioctl_cannot_bypass_artifact_quota_or_source_readonly() {
+        let filter = unsafe { build_dangerous_filter() };
+        for command in [0x40049409, 0x4020940d, 0xc0189436, 0x40086602, 0x401c5820] {
+            assert_eq!(
+                bpf_verdict_with_ioctl(&filter, 0xc000003e, libc::SYS_ioctl as u32, command),
+                0
+            );
+        }
+        assert_eq!(
+            bpf_verdict_with_ioctl(&filter, 0xc000003e, libc::SYS_ioctl as u32, 0x5401),
+            0x7fff0000
         );
     }
 }

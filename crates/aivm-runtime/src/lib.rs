@@ -55,6 +55,8 @@ pub struct VmConfig {
     #[serde(default)]
     pub resources: ResourceBlock,
     #[serde(default)]
+    pub build: aivm_tools::build::BuildConfig,
+    #[serde(default)]
     pub filesystem: FilesystemBlock,
     #[serde(default)]
     pub network: NetworkBlock,
@@ -277,7 +279,7 @@ impl Runtime {
                     .tools
                     .allow
                     .iter()
-                    .filter_map(|s| resolve_tool(s))
+                    .filter_map(|s| resolve_runtime_tool(s, &workspace, &config.build))
                     .collect(),
                 deny: vec!["/bin/sh".into(), "/bin/bash".into()],
             },
@@ -357,6 +359,11 @@ impl Runtime {
         // DENY ทุก process.exec ที่ gateway พร้อม audit อยู่ดี
         let level = SandboxLevel::from_str(&config.runtime.isolation)
             .map_err(|e| RuntimeError::Config(e.to_string()))?;
+        config
+            .build
+            .validate()
+            .map_err(|e| RuntimeError::Config(e.to_string()))?;
+        gateway.build = config.build.clone();
         gateway.level = level;
         gateway.limits = resource_limits(&config.resources)?;
         gateway.state_path = Some(base_dir.join(STATE_FILE));
@@ -715,6 +722,20 @@ fn resolve_tool(name: &str) -> Option<String> {
     Some(real.to_string_lossy().to_string())
 }
 
+fn resolve_runtime_tool(
+    name: &str,
+    workspace: &Path,
+    build: &aivm_tools::build::BuildConfig,
+) -> Option<String> {
+    if let Some(name) = name.strip_prefix("build:") {
+        return build
+            .artifact_path(workspace, name)
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
+    }
+    resolve_tool(name)
+}
+
 /// โหลดค่า secrets ของ operator (G4 §26): ไฟล์ `{base}/secrets.yaml` รูป
 /// `{resource: value}` — ไม่มีไฟล์ = broker ว่าง (deny หมด) ไม่ใช่ error
 /// สิทธิ์ต้อง owner-only (0600) ไม่งั้นปฏิเสธทั้งไฟล์ (fail-closed:
@@ -802,7 +823,7 @@ fn resolve_scope(base_dir: &Path, workspace: &Path, scope: &str) -> String {
 
 /// Config Loader และ Validator
 pub mod config {
-    use super::{resolve_tool, RuntimeError, VmConfig};
+    use super::{resolve_runtime_tool, RuntimeError, VmConfig};
     use aivm_policy::{Policy, PolicyManager};
     use std::path::Path;
 
@@ -903,7 +924,7 @@ pub mod config {
                     .tools
                     .allow
                     .iter()
-                    .filter_map(|s| resolve_tool(s))
+                    .filter_map(|s| resolve_runtime_tool(s, Path::new(&ws_str), &config.build))
                     .collect(),
                 deny: vec!["/bin/sh".into(), "/bin/bash".into()],
             },

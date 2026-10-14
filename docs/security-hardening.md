@@ -13,7 +13,7 @@
 - อ่าน stdout/stderr พร้อมกัน มี deadline และฆ่า process group เมื่อจบหรือหมดเวลา ปฏิเสธ `setsid`/`setpgid` หลังเริ่มงานเพื่อกันลูกแยกกลุ่มหนี cleanup
 - Namespace เป็นชั้นเสริมและรายงานจากผล syscall จริง PID namespace ของ process backend รายงานว่าไม่ได้ใช้; งานที่ต้องการแยก PID/kernel ให้ใช้ MicroVM
 
-ข้อจำกัด: process backend จึงไม่รองรับ build tool ที่ต้องสร้าง output files ใหม่ใน workspace โดยตรง การสร้างไฟล์ผ่าน gateway ยังคงทำงานได้
+เปิด bounded output slots ได้ด้วย `build.enabled` โดย operator: gateway เตรียมไฟล์ใน `.aivm-build` และให้ compiler เขียนเฉพาะ slots ที่ประกาศ จำกัดจำนวนไฟล์และขนาดรายไฟล์ ไม่ได้ให้ child สร้างไฟล์ทั่วไป ดู [build-workflow.md](build-workflow.md) สำหรับรูปแบบ intent และข้อจำกัดของ build tools ที่ใช้ temporary files แบบสุ่ม
 
 ## Secrets
 

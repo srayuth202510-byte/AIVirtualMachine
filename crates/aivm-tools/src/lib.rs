@@ -60,7 +60,7 @@ pub struct ToolResult {
 
 /// body ของ `process.exec` รูป object (G4): ใช้แทน argv array ล้วนเมื่อต้อง
 /// แนบ secret lease — strict schema (`deny_unknown_fields` + parse ไม่ได้
-/// = DENY) ฟิลด์อื่นนอกจากสองตัวนี้ = DENY ทันที
+/// = DENY) ฟิลด์นอก argv/secret/outputs = DENY ทันที
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecContent {
@@ -68,6 +68,9 @@ pub struct ExecContent {
     /// lease id จาก `secret.request` (ไม่มี = รันปกติไม่มี secret)
     #[serde(default)]
     pub secret: Option<String>,
+    /// ชื่อ output slots ใน .aivm-build (ต้องเปิด profile โดย operator)
+    #[serde(default)]
+    pub outputs: Vec<String>,
 }
 
 /// body ของ `secret.request` (G4 §26 — structured schema เท่านั้น):
@@ -96,6 +99,7 @@ const MAX_SECRET_FIELD: usize = 256;
 /// เพดานความยาว lease id (uuid ~36 ตัวอักษร)
 const MAX_LEASE_ID: usize = 128;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
+pub mod build;
 mod secure_fs;
 pub mod state_store;
 
@@ -117,6 +121,7 @@ pub struct ToolGateway {
     pub microvm_cfg: Option<aivm_sandbox::microvm::MicroVmConfig>,
     pub limits: ResourceLimits,
     pub state_path: Option<PathBuf>,
+    pub build: build::BuildConfig,
     req_counter: u64,
     deny_tracker: DenyTracker,
     /// Secret broker (G4 §26): `None` = ไม่ตั้งค่า → `secret.request` และ
@@ -229,6 +234,7 @@ impl ToolGateway {
             microvm_cfg: None,
             limits: ResourceLimits::default(),
             state_path: None,
+            build: build::BuildConfig::default(),
             req_counter: 0,
             deny_tracker: DenyTracker::default(),
             secret_broker: None,
@@ -692,7 +698,7 @@ impl ToolGateway {
         exe: &str,
         args: &[String],
     ) -> Result<ToolResult, ToolError> {
-        self.exec_inner(cube, exe, args, None)
+        self.exec_inner(cube, exe, args, None, &[])
     }
 
     /// `process.exec` แบบแนบ secret lease (G4 §26): lease มาจาก
@@ -705,8 +711,30 @@ impl ToolGateway {
         exe: &str,
         args: &[String],
         lease_id: Option<&str>,
+        outputs: &[String],
     ) -> Result<ToolResult, ToolError> {
         self.check_quarantine(cube, "execute", exe)?;
+        let artifact = if let Some(name) = exe.strip_prefix("build:") {
+            match self.build.artifact_path(&self.workspace, name) {
+                Ok(path) => Some(path.to_string_lossy().into_owned()),
+                Err(error) => {
+                    self.audit_decision(
+                        cube,
+                        "execute",
+                        exe,
+                        "deny",
+                        "build-artifact-denied",
+                        "error",
+                    )?;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        let exe = artifact.as_deref().unwrap_or(exe);
+        let artifact_executable =
+            Path::new(exe).parent() == Some(self.workspace.join(build::DIRECTORY).as_path());
         // secret ระดับ microvm ยัง inject ไม่ได้ (guest ไม่รับ env_extra) —
         // fail-closed ตั้งแต่ต้น ไม่เงียบทิ้ง (G4)
         if lease_id.is_some() && self.level == SandboxLevel::MicroVm {
@@ -722,6 +750,21 @@ impl ToolGateway {
                 "secret injection not supported at microvm level".into(),
             ));
         }
+        if (!outputs.is_empty() || artifact_executable)
+            && (lease_id.is_some() || self.level != SandboxLevel::Process)
+        {
+            self.audit_decision(
+                cube,
+                "execute",
+                exe,
+                "deny",
+                "build-profile-unsupported",
+                "error",
+            )?;
+            return Err(ToolError::Denied(
+                "build outputs require a process sandbox without secrets".into(),
+            ));
+        }
         let mut spec = ExecSpec {
             exe: PathBuf::from(exe),
             args: args.to_vec(),
@@ -729,6 +772,7 @@ impl ToolGateway {
             workspace: self.workspace.clone(),
             env_extra: vec![],
             timeout_ms: 30000,
+            build: None,
             limits: self.limits.clone(),
         };
         // ประตูชั้นแรก (fail-closed ไม่ spawn) หมายเหตุ: ประตูนี้ตรวจซ้ำ
@@ -828,6 +872,22 @@ impl ToolGateway {
             "authorized",
         )?;
         self.checkpoint(cube)?;
+        if !outputs.is_empty() || artifact_executable {
+            spec.build = match self.build.prepare(&self.workspace, outputs, &self.limits) {
+                Ok(build) => Some(build),
+                Err(error) => {
+                    self.audit_decision(
+                        cube,
+                        "execute",
+                        &scope,
+                        "deny",
+                        "build-output-denied",
+                        &error.to_string(),
+                    )?;
+                    return Err(error);
+                }
+            };
+        }
         spec.env_extra = secret_env;
         // เปิดฟีเจอร์ `microvm` + มี config: ระดับ MicroVm เดินประตู
         // skeleton ด้วย config จริง (pin hash + quota จาก `aivm.yaml`)
@@ -907,7 +967,19 @@ impl ToolGateway {
         Ok(ToolResult {
             ok: outcome.success(),
             decision: "allow".into(),
-            output: outcome.stdout,
+            output: if lease_id.is_some() {
+                "[REDACTED]".into()
+            } else {
+                format!(
+                    "exit status: {}\n{}{}",
+                    outcome
+                        .code
+                        .map(|c| c.to_string())
+                        .unwrap_or("signal".into()),
+                    outcome.stdout,
+                    outcome.stderr
+                )
+            },
         })
     }
 
@@ -1190,30 +1262,31 @@ impl ToolGateway {
             }
             "code.search" => self.search(cube, &req.path),
             "process.exec" => {
-                // argv มาจาก JSON array ล้วน (เดิม) หรือ object {argv, secret?}
+                // argv มาจาก JSON array ล้วน (เดิม) หรือ object {argv, secret?, outputs?}
                 // (G4) — parse ไม่ได้เลย = DENY (กัน shell interpolation:
                 // ไม่มีจุดไหนต่อสตริงเป็นคำสั่งเลย)
-                let (args, lease): (Vec<String>, Option<String>) = match req.content.as_deref() {
-                    Some(s) => {
-                        if let Ok(a) = serde_json::from_str::<Vec<String>>(s) {
-                            (a, None)
-                        } else {
-                            match serde_json::from_str::<ExecContent>(s) {
-                                Ok(c) => (c.argv, c.secret),
-                                Err(_) => {
-                                    self.audit_decision(
-                                        cube, "execute", &req.path, "deny", "bad-argv", "error",
-                                    )?;
-                                    return Err(ToolError::Denied(
-                                        "argv must be a JSON array of strings".into(),
-                                    ));
+                let (args, lease, outputs): (Vec<String>, Option<String>, Vec<String>) =
+                    match req.content.as_deref() {
+                        Some(s) => {
+                            if let Ok(a) = serde_json::from_str::<Vec<String>>(s) {
+                                (a, None, vec![])
+                            } else {
+                                match serde_json::from_str::<ExecContent>(s) {
+                                    Ok(c) => (c.argv, c.secret, c.outputs),
+                                    Err(_) => {
+                                        self.audit_decision(
+                                            cube, "execute", &req.path, "deny", "bad-argv", "error",
+                                        )?;
+                                        return Err(ToolError::Denied(
+                                            "argv must be a JSON array of strings".into(),
+                                        ));
+                                    }
                                 }
                             }
                         }
-                    }
-                    None => (vec![], None),
-                };
-                self.exec_inner(cube, &req.path, &args, lease.as_deref())
+                        None => (vec![], None, vec![]),
+                    };
+                self.exec_inner(cube, &req.path, &args, lease.as_deref(), &outputs)
             }
             "secret.request" => self.secret_request(cube, req.content.as_deref()),
             "network.fetch" => {
@@ -1459,6 +1532,8 @@ fn is_boundary_path(p: &Path) -> bool {
         || s.contains("/secrets/")
         || s.ends_with("/secrets.yaml")
         || s.ends_with("/state.json")
+        || p.components()
+            .any(|part| part.as_os_str() == build::DIRECTORY)
         || s.contains("/.git/config")
 }
 

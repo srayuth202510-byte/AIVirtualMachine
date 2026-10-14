@@ -32,7 +32,7 @@ AIVM คือ runtime สำหรับรัน AI Agent โดยเฉพ�
 # 1. ติดตั้งของที่ต้องใช้ (ดูรายละเอียดใน docs/setup.md)
 #    Rust stable + clippy + rustfmt
 
-# 2. build + พิสูจน์เส้น enforcement (13 เคส ALLOW/DENY, ~1 วินาที)
+# 2. build + พิสูจน์เส้น enforcement (14 เคส ALLOW/DENY, ~1 วินาที)
 cargo build -p aivm-cli
 cargo run -q -p aivm-cli -- demo
 
@@ -68,7 +68,7 @@ cargo run -q -p aivm-cli -- audit coder
 | `logs` / `audit` | ท้าย audit log / ตรวจ hash chain |
 | `index` / `search` | สร้าง/ค้น RAG index (Phase 6) |
 | `probe` | ตรวจความพร้อม isolation ของเครื่อง (KVM/firecracker รายงานซื่อสัตย์) |
-| `demo` | self-test 13 เคส ไม่ต้องมี VM |
+| `demo` | self-test 14 เคส ไม่ต้องมี VM |
 | `pause` / `stop` / `kill` | จัดการ lifecycle |
 
 config เขียนยังไงดู [`docs/configuration.md`](./docs/configuration.md) (มีตัวอย่าง `microvm:` สำหรับ isolation ระดับ MicroVM)
@@ -78,6 +78,7 @@ config เขียนยังไงดู [`docs/configuration.md`](./docs/con
 ```bash
 make verify      # gate หลัก: fmt + clippy(-D warnings) + tests + demo
 make ci          # เท่า CI บน GitHub (= verify + e2e + microvm)
+make test-coding # agent อ่าน/แก้ source + compiler/linker/test binary จริง
 make test-adv    # adversarial must-deny อย่างเดียว (สเปก §38)
 make test-microvm# MicroVM ทั้งสาย (บูตจริงถ้าตั้ง AIVM_MICROVM_PINS)
 make demo        # self-test เร็วสุดสำหรับดีบัก enforcement
@@ -108,6 +109,7 @@ crates/
 - [`docs/setup.md`](./docs/setup.md) — ติดตั้ง Rust, Firecracker, เครื่องมือ host
 - [`docs/configuration.md`](./docs/configuration.md) — `aivm.yaml` ทุกบล็อก + defaults + ตัวอย่าง microvm
 - [`docs/microvm.md`](./docs/microvm.md) — เตรียม pins, บูตจริง, ข้อจำกัดที่รู้ตัว
+- [`docs/build-workflow.md`](./docs/build-workflow.md) — bounded build outputs และ coding end-to-end
 - [`docs/testing.md`](./docs/testing.md) — matrix คำสั่งทดสอบ, feature flags, CI
 - [`docs/architecture.md`](./docs/architecture.md) — เส้นทาง request, isolation levels, audit, invariants
 - [`docs/threat-model.md`](./docs/threat-model.md) — attacker positions, signals, DNA, non-goals, ช่องว่าง G1–G5

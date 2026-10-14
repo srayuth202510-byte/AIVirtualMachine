@@ -54,7 +54,8 @@ To call a tool: {\"tool\": \"<name>\", \"path\": \"<argument>\", \"content\": \"
 To finish:        {\"done\": true, \"summary\": \"<short text>\"}\n\
 Allowed tools: filesystem.read, filesystem.write, code.search, process.exec, network.fetch, network.connect, secret.request.\n\
 path means: a workspace-relative file path (read/write), a search string (code.search), \
-an absolute executable (process.exec), or a URL (network.fetch).\n\
+an absolute executable or build:<artifact> (process.exec), or a URL (network.fetch).\n\
+For builds, process.exec content is a JSON string encoding {\"argv\":[...],\"outputs\":[\"main.o\"]}; outputs require an operator-enabled build profile.\n\
 Every request is mediated and may be DENIED; if denied, choose a different action.";
 
 /// เจตนาที่สกัดจากข้อความของโมเดล
@@ -199,7 +200,8 @@ pub fn run_loop(
                 // ทางเดียวที่การกระทำจะเกิดขึ้น: ผ่าน gateway ที่ mediate ทุกอย่าง
                 let outcome = match gateway.dispatch(cube, &req) {
                     Ok(res) => format!(
-                        "OK {} {} :: {}",
+                        "{} {} {} :: {}",
+                        if res.ok { "OK" } else { "FAIL" },
                         req.tool,
                         req.path,
                         clip(&res.output, MAX_OBS_CHARS)

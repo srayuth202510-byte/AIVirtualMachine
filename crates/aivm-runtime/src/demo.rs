@@ -372,6 +372,25 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
             Expect::Allow,
             r,
         );
+        // build profile ค่าเริ่มต้นปิด: แม้ execute cap ครบก็สร้าง artifacts ไม่ได้
+        case(
+            &mut cases,
+            "build outputs without profile",
+            Expect::Deny,
+            rt.gateway
+                .dispatch(
+                    &mut rt.cube,
+                    &ToolRequest {
+                        tool: "process.exec".into(),
+                        path: "/bin/true".into(),
+                        content: Some(
+                            serde_json::json!({"argv": [], "outputs": ["demo.o"]}).to_string(),
+                        ),
+                    },
+                )
+                .map(|result| result.output)
+                .map_err(|error| error.to_string()),
+        );
     }
 
     // 13. secret.request ไม่มี broker ต้องถูกปฏิเสธ (G4: fail-closed)

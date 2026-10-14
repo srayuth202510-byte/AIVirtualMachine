@@ -107,3 +107,7 @@ aivm transition <name> DEPLOY   --policy-approved       # VALIDATE → DEPLOY (H
 ```
 
 กระโดดข้าม (เช่น INIT→DEPLOY) ถูกปฏิเสธเสมอ state ไม่ขยับถ้า guard ไม่ผ่าน
+
+## Build output profile (opt-in)
+
+`build.enabled` ค่าเริ่มต้น false, `max_files` ค่าเริ่มต้น 16 (1..64), `max_bytes` ค่าเริ่มต้น 16 MiB (1 KiB..512 MiB) งบแบ่งเท่ากันราย slot Artifact ที่ต้องรันต้องอยู่ใน `tools.allow` เช่น `build:tests` ด้วย ดู [build-workflow.md](build-workflow.md) และ `examples/build-c.yaml`
