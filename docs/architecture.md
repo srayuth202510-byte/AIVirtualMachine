@@ -29,7 +29,8 @@ operator transition ล้างได้, ไม่ยืดเวลาเอ�
 `secret.request` (structured schema เข้ม) → broker ตรวจ capability + policy →
 Low-risk ที่ operator ตั้ง `low_risk_allow` ออก one-time lease (คืนแต่ lease_id) / High-risk ไม่มี approval =
 DENY + audit `hitl-required` → `process.exec` แนบ `{"argv":[…],"secret":id}`
-ฉีดค่าเข้า child env (`env_extra` ช่องเดียว) แล้ว zeroize + ปิด process output/สิทธิ์เขียนไฟล์ — value ไม่มีทาง
+ฉีดค่าเข้า child env (`env_extra` ช่องเดียว) แล้ว zeroize ทันทีที่ spawn
+เสร็จ + redact ผลลัพธ์เป็น `[REDACTED]` ก่อนคืน agent — value ไม่มีทาง
 อยู่ AI context/memory/audit (redaction โดย construction) ระดับ microvm
 inject ไม่ได้ = DENY ตรง ๆ ไม่เงียบทิ้ง
 
