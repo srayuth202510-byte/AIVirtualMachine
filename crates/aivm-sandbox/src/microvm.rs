@@ -7,8 +7,9 @@
 //!
 //! ลำดับประตู (ตั้งใจเรียงแบบนี้ ห้ามสลับ):
 //! 1. `validate` สเปกงาน (exe/policy/arg/env/cwd — ประตูเดียวกับ Process)
-//! 2. shape ของ config + `verify_artifact` kernel/rootfs (supply chain
-//!    ต้องมาก่อนตรวจ host: image ปลอมต้องตายก่อน ไม่ว่าเครื่องจะพร้อมหรือไม่)
+//! 2. shape ของ config + `verify_artifact` kernel/rootfs (+ alt ทุกชุด
+//!    ถ้ามี) — supply chain ต้องมาก่อนตรวจ host: image ปลอมต้องตายก่อน
+//!    ไม่ว่าเครื่องจะพร้อมหรือไม่ (test Deterministic ทุกเครื่องแม้ไม่มี KVM)
 //! 3. host readiness: Linux + `/dev/kvm` + ไบนารี `firecracker` (+ pin
 //!    hash ของไบนารีถ้า operator ตั้ง `fc_sha256` ไว้)
 //! 4. boot จริงพร้อมเส้นตาย (timeout) ฆ่าทิ้งแบบ fail-closed เมื่อเกินเวลา
@@ -200,6 +201,16 @@ pub fn run_in_microvm(
         .map_err(|e| (e, RunVerdict::Clean))?;
     verify_artifact(&cfg.rootfs_path, &cfg.rootfs_sha256, cfg.max_artifact_bytes)
         .map_err(|e| (e, RunVerdict::Clean))?;
+    // 3b. alt images (G5 DNA, ถ้ามี): verify ทุกชุดตั้งแต่ประตู (supply chain
+    // มาก่อน host readiness เหมือนชุดหลัก) แล้วค่อยสุ่มเลือกในขั้น boot
+    if let Some(alt) = &cfg.alt_kernel {
+        verify_artifact(&alt.path, &alt.sha256, cfg.max_artifact_bytes)
+            .map_err(|e| (e, RunVerdict::Clean))?;
+    }
+    if let Some(alt) = &cfg.alt_rootfs {
+        verify_artifact(&alt.path, &alt.sha256, cfg.max_artifact_bytes)
+            .map_err(|e| (e, RunVerdict::Clean))?;
+    }
     // 4. host readiness (Linux + KVM + binary) — ไม่พร้อมคือ Disabled
     #[cfg(not(target_os = "linux"))]
     {
@@ -225,16 +236,6 @@ pub fn run_in_microvm(
                 RunVerdict::Clean,
             )
         })?;
-        // 3b. alt images (G5 DNA, ถ้ามี): verify ทุกชุดตั้งแต่ประตู แล้วค่อย
-        // สุ่มเลือกหนึ่งชุดต่อบูตในขั้น boot (verify ก่อนสุ่มเสมอ)
-        if let Some(alt) = &cfg.alt_kernel {
-            verify_artifact(&alt.path, &alt.sha256, cfg.max_artifact_bytes)
-                .map_err(|e| (e, RunVerdict::Clean))?;
-        }
-        if let Some(alt) = &cfg.alt_rootfs {
-            verify_artifact(&alt.path, &alt.sha256, cfg.max_artifact_bytes)
-                .map_err(|e| (e, RunVerdict::Clean))?;
-        }
         // supply chain ของ VMM เอง: pin ไว้ก็ต้องตรง (ไม่ pin = ยอมรับตาม
         // PATH ของ operator แล้วรายงานใน `degraded` ให้รู้ตัว)
         if !cfg.fc_sha256.is_empty() {
