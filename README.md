@@ -20,6 +20,7 @@ AIVM คือ runtime สำหรับรัน AI Agent โดยเฉพ�
 | 6 — CubeRAG | workspace retrieval (`index`/`search`) | ✅ |
 | 7 — MicroVM (Level 2) | บูต guest จริงผ่าน Firecracker/KVM (หลังฟีเจอร์ `microvm`) | ✅ |
 | MVP-C | `network.fetch`/`network.connect` แบบมี policy | ✅ |
+| Level 1 — Container | bubblewrap + Landlock/seccomp + cgroups v2 CPU/RAM/PIDs (ต้องเตรียม host) | ✅ |
 | Level 3 — Hardware isolation | อนาคต (สเปก §Level 3) | ❌ |
 
 กฎเหล็ก: **fail-closed** — parse/eval/context error ใด ๆ → `DENY` เสมอ ไม่มี default-allow
@@ -106,6 +107,7 @@ crates/
 
 ## เอกสาร
 
+- [`docs/container.md`](./docs/container.md) — bubblewrap backend + delegated cgroups v2
 - [`docs/setup.md`](./docs/setup.md) — ติดตั้ง Rust, Firecracker, เครื่องมือ host
 - [`docs/configuration.md`](./docs/configuration.md) — `aivm.yaml` ทุกบล็อก + defaults + ตัวอย่าง microvm
 - [`docs/microvm.md`](./docs/microvm.md) — เตรียม pins, บูตจริง, ข้อจำกัดที่รู้ตัว

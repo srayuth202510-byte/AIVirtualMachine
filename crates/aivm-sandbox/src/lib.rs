@@ -18,6 +18,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use thiserror::Error;
+pub mod container;
 #[cfg(target_os = "linux")]
 mod landlock;
 
@@ -171,6 +172,9 @@ impl ExecOutcome {
 /// สิ่งที่ OS เครื่องนี้รองรับ (probe แบบไม่ทิ้งผลข้างเคียง)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxProbe {
+    /// Checks default container paths; namespaces are reported separately.
+    #[serde(default)]
+    pub container: container::ContainerProbe,
     pub userns: bool,
     pub cgroup_v2_writable: bool,
     pub seccomp_install: bool,
@@ -405,6 +409,7 @@ fn interpreter_basename(name: &str) -> bool {
             | "socat"
             | "env"
             | "busybox"
+            | "aivm-container-init"
     ) || name.starts_with("python")
         || name.starts_with("perl")
         || name.starts_with("ruby")
@@ -650,7 +655,8 @@ impl RunVerdict {
 /// - `MicroVm` = เปิดฟีเจอร์ `microvm` แล้วเดินประตู skeleton
 ///   (spec → shape → supply chain → host readiness → `Disabled` จนกว่า
 ///   milestone boot/exec จะส่งมอบ) ไม่เปิดฟีเจอร์คือ `Disabled` ทันที
-/// - `Container`/`Hardware` = ยังไม่มี backend คืน `Disabled` เสมอ
+/// - `Container` = bubblewrap + mandatory delegated cgroup v2
+/// - `Hardware` = ยังไม่มี backend คืน `Disabled` เสมอ
 ///
 /// gateway ชั้นบนจึงไม่ต้องแยกเคสเอง
 pub fn run_checked_with_level(
@@ -660,10 +666,8 @@ pub fn run_checked_with_level(
 ) -> Result<ExecOutcome, (SandboxError, RunVerdict)> {
     match level {
         SandboxLevel::Process => run_checked(spec, policy).map_err(|e| (e, RunVerdict::Clean)),
-        SandboxLevel::Container => Err((
-            SandboxError::Disabled("container backend not implemented; use Process level".into()),
-            RunVerdict::Clean,
-        )),
+        SandboxLevel::Container => container::run(spec, policy, &container::ContainerConfig::default())
+            .map_err(|e| (e, RunVerdict::Clean)),
         #[cfg(feature = "microvm")]
         SandboxLevel::MicroVm => microvm::run_in_microvm(spec, policy, &microvm::MicroVmConfig::default()),
         #[cfg(not(feature = "microvm"))]
@@ -1173,6 +1177,7 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
 /// KVM/Firecracker ตรวจแค่การมีอยู่ (ไม่ boot จริง) เพื่อใช้วางแผน Phase 7
 pub fn probe() -> SandboxProbe {
     SandboxProbe {
+        container: container::ContainerConfig::default().probe(),
         userns: can_true_with(probe_userns),
         seccomp_install: can_true_with(probe_seccomp),
         pid_namespace: can_true_with(probe_pid_namespace),
@@ -1743,7 +1748,8 @@ mod tests {
         let real = std::fs::canonicalize("/bin/true").unwrap();
         let pol = test_policy(&[&real.to_string_lossy()]);
         let s = spec("/bin/true", &ws);
-        for level in [SandboxLevel::Container, SandboxLevel::Hardware] {
+        {
+            let level = SandboxLevel::Hardware;
             let r = run_checked_with_level(&s, &pol, level);
             assert!(
                 matches!(r, Err((SandboxError::Disabled(_), _))),

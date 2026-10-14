@@ -1,11 +1,12 @@
 //! Landlock บังคับ filesystem scope กับทั้ง subprocess tree (ต้องมี ABI >= 3)
 use crate::{BuildSpec, SandboxError};
 use aivm_policy::{Decision, EvalContext, Policy};
+use std::cell::RefCell;
 use std::ffi::CString;
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const EXECUTE: u64 = 1;
 const WRITE_FILE: u64 = 1 << 1;
@@ -26,11 +27,61 @@ fn error() -> SandboxError {
         std::io::Error::last_os_error()
     ))
 }
-fn add(rules: &File, path: &Path, access: u64) -> Result<(), SandboxError> {
+pub(crate) struct MountGrant {
+    pub path: PathBuf,
+    pub file: File,
+    pub access: u64,
+    pub directory: bool,
+}
+struct PreparedRules {
+    file: File,
+    mounts: RefCell<Option<Vec<MountGrant>>>,
+    workspace: Option<(PathBuf, File)>,
+}
+impl AsRawFd for PreparedRules {
+    fn as_raw_fd(&self) -> i32 {
+        self.file.as_raw_fd()
+    }
+}
+fn add(rules: &PreparedRules, path: &Path, access: u64) -> Result<(), SandboxError> {
     let name = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| SandboxError::Invalid("NUL in Landlock path".into()))?;
     // SAFETY: CString มีอายุครอบคลุม syscall และ fd ทุกตัวมีเจ้าของ
-    let raw = unsafe { libc::open(name.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    let raw = if let Some((workspace, root)) = &rules.workspace {
+        if let Ok(relative) = path.strip_prefix(workspace) {
+            #[repr(C)]
+            struct OpenHow {
+                flags: u64,
+                mode: u64,
+                resolve: u64,
+            }
+            let relative = if relative.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                relative
+            };
+            let relative = CString::new(relative.as_os_str().as_bytes())
+                .map_err(|_| SandboxError::Invalid("NUL in relative mount path".into()))?;
+            let how = OpenHow {
+                flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+                mode: 0,
+                resolve: 0x08 | 0x04 | 0x01,
+            }; // BENEATH | NO_SYMLINKS | NO_XDEV
+            unsafe {
+                libc::syscall(
+                    libc::SYS_openat2,
+                    root.as_raw_fd(),
+                    relative.as_ptr(),
+                    &how,
+                    std::mem::size_of::<OpenHow>(),
+                ) as i32
+            }
+        } else {
+            unsafe { libc::open(name.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) }
+        }
+    } else {
+        unsafe { libc::open(name.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) }
+    };
     if raw < 0 {
         return Err(error());
     }
@@ -50,6 +101,23 @@ fn add(rules: &File, path: &Path, access: u64) -> Result<(), SandboxError> {
     if unsafe { libc::syscall(libc::SYS_landlock_add_rule, rules.as_raw_fd(), 1, &rule, 0) } < 0 {
         return Err(error());
     }
+    if let Some(mounts) = rules.mounts.borrow_mut().as_mut() {
+        if mounts.len() >= 1024 {
+            return Err(SandboxError::Invalid(
+                "container mount plan exceeds 1024 grants".into(),
+            ));
+        }
+        let directory = file
+            .metadata()
+            .map_err(|e| SandboxError::Invalid(e.to_string()))?
+            .is_dir();
+        mounts.push(MountGrant {
+            path: path.to_path_buf(),
+            file,
+            access,
+            directory,
+        });
+    }
     Ok(())
 }
 pub fn prepare(
@@ -59,34 +127,42 @@ pub fn prepare(
     budget: u64,
     build: Option<&BuildSpec>,
 ) -> Result<(File, u64), SandboxError> {
-    let abi = unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            std::ptr::null::<u8>(),
-            0,
-            1,
-        )
-    };
-    if abi < 3 {
-        return Err(SandboxError::Disabled(
-            "process sandbox requires Landlock ABI >= 3".into(),
-        ));
+    let (file, limit, _) = prepare_inner(workspace, exe, policy, budget, build, false)?;
+    Ok((file, limit))
+}
+pub(crate) fn prepare_mounts(
+    workspace: &Path,
+    exe: &Path,
+    policy: &Policy,
+    budget: u64,
+    build: Option<&BuildSpec>,
+) -> Result<(Vec<MountGrant>, u64), SandboxError> {
+    let (_, limit, mounts) = prepare_inner(workspace, exe, policy, budget, build, true)?;
+    Ok((mounts, limit))
+}
+fn prepare_inner(
+    workspace: &Path,
+    exe: &Path,
+    policy: &Policy,
+    budget: u64,
+    build: Option<&BuildSpec>,
+    collect_mounts: bool,
+) -> Result<(File, u64, Vec<MountGrant>), SandboxError> {
+    let mut rules = new_rules(collect_mounts)?;
+    if collect_mounts {
+        let name = CString::new(workspace.as_os_str().as_bytes())
+            .map_err(|_| SandboxError::Invalid("NUL in workspace".into()))?;
+        let fd = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+            )
+        };
+        if fd < 0 {
+            return Err(error());
+        }
+        rules.workspace = Some((workspace.to_path_buf(), unsafe { File::from_raw_fd(fd) }));
     }
-    let attributes = Ruleset {
-        handled: (1 << 15) - 1,
-    };
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            &attributes,
-            std::mem::size_of::<Ruleset>(),
-            0,
-        )
-    } as i32;
-    if fd < 0 {
-        return Err(error());
-    }
-    let rules = unsafe { File::from_raw_fd(fd) };
     // libraries/toolchain อ่านได้ แต่ไม่มีสิทธิ์เขียน host directories
     for path in [
         "/usr/lib",
@@ -123,7 +199,7 @@ pub fn prepare(
     // เดินรายการไฟล์จริงแล้ว grant เฉพาะที่ policy อนุญาต; ไม่ grant subtree
     // อ่านกว้าง เพราะจะทำให้ deny ของไฟล์ลูกไม่มีผล (Landlock เป็น additive)
     fn walk(
-        rules: &File,
+        rules: &PreparedRules,
         dir: &Path,
         workspace: &Path,
         policy: &Policy,
@@ -203,7 +279,7 @@ pub fn prepare(
         // deny globs (.env/secrets/...) ไม่สามารถแทนด้วย additive Landlock ได้
         // จึงให้เขียนไฟล์ที่มีอยู่และอนุญาตเท่านั้น; file creation ผ่าน gateway
         fn grant_write(
-            rules: &File,
+            rules: &PreparedRules,
             dir: &Path,
             policy: &Policy,
             writable: &mut std::collections::BTreeMap<std::path::PathBuf, u64>,
@@ -293,5 +369,57 @@ pub fn prepare(
     let per_file = build
         .map(|profile| per_file.min(profile.max_file_bytes))
         .unwrap_or(per_file);
-    Ok((rules, per_file.max(1)))
+    Ok((
+        rules.file,
+        per_file.max(1),
+        rules.mounts.into_inner().unwrap_or_default(),
+    ))
+}
+
+fn new_rules(collect_mounts: bool) -> Result<PreparedRules, SandboxError> {
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<u8>(),
+            0,
+            1,
+        )
+    };
+    if abi < 3 {
+        return Err(SandboxError::Disabled(
+            "process sandbox requires Landlock ABI >= 3".into(),
+        ));
+    }
+    let attributes = Ruleset {
+        handled: (1 << 15) - 1,
+    };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &attributes,
+            std::mem::size_of::<Ruleset>(),
+            0,
+        )
+    } as i32;
+    if fd < 0 {
+        return Err(error());
+    }
+    Ok(PreparedRules {
+        file: unsafe { File::from_raw_fd(fd) },
+        mounts: RefCell::new(collect_mounts.then(Vec::new)),
+        workspace: None,
+    })
+}
+
+pub(crate) fn restrict_mounts(grants: &[(PathBuf, u64)]) -> Result<(), SandboxError> {
+    let rules = new_rules(false)?;
+    for (path, access) in grants {
+        add(&rules, path, *access)?;
+    }
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
+        || unsafe { libc::syscall(libc::SYS_landlock_restrict_self, rules.as_raw_fd(), 0) } < 0
+    {
+        return Err(error());
+    }
+    Ok(())
 }

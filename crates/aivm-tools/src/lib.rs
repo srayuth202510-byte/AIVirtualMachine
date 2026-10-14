@@ -119,6 +119,7 @@ pub struct ToolGateway {
     /// (= `None`) จะใช้ค่า default ที่ deny ตั้งแต่ artifact หาย
     #[cfg(feature = "microvm")]
     pub microvm_cfg: Option<aivm_sandbox::microvm::MicroVmConfig>,
+    pub container_cfg: aivm_sandbox::container::ContainerConfig,
     pub limits: ResourceLimits,
     pub state_path: Option<PathBuf>,
     pub build: build::BuildConfig,
@@ -235,6 +236,7 @@ impl ToolGateway {
             level: SandboxLevel::Process,
             #[cfg(feature = "microvm")]
             microvm_cfg: None,
+            container_cfg: aivm_sandbox::container::ContainerConfig::default(),
             limits: ResourceLimits::default(),
             state_path: None,
             build: build::BuildConfig::default(),
@@ -935,18 +937,25 @@ impl ToolGateway {
             };
         }
         spec.env_extra = secret_env;
-        // เปิดฟีเจอร์ `microvm` + มี config: ระดับ MicroVm เดินประตู
-        // skeleton ด้วย config จริง (pin hash + quota จาก `aivm.yaml`)
-        // ไม่มี config (= `None`) ตกไปใช้ค่า default ที่ deny อยู่ดี
-        #[cfg(feature = "microvm")]
-        let mut run_result = match &self.microvm_cfg {
-            Some(cfg) => {
-                aivm_sandbox::run_checked_with_level_and_cfg(&spec, &self.policy, self.level, cfg)
+        let mut run_result = if self.level == SandboxLevel::Container {
+            aivm_sandbox::container::run(&spec, &self.policy, &self.container_cfg)
+                .map_err(|e| (e, aivm_sandbox::RunVerdict::Clean))
+        } else {
+            #[cfg(feature = "microvm")]
+            {
+                match &self.microvm_cfg {
+                    Some(cfg) => aivm_sandbox::run_checked_with_level_and_cfg(
+                        &spec,
+                        &self.policy,
+                        self.level,
+                        cfg,
+                    ),
+                    None => aivm_sandbox::run_checked_with_level(&spec, &self.policy, self.level),
+                }
             }
-            None => aivm_sandbox::run_checked_with_level(&spec, &self.policy, self.level),
+            #[cfg(not(feature = "microvm"))]
+            aivm_sandbox::run_checked_with_level(&spec, &self.policy, self.level)
         };
-        #[cfg(not(feature = "microvm"))]
-        let mut run_result = aivm_sandbox::run_checked_with_level(&spec, &self.policy, self.level);
         // value ใน env ล้างทันทีที่ spawn เสร็จ (child ได้สำเนาของตัวเองไปแล้ว
         // broker เก็บต้นฉบับตาม max_uses — gateway ไม่ถือค้าง)
         for (_, v) in spec.env_extra.iter_mut() {
@@ -2082,6 +2091,28 @@ network: {{allow: [], deny: []}}
             "ต้อง audit การ deny ระดับ level"
         );
         assert!(log.contains("\"decision\":\"deny\""));
+    }
+
+    #[test]
+    fn container_prerequisite_denial_is_audited() {
+        let (mut gw, mut cube, dir) = exec_harness();
+        gw.level = SandboxLevel::Container;
+        gw.container_cfg.bubblewrap = dir.join("missing-bwrap");
+        let r = gw.dispatch(
+            &mut cube,
+            &ToolRequest {
+                tool: "process.exec".into(),
+                path: "/bin/true".into(),
+                content: Some("[]".into()),
+            },
+        );
+        assert!(
+            matches!(r, Err(ToolError::Denied(ref msg)) if msg.contains("container prerequisites"))
+        );
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(log.contains("level-disabled"));
+        assert!(log.contains("\"decision\":\"deny\""));
+        assert!(log.contains("verdict:clean"));
     }
 
     // Phase 7 (ฟีเจอร์ microvm): artifact ปลอมต้อง DENY พร้อม audit

@@ -28,6 +28,10 @@ secrets:
 
 หากไม่ตั้ง `low_risk_allow` ค่าเริ่มต้นของ resource เป็น High โปรแกรมที่ได้รับ secret จะได้รับผ่าน environment variable (inject ผ่าน `env_extra` ใน `ExecSpec`) และค่า secret จะถูก zeroize ทันทีหลัง spawn เสร็จ ผลลัพธ์ที่คืนให้ agent จะเป็น `[REDACTED]` แทน stdout/stderr จริง เพื่อป้องกันการส่งค่า secret กลับมา ต้องตรวจผลการทำงานผ่าน exit status/audit metadata แทน (ดู `crates/aivm-tools/src/lib.rs` ฟังก์ชัน `exec_inner`)
 
+Container backend บังคับ namespaces + Landlock/seccomp + cgroups v2 CPU/RAM/PIDs
+ไม่มี fallback เมื่อ setup ไม่ครบ ใช้ mounts จาก pinned descriptors และฆ่าทั้ง tree
+ผ่าน `cgroup.kill` ดูข้อกำหนดและข้อจำกัดใน [`container.md`](./container.md)
+
 ## Audit และ state
 
 - เขียน audit ไม่ได้ = action ไม่เริ่ม authorization และ outcome มี record แยกกัน

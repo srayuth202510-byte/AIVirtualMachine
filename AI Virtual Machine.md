@@ -1103,7 +1103,7 @@ AIVM แบ่ง Security Level ตามระดับ Isolation (Progressive
 
 ### Level 1 — Container Sandbox
 
-- OCI Runtime (runc/crun) 
+- Namespace sandbox backend: bubblewrap + trusted AIVM init + Landlock (first implementation); OCI runtime (runc/crun) remains a future backend option
 - \+ AIVM Policy Engine (State-Aware)
 - \+ Cube Engine (State + Capability)
 - \+ Tool Gateway (Complete Mediation)

@@ -82,6 +82,8 @@ pub struct VmConfig {
 pub struct RuntimeBlock {
     #[serde(default = "default_isolation")]
     pub isolation: String,
+    #[serde(default)]
+    pub container: aivm_sandbox::container::ContainerConfig,
 }
 // ค่าเริ่มต้นต้องเป็น "sandbox" ไม่ใช่ "" (derive Default ให้ String ว่าง
 // ซึ่ง from_str จะปฏิเสธแบบ fail-closed — config ที่ไม่ระบุ isolation
@@ -90,6 +92,7 @@ impl Default for RuntimeBlock {
     fn default() -> Self {
         Self {
             isolation: default_isolation(),
+            container: aivm_sandbox::container::ContainerConfig::default(),
         }
     }
 }
@@ -365,6 +368,7 @@ impl Runtime {
             .map_err(|e| RuntimeError::Config(e.to_string()))?;
         gateway.build = config.build.clone();
         gateway.level = level;
+        gateway.container_cfg = config.runtime.container.clone();
         gateway.limits = resource_limits(&config.resources)?;
         gateway.state_path = Some(base_dir.join(STATE_FILE));
         // ส่ง config MicroVM ลง gateway (เฉพาะบิลด์ที่เปิดฟีเจอร์)
@@ -1101,6 +1105,28 @@ capabilities:
         assert!(Runtime::init(cfg, base.clone()).is_err());
         aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn container_config_reaches_gateway() {
+        let base = std::env::temp_dir().join(format!(
+            "aivm-rt-container-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut cfg = test_config();
+        cfg.runtime.isolation = "container".into();
+        cfg.runtime.container.cgroup_root = "/sys/fs/cgroup/custom-delegation".into();
+        let rt = Runtime::init(cfg, base.clone()).unwrap();
+        assert_eq!(rt.gateway.level, SandboxLevel::Container);
+        assert_eq!(
+            rt.gateway.container_cfg.cgroup_root,
+            PathBuf::from("/sys/fs/cgroup/custom-delegation")
+        );
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

@@ -34,6 +34,9 @@ cargo run -q -p aivm-cli -- demo   # พิสูจน์เส้น enforceme
 cargo run -q -p aivm-cli -- probe
 ```
 
+Container backend ต้องมี bubblewrap, helper ที่ติดตั้งโดย root และ delegated cgroup v2
+ดูขั้นตอนและข้อกำหนดใน [`container.md`](./container.md)
+
 ## 3. ของเสริมตามฟีเจอร์ (optional ทั้งหมด)
 
 | ฟีเจอร์ | เปิดด้วย | ต้องมีเพิ่ม |

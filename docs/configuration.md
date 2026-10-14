@@ -8,6 +8,10 @@ name: coder
 
 runtime:
   isolation: sandbox   # sandbox | microvm | container | hardware (ดู docs/architecture.md)
+  # container:         # ใช้เมื่อ isolation: container; ดู docs/container.md
+  #   bubblewrap: /usr/bin/bwrap
+  #   init: /usr/libexec/aivm-container-init
+  #   cgroup_root: /sys/fs/cgroup/aivm
   # ค่าแปลก (เช่น docker) = บูตไม่ขึ้น ไม่เงียบไปใช้ sandbox
 
 model:
