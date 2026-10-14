@@ -58,6 +58,14 @@ policy:
 #   hitl_required_for: ["high"]   # low-risk ออก lease ให้เลย high ต้อง approve
 #   max_ttl_seconds: 3600         # 0 = ไม่จำกัด
 #   max_uses_allowed: 5           # 0 = ไม่จำกัด
+#
+# secrets.yaml (`<vm-dir>/secrets.yaml`, 0600 — สิทธิ์หลวมกว่านี้ไม่บูต):
+#   github_token: ghp_...
+#
+# ขอ high-risk → pending (deny + lease id ใน audit) แล้ว operator สั่ง:
+#   aivm approve-secret <vm> <lease-id> [--by NAME]
+# approve แล้วใช้ได้ตาม max_uses/TTL เดิม (ไม่ต่ออายุ) ข้าม restart ได้
+# (persist 0600) หมดอายุ/ใช้ครบ/จบแล้ว = ทิ้ง
 
 # บล็อก microvm: (ใช้เมื่อเปิดฟีเจอร์ microvm เท่านั้น บิลด์ปกติเมินทิ้ง)
 # ดูวิธีเตรียม pins ใน docs/microvm.md

@@ -165,6 +165,37 @@ impl Supervisor {
         Ok(out)
     }
 
+    /// Approve PENDING secret lease (G4b — operator เท่านั้น):
+    /// exact lease id + audit ระบุผู้ approve + persist ทันที
+    /// คืนสรุป lease (ไม่มี value) ไว้แสดงให้ operator ดู
+    pub fn approve_secret(
+        &mut self,
+        name: &str,
+        lease_id: &str,
+        approved_by: &str,
+    ) -> Result<String, SupervisorError> {
+        let dir = self.resolve(name)?;
+        let cfg = VmConfig::from_file(&dir.join("aivm.yaml"))
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        let mut rt =
+            Runtime::init(cfg, dir.clone()).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        let sum = rt
+            .approve_secret_lease(lease_id, approved_by)
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        rt.persist()
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        Ok(format!(
+            "approved {} (tool={} resource={} scope={} uses={}/{} by={})",
+            sum.id,
+            sum.tool,
+            sum.resource,
+            sum.scope,
+            sum.uses,
+            sum.max_uses,
+            sum.approved_by.unwrap_or_default(),
+        ))
+    }
+
     pub fn pause(&mut self, name: &str) -> Result<(), SupervisorError> {
         let dir = self.resolve(name)?;
         let (st, _) = self

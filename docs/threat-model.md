@@ -118,14 +118,15 @@ DNA ทุกครั้งต้องลง audit (ไม่รวม secret)
 
 ลำดับแนะนำ: ~~G3 → G5 → G1 → G4 →~~ G2
 
-## 6. งานค้างหลัง G4 (G4b — approve flow สำหรับ High-risk)
+## 6. งานค้างหลัง G4 (G4b — approve flow สำหรับ High-risk) ✅ เสร็จ
 
-G4 ที่เสร็จครอบคลุม: request → lease (low) / deny (high) → inject → audit
-ส่วนที่ยังไม่มี: pending lease + operator approve (`aivm approve-secret`
-หรือเทียบเท่า) + lease persistence ข้าม restart (ตอนนี้ approve หายเมื่อ restart
-= fail-closed ปลอดภัย) — ออกแบบก่อนลงมือ (threat: approval phishing /
-confused deputy ผ่าน lease id เดา)
+- pending lease เก็บพร้อม id ใน error/audit (id ไม่ใช่ secret บอกได้)
+- operator `approve-secret` ด้วย id ตรงตัวเท่านั้น (เดา/ต่อเติม/ซ้ำ/ไม่ระบุคน = ปฏิเสธ)
+- approve แล้วใช้ได้ตาม max_uses/TTL เดิม ไม่ต่ออายุ (TTL นับจากตอนขอ)
+- ข้าม restart ได้ (persist 0600 + rehydrate คัดเฉพาะที่ใช้ได้)
+- ใช้ก่อน approve = DENY (`lease-not-approved`)
+- agent loop แสดง `secret.request` ได้แล้ว (parse ผ่าน) แต่ยังกั้นด้วย capability/policy/HITL เหมือนเดิม (expressible ≠ authorized)
 
-**ตามมาจาก G2**: `secret.request` เป็น gateway tool แล้ว แต่ agent loop แสดงออก
-ไม่ได้ (`KNOWN_TOOLS` ไม่มีชื่อนี้ — ตั้งใจ fail-closed ไว้ก่อน) ถ้าจะให้ agent
-ขอ secret ได้ต้องตัดสินใจเพิ่ม surface ตรงนี้พร้อม adversarial คุม (อย่าแอบเพิ่ม)
+คงเหลือเชิง fatigue (operator กด approve ผิดตัวเพราะเหนื่อย): บรรเทาด้วย
+approve ต้องใช้ id เต็ม + แสดงรายละเอียด lease + audit ระบุคน — ไม่มี
+auto-approve เด็ดขาด

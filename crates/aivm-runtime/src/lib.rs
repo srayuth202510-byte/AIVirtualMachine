@@ -41,6 +41,8 @@ pub enum RuntimeError {
     Io(String),
     #[error("transition denied: {0}")]
     Transition(String),
+    #[error("secret: {0}")]
+    Secret(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +207,10 @@ pub struct Runtime {
 struct PersistedState {
     cube: Cube,
     caps: CapabilitySet,
+    /// leases ค้าง (G4b): รวม values (ไฟล์ 0600 อยู่แล้ว — ระดับเดียวกับ
+    /// secrets.yaml) ฟื้นเฉพาะที่ยังใช้ได้ ที่เหลือทิ้ง (fail-closed ข้าม restart)
+    #[serde(default)]
+    leases: Vec<aivm_secrets::SecretLease>,
 }
 
 impl Runtime {
@@ -326,6 +332,10 @@ impl Runtime {
             if let Ok(saved) = serde_json::from_str::<PersistedState>(&text) {
                 cube = saved.cube;
                 gateway.caps = saved.caps;
+                // G4b: ฟื้น leases ที่ยังใช้ได้ (หมดอายุ/หมดโควต้า/จบแล้วทิ้ง)
+                if let Some(broker) = gateway.secret_broker_mut() {
+                    broker.restore(saved.leases);
+                }
             }
         }
         let memory = Memory::new(base_dir.join("memory"));
@@ -415,12 +425,44 @@ impl Runtime {
         Ok((granted, revoked))
     }
 
+    /// Approve PENDING secret lease (G4b — operator เท่านั้น ไม่ใช่ agent):
+    /// exact lease id + ต้อง pending อยู่ + ระบุผู้ approve + audit ระบุคน
+    /// คืนสรุป lease (ไม่มี value) approve แล้วใช้ได้ตาม max_uses/TTL เดิม
+    pub fn approve_secret_lease(
+        &mut self,
+        lease_id: &str,
+        approved_by: &str,
+    ) -> Result<aivm_secrets::LeaseSummary, RuntimeError> {
+        let broker = self
+            .gateway
+            .secret_broker_mut()
+            .ok_or_else(|| RuntimeError::Secret("secret broker not configured".into()))?;
+        let lease = broker
+            .approve_lease(lease_id, approved_by)
+            .map_err(|e| RuntimeError::Secret(e.to_string()))?;
+        let state = self.cube.current_state().to_string();
+        self.audit_op("secret-approve", &lease.id, approved_by, &state)?;
+        Ok(aivm_secrets::LeaseSummary {
+            id: lease.id.clone(),
+            tool: lease.request.tool.clone(),
+            resource: lease.request.resource.clone(),
+            scope: lease.request.scope.clone(),
+            purpose: lease.request.purpose.clone(),
+            status: lease.status,
+            uses: lease.uses,
+            max_uses: lease.request.max_uses,
+            hitl_approved: lease.hitl_approved,
+            approved_by: lease.approved_by.clone(),
+        })
+    }
+
     /// persist cube ที่ validate แล้ว + lease ที่ยังใช้ได้ เพื่อให้
     /// `transition_to` รอดข้าม restart supervisor เรียกหลัง run/transition/create
     pub fn persist(&self) -> Result<(), RuntimeError> {
         let saved = PersistedState {
             cube: self.cube.clone(),
             caps: self.gateway.caps.clone(),
+            leases: self.gateway.live_secret_leases(),
         };
         let text =
             serde_json::to_string_pretty(&saved).map_err(|e| RuntimeError::Io(e.to_string()))?;
@@ -1216,6 +1258,114 @@ secrets:
         let r = r.unwrap();
         assert!(r.ok);
         assert!(!r.output.contains("VALUE"));
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // G4b: request(high) → pending → persist → restart → approve → use ได้
+    // (deterministic: Process level ไม่ต้องมี KVM)
+    #[test]
+    fn approve_persist_rehydrate_use_roundtrip() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!(
+            "aivm-rt-approve-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("secrets.yaml"), "test_tok: ROUNDTRIP-VALUE\n").unwrap();
+        std::fs::set_permissions(
+            base.join("secrets.yaml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let cfg = VmConfig::from_yaml(
+            r#"
+name: t
+runtime:
+  isolation: sandbox
+tools:
+  allow: [/usr/bin/printenv]
+secrets:
+  allow: ["test_tok:write"]
+  hitl_required_for: ["high"]
+"#,
+        )
+        .unwrap();
+        let printenv = std::fs::canonicalize("/usr/bin/printenv")
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let grant_all = |rt: &mut Runtime| {
+            rt.gateway.caps.grant(aivm_capability::Capability::new(
+                "use",
+                "secret",
+                "test_tok:write",
+            ));
+            rt.gateway.caps.grant(aivm_capability::Capability::new(
+                "execute", "process", &printenv,
+            ));
+        };
+        let body = serde_json::json!({
+            "tool": "process.exec",
+            "resource": "test_tok",
+            "scope": "write",
+            "purpose": "test",
+            "risk": "high",
+        })
+        .to_string();
+        // 1. ขอ high-risk → pending (deny + มี lease id ใน audit)
+        let mut rt = Runtime::init(cfg.clone(), base.clone()).unwrap();
+        grant_all(&mut rt);
+        let r = rt.gateway.secret_request(&mut rt.cube, Some(body.as_str()));
+        assert!(r.is_err());
+        let log = std::fs::read_to_string(base.join("audit.jsonl")).unwrap();
+        assert!(log.contains("hitl-required"));
+        let pending = log
+            .lines()
+            .find_map(|l| {
+                let p = l.find("pending:lease-")?;
+                Some(
+                    l[p + "pending:".len()..]
+                        .split('"')
+                        .next()
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .expect("ต้องมี pending lease id ใน audit");
+        // 2. persist + restart (จำลองข้าม process) → approve ได้
+        rt.persist().unwrap();
+        drop(rt);
+        let mut rt = Runtime::init(cfg, base.clone()).unwrap();
+        grant_all(&mut rt);
+        let sum = rt.approve_secret_lease(&pending, "op").unwrap();
+        assert_eq!(sum.resource, "test_tok");
+        assert_eq!(sum.approved_by.as_deref(), Some("op"));
+        // 3. ใช้ lease ที่ approve แล้วได้ (inject ทำงานหลัง restart)
+        let r = rt
+            .gateway
+            .dispatch(
+                &mut rt.cube,
+                &aivm_tools::ToolRequest {
+                    tool: "process.exec".into(),
+                    path: "/usr/bin/printenv".into(),
+                    content: Some(
+                        serde_json::json!({"argv": ["AIVM_SECRET_TEST_TOK_WRITE"], "secret": pending})
+                            .to_string(),
+                    ),
+                },
+            )
+            .unwrap();
+        assert!(r.ok);
+        assert!(r.output.contains("ROUNDTRIP-VALUE"));
+        // 4. audit มีรอย approve ระบุคน + ไม่มี value หลุด
+        let log = std::fs::read_to_string(base.join("audit.jsonl")).unwrap();
+        assert!(log.contains("secret-approve"));
+        assert!(log.contains("\"op\""), "audit ต้องระบุผู้ approve");
+        assert!(!log.contains("ROUNDTRIP-VALUE"));
         aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);
     }

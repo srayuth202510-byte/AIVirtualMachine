@@ -139,6 +139,16 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         policy_approved: bool,
     },
+    /// อนุมัติ PENDING secret lease (G4b — operator เท่านั้น ดู lease id
+    /// เต็มจาก audit `hitl-required` แล้วสั่งด้วย id ตรงตัว)
+    ApproveSecret {
+        name: String,
+        /// lease id เต็ม (exact match — เดา/ต่อเติมไม่ได้)
+        lease: String,
+        /// ใคร approve (ลง audit)
+        #[arg(long, default_value = "operator")]
+        by: String,
+    },
     /// ตรวจความพร้อม isolation ของเครื่องนี้ (userns/pidns/seccomp/KVM/firecracker)
     /// ใช้วางแผน Phase 7: ไม่มี KVM ก็รายงาน false อย่างซื่อสัตย์ ไม่ error
     Probe,
@@ -317,6 +327,14 @@ fn main() -> Result<(), AnyErr> {
             };
             let (granted, revoked) = sup.transition(&name, next, &guards).map_err(err)?;
             println!("{name}: -> {next} (granted {granted}, revoked {revoked})");
+        }
+        Cmd::ApproveSecret { name, lease, by } => {
+            if sup.status(&name).is_none() {
+                eprintln!("vm '{name}' not registered under this --root; `create` it first");
+                std::process::exit(2);
+            }
+            let out = sup.approve_secret(&name, &lease, &by).map_err(err)?;
+            println!("{out}");
         }
         Cmd::Probe => {
             let pr = aivm_sandbox::probe();

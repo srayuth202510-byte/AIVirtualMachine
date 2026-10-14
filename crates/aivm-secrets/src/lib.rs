@@ -58,7 +58,9 @@ pub struct SecretLease {
     /// Secret request ที่เกี่ยวข้อง
     pub request: SecretRequest,
     /// Secret value (จะถูก zeroize หลังใช้งาน)
-    #[serde(skip_serializing)]
+    /// หมายเหตุ: serialize ได้ (ต้องใช้ตอน persist ข้าม restart — ไฟล์
+    /// 0600 ระดับเดียวกับ secrets.yaml) ห้าม serialize ผ่านช่องอื่น
+    /// (API/summary/audit ใช้ LeaseSummary หรือ field เลือกเองเสมอ)
     pub value: String,
     /// สถานะ
     pub status: LeaseStatus,
@@ -125,8 +127,8 @@ pub enum SecretError {
     CapabilityDenied(String),
     #[error("policy denied: {0}")]
     PolicyDenied(String),
-    #[error("hitl required but not approved")]
-    HitlRequired,
+    #[error("hitl required but not approved (pending lease: {0})")]
+    HitlRequired(String),
     #[error("lease not found: {0}")]
     LeaseNotFound(String),
     #[error("lease exhausted (max uses reached)")]
@@ -135,12 +137,29 @@ pub enum SecretError {
     LeaseExpired,
     #[error("lease revoked")]
     LeaseRevoked,
+    #[error("lease pending approval (not approved yet)")]
+    NotApproved,
     #[error("invalid request: {0}")]
     InvalidRequest(String),
     #[error("secret not found in broker: {0}")]
     SecretNotFound(String),
     #[error("audit error: {0}")]
     AuditError(String),
+}
+
+/// สรุป lease แบบไม่มี value (G4b — operator ดูก่อน approve)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseSummary {
+    pub id: String,
+    pub tool: String,
+    pub resource: String,
+    pub scope: String,
+    pub purpose: String,
+    pub status: LeaseStatus,
+    pub uses: u32,
+    pub max_uses: u32,
+    pub hitl_approved: bool,
+    pub approved_by: Option<String>,
 }
 
 /// Secret Broker — trusted component outside sandbox that manages secrets
@@ -188,11 +207,11 @@ impl SecretBroker {
         // 2. Policy check
         self.check_policy(&request)?;
 
-        // 3. Risk evaluation + HITL
+        // 3. Risk evaluation + HITL (G4b): High-risk ที่ไม่มี approval ไม่ทิ้ง
+        // แต่เก็บเป็น PENDING lease ให้ operator approve ต่อได้ (lease id
+        // อยู่ใน error — ไม่ใช่ secret จึงบอกได้)
         let requires_hitl = self.policy.hitl_required_for.contains(&request.risk);
-        if requires_hitl && !hitl_approved {
-            return Err(SecretError::HitlRequired);
-        }
+        let pre_approved = hitl_approved;
 
         // 4. Validate TTL and max_uses against policy
         if self.policy.max_ttl_seconds > 0 && request.ttl_seconds > self.policy.max_ttl_seconds {
@@ -215,26 +234,31 @@ impl SecretBroker {
             .ok_or_else(|| SecretError::SecretNotFound(request.resource.clone()))?
             .clone();
 
-        // 6. Create lease
+        // 6. Create lease (High-risk ที่ยังไม่ approve = PENDING ไว้ก่อน)
         let resource_for_audit = request.resource.clone();
         let ttl_seconds = request.ttl_seconds;
         let now = Utc::now();
+        let pending = requires_hitl && !pre_approved;
         let lease = SecretLease {
             id: format!("lease-{}", uuid::Uuid::new_v4()),
             request,
             value,
-            status: LeaseStatus::Active,
+            status: if pending {
+                LeaseStatus::Pending
+            } else {
+                LeaseStatus::Active
+            },
             created_at: now,
             expires_at: now + Duration::from_secs(ttl_seconds),
             uses: 0,
-            hitl_approved,
-            approved_by,
+            hitl_approved: pre_approved,
+            approved_by: if pre_approved { approved_by } else { None },
         };
 
         let lease_id = lease.id.clone();
         self.leases.insert(lease_id.clone(), lease.clone());
 
-        // Audit
+        // Audit (pending = deny/hitl-required ไว้ก่อน ไม่ใช่ allow)
         if let Some(audit) = &mut self.audit {
             let mut rec = aivm_audit::AuditRecord::new(
                 0,
@@ -244,14 +268,21 @@ impl SecretBroker {
                 "INIT",
                 "secret.lease",
                 &resource_for_audit,
-                "allow",
+                if pending { "deny" } else { "allow" },
                 "secret-policy",
             );
-            rec.rule_matched = format!("lease_created:{}", lease_id);
+            rec.rule_matched = if pending {
+                format!("hitl-required:{lease_id}")
+            } else {
+                format!("lease_created:{lease_id}")
+            };
             rec.result = "success".into();
             let _ = audit.append(rec);
         }
 
+        if pending {
+            return Err(SecretError::HitlRequired(lease_id));
+        }
         Ok(lease)
     }
 
@@ -274,9 +305,9 @@ impl SecretBroker {
             LeaseStatus::Exhausted => return Err(SecretError::LeaseExhausted),
             LeaseStatus::Expired => return Err(SecretError::LeaseExpired),
             LeaseStatus::Revoked => return Err(SecretError::LeaseRevoked),
-            LeaseStatus::Pending => {
-                return Err(SecretError::InvalidRequest("lease not approved".into()))
-            }
+            // PENDING ใช้ไม่ได้จนกว่า operator จะ approve (G4b) — แยก variant
+            // จาก InvalidRequest ทั่วไปเพื่อให้ gateway ลง audit ถูก
+            LeaseStatus::Pending => return Err(SecretError::NotApproved),
         }
 
         // Check expiration
@@ -309,6 +340,99 @@ impl SecretBroker {
             .ok_or(SecretError::LeaseNotFound(lease_id.to_string()))?;
         lease.status = LeaseStatus::Revoked;
         Ok(())
+    }
+
+    /// Approve a PENDING lease (G4b — operator เท่านั้น, ไม่ใช่ agent):
+    /// ตรวจ exact id + ต้อง pending อยู่ + ไม่หมดอายุ + ระบุผู้ approve
+    /// (กัน approve ลม ๆ แล้ง ๆ) approve แล้วใช้ได้ตาม max_uses/TTL เดิม
+    /// (ไม่ต่ออายุตอน approve — TTL นับจากตอนขอเสมอ)
+    pub fn approve_lease(
+        &mut self,
+        lease_id: &str,
+        approved_by: &str,
+    ) -> Result<SecretLease, SecretError> {
+        if approved_by.is_empty() {
+            return Err(SecretError::InvalidRequest("approver required".into()));
+        }
+        let lease = self
+            .leases
+            .get_mut(lease_id)
+            .ok_or(SecretError::LeaseNotFound(lease_id.to_string()))?;
+        match lease.status {
+            LeaseStatus::Pending => {}
+            _ => {
+                return Err(SecretError::InvalidRequest(
+                    "only pending leases can be approved".into(),
+                ));
+            }
+        }
+        if Utc::now() > lease.expires_at {
+            lease.status = LeaseStatus::Expired;
+            return Err(SecretError::LeaseExpired);
+        }
+        lease.status = LeaseStatus::Active;
+        lease.hitl_approved = true;
+        lease.approved_by = Some(approved_by.to_string());
+        Ok(lease.clone())
+    }
+
+    /// สรุป leases ทั้งหมดแบบไม่มี value (ไว้แสดงให้ operator ดูก่อน approve —
+    /// value ไม่มีทางออกทางช่องนี้)
+    pub fn summaries(&self) -> Vec<LeaseSummary> {
+        let mut out: Vec<LeaseSummary> = self
+            .leases
+            .values()
+            .map(|l| LeaseSummary {
+                id: l.id.clone(),
+                tool: l.request.tool.clone(),
+                resource: l.request.resource.clone(),
+                scope: l.request.scope.clone(),
+                purpose: l.request.purpose.clone(),
+                status: l.status,
+                uses: l.uses,
+                max_uses: l.request.max_uses,
+                hitl_approved: l.hitl_approved,
+                approved_by: l.approved_by.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// คืนชีพ leases จาก persistence (G4b): รับเฉพาะ Active/Pending ที่ยังไม่
+    /// หมดอายุ ที่เหลือทิ้ง (fail-closed ข้าม restart) คืนจำนวนที่รับไว้
+    pub fn restore(&mut self, leases: Vec<SecretLease>) -> usize {
+        let now = Utc::now();
+        let mut kept = 0;
+        for mut l in leases {
+            match l.status {
+                LeaseStatus::Active | LeaseStatus::Pending => {}
+                _ => continue,
+            }
+            if now > l.expires_at {
+                continue;
+            }
+            if l.uses >= l.request.max_uses {
+                continue;
+            }
+            l.status = if l.hitl_approved {
+                LeaseStatus::Active
+            } else {
+                LeaseStatus::Pending
+            };
+            self.leases.insert(l.id.clone(), l);
+            kept += 1;
+        }
+        kept
+    }
+
+    /// leases ที่ยังมีชีวิต (ไว้ persist — ที่จบแล้วไม่ต้องเก็บ)
+    pub fn live_leases(&self) -> Vec<SecretLease> {
+        self.leases
+            .values()
+            .filter(|l| matches!(l.status, LeaseStatus::Active | LeaseStatus::Pending))
+            .cloned()
+            .collect()
     }
 
     /// Clean up expired/exhausted leases
@@ -499,9 +623,24 @@ mod tests {
             risk: RiskLevel::High,
         };
 
-        // Without HITL should fail
+        // Without HITL should fail but leave a PENDING lease with id
         let result = broker.request_lease(request.clone(), &cube, &mut caps, false, None);
-        assert!(matches!(result, Err(SecretError::HitlRequired)));
+        let pending_id = match result {
+            Err(SecretError::HitlRequired(id)) => id,
+            other => panic!("expected HitlRequired, got {other:?}"),
+        };
+        assert!(!pending_id.is_empty());
+        let stored = broker
+            .get_lease(&pending_id)
+            .expect("pending must be stored");
+        assert_eq!(stored.status, LeaseStatus::Pending);
+        assert!(!stored.hitl_approved);
+
+        // Using a pending lease must fail distinctly (not approved yet)
+        assert!(matches!(
+            broker.use_lease(&pending_id),
+            Err(SecretError::NotApproved)
+        ));
 
         // With HITL should succeed
         let lease = broker
@@ -509,6 +648,104 @@ mod tests {
             .unwrap();
         assert_eq!(lease.status, LeaseStatus::Active);
         assert!(lease.hitl_approved);
+    }
+
+    // G4b: approve flow — pending → active, ใช้ได้, approve ซ้ำ/ผิด id ไม่ได้
+    #[test]
+    fn test_approve_flow() {
+        let mut caps = CapabilitySet::new(vec![aivm_capability::Capability::new(
+            "use",
+            "secret",
+            "github_token:write",
+        )]);
+        // policy ตรง ๆ สำหรับเคสนี้ (test_broker allow แค่ read)
+        let mut broker = SecretBroker::new(
+            SecretPolicy {
+                allow: vec!["github_token:write".into()],
+                deny: vec![],
+                hitl_required_for: vec![RiskLevel::High],
+                max_ttl_seconds: 3600,
+                max_uses_allowed: 5,
+            },
+            None,
+        );
+        broker.register_secret("github_token".into(), "ghp_test123".into());
+        let cube = Cube::new("test");
+        let request = SecretRequest {
+            tool: "git.push".into(),
+            resource: "github_token".into(),
+            scope: "write".into(),
+            purpose: "push".into(),
+            max_uses: 1,
+            ttl_seconds: 300,
+            risk: RiskLevel::High,
+        };
+        let Err(SecretError::HitlRequired(id)) =
+            broker.request_lease(request, &cube, &mut caps, false, None)
+        else {
+            panic!("expected pending");
+        };
+        // approve id มั่วต้องไม่ผ่าน (กันเดา/confused deputy)
+        assert!(matches!(
+            broker.approve_lease("lease-nope", "operator"),
+            Err(SecretError::LeaseNotFound(_))
+        ));
+        // approve ไม่ระบุคนต้องไม่ผ่าน
+        assert!(matches!(
+            broker.approve_lease(&id, ""),
+            Err(SecretError::InvalidRequest(_))
+        ));
+        // approve จริง → active + ใช้ได้ครั้งเดียวตาม max_uses
+        let approved = broker.approve_lease(&id, "operator").unwrap();
+        assert_eq!(approved.status, LeaseStatus::Active);
+        assert_eq!(approved.approved_by.as_deref(), Some("operator"));
+        assert_eq!(broker.use_lease(&id).unwrap(), "ghp_test123");
+        // approve ซ้ำ (ไม่ pending แล้ว) ต้องไม่ผ่าน
+        assert!(matches!(
+            broker.approve_lease(&id, "operator"),
+            Err(SecretError::InvalidRequest(_))
+        ));
+        // summaries ไม่มี value
+        let sums = broker.summaries();
+        assert_eq!(sums.len(), 1);
+        assert_eq!(sums[0].id, id);
+    }
+
+    // G4b: restore รับเฉพาะ lease ที่ยังใช้ได้ (หมดอายุ/หมดโควต้า/จบแล้วทิ้ง)
+    #[test]
+    fn test_restore_filters_terminal_leases() {
+        let mut broker = test_broker();
+        let now = Utc::now();
+        let mk = |status| SecretLease {
+            id: format!("lease-r-{}", uuid::Uuid::new_v4()),
+            request: SecretRequest {
+                tool: "t".into(),
+                resource: "github_token".into(),
+                scope: "read".into(),
+                purpose: "p".into(),
+                max_uses: 1,
+                ttl_seconds: 300,
+                risk: RiskLevel::Low,
+            },
+            value: "v".into(),
+            status,
+            created_at: now,
+            expires_at: now + chrono::Duration::seconds(300),
+            uses: 0,
+            hitl_approved: true,
+            approved_by: None,
+        };
+        let mut expired = mk(LeaseStatus::Active);
+        expired.expires_at = now - chrono::Duration::seconds(1);
+        let kept = broker.restore(vec![
+            mk(LeaseStatus::Active),
+            mk(LeaseStatus::Pending),
+            expired,
+            mk(LeaseStatus::Exhausted),
+            mk(LeaseStatus::Revoked),
+        ]);
+        assert_eq!(kept, 2);
+        assert_eq!(broker.leases.len(), 2);
     }
 
     #[test]

@@ -33,6 +33,11 @@ DENY + audit `hitl-required` → `process.exec` แนบ `{"argv":[…],"secret
 อยู่ AI context/memory/audit (redaction โดย construction) ระดับ microvm
 inject ไม่ได้ = DENY ตรง ๆ ไม่เงียบทิ้ง
 
+High-risk flow (G4b): request → pending (deny + lease id ใน audit) →
+operator `approve-secret` ด้วย id ตรงตัว (audit ระบุคน) → ใช้ได้ตาม
+max_uses/TTL เดิม ข้าม restart ได้ (persist 0600, หมดอายุทิ้ง) ใช้ก่อน
+approve = DENY (`lease-not-approved`)
+
 ## Isolation levels (`runtime.isolation`)
 
 | ค่า | backend | สถานะ |

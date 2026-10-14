@@ -61,6 +61,7 @@ cargo run -q -p aivm-cli -- audit coder
 | `run <name> [--prompt …]` | รันหนึ่งก้าวแบบผ่านตัวกลาง |
 | `agent <name> <task> [--max-steps N]` | agent loop เต็มรอบ (Phase 5) |
 | `transition <name> <STATE> [--confidence F] [--tests-passed] [--policy-approved]` | เปลี่ยน state + ให้/เพิกถอนสิทธิ์ |
+| `approve-secret <name> <lease> [--by NAME]` | อนุมัติ PENDING secret lease (operator เท่านั้น) |
 | `inspect` / `state` / `capabilities` | ดู VM / state / สิทธิ์ |
 | `logs` / `audit` | ท้าย audit log / ตรวจ hash chain |
 | `index` / `search` | สร้าง/ค้น RAG index (Phase 6) |

@@ -246,6 +246,19 @@ impl ToolGateway {
         self.deny_tracker.clear();
     }
 
+    /// broker สำหรับ rehydrate leases (G4b — runtime เท่านั้น)
+    pub fn secret_broker_mut(&mut self) -> Option<&mut SecretBroker> {
+        self.secret_broker.as_mut()
+    }
+
+    /// leases ที่ยังมีชีวิตไว้ persist (G4b — runtime เท่านั้น)
+    pub fn live_secret_leases(&self) -> Vec<aivm_secrets::SecretLease> {
+        match &self.secret_broker {
+            Some(b) => b.live_leases(),
+            None => vec![],
+        }
+    }
+
     /// G1: ประตู quarantine สำหรับทุก tool method (complete mediation —
     /// เรียกตรงโดยไม่ผ่าน dispatch ก็หนีไม่พ้น) อยู่ใน quarantine = DENY
     /// พร้อม audit ของตัวเอง
@@ -660,6 +673,7 @@ impl ToolGateway {
                                     SecretError::LeaseExhausted => "lease-exhausted",
                                     SecretError::LeaseExpired => "lease-expired",
                                     SecretError::LeaseRevoked => "lease-revoked",
+                                    SecretError::NotApproved => "lease-not-approved",
                                     _ => "secret-error",
                                 };
                                 let mut env = env;
@@ -1171,32 +1185,55 @@ impl ToolGateway {
             }
         };
         // borrow broker จบใน match นี้ (owned ออกมา) แล้วค่อย audit
+        // pending lease id (high-risk) ส่งต่อใน audit result ให้ operator
+        // เอาไป approve (id ไม่ใช่ secret บอกได้)
         enum Outcome {
             Allow(SecretLease),
-            Deny { rule: &'static str, msg: String },
+            Deny {
+                rule: &'static str,
+                msg: String,
+                audit_result: String,
+            },
         }
         let outcome = match broker.request_lease(req, cube, &mut self.caps, false, None) {
             Ok(lease) => Outcome::Allow(lease),
             Err(e) => {
-                let (rule, msg) = match &e {
-                    SecretError::HitlRequired => (
+                let (rule, msg, audit_result) = match &e {
+                    SecretError::HitlRequired(id) => (
                         "hitl-required",
                         "high-risk secret requires operator approval".to_string(),
+                        format!("pending:{id}"),
                     ),
-                    SecretError::CapabilityDenied(_) => ("no-capability", "no capability".into()),
-                    SecretError::PolicyDenied(_) => {
-                        ("secret-policy", "secret denied by policy".into())
+                    SecretError::CapabilityDenied(_) => {
+                        ("no-capability", "no capability".into(), "error".into())
                     }
+                    SecretError::PolicyDenied(_) => (
+                        "secret-policy",
+                        "secret denied by policy".into(),
+                        "error".into(),
+                    ),
                     // ไม่บอกว่ามี resource อะไรบ้าง (กัน enumerate)
-                    SecretError::SecretNotFound(_) => {
-                        ("secret-unknown", "unknown secret resource".into())
-                    }
-                    SecretError::InvalidRequest(_) => {
-                        ("bad-secret-request", "bad secret request".into())
-                    }
-                    _ => ("secret-error", "secret request failed".into()),
+                    SecretError::SecretNotFound(_) => (
+                        "secret-unknown",
+                        "unknown secret resource".into(),
+                        "error".into(),
+                    ),
+                    SecretError::InvalidRequest(_) => (
+                        "bad-secret-request",
+                        "bad secret request".into(),
+                        "error".into(),
+                    ),
+                    _ => (
+                        "secret-error",
+                        "secret request failed".into(),
+                        "error".into(),
+                    ),
                 };
-                Outcome::Deny { rule, msg }
+                Outcome::Deny {
+                    rule,
+                    msg,
+                    audit_result,
+                }
             }
         };
         match outcome {
@@ -1223,7 +1260,14 @@ impl ToolGateway {
                     output: out,
                 })
             }
-            Outcome::Deny { rule, msg } => Err(self.deny_secret(cube, rule, &msg)),
+            Outcome::Deny {
+                rule,
+                msg,
+                audit_result,
+            } => {
+                self.audit_decision(cube, "secret.request", &scope, "deny", rule, &audit_result);
+                Err(ToolError::Denied(msg))
+            }
         }
     }
 

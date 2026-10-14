@@ -697,3 +697,135 @@ fn secret_malformed_request_must_deny() {
     }
     adv_clean(&dir);
 }
+
+// ---- G4b approve flow (operator เท่านั้น) ----
+
+fn approve_harness_adv(tag: &str) -> (aivm_runtime::Runtime, std::path::PathBuf) {
+    let dir = adv_dir(&format!("approve-{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("secrets.yaml"), "tok: APPROVE-SECRET\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            dir.join("secrets.yaml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let cfg = aivm_runtime::VmConfig::from_yaml(
+        "name: adv-approve\nsecrets:\n  allow: [\"tok:write\"]\n  hitl_required_for: [\"high\"]\n",
+    )
+    .unwrap();
+    let mut rt = aivm_runtime::Runtime::init(cfg, dir.clone()).unwrap();
+    rt.gateway
+        .caps
+        .grant(Capability::new("use", "secret", "tok:write"));
+    (rt, dir)
+}
+
+fn request_high_risk(rt: &mut aivm_runtime::Runtime) -> String {
+    let r = rt
+        .gateway
+        .secret_request(
+            &mut rt.cube,
+            Some(
+                &serde_json::json!({
+                    "tool": "process.exec",
+                    "resource": "tok",
+                    "scope": "write",
+                    "purpose": "adv",
+                    "risk": "high",
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap_err();
+    assert!(r.to_string().contains("approval"));
+    let log = std::fs::read_to_string(rt.base_dir.join("audit.jsonl")).unwrap();
+    let id = log
+        .lines()
+        .find_map(|l| {
+            let p = l.find("pending:lease-")?;
+            Some(
+                l[p + "pending:".len()..]
+                    .split('"')
+                    .next()
+                    .unwrap()
+                    .to_string(),
+            )
+        })
+        .expect("ต้องมี pending lease id");
+    id
+}
+
+// G4b: pending → approve ด้วย id ตรง → ใช้ได้ (เส้น operator ปกติ)
+#[test]
+fn secret_approve_flow_allows_use() {
+    let (mut rt, dir) = approve_harness_adv("ok");
+    let id = request_high_risk(&mut rt);
+    let sum = rt.approve_secret_lease(&id, "op").unwrap();
+    assert_eq!(sum.resource, "tok");
+    // ใช้ lease ที่ approve แล้วได้ (ครั้งเดียวตาม default max_uses=1)
+    let out = rt
+        .gateway
+        .secret_broker_mut()
+        .unwrap()
+        .use_lease(&id)
+        .unwrap();
+    assert_eq!(out, "APPROVE-SECRET");
+    let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+    assert!(log.contains("secret-approve"));
+    adv_clean(&dir);
+}
+
+// G4b: approve id มั่ว / ซ้ำ / ไม่ระบุคน ต้องไม่ผ่านทั้งหมด
+#[test]
+fn secret_approve_abuse_must_deny() {
+    let (mut rt, dir) = approve_harness_adv("abuse");
+    let id = request_high_risk(&mut rt);
+    // เดา id
+    assert!(rt.approve_secret_lease("lease-deadbeef", "op").is_err());
+    // ไม่ระบุคน
+    assert!(rt.approve_secret_lease(&id, "").is_err());
+    // approve จริงครั้งแรกผ่าน
+    assert!(rt.approve_secret_lease(&id, "op").is_ok());
+    // approve ซ้ำต้องไม่ผ่าน (ไม่ pending แล้ว)
+    assert!(rt.approve_secret_lease(&id, "op").is_err());
+    adv_clean(&dir);
+}
+
+// G4b: ใช้ lease ตั้งแต่ยังไม่ approve ต้อง DENY (lease-not-approved + audit)
+#[test]
+fn secret_use_before_approve_must_deny() {
+    let (mut rt, dir) = approve_harness_adv("early");
+    let id = request_high_risk(&mut rt);
+    let broker = rt.gateway.secret_broker_mut().unwrap();
+    let r = broker.use_lease(&id);
+    assert!(
+        matches!(r, Err(aivm_secrets::SecretError::NotApproved)),
+        "pending ต้องใช้ไม่ได้"
+    );
+    // ผ่าน gateway exec ก็ต้อง DENY พร้อม audit (inject ไม่เกิด)
+    let real = std::fs::canonicalize("/bin/true")
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    rt.gateway.policy.process.allow.push(real.clone());
+    rt.gateway
+        .caps
+        .grant(Capability::new("execute", "process", &real));
+    let r = rt.gateway.dispatch(
+        &mut rt.cube,
+        &aivm_tools::ToolRequest {
+            tool: "process.exec".into(),
+            path: "/bin/true".into(),
+            content: Some(serde_json::json!({"argv": [], "secret": id}).to_string()),
+        },
+    );
+    assert!(r.is_err());
+    let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+    assert!(log.contains("lease-not-approved"));
+    adv_clean(&dir);
+}

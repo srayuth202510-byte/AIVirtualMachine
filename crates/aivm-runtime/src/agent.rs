@@ -67,6 +67,8 @@ pub fn build_workspace_index(ws: &Path, current_state: u32) -> rag::RagIndex {
 
 /// tool ที่ยอมรับในระดับ intent (deny-by-default: นอกลิสต์ = ปฏิเสธ)
 /// ต้องตรงกับ `ToolGateway::dispatch`
+/// หมายเหตุ G4b: `secret.request` แสดงออกได้ แต่ gateway กั้นด้วย capability
+/// + policy + HITL อยู่ดี (expressible ไม่เท่ากับ authorized)
 pub const KNOWN_TOOLS: &[&str] = &[
     "filesystem.read",
     "filesystem.write",
@@ -74,6 +76,7 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "process.exec",
     "network.fetch",
     "network.connect",
+    "secret.request",
 ];
 
 /// จำนวนก้าวสูงสุดโดยปริยายของ agent loop
@@ -87,7 +90,7 @@ const SYSTEM_PROMPT: &str = "You are an agent operating a sandboxed workspace. \
 You may ONLY act by emitting exactly one JSON object and no prose.\n\
 To call a tool: {\"tool\": \"<name>\", \"path\": \"<argument>\", \"content\": \"<optional>\"}\n\
 To finish:        {\"done\": true, \"summary\": \"<short text>\"}\n\
-Allowed tools: filesystem.read, filesystem.write, code.search, process.exec, network.fetch, network.connect.\n\
+Allowed tools: filesystem.read, filesystem.write, code.search, process.exec, network.fetch, network.connect, secret.request.\n\
 path means: a workspace-relative file path (read/write), a search string (code.search), \
 an absolute executable (process.exec), or a URL (network.fetch).\n\
 Every request is mediated and may be DENIED; if denied, choose a different action.";
@@ -587,18 +590,19 @@ mod tests {
         );
     }
 
-    // G2: ภาษา intent แสดงสิทธิ์ไม่ได้โดยโครงสร้าง (transition/grant/approve
+    // G2: ภาษา intent แสดงสิทธิ์ไม่ได้โดยโครงสร้าง (transition/grant
     // ไม่อยู่ใน KNOWN_TOOLS) — มาช่องนี้ = invalid-intent ตั้งแต่ parse
+    // หมายเหตุ: `secret.request` แสดงออกได้ (G4b) แต่ gateway กั้นด้วย
+    // capability/policy/HITL — ดู `secret_request_without_capability_denied_in_loop`
     #[test]
     fn privilege_intents_are_not_expressible() {
         let mut fx = fixture("priv");
         let model = ScriptedModel::new(&[
             r#"{"tool":"transition","path":"DEPLOY"}"#,
             r#"{"tool":"grant","path":"execute"}"#,
-            r#"{"tool":"secret.request","path":"-"}"#,
         ]);
-        let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "escalate", 3, None).unwrap();
-        assert_eq!(run.steps.len(), 3);
+        let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "escalate", 2, None).unwrap();
+        assert_eq!(run.steps.len(), 2);
         for s in &run.steps {
             assert!(
                 s.outcome.starts_with("ERROR invalid intent"),
@@ -606,6 +610,23 @@ mod tests {
             );
         }
         assert!(audit_contains(&fx, "invalid-intent"));
+    }
+
+    // G4b: agent ขอ secret ได้ แต่ไม่มี capability = DENY (expressible
+    // ไม่เท่ากับ authorized — poisoned model สั่งขอ secret ก็ติดประตูเดิม)
+    #[test]
+    fn secret_request_without_capability_denied_in_loop() {
+        let mut fx = fixture("secloop");
+        let model = ScriptedModel::new(&[
+            r#"{"tool":"secret.request","path":"-","content":"{\"tool\":\"process.exec\",\"resource\":\"tok\",\"scope\":\"read\",\"purpose\":\"x\"}"}"#,
+        ]);
+        let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "get secret", 1, None).unwrap();
+        assert!(
+            run.steps[0].outcome.starts_with("DENY secret.request"),
+            "{:?}",
+            run.steps
+        );
+        assert!(audit_contains(&fx, "secret-unconfigured"));
     }
 
     // G2: เห็น DENY แล้วลองทางอื่นต่อก็ยังโดน (observation ย้อนกลับไม่ลดประตู)
