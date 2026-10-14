@@ -178,6 +178,7 @@ impl Model for EchoModel {
 pub struct LocalLlamaModel {
     backend: LlamaBackend,
     model: LlamaModel,
+    chat_template: Option<llama_cpp_2::model::LlamaChatTemplate>,
     config: LocalModelConfig,
     name: String,
 }
@@ -200,10 +201,18 @@ impl LocalLlamaModel {
 
         let model = LlamaModel::load_from_file(&backend, &config.model_path, &model_params)
             .map_err(|e| ModelError::LoadFailed(e.to_string()))?;
+        // Instruct GGUF-үүдийн template model metadata-д бий. Байхгүй
+        // base model-д хуучин raw-prompt үйлдлийг хэвээр үлдээнэ.
+        let chat_template = match model.chat_template(None) {
+            Ok(template) => Some(template),
+            Err(llama_cpp_2::ChatTemplateError::MissingTemplate) => None,
+            Err(error) => return Err(ModelError::LoadFailed(error.to_string())),
+        };
 
         Ok(Self {
             backend,
             model,
+            chat_template,
             name: config.model_path.clone(),
             config,
         })
@@ -232,8 +241,18 @@ impl Model for LocalLlamaModel {
             .new_context(&self.backend, ctx_params)
             .map_err(|e| ModelError::InferenceFailed(e.to_string()))?;
 
+        let prompt = if let Some(template) = &self.chat_template {
+            let message =
+                llama_cpp_2::model::LlamaChatMessage::new("user".into(), context.to_string())
+                    .map_err(|e| ModelError::Tokenizer(e.to_string()))?;
+            self.model
+                .apply_chat_template(template, &[message], true)
+                .map_err(|e| ModelError::Tokenizer(e.to_string()))?
+        } else {
+            context.to_string()
+        };
         let vocab = self.model.vocab();
-        let tokens = vocab.tokenize(context.as_bytes(), true, true);
+        let tokens = vocab.tokenize(prompt.as_bytes(), true, true);
         if tokens.is_empty() {
             return Err(ModelError::Tokenizer("input produced no tokens".into()));
         }
