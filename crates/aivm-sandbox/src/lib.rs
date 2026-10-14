@@ -1467,7 +1467,11 @@ mod tests {
     #[test]
     fn userns_probe_requires_mapped_identity() {
         fn check_mapped_identity() -> std::io::Result<()> {
-            probe_userns()?;
+            // ตรวจผลและ identity จาก child เดียวกัน ไม่เทียบ probe สองครั้ง:
+            // namespace quota อาจเปลี่ยนระหว่างครั้งเมื่อเทสต์รันพร้อมกัน
+            if probe_userns().is_err() {
+                return Ok(()); // เครื่องที่ใช้ userns ไม่ได้ต้องรายงาน false ได้ตามปกติ
+            }
             // kernel ต้องเห็นตัวเราเป็น uid/gid 0 ใน namespace ใหม่จริง
             // หาก probe ตรวจแค่ unshare จะเห็น overflow IDs แทน
             if unsafe { libc::getuid() != 0 || libc::getgid() != 0 } {
@@ -1475,10 +1479,9 @@ mod tests {
             }
             Ok(())
         }
-        assert_eq!(
-            can_true_with(probe_userns),
+        assert!(
             can_true_with(check_mapped_identity),
-            "userns readiness requires successful UID/GID mapping"
+            "a successful userns probe requires mapped UID/GID"
         );
     }
 
