@@ -19,8 +19,9 @@ import time
 import sqlite3
 from collections import defaultdict
 import json as _json
+import html
 
-LOG_PATH = "/var/log/aivm/audit.log"
+LOG_PATH = os.environ.get("AIVM_AUDIT_LOG", "/var/log/aivm/audit.log")
 PORT = 8000
 DB_PATH = "/home/lokis/Documents/AIVirtualMachine/scripts/events.db"
 MAX_ENTRIES = 500
@@ -119,9 +120,9 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
 
         entry_rows = []
         for e in entries[:20]:
-            etype = e.get("type", "unknown")
-            path_s = e.get("path", "")[:60]
-            reason_s = e.get("reason", "")[:50]
+            etype = html.escape(str(e.get("type", "unknown")))
+            path_s = html.escape(str(e.get("path", ""))[:60])
+            reason_s = html.escape(str(e.get("reason", ""))[:50])
             entry_rows.append("<tr><td>%s</td><td>%s</td><td>%s</td></tr>" % (etype, path_s, reason_s))
 
         html = (
@@ -187,7 +188,9 @@ def main():
     print("Open your browser to http://localhost:%d" % PORT)
     print("-" * 50)
     try:
-        with HTTPServer(("", PORT), DashboardHandler) as httpd:
+        # Keep the local dashboard off the network unless an operator changes
+        # this deliberately in source/configuration.
+        with HTTPServer(("127.0.0.1", PORT), DashboardHandler) as httpd:
             print("Server running on port %d" % PORT)
             httpd.serve_forever()
     except OSError as e:

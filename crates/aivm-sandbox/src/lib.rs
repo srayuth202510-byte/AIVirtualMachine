@@ -329,12 +329,14 @@ const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_getegid,
     libc::SYS_gettid,
     libc::SYS_clone,
+    libc::SYS_clone3,
     libc::SYS_fork,
     libc::SYS_vfork,
     libc::SYS_execve,
     libc::SYS_wait4,
     libc::SYS_waitid,
     libc::SYS_set_tid_address,
+    libc::SYS_set_robust_list,
     libc::SYS_futex,
     libc::SYS_sched_getaffinity,
     libc::SYS_sched_yield,
@@ -364,9 +366,19 @@ const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_munlockall,
     // File operations
     libc::SYS_statx,
+    libc::SYS_stat,
     libc::SYS_fstat,
+    libc::SYS_statfs,
+    libc::SYS_fstatfs,
     libc::SYS_lstat,
     libc::SYS_newfstatat,
+    libc::SYS_readlink,
+    libc::SYS_readlinkat,
+    libc::SYS_getxattr,
+    libc::SYS_lgetxattr,
+    libc::SYS_listxattr,
+    libc::SYS_llistxattr,
+    libc::SYS_getdents,
     libc::SYS_access,
     libc::SYS_faccessat,
     libc::SYS_chdir,
@@ -398,6 +410,7 @@ const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     // Time
     libc::SYS_clock_gettime,
     libc::SYS_clock_getres,
+    libc::SYS_clock_nanosleep,
     libc::SYS_nanosleep,
     libc::SYS_timer_create,
     libc::SYS_timer_settime,
@@ -488,7 +501,7 @@ unsafe fn build_hybrid_filter(mode: SeccompMode) -> Vec<libc::sock_filter> {
 
     // Default action ตามโหมด
     let default_action = match mode {
-        SeccompMode::Hybrid => 0x7fff0000, // ALLOW (fail-closed production)
+        SeccompMode::Hybrid => 0x7fff0000, // ALLOW after explicit allow/deny checks
         SeccompMode::Audit => 0x7ff00000,  // TRACE (ENOSYS + notify tracer)
         _ => 0x00000000,                   // KILL_PROCESS
     };
@@ -585,7 +598,7 @@ unsafe fn build_hybrid_filter(mode: SeccompMode) -> Vec<libc::sock_filter> {
     }
 
     // ============ DEFAULT ACTION ============
-    filter.push(ret(default_action)); // ALLOW (0x7fff0000) หรือ TRACE
+    filter.push(ret(default_action)); // TRACE หรือ KILL
     filter.push(ret(0x00000000)); // KILL (fallback)
 
     filter
@@ -1861,7 +1874,7 @@ mod tests {
             bpf_verdict(&f, 0xc000003e, libc::SYS_write as u32),
             0x7fff0000
         );
-        // syscall ปกติ -> ALLOW (default-allow)
+        // Explicitly dangerous syscall -> KILL.
         assert_eq!(
             bpf_verdict(&f, 0xc000003e, libc::SYS_reboot as u32),
             0x00000000

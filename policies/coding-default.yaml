@@ -42,7 +42,7 @@ rules:
     action: write
     resource: filesystem
     scope: /workspace/src/**
-    when: "state in {'MODIFY', 'VALIDATE'} && confidence >= 0.8"
+    when: "state in ['MODIFY', 'VALIDATE'] && confidence >= 0.8"
 
   - id: require_test_before_network
     action: network

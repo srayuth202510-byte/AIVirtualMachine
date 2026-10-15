@@ -334,25 +334,23 @@ fn main() -> Result<(), AnyErr> {
         }
         Cmd::ModelStatus { config, json } => {
             let config = VmConfig::from_file(&config).map_err(err)?;
-            let status = if config.model.provider != "local" {
-                "not-applicable".to_string()
-            } else if let Some(local) = &config.model.local {
-                let actual = aivm_model::model_file_sha256(&local.model_path).map_err(err)?;
-                if local.model_sha256.is_empty() {
-                    "unpinned".to_string()
-                } else if actual.eq_ignore_ascii_case(&local.model_sha256) {
-                    "verified".to_string()
-                } else {
-                    "mismatch".to_string()
+            let local = config.model.local.as_ref();
+            let (actual_sha256, status) = if config.model.provider != "local" {
+                (None, "not-applicable".to_string())
+            } else if let Some(local) = local {
+                match aivm_model::model_file_sha256(&local.model_path) {
+                    Ok(actual) if local.model_sha256.is_empty() => {
+                        (Some(actual), "unpinned".to_string())
+                    }
+                    Ok(actual) if actual.eq_ignore_ascii_case(&local.model_sha256) => {
+                        (Some(actual), "verified".to_string())
+                    }
+                    Ok(actual) => (Some(actual), "mismatch".to_string()),
+                    Err(_) => (None, "unavailable".to_string()),
                 }
             } else {
-                "missing-config".to_string()
+                (None, "missing-config".to_string())
             };
-            let local = config.model.local.as_ref();
-            let actual_sha256 = local
-                .map(|m| aivm_model::model_file_sha256(&m.model_path))
-                .transpose()
-                .map_err(err)?;
             let report = ModelArtifactStatus {
                 profile: config.security.profile,
                 provider: config.model.provider,
@@ -386,6 +384,7 @@ fn main() -> Result<(), AnyErr> {
             }
             if report.status == "mismatch"
                 || (report.profile == "production" && report.status == "unpinned")
+                || report.status == "unavailable"
                 || report.status == "missing-config"
             {
                 std::process::exit(1);
