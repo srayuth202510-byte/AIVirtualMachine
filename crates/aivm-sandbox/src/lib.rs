@@ -192,6 +192,18 @@ pub struct SandboxProbe {
     /// ไบนารี `firecracker` อยู่ใน PATH (ยังไม่การันตีเวอร์ชัน)
     #[serde(default)]
     pub firecracker: bool,
+    /// ไบนารี `qemu-system-x86_64` อยู่ใน PATH (เงื่อนไขตั้งต้น Hardware Level 3)
+    #[serde(default)]
+    pub qemu: bool,
+    /// `/dev/sev` มีอยู่ (AMD SEV-SNP)
+    #[serde(default)]
+    pub sev_snp: bool,
+    /// `/dev/tdx_guest` มีอยู่ (Intel TDX)
+    #[serde(default)]
+    pub tdx: bool,
+    /// ไบนารี `swtpm` อยู่ใน PATH (vTPM สำหรับ Hardware Level 3)
+    #[serde(default)]
+    pub swtpm: bool,
 }
 
 // ขีดจำกัดกันบัฟเฟอร์บวม/คำสั่งประหลาด (fail-closed)
@@ -1220,7 +1232,37 @@ pub fn probe() -> SandboxProbe {
         chattr: std::process::Command::new("chattr").output().is_ok(),
         kvm: probe_kvm(),
         firecracker: probe_firecracker(),
+        qemu: find_qemu().is_some(),
+        sev_snp: std::path::Path::new("/dev/sev").exists(),
+        tdx: std::path::Path::new("/dev/tdx_guest").exists(),
+        swtpm: probe_binary_in_path("swtpm"),
     }
+}
+
+/// ไบนารีชื่อตรงอยู่ใน PATH และรันได้หรือไม่ (ไม่รัน ไม่ spawn —
+/// ตรวจแค่การมีอยู่แบบ side-effect free เหมือน `find_firecracker`)
+fn probe_binary_in_path(name: &str) -> bool {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join(name);
+        if !cand.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(md) = std::fs::metadata(&cand) {
+                if md.permissions().mode() & 0o111 != 0 {
+                    return true;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// `/dev/kvm` มีอยู่และเปิดอ่านได้ (ไม่ต้องมีสิทธิ์ใช้จริง)
@@ -1702,9 +1744,20 @@ mod tests {
         let text = serde_json::to_string(&pr).unwrap();
         assert!(text.contains("kvm"));
         assert!(text.contains("firecracker"));
+        // Level 3: probe ต้องรายงานฟิลด์ hardware ด้วย (qemu/sev/tdx/swtpm)
+        for f in ["qemu", "sev_snp", "tdx", "swtpm"] {
+            assert!(text.contains(f), "probe ต้องมีฟิลด์ {f}");
+        }
         // ถ้าไม่มี /dev/kvm ต้องรายงาน false (ซื่อสัตย์ ไม่เงียบ)
         if !Path::new("/dev/kvm").exists() {
             assert!(!pr.kvm, "ไม่มี /dev/kvm ต้องรายงาน kvm=false");
+        }
+        // TEE device ไม่มี = false (ไม่ใช่ error) — CI ทั่วไปต้องได้แบบนี้
+        if !Path::new("/dev/sev").exists() {
+            assert!(!pr.sev_snp, "ไม่มี /dev/sev ต้องรายงาน sev_snp=false");
+        }
+        if !Path::new("/dev/tdx_guest").exists() {
+            assert!(!pr.tdx, "ไม่มี /dev/tdx_guest ต้องรายงาน tdx=false");
         }
     }
 

@@ -43,6 +43,7 @@ Container backend ต้องมี bubblewrap, helper ที่ติดตั
 |---|---|---|
 | `llama` (โมเดล local GGUF) | `--features llama` (ดู chain ใน `docs/testing.md`) | cmake + toolchain C++ (build `llama-cpp-2`), ไฟล์ `.gguf` |
 | `microvm` (บูต guest จริง) | `--features microvm` (หรือ `aivm-cli/microvm` ทั้งสาย) | ของในข้อ 2 + pins (ดู `docs/microvm.md`) |
+| `hardware` (TEE skeleton) | `--features hardware` (หรือ `aivm-cli/hardware` ทั้งสาย) | `/dev/kvm` + `qemu-system-x86_64` + `mkfs.ext4`/`debugfs`/`ldd` (เหมือนข้อ 2 แต่ใช้ QEMU แทน firecracker) + pins (ดู `docs/hardware.md`); TEE จริงต้อง `/dev/sev` (SEV-SNP) หรือ `/dev/tdx_guest` (TDX) + `swtpm` ถ้าเปิด vTPM |
 | `graphify` (`make query/path/explain`) | ไบนารี `graphify` ใน `PATH` | ใช้ค้นโค้ดผ่าน knowledge graph; ไม่มีก็ใช้ `grep` แทนได้ |
 
 ## 4. โครงที่ได้หลัง `create`

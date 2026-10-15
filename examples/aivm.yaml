@@ -25,6 +25,20 @@ runtime:
 #     namespace: true        # namespace isolation (pid, net, mnt, ipc, uts)
 #     drop_caps: true        # drop all capabilities
 #     no_new_privs: true     # no new privileges
+# ตัวอย่าง isolation ระดับ hardware (TEE skeleton) — ต้อง build ด้วย
+# `--features hardware` พร้อมบล็อก pins ข้างล่าง (ดู docs/hardware.md):
+# isolation: hardware
+# hardware:
+#   tee_type: generic            # sevsnp | tdx | generic (generic = จำลอง ไม่ isolate จริง)
+#   attestation_mode: none       # strict | best_effort | none (generic + strict = บูตไม่ขึ้น)
+#   kernel_path: /home/USER/.local/share/aivm/hardware/vmlinux.bin
+#   kernel_sha256: "<sha256 64 hex ของไฟล์ข้างบน>"
+#   rootfs_path: /home/USER/.local/share/aivm/hardware/rootfs.ext4
+#   rootfs_sha256: "<sha256 64 hex ของไฟล์ข้างบน>"
+#   qemu_sha256: "<sha256 ของไบนารี qemu-system-x86_64>"  # ไม่ตั้ง = ไม่ pin VMM
+#   vcpu_count: 2      # 1..=256
+#   mem_mb: 2048       # 1024..=1048576
+#   launch_timeout_secs: 120   # 10..=1800
 
 model:
   provider: echo
@@ -36,9 +50,10 @@ model:
   #     model_path: /models/model.gguf
   #     ctx_size: 8192
   #     gpu_layers: 0      # -1 = ยกทุกชั้นไป GPU
-  #     temperature: 0.7
-  #     top_p: 0.95
-  #     top_k: 40
+  #     seed: 42           # deterministic seed (default: 42)
+  #     temperature: 0.0   # greedy/deterministic (default: 0.0)
+  #     top_p: 0.1         # (default: 0.1)
+  #     top_k: 1           # greedy (default: 1)
   #     max_tokens: 2048
 
 resources:

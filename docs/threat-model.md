@@ -57,6 +57,10 @@ deadline) — serial log ของ guest ใช้สืบย้อนเท่
 - **test ที่มี**: `exec_microvm_level_must_deny`, `garbage_kernel_fails_closed`,
   `tampered_artifact_fails_closed_as_invalid`, `wrong_fc_pin_fails_closed_as_invalid`,
   `missing_artifact_fails_closed_as_invalid`, `i10_structural_enforcement`
+  (+ ฝั่ง hardware: `wrong_qemu_pin…`, `tampered_alt_artifact…` (kernel/initrd/rootfs),
+  `kernel-copy-reverify` ผ่าน `rootfs-copy-reverify-failed` pattern,
+  `machine_flag_appears_exactly_once`, `guest_network_is_always_disabled`,
+  `shell_metachars_stay_single_argv`, `exec_with_tampered_hardware_artifact_denied_with_audit`)
 - **DNA ช่วยตรงนี้เต็ม ๆ**: layout/image/profile ไม่ซ้ำต่อบูต → exploit ที่ผูก
   กับค่าตายตัวใช้ไม่ได้ทุกครั้ง (ดู §3)
 
@@ -80,6 +84,9 @@ deadline) — serial log ของ guest ใช้สืบย้อนเท่
 - **test ที่มี**: `tampered_artifact…`, `wrong_fc_pin…`, `missing_artifact…`,
   `exec_with_tampered_artifact_denied_with_audit`,
   `exec_with_tampered_fc_pin_denied_with_audit`
+  (+ ฝั่ง hardware: kernel/initrd/rootfs ทุกไฟล์ verify ที่ประตู + verify
+  สำเนาซ้ำหลังก็อป (`-copy-reverify-failed` = `Compromise`), pin QEMU ผ่าน
+  `qemu_sha256`, G5 alt images verify ทุกชุดก่อนสุ่ม)
 - **หมายเหตุ**: monitoring ไม่ช่วย A5 — ต้องกันที่ verify (กันได้ 100% ถ้า
   trust root ของ hash ไม่แตก)
 
@@ -102,7 +109,7 @@ DNA ทุกครั้งต้องลง audit (ไม่รวม secret)
 ## 4. Non-goals (ไม่กัน ไม่แกล้งว่ามี)
 
 - A6: host/operator compromise (trust root)
-- Hardware side-channel (spec §Level 3 อนาคต)
+- Hardware side-channel (Level 3 เป็น skeleton อยู่ — side-channel ยังไม่กัน)
 - โมเดลโกหกเรื่อง confidence/justification (กันด้วย guard ฝั่ง operator แทน)
 - Availability ภายใต้ DoS จากภายนอก (fail-closed อาจปฏิเสธงานตัวเอง — ยอมรับ)
 

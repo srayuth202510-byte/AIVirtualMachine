@@ -421,7 +421,14 @@ fn verify_attestation(cfg: &HardwareConfig) -> Result<(), (SandboxError, RunVerd
     let tool = match cfg.tee_type {
         TeeType::Sevsnp => "sev-tool",
         TeeType::Tdx => "tdx-attest",
-        TeeType::Generic => unreachable!("generic handled above"),
+        // generic ออกตั้งแต่ข้างบนแล้ว — แขนนี้กัน match ไม่ครบ (fail-closed
+        // ไม่ panic ถ้า logic ข้างบนเปลี่ยนในอนาคต)
+        TeeType::Generic => {
+            return Err((
+                SandboxError::Disabled("generic TEE has nothing to attest".into()),
+                RunVerdict::Clean,
+            ));
+        }
     };
     if which::which(tool).is_err() {
         return Err((
