@@ -25,6 +25,12 @@ fn run() -> Result<(), WorkerError> {
         .map_err(|e| WorkerError::Failed(format!("read model config: {e}")))?;
     let config: ModelConfig = serde_json::from_str(&config_text)
         .map_err(|e| WorkerError::Failed(format!("parse model config JSON: {e}")))?;
+    // The worker must load the backend inline. Clearing worker_path prevents
+    // recursive worker spawning when the control plane configured a worker.
+    let mut config = config;
+    if let Some(local) = config.local.as_mut() {
+        local.worker_path = None;
+    }
     let model = create_model(&config).map_err(|e| WorkerError::Failed(e.to_string()))?;
     let limits = InferenceLimits::default();
     let stdin = io::stdin();

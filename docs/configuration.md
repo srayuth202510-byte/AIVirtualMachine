@@ -180,8 +180,8 @@ provider (`openai`/`anthropic`) ถือเป็น placeholder เดิม�
 ต้องเป็น JSON ที่มี field `model_sha256` ตรงกับ config; tokenizer/config สามารถ
 pin เพิ่มเติมได้ด้วย `*_path` และ `*_sha256` คู่กัน
 
-ตั้ง `worker_path` เพื่อให้คำสั่ง `aivm reason` ส่ง inference ผ่าน standalone
-worker process; หากไม่ตั้งค่า จะใช้ backend ใน process เดิมเพื่อความเข้ากันได้ย้อนหลัง
+ตั้ง `worker_path` เพื่อให้ runtime และคำสั่ง `aivm reason` ส่ง inference ผ่าน
+standalone worker process; หากไม่ตั้งค่า จะใช้ backend ใน process เดิมเพื่อความเข้ากันได้ย้อนหลัง
 
 ตั้งค่า `model.local` ต่อไปนี้สำหรับ production ที่ต้องการ deterministic output:
 

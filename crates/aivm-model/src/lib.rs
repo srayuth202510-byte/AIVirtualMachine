@@ -264,6 +264,68 @@ pub trait Model: Send + Sync {
     fn max_context(&self) -> usize;
 }
 
+/// Model adapter that keeps inference in the standalone worker process.
+pub struct WorkerModel {
+    client: worker::WorkerClient,
+    config: ModelConfig,
+    limits: worker::InferenceLimits,
+}
+
+impl WorkerModel {
+    fn new(config: ModelConfig, worker_path: String) -> Result<Self, ModelError> {
+        let local = config.local.as_ref().ok_or_else(|| {
+            ModelError::LoadFailed("local config required for worker model".into())
+        })?;
+        Ok(Self {
+            client: worker::WorkerClient::new(worker_path),
+            limits: worker::InferenceLimits {
+                max_context_tokens: local.ctx_size,
+                max_output_tokens: local.max_tokens,
+                timeout_ms: 120_000,
+                ..worker::InferenceLimits::default()
+            },
+            config,
+        })
+    }
+}
+
+impl Model for WorkerModel {
+    fn reason(&self, context: &str) -> Result<String, ModelError> {
+        let request = worker::InferenceRequest {
+            protocol_version: worker::PROTOCOL_VERSION,
+            request_id: format!("infer-{}", uuid_like_id()),
+            model_id: self.config.name.clone(),
+            prompt: context.to_string(),
+            max_output_tokens: self.limits.max_output_tokens,
+            timeout_ms: self.limits.timeout_ms,
+        };
+        self.client
+            .infer(&self.config, request, &self.limits)
+            .map_err(|e| ModelError::InferenceFailed(e.to_string()))
+            .and_then(|response| {
+                response
+                    .output
+                    .ok_or_else(|| ModelError::InferenceFailed("worker returned no output".into()))
+            })
+    }
+
+    fn token_count(&self, text: &str) -> usize {
+        text.split_whitespace().count()
+    }
+
+    fn max_context(&self) -> usize {
+        self.limits.max_context_tokens
+    }
+}
+
+fn uuid_like_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".into())
+}
+
 /// โมเดลออฟไลน์แบบ deterministic (ไว้ใช้ในเทสต์ CI และเดโม MVP)
 pub struct EchoModel {
     pub name: String,
@@ -461,7 +523,17 @@ pub fn create_model(config: &ModelConfig) -> Result<Box<dyn Model>, ModelError> 
         "echo" => Ok(Box::new(EchoModel {
             name: config.name.clone(),
         })),
-        "local" => create_local_model(config),
+        "local" => {
+            if let Some(worker_path) = config
+                .local
+                .as_ref()
+                .and_then(|local| local.worker_path.clone())
+            {
+                Ok(Box::new(WorkerModel::new(config.clone(), worker_path)?))
+            } else {
+                create_local_model(config)
+            }
+        }
         "openai" => Ok(Box::new(providers::OpenAIProvider::new(
             config.openai_config(),
         )?)),
@@ -636,6 +708,32 @@ mod tests {
         assert!(verify_model_file(&path, "zz").is_err());
         assert!(verify_model_file(&path, "abcd").is_err());
         assert!(verify_model_file(dir.join("missing.gguf").to_str().unwrap(), &good).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_path_routes_inference_through_child_process() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aivm-worker-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("worker.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nread request\nprintf '%s\\n' '{\"protocol_version\":1,\"request_id\":\"test\",\"output\":\"worker-ok\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"elapsed_ms\":0},\"termination\":\"completed\",\"artifact_verified\":true,\"applied_limits\":[],\"audit_id\":null}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut local = LocalModelConfig::default();
+        local.worker_path = Some(script.to_string_lossy().into_owned());
+        let config = ModelConfig {
+            provider: "local".into(),
+            name: "worker-test".into(),
+            local: Some(local),
+            ..Default::default()
+        };
+        let model = create_model(&config).unwrap();
+        assert_eq!(model.reason("hello").unwrap(), "worker-ok");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

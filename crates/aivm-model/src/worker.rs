@@ -22,6 +22,24 @@ pub struct InferenceLimits {
     pub max_context_tokens: usize,
     pub max_output_tokens: usize,
     pub timeout_ms: u64,
+    #[serde(default = "default_memory_mb")]
+    pub memory_mb: u64,
+    #[serde(default = "default_cpu_seconds")]
+    pub cpu_seconds: u64,
+    #[serde(default = "default_pids_max")]
+    pub pids_max: u64,
+}
+
+fn default_memory_mb() -> u64 {
+    1024
+}
+
+fn default_cpu_seconds() -> u64 {
+    120
+}
+
+fn default_pids_max() -> u64 {
+    64
 }
 
 impl Default for InferenceLimits {
@@ -30,6 +48,9 @@ impl Default for InferenceLimits {
             max_context_tokens: 8192,
             max_output_tokens: 2048,
             timeout_ms: 120_000,
+            memory_mb: default_memory_mb(),
+            cpu_seconds: default_cpu_seconds(),
+            pids_max: default_pids_max(),
         }
     }
 }
@@ -146,12 +167,39 @@ impl WorkerClient {
         request: InferenceRequest,
         limits: &InferenceLimits,
     ) -> Result<InferenceResponse, WorkerError> {
-        let mut child = Command::new(&self.executable)
+        let mut command = Command::new(&self.executable);
+        command
             .arg("--config")
             .arg(config_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .env_clear();
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let memory_bytes = limits
+                .memory_mb
+                .checked_mul(1024 * 1024)
+                .ok_or_else(|| WorkerError::LimitExceeded("memory bytes overflow".into()))?;
+            let cpu_seconds = limits.cpu_seconds;
+            let pids_max = limits.pids_max;
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    set_limit(libc::RLIMIT_CPU, cpu_seconds, cpu_seconds)?;
+                    set_limit(libc::RLIMIT_AS, memory_bytes, memory_bytes)?;
+                    set_limit(libc::RLIMIT_NPROC, pids_max, pids_max)?;
+                    Ok(())
+                });
+            }
+        }
+        let mut child = command
             .spawn()
             .map_err(|e| WorkerError::Failed(format!("spawn worker: {e}")))?;
         let mut stdin = child
@@ -211,6 +259,19 @@ impl WorkerClient {
     }
 }
 
+#[cfg(unix)]
+fn set_limit(resource: libc::__rlimit_resource_t, soft: u64, hard: u64) -> std::io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: soft as libc::rlim_t,
+        rlim_max: hard as libc::rlim_t,
+    };
+    if unsafe { libc::setrlimit(resource, &limit) } != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn write_ephemeral_config(config: &ModelConfig) -> Result<PathBuf, WorkerError> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -251,6 +312,7 @@ mod tests {
             max_context_tokens: 32,
             max_output_tokens: 32,
             timeout_ms: 2_000,
+            ..InferenceLimits::default()
         };
         assert!(request().validate(&limits, 4).is_ok());
     }

@@ -48,6 +48,10 @@ worker ไม่มีสิทธิ์อ่าน secrets, audit writer, supe
 5. เพิ่ม container และ MicroVM launcher ตาม deployment tier
 6. เพิ่ม streaming, batching และ backend adapters หลัง boundary ผ่านการทดสอบ
 
+ปัจจุบัน `model.local.worker_path` เปิดใช้ worker-backed model ให้กับ runtime
+และคำสั่ง `aivm reason` แล้ว โดยยังต้องเลือก executable ที่ผ่านการติดตั้งและตรวจสอบ
+โดย operator เอง
+
 ## ขอบเขตความเชื่อถือ
 
 การออกแบบ baseline เชื่อถือ host, kernel และ operator ตาม threat model ปัจจุบัน

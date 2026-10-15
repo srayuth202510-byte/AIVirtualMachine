@@ -438,6 +438,7 @@ fn main() -> Result<(), AnyErr> {
                         max_context_tokens: local.ctx_size,
                         max_output_tokens: local.max_tokens,
                         timeout_ms: 120_000,
+                        ..aivm_model::worker::InferenceLimits::default()
                     };
                     let model_config = aivm_model::ModelConfig {
                         provider: config.model.provider.clone(),
