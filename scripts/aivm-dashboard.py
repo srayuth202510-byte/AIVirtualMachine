@@ -20,6 +20,7 @@ import sqlite3
 from collections import defaultdict
 import json as _json
 import html
+import hashlib
 
 LOG_PATH = os.environ.get("AIVM_AUDIT_LOG", "/var/log/aivm/audit.log")
 PORT = 8000
@@ -28,9 +29,14 @@ MAX_ENTRIES = 500
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-init_sql = "CREATE TABLE IF NOT EXISTS events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL NOT NULL, type TEXT NOT NULL, path TEXT, reason TEXT); CREATE INDEX IF NOT EXISTS idx_ts ON events(timestamp);"
+init_sql = "CREATE TABLE IF NOT EXISTS events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL NOT NULL, type TEXT NOT NULL, path TEXT, reason TEXT, fingerprint TEXT UNIQUE); CREATE INDEX IF NOT EXISTS idx_ts ON events(timestamp);"
 conn = sqlite3.connect(DB_PATH)
 conn.executescript(init_sql)
+try:
+    conn.execute("ALTER TABLE events ADD COLUMN fingerprint TEXT")
+except sqlite3.OperationalError:
+    pass
+conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_fingerprint ON events(fingerprint)")
 conn.commit()
 
 
@@ -45,10 +51,36 @@ def purge_old() -> None:
 
 
 def add_event(ev_type: str, path: str, reason: str) -> None:
-    with open(LOG_PATH, "a") as f:
-        ts = time.time()
-        f.write("expect %s -> deny:denied: %s #ts=%f\n" % (ev_type, reason, ts))
-    conn.execute("INSERT INTO events (timestamp, type, path, reason) VALUES (?, ?, ?, ?)", (time.time(), ev_type, path, reason))
+    conn.execute(
+        "INSERT OR IGNORE INTO events (timestamp, type, path, reason, fingerprint) VALUES (?, ?, ?, ?, ?)",
+        (time.time(), ev_type, path, reason, hashlib.sha256(f"{time.time_ns()}:{ev_type}:{path}:{reason}".encode()).hexdigest()),
+    )
+    conn.commit()
+    purge_old()
+
+
+def sync_audit_log() -> None:
+    """Import real AIVM JSONL audit decisions without rewriting the source log."""
+    try:
+        with open(LOG_PATH, encoding="utf-8") as source:
+            lines = source.readlines()[-MAX_ENTRIES:]
+    except OSError:
+        return
+    for line in lines:
+        try:
+            record = _json.loads(line)
+        except _json.JSONDecodeError:
+            continue
+        decision = str(record.get("decision", "")).lower()
+        result = str(record.get("result", ""))
+        if "deny" not in decision and not any(word in result.lower() for word in ("budget", "quarantine")):
+            continue
+        fingerprint = hashlib.sha256(line.rstrip("\n").encode()).hexdigest()
+        conn.execute(
+            "INSERT OR IGNORE INTO events (timestamp, type, path, reason, fingerprint) VALUES (?, ?, ?, ?, ?)",
+            (float(record.get("timestamp", time.time())), record.get("action", "unknown"),
+             record.get("resource", ""), result or record.get("rule_matched", ""), fingerprint),
+        )
     conn.commit()
     purge_old()
 
@@ -77,6 +109,7 @@ def get_stats() -> dict:
 class DashboardHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.rstrip("/")
+        sync_audit_log()
         entries = parse_log(LOG_PATH)
         stats = get_stats()
 
