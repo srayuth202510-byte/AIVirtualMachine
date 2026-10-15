@@ -496,8 +496,6 @@ mod linux {
             filter.as_raw_fd().to_string().into(),
             OsString::from("--json-status-fd"),
             status_file.as_raw_fd().to_string().into(),
-            OsString::from("--"),
-            OsString::from("/run/aivm-container-init"),
         ]);
 
         // Avoid ARG_MAX, keep injected values out of the launcher's command line.
@@ -528,12 +526,20 @@ mod linux {
         let fsize = file_limit.min(SANDBOX_FS_MB * 1024 * 1024);
         // Execute the validated inode; a path swap cannot substitute another launcher.
         let mut cmd = Command::new(format!("/proc/self/fd/{}", bwrap.as_raw_fd()));
-        cmd.args(["--args", &arg_file.as_raw_fd().to_string()])
-            .env_clear()
-            .current_dir("/")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        // --args expands options only: bubblewrap looks for COMMAND on its
+        // original argv. Keep the fixed trusted helper there, while mounts
+        // and injected environment values remain in the sealed argument fd.
+        cmd.args([
+            "--args",
+            &arg_file.as_raw_fd().to_string(),
+            "--",
+            "/run/aivm-container-init",
+        ])
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
         unsafe {
             cmd.pre_exec(move || {
                 if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0

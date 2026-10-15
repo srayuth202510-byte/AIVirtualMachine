@@ -18,6 +18,12 @@
 
 การเลือก cloud model และการกู้ state อธิบายเพิ่มเติมใน [configuration.md](configuration.md)
 
+ทดสอบนอก sandbox บน host จริงเพิ่มเติมแล้ว: Local inference และ MicroVM ผ่าน
+รวมถึง QEMU Generic boot; Container boundary test ผ่านหลังติดตั้ง helper
+และแก้การส่งคำสั่งจาก launcher ไปยัง bubblewrap
+รายละเอียดและข้อจำกัดความถูกต้องของ summary จากโมเดลอยู่ใน
+[host-validation-2026-10-15.md](host-validation-2026-10-15.md)
+
 ## ผลตรวจที่ต้องแก้ เรียงตามความสำคัญ
 
 ### 1. P1 — Cache ข้ามข้อจำกัด `max_bytes` ของ read capability

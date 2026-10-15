@@ -134,3 +134,13 @@ AIVM_CONTAINER_TEST_CONFIG=/tmp/aivm-container-test.json make test-container
 GPU device absence, execute denial, network syscall denial, PIDs/RAM limits,
 timeout และ cleanup โดยไม่ fallback หรือ skip เมื่อ host ไม่พร้อม
 ต้องมี C compiler (`cc`) สำหรับสร้าง adversarial payload
+
+บน host ที่ใช้ systemd และเปิด user delegation ได้ หลังติดตั้ง root-owned helper
+ตามขั้นตอนข้างต้น ใช้สคริปต์นี้เพื่อเตรียม transient delegated service และรัน test:
+
+```bash
+sh scripts/test-container-host.sh
+```
+
+สคริปต์แยก runner เข้า child cgroup และเปิด controllers ใน delegation root
+จึงไม่ต้องเตรียม `/sys/fs/cgroup/aivm` หรือแก้ global sysctl
