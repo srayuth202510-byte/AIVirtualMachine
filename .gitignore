@@ -3,3 +3,4 @@
 audit.log*
 /vms/
 /graphify-out/
+__pycache__/

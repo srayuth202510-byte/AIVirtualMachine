@@ -74,6 +74,9 @@ enum Cmd {
         /// จำนวนก้าวสูงสุด
         #[arg(long, default_value_t = aivm_runtime::agent::DEFAULT_MAX_STEPS)]
         max_steps: usize,
+        /// Emit the structured agent result for scripts.
+        #[arg(long)]
+        json: bool,
     },
     /// สร้าง inverted index สำหรับ workspace
     Index {
@@ -182,6 +185,7 @@ fn main() -> Result<(), AnyErr> {
             name,
             task,
             max_steps,
+            json,
         } => {
             if sup.status(&name).is_none() {
                 eprintln!("vm '{name}' not registered under this --root; `create` it first");
@@ -191,6 +195,10 @@ fn main() -> Result<(), AnyErr> {
             let run = sup
                 .run_agent(&name, &task, max_steps, Some(&ws))
                 .map_err(err)?;
+            if json {
+                println!("{}", serde_json::to_string(&run)?);
+                return Ok(());
+            }
             if !run.subtasks.is_empty() {
                 println!("subtasks: {}", run.subtasks.join(" -> "));
             }

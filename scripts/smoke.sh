@@ -28,6 +28,19 @@ $BIN run coder | grep -q "intent from context" || { echo "FAIL: run"; exit 1; }
 echo "== agent loop (Phase 5): non-conforming output is denied, nothing runs =="
 $BIN agent coder "read the seed file" | grep -q "invalid intent" || { echo "FAIL: agent loop"; exit 1; }
 
+echo "== structured agent output for scripts =="
+$BIN agent coder "read the seed file" --max-steps 1 --json > "$ROOT/agent.json"
+python3 - "$ROOT/agent.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as file:
+    run = json.load(file)
+assert run["stopped"] == "max-steps"
+assert run["summary"] is None
+assert len(run["steps"]) == 1
+assert run["steps"][0]["action"] == "invalid-intent"
+PY
+
 echo "== transition (dynamic grants) =="
 $BIN transition coder ANALYZE | grep -q "granted 0" || { echo "FAIL: ANALYZE grant"; exit 1; }
 $BIN transition coder MODIFY --confidence 0.95 | grep -q "granted 1" || { echo "FAIL: MODIFY grant"; exit 1; }

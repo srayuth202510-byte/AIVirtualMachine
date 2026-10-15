@@ -44,6 +44,11 @@ sh scripts/llama-smoke.sh \
 ดังนั้น model backend และเส้นทาง tool ทำงานจริง แต่ยังไม่นับว่างาน agent
 ที่ต้องสรุปข้อมูลอย่างถูกต้องผ่าน การตอบ `done` ของโมเดลไม่ใช่หลักฐานว่างานถูกต้อง
 
+เพิ่มสคริปต์ช่วยอ่านและตรวจคำตอบแล้วใน [qwen-assistant.md](qwen-assistant.md)
+เมื่อลองไฟล์เดิม Qwen ตอบตรงหลัง feedback ในครั้งที่ 2 สคริปต์ยืนยันทั้ง
+tool read และการคัดลอกเนื้อหาตรง snapshot ก่อนคืน `verified: true`
+ผลนี้ยืนยันการคัดลอกด้วยตัวช่วย ยังไม่ยืนยันความถูกต้องของ summary อิสระ
+
 ## MicroVM จริง
 
 host เปิด `/dev/kvm` ได้และคืน KVM API version 12 มี Firecracker อยู่เดิม

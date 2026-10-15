@@ -107,6 +107,8 @@ crates/
 
 ## เอกสาร
 
+- [`docs/qwen-assistant.md`](./docs/qwen-assistant.md) — สคริปต์ช่วย Qwen อ่านไฟล์ ตรวจคำตอบ และ retry เมื่อไม่ตรงหลักฐาน
+
 - [`docs/container.md`](./docs/container.md) — bubblewrap backend + delegated cgroups v2
 - [`docs/setup.md`](./docs/setup.md) — ติดตั้ง Rust, Firecracker, เครื่องมือ host
 - [`docs/configuration.md`](./docs/configuration.md) — `aivm.yaml` ทุกบล็อก + defaults + ตัวอย่าง microvm

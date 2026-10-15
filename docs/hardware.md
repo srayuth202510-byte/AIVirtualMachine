@@ -1,8 +1,8 @@
 # Hardware Isolation — Level 3 (skeleton, fail-closed)
 
 สถานะ: 🚧 **skeleton** — ประตู fail-closed ครบทุกลำดับ (spec/shape/supply-chain/host)
-โค้ดรัน workload พร้อมแล้ว (drive-stuffing แบบเดียวกับ MicroVM) แต่**ยังไม่เคย
-บูตจริงบนเครื่องที่มี KVM** (รอ `AIVM_HARDWARE_PINS` — ดูข้างล่าง) และ
+โค้ดรัน workload (drive-stuffing แบบเดียวกับ MicroVM) และ **บูต QEMU/KVM
+โหมด Generic จริงผ่านแล้ว** (ดู [รายงาน host validation](host-validation-2026-10-15.md)) แต่ยังไม่ได้ยืนยัน TEE จริง และ
 attestation/measured-boot/disk-encryption/GPU ยังเป็น stub ที่รายงานซื่อสัตย์
 ใน `degraded` (ดู "ข้อจำกัดที่รู้ตัว" ท้ายไฟล์)
 
