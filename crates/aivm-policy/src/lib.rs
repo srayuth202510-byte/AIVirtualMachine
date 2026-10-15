@@ -796,8 +796,18 @@ pub fn validate_path_containment(
         return Ok(real);
     }
 
-    // Path ยังไม่มีอยู่ (write case) - ตรวจสอบ parent directories
-    let mut cur: Option<&Path> = Some(&normalized);
+    // Path ยังไม่มีอยู่ (write case) - หา deepest existing prefix แล้ว
+    // canonicalize ส่วนนั้น ตามด้วยส่วนที่เหลือ เพื่อบีบหน้าต่าง TOCTOU
+    let mut deepest_existing = normalized.as_path();
+    while !deepest_existing.exists() {
+        if let Some(parent) = deepest_existing.parent() {
+            deepest_existing = parent;
+        } else {
+            break;
+        }
+    }
+    // ตรวจสอบ symlink escape บน prefix ที่มีอยู่จริง
+    let mut cur: Option<&Path> = Some(deepest_existing);
     while let Some(p) = cur {
         if p == ws || p == Path::new("") {
             break;
@@ -815,8 +825,16 @@ pub fn validate_path_containment(
         }
         cur = p.parent();
     }
-
-    Ok(normalized)
+    // สร้าง path กลับ: prefix ที่ canonicalize แล้ว + ส่วนที่เหลือ
+    let canonical_prefix = std::fs::canonicalize(deepest_existing)
+        .map_err(|e| format!("prefix canonicalize failed: {e}"))?;
+    if canonical_prefix != ws && !canonical_prefix.starts_with(&ws) {
+        return Err(format!("prefix escapes workspace: {requested}"));
+    }
+    let remainder = normalized
+        .strip_prefix(deepest_existing)
+        .map_err(|_| format!("internal prefix mismatch"))?;
+    Ok(canonical_prefix.join(remainder))
 }
 
 /// Normalize path แบบ lexical (ตัด . และ ..)
