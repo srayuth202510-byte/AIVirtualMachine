@@ -64,7 +64,8 @@ class JudgeTests(unittest.TestCase):
             [], [],
             [vote("qwen", origin="qwen"), vote("qwen", origin="qwen"),
              vote("q2", origin="qwen2"), vote("a1", verdict="abstain")])
-        self.assertEqual(verdict["votes"], {"guilty": 2, "not_guilty": 0, "abstained": 1})
+        self.assertEqual(verdict["votes"], {"guilty": 2, "not_guilty": 0, "abstained": 1,
+                                              "timed_out": 0})
         # โหวตถึง quorum แต่แหล่งอิสระมี 1 (origin ซ้ำนับครั้งเดียว) -> หลักฐานไม่พอ
         self.assertEqual(verdict["outcome"], "insufficient-evidence")
 
@@ -98,6 +99,32 @@ class JudgeTests(unittest.TestCase):
         table = court.decision_table()
         self.assertEqual(table[0]["outcome"], "rejected-supreme-law")
         self.assertIn("unanimous", table[0]["note"])
+
+    def test_timed_out_votes_empower_nothing(self):
+        votes = court.simulate_jury(
+            [{"voter": "j1", "origin": "r1", "verdict": "guilty", "latency_secs": 5},
+             {"voter": "j2", "origin": "r2", "verdict": "guilty", "latency_secs": 999}],
+            timeout_secs=10)
+        self.assertEqual([v["verdict"] for v in votes], ["guilty", "timeout"])
+        verdict = court.judge(base_case(), [ev("v1"), ev("v2", source="rule")],
+                              [], [], votes)
+        self.assertEqual(verdict["votes"]["timed_out"], 1)
+        self.assertEqual(verdict["outcome"], "below-quorum")
+
+    def test_contested_tie_downgrades_one_level(self):
+        votes = [vote("j1"), vote("j2", origin="o2"),
+                 vote("n1", verdict="not-guilty", origin="o3"),
+                 vote("n2", verdict="not-guilty", origin="o4")]
+        verdict = court.judge(base_case(), [ev("v1"), ev("v2", source="rule")],
+                              [], [], votes)
+        self.assertEqual((verdict["outcome"], verdict["action"]), ("decided", "restrict"))
+        self.assertTrue(any(c.startswith("contested-tie:") for c in verdict["conditions"]))
+
+    def test_simulate_jury_rejects_malformed_specs(self):
+        with self.assertRaises(ValueError):
+            court.simulate_jury([], timeout_secs=10)
+        with self.assertRaises(ValueError):
+            court.simulate_jury([{"voter": "j1"}], timeout_secs=10)
 
 
 if __name__ == "__main__":

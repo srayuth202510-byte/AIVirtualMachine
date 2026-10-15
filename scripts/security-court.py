@@ -119,9 +119,28 @@ def validate_vote(item):
     _check_id(item["voter"], "voter")
     if not isinstance(item["origin"], str) or not item["origin"]:
         raise ValueError("invalid vote origin")
-    if item["verdict"] not in {"guilty", "not-guilty", "abstain"}:
+    if item["verdict"] not in {"guilty", "not-guilty", "abstain", "timeout"}:
         raise ValueError("unknown vote verdict")
     return item
+
+
+def simulate_jury(specs, timeout_secs):
+    """ลูกขุนจำลองระยะ 2: ช้ากว่าเส้นตายกลายเป็น timeout (ไม่นับฝั่งใด) determinism ล้วน."""
+    if not isinstance(timeout_secs, int) or timeout_secs < 0:
+        raise ValueError("timeout_secs must be >= 0")
+    if not isinstance(specs, list) or not specs:
+        raise ValueError("specs must be a non-empty list")
+    votes = []
+    for spec in sorted(specs, key=lambda s: (s.get("voter", ""), s.get("origin", ""))):
+        if not isinstance(spec, dict) or set(spec) != {"voter", "origin", "verdict", "latency_secs"}:
+            raise ValueError("juror spec fields must be exactly voter, origin, verdict, latency_secs")
+        if spec["verdict"] not in {"guilty", "not-guilty", "abstain"}:
+            raise ValueError("unknown juror verdict")
+        if not isinstance(spec["latency_secs"], int) or spec["latency_secs"] < 0:
+            raise ValueError("latency_secs must be >= 0")
+        verdict = "timeout" if spec["latency_secs"] > timeout_secs else spec["verdict"]
+        votes.append({"voter": spec["voter"], "origin": spec["origin"], "verdict": verdict})
+    return votes
 
 
 def _unique_ids(items, field):
@@ -162,12 +181,14 @@ def judge(case, evidences, allegations, objections, votes):
     # แหล่งอิสระนับ (source, origin) ซ้ำครั้งเดียว (เรียกโมเดลตัวเดิมหลายรอบไม่นับซ้ำ)
     sources = sorted({(e["source"], e["origin"]) for e in usable})
 
-    # นับโหวตต่อ (voter, origin) ซ้ำครั้งเดียว งดออกเสียงไม่นับฝั่งใด
-    guilty_keys, not_guilty, abstained = set(), 0, 0
+    # นับโหวตต่อ (voter, origin) ซ้ำครั้งเดียว งดออกเสียง/timeout ไม่นับฝั่งใด
+    guilty_keys, not_guilty, abstained, timed_out = set(), 0, 0, 0
     for v in votes:
         key = (v["voter"], v["origin"])
         if v["verdict"] == "abstain":
             abstained += 1
+        elif v["verdict"] == "timeout":
+            timed_out += 1
         elif v["verdict"] == "guilty":
             guilty_keys.add(key)
         else:
@@ -201,6 +222,10 @@ def judge(case, evidences, allegations, objections, votes):
             # veto ลดความแรงหนึ่งระดับ (ไม่ใช่การยับยั้งลอยๆ ตรวจซ้ำได้)
             action = ACTIONS[SEVERITY[action] - 1]
             conditions.append(f"veto:{len(vetoes)}:downgraded-to:{action}")
+        if not_guilty >= guilty and SEVERITY[action] > SEVERITY["watch"]:
+            # คะแนนเท่ากัน (contested) ลดหนึ่งระดับ แยกเสี่ยงพอเฝ้าดูจากยืนยันว่าถูกยึด
+            action = ACTIONS[SEVERITY[action] - 1]
+            conditions.append(f"contested-tie:{guilty}v{not_guilty}:downgraded-to:{action}")
 
     return {
         "case_id": case["id"],
@@ -212,7 +237,8 @@ def judge(case, evidences, allegations, objections, votes):
         "evidence_used": sorted(e["id"] for e in usable),
         "evidence_excluded": excluded,
         "independent_sources": len(sources),
-        "votes": {"guilty": guilty, "not_guilty": not_guilty, "abstained": abstained},
+        "votes": {"guilty": guilty, "not_guilty": not_guilty,
+                  "abstained": abstained, "timed_out": timed_out},
     }
 
 
@@ -231,6 +257,10 @@ def decision_table():
          "action": "<requested>", "note": "capped at requested_action severity"},
         {"when": "quorum met, veto present", "outcome": "decided",
          "action": "<requested downgraded one level>", "note": "veto downgrades, never silently drops"},
+        {"when": "quorum met but not-guilty >= guilty", "outcome": "decided",
+         "action": "<requested downgraded one level, floor watch>", "note": "contested tie is not confirmation"},
+        {"when": "juror exceeds timeout", "outcome": "(per table)",
+         "action": "(vote recorded as timeout)", "note": "timeout counts for neither side"},
     ]
 
 

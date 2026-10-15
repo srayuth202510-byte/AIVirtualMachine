@@ -61,9 +61,11 @@ watcher/supervisor เดิม โดยเฉพาะกรณี config ผ�
   พร้อม decision table และตัวอย่างที่ควรอนุญาต/ปฏิเสธ
   (ทำแล้วใน `scripts/security-court.py` + `scripts/test_security_court.py`:
   `decision-table`, unanimous-override ปฏิเสธ, หลักฐานเสียถูกแยก, replay ซ้ำได้)
-- [ ] **ระยะ 2 — ผู้พิพากษาแบบ deterministic**
+- [x] **ระยะ 2 — ผู้พิพากษาแบบ deterministic**
   เริ่มจากลูกขุนจำลอง ทดสอบกฎสูงสุด, หลักฐานขาด, คะแนนเท่ากัน,
   timeout, ข้อมูลซ้ำ และโหวตเอกฉันท์ที่ขัดกฎ
+  (ทำแล้วใน `scripts/security-court.py`: `simulate_jury` แปลงช้าเกินเป็น
+  timeout, tie ลดหนึ่งระดับ, โหวตซ้ำ/งดออกเสียง/timeout ไม่นับซ้ำฝั่งใด)
 - [ ] **ระยะ 3 — ฝ่ายทักท้วงและลูกขุนหลายแหล่ง**
   เชื่อมกฎ/runtime/Qwen แบบ advisory ตรวจ schema และ evidence IDs
   ไม่ส่งคำสั่งจากข้อความโมเดลเข้า runtime
