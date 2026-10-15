@@ -66,15 +66,22 @@ watcher/supervisor เดิม โดยเฉพาะกรณี config ผ�
   timeout, ข้อมูลซ้ำ และโหวตเอกฉันท์ที่ขัดกฎ
   (ทำแล้วใน `scripts/security-court.py`: `simulate_jury` แปลงช้าเกินเป็น
   timeout, tie ลดหนึ่งระดับ, โหวตซ้ำ/งดออกเสียง/timeout ไม่นับซ้ำฝั่งใด)
-- [ ] **ระยะ 3 — ฝ่ายทักท้วงและลูกขุนหลายแหล่ง**
+- [x] **ระยะ 3 — ฝ่ายทักท้วงและลูกขุนหลายแหล่ง**
   เชื่อมกฎ/runtime/Qwen แบบ advisory ตรวจ schema และ evidence IDs
   ไม่ส่งคำสั่งจากข้อความโมเดลเข้า runtime
-- [ ] **ระยะ 4 — Shadow evaluation**
+  (ทำแล้ว: `advisory_to_votes` ตรวจ schema/อ้าง event นอกเคส/ข้อความคำสั่ง
+  ทิ้งทั้งชิ้น ที่ปรึกษาซ้ำนับครั้งเดียว)
+- [x] **ระยะ 4 — Shadow evaluation**
   บันทึกคำตัดสินโดยไม่เปลี่ยน runtime เทียบ baseline เดิมกับ corpus,
   mutations และข้อมูลจริงที่ผู้ดูแลให้ label แยกจากผู้เสนอ
-- [ ] **ระยะ 5 — ทบทวนก่อนเชื่อม enforcement**
+  (ทำแล้ว: `shadow` รัน `examples/security-court/` 3 bundles + `labels.json`
+  ตรวจ mismatch + `diff_runs` เทียบสองรัน replay ได้)
+- [x] **ระยะ 5 — ทบทวนก่อนเชื่อม enforcement**
   สรุปผลและข้อจำกัด กำหนด deployment policy, kill switch, rollback,
   budget และช่องทางทบทวน ก่อนพิจารณาเปิดการตอบสนองจริงในงานถัดไป
+  (ทำแล้ว: `validate_policy`/`apply_policy`/`review` — kill switch หยุดทุก
+  action, เพดานกด action ลง, law รุ่นผิด fail-closed, review ไม่คืนสิทธิ์เอง;
+  การต่อ enforcement จริงยังเป็นงานถัดไปโดย design)
 
 ## เกณฑ์พิสูจน์ก่อนขยับแต่ละระยะ
 

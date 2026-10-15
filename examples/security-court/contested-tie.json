@@ -1,0 +1,33 @@
+{
+  "case": {
+    "id": "contested-access",
+    "instance": "vm-a",
+    "session": "s-1",
+    "events": ["e1", "e2"],
+    "max_evidence_age_secs": 300,
+    "min_sources": 2,
+    "quorum": 2,
+    "requested_action": "quarantine",
+    "supreme_violation": false
+  },
+  "evidences": [
+    {"id": "audit-1", "source": "audit", "origin": "host",
+     "event_ids": ["e1"], "instance": "vm-a", "session": "s-1",
+     "age_secs": 12, "chain_ok": true},
+    {"id": "sig-1", "source": "runtime-signal", "origin": "host",
+     "event_ids": ["e2"], "instance": "vm-a", "session": "s-1",
+     "age_secs": 20, "chain_ok": true}
+  ],
+  "allegations": [
+    {"id": "a1", "event_ids": ["e1", "e2"], "requested_action": "quarantine"}
+  ],
+  "objections": [
+    {"id": "o1", "kind": "alternate-cause", "ref_evidence_ids": ["sig-1"]}
+  ],
+  "votes": [
+    {"voter": "j1", "origin": "rule", "verdict": "guilty"},
+    {"voter": "j2", "origin": "runtime", "verdict": "guilty"},
+    {"voter": "n1", "origin": "challenge-a", "verdict": "not-guilty"},
+    {"voter": "n2", "origin": "challenge-b", "verdict": "not-guilty"}
+  ]
+}

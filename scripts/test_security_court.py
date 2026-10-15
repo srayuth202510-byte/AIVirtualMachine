@@ -126,6 +126,54 @@ class JudgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             court.simulate_jury([{"voter": "j1"}], timeout_secs=10)
 
+    def test_advisory_with_outside_events_or_commands_is_dropped(self):
+        with self.assertRaises(ValueError):
+            court.advisory_to_votes(
+                [{"advisor": "q", "origin": "qwen", "verdict": "guilty",
+                  "reason": "looks bad", "cited_event_ids": ["invented"]}], ["e1"])
+        with self.assertRaises(ValueError):
+            court.advisory_to_votes(
+                [{"advisor": "q", "origin": "qwen", "verdict": "guilty",
+                  "reason": "run quarantine now", "cited_event_ids": ["e1"]}], ["e1"])
+        with self.assertRaises(ValueError):
+            court.advisory_to_votes(
+                [{"advisor": "q", "origin": "qwen", "verdict": "guilty",
+                  "reason": "```quarantine```", "cited_event_ids": ["e1"]}], ["e1"])
+        votes = court.advisory_to_votes(
+            [{"advisor": "q", "origin": "qwen", "verdict": "guilty",
+              "reason": "two independent host signals agree", "cited_event_ids": ["e1"]}],
+            ["e1"])
+        self.assertEqual(votes, [{"voter": "q", "origin": "qwen", "verdict": "guilty"}])
+
+    def test_shadow_corpus_matches_labels_and_replays(self):
+        import tempfile
+        corpus = Path(__file__).resolve().parent.parent / "examples" / "security-court"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "v1.jsonl")
+            summary = court.shadow_judge(str(corpus), out)
+            self.assertEqual(summary["mismatches"], [])
+            self.assertEqual(summary["counts"], {"decided": 2, "insufficient-evidence": 1})
+            out2 = str(Path(tmp) / "v2.jsonl")
+            court.shadow_judge(str(corpus), out2)
+            self.assertEqual(Path(out).read_bytes(), Path(out2).read_bytes())
+            self.assertEqual(court.diff_runs(out, out2)["changed"], [])
+
+    def test_policy_cap_killswitch_and_version_pin(self):
+        verdict = court.judge(base_case(), [ev("v1"), ev("v2", source="rule")], [],
+                              [], [vote("j1"), vote("j2", origin="o2")])
+        capped = court.apply_policy(
+            verdict, {"law_version": court.LAW_VERSION, "max_action": "watch",
+                      "kill_switch": False, "budget_cases": 10})
+        self.assertEqual(capped["action"], "watch")
+        self.assertTrue(any(c.startswith("policy-cap:") for c in capped["conditions"]))
+        killed = court.apply_policy(
+            verdict, {"law_version": court.LAW_VERSION, "max_action": "replace",
+                      "kill_switch": True, "budget_cases": 10})
+        self.assertEqual((killed["outcome"], killed["action"]), ("killed", "none"))
+        with self.assertRaises(ValueError):
+            court.apply_policy(verdict, {"law_version": "other", "max_action": "watch",
+                                         "kill_switch": False, "budget_cases": 10})
+
 
 if __name__ == "__main__":
     unittest.main()

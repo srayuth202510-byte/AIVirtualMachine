@@ -1,0 +1,5 @@
+{
+  "clear-quarantine.json": ["decided", "quarantine"],
+  "weak-evidence.json": ["insufficient-evidence", "none"],
+  "contested-tie.json": ["decided", "restrict"]
+}

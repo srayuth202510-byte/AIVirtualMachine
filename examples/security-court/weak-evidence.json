@@ -1,0 +1,27 @@
+{
+  "case": {
+    "id": "weak-signal",
+    "instance": "vm-a",
+    "session": "s-1",
+    "events": ["e1"],
+    "max_evidence_age_secs": 300,
+    "min_sources": 2,
+    "quorum": 2,
+    "requested_action": "restrict",
+    "supreme_violation": false
+  },
+  "evidences": [
+    {"id": "audit-1", "source": "audit", "origin": "host",
+     "event_ids": ["e1"], "instance": "vm-a", "session": "s-1",
+     "age_secs": 12, "chain_ok": true}
+  ],
+  "allegations": [
+    {"id": "a1", "event_ids": ["e1"], "requested_action": "restrict"}
+  ],
+  "objections": [
+    {"id": "o1", "kind": "evidence-gap", "ref_evidence_ids": ["audit-1"]}
+  ],
+  "votes": [
+    {"voter": "j1", "origin": "rule", "verdict": "guilty"}
+  ]
+}

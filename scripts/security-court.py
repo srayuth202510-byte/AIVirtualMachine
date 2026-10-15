@@ -242,6 +242,155 @@ def judge(case, evidences, allegations, objections, votes):
     }
 
 
+# ระยะ 3: รับความเห็นโมเดลเป็น advisory เท่านั้น (ไม่ส่งคำสั่งจากข้อความโมเดลเข้า runtime)
+# - schema เข้มเหมือนเดิม ฟิลด์เกิน/ชนิดผิด/อ้าง event นอกเคส = ทิ้งทั้งชิ้น (ValueError)
+# - reason ที่มีลักษณะคำสั่ง (code fence หรือบรรทัดสั่งการ) = ทิ้งทั้งชิ้น
+_COMMAND_RE = re.compile(r"(?m)^\s*(run|exec|allow|deny|quarantine|replace|approve)\b")
+
+
+def validate_advisory(item, known_events):
+    """schema ของความเห็นโมเดลหนึ่งชิ้น (advisory ไม่มีสิทธิ์เพิ่ม permissions)."""
+    if not isinstance(item, dict) or set(item) != {
+            "advisor", "origin", "verdict", "reason", "cited_event_ids"}:
+        raise ValueError("advisory fields must be exactly advisor, origin, verdict, "
+                         "reason, cited_event_ids")
+    _check_id(item["advisor"], "advisor")
+    if not isinstance(item["origin"], str) or not item["origin"]:
+        raise ValueError("invalid advisory origin")
+    if item["verdict"] not in {"guilty", "not-guilty", "abstain"}:
+        raise ValueError("unknown advisory verdict")
+    if not isinstance(item["reason"], str) or not item["reason"] or len(item["reason"]) > 2000:
+        raise ValueError("reason must be 1..2000 chars")
+    if "```" in item["reason"] or _COMMAND_RE.search(item["reason"]):
+        # ข้อความโมเดลห้ามมีคำสั่ง/โค้ดที่อาจถูกส่งต่อเข้า runtime
+        raise ValueError("advisory reason must not contain commands or code fences")
+    if (not isinstance(item["cited_event_ids"], list) or not item["cited_event_ids"]
+            or any(not isinstance(e, str) for e in item["cited_event_ids"])):
+        raise ValueError("cited_event_ids must be a non-empty string list")
+    if any(e not in known_events for e in item["cited_event_ids"]):
+        # อ้าง event นอกเคส = หลักฐานเท็จ ไม่นับและไม่ส่งต่อ
+        raise ValueError("advisory cites events outside the case")
+    return item
+
+
+def advisory_to_votes(advisories, known_events):
+    """แปลง advisories เป็น votes (ที่ปรึกษาซ้ำนับครั้งเดียว แหล่งร่วมต้องระบุ)."""
+    if not isinstance(advisories, list):
+        raise ValueError("advisories must be a list")
+    votes, seen = [], set()
+    for advisory in advisories:
+        item = validate_advisory(dict(advisory), set(known_events))
+        key = (item["advisor"], item["origin"])
+        if key in seen:
+            raise ValueError(f"duplicate advisory source: {key!r}")
+        seen.add(key)
+        votes.append({"voter": item["advisor"], "origin": item["origin"],
+                      "verdict": item["verdict"]})
+    return votes
+
+
+# ระยะ 4: shadow evaluation (บันทึกคำตัดสินโดยไม่เปลี่ยน runtime เปรียบเทียบ baseline)
+def shadow_judge(corpus_dir, out_path):
+    """รัน judge ทุก bundle ใน corpus เขียน verdicts JSONL + สรุป (deterministic)."""
+    corpus = Path(corpus_dir)
+    bundles = sorted(corpus.glob("*.json"))
+    if not bundles or (len(bundles) == 1 and bundles[0].name == "labels.json"):
+        raise ValueError("corpus has no bundles")
+    labels = {}
+    labels_path = corpus / "labels.json"
+    if labels_path.exists():
+        labels = json.loads(labels_path.read_bytes().decode())
+    lines, counts, mismatches = [], {}, []
+    for bundle_path in bundles:
+        if bundle_path.name == "labels.json":
+            continue
+        bundle = read_bundle(bundle_path)
+        verdict = judge(bundle["case"], bundle["evidences"], bundle["allegations"],
+                        bundle["objections"], bundle["votes"])
+        lines.append(canonical({"bundle": bundle_path.name, "verdict": verdict}))
+        counts[verdict["outcome"]] = counts.get(verdict["outcome"], 0) + 1
+        expected = labels.get(bundle_path.name)
+        if expected is not None and [verdict["outcome"], verdict["action"]] != expected:
+            mismatches.append({"bundle": bundle_path.name, "expected": expected,
+                               "got": [verdict["outcome"], verdict["action"]]})
+    Path(out_path).write_text("\n".join(lines) + "\n")
+    return {"bundles": len(lines), "counts": counts, "mismatches": mismatches,
+            "law_version": LAW_VERSION}
+
+
+def diff_runs(old_path, new_path):
+    """เทียบ verdicts สองรัน (replay/เปลี่ยนกฎต้องอธิบายทุกเคสที่คำตัดสินเปลี่ยน)."""
+    def load(path):
+        rows = {}
+        for line in Path(path).read_text().splitlines():
+            if line.strip():
+                row = json.loads(line)
+                rows[row["bundle"]] = [row["verdict"]["outcome"], row["verdict"]["action"]]
+        return rows
+    old, new = load(old_path), load(new_path)
+    changed = [{"bundle": name, "old": old[name], "new": new[name]}
+               for name in sorted(set(old) & set(new)) if old[name] != new[name]]
+    only_old = sorted(set(old) - set(new))
+    only_new = sorted(set(new) - set(old))
+    return {"changed": changed, "only_old": only_old, "only_new": only_new}
+
+
+# ระยะ 5: ทบทวนก่อนเชื่อม enforcement (policy gate + kill switch + cap)
+def validate_policy(policy):
+    """schema ของ deployment policy (kill switch, เพดาน action, budget)."""
+    if not isinstance(policy, dict) or set(policy) != {
+            "law_version", "max_action", "kill_switch", "budget_cases"}:
+        raise ValueError("policy fields must be exactly law_version, max_action, "
+                         "kill_switch, budget_cases")
+    if policy["law_version"] != LAW_VERSION:
+        raise ValueError("policy law_version mismatch (fail-closed)")
+    if policy["max_action"] not in ACTIONS:
+        raise ValueError("unknown max_action")
+    if not isinstance(policy["kill_switch"], bool):
+        raise ValueError("kill_switch must be bool")
+    if not isinstance(policy["budget_cases"], int) or policy["budget_cases"] < 0:
+        raise ValueError("budget_cases must be >= 0")
+    return policy
+
+
+def apply_policy(verdict, policy):
+    """ครอบ verdict ด้วย policy: kill switch หยุดทุก action เพดานกด action ลง."""
+    policy = validate_policy(dict(policy))
+    if verdict.get("law_version") != LAW_VERSION:
+        raise ValueError("verdict law_version mismatch (fail-closed)")
+    result = dict(verdict)
+    result["conditions"] = list(verdict.get("conditions", []))
+    if policy["kill_switch"]:
+        result["conditions"].append("policy:kill-switch:on")
+        result.update(action="none", outcome="killed")
+        return result
+    if SEVERITY[verdict["action"]] > SEVERITY[policy["max_action"]]:
+        result["conditions"].append(f"policy-cap:{verdict['action']}->{policy['max_action']}")
+        result["action"] = policy["max_action"]
+    return result
+
+
+def review_verdicts(verdicts_path, policy):
+    """ทบทวนไฟล์ verdicts: law ตรงรุ่นทุกแถว สรุป outcome/abstain/timeout (ไม่คืนสิทธิ์เอง)."""
+    policy = validate_policy(dict(policy))
+    outcomes, abstained, timed_out, checked = {}, 0, 0, 0
+    for line in Path(verdicts_path).read_text().splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        verdict = apply_policy(row["verdict"], policy)
+        outcomes[verdict["outcome"]] = outcomes.get(verdict["outcome"], 0) + 1
+        abstained += verdict["votes"].get("abstained", 0)
+        timed_out += verdict["votes"].get("timed_out", 0)
+        checked += 1
+        if checked > policy["budget_cases"]:
+            raise ValueError("review budget exceeded")
+    return {"cases": checked, "outcomes": outcomes,
+            "abstained_votes": abstained, "timed_out_votes": timed_out,
+            "policy": {"max_action": policy["max_action"],
+                       "kill_switch": policy["kill_switch"]}}
+
+
 def decision_table():
     """ตารางตัดสิน (ตรวจทานได้ ไม่ให้โมเดลเปลี่ยน threshold ระหว่างพิจารณา)."""
     return [
@@ -261,6 +410,12 @@ def decision_table():
          "action": "<requested downgraded one level, floor watch>", "note": "contested tie is not confirmation"},
         {"when": "juror exceeds timeout", "outcome": "(per table)",
          "action": "(vote recorded as timeout)", "note": "timeout counts for neither side"},
+        {"when": "model advisory cites outside events/commands", "outcome": "(rejected)",
+         "action": "(advisory dropped)", "note": "advisory never adds permissions"},
+        {"when": "policy kill_switch on", "outcome": "killed",
+         "action": "none", "note": "review only; never auto-restores quarantine"},
+        {"when": "verdict action exceeds policy max_action", "outcome": "(kept)",
+         "action": "<capped at max_action>", "note": "policy-cap recorded in conditions"},
     ]
 
 
@@ -283,9 +438,22 @@ def main(argv=None):
     judge_cmd = sub.add_parser("judge", help="ตัดสิน bundle หนึ่งเคสแล้วพิมพ์ verdict JSON")
     judge_cmd.add_argument("bundle")
     sub.add_parser("decision-table", help="พิมพ์ตารางตัดสินที่ตรวจทานแล้ว")
+    shadow_cmd = sub.add_parser("shadow", help="รันทุก bundle ใน corpus โดยไม่เปลี่ยน runtime")
+    shadow_cmd.add_argument("corpus_dir")
+    shadow_cmd.add_argument("out_jsonl")
+    review_cmd = sub.add_parser("review", help="ทบทวน verdicts ภายใต้ policy (ไม่คืนสิทธิ์เอง)")
+    review_cmd.add_argument("verdicts_jsonl")
+    review_cmd.add_argument("policy_json")
     args = parser.parse_args(argv)
     if args.command == "decision-table":
         print(json.dumps(decision_table(), indent=2))
+        return
+    if args.command == "shadow":
+        print(json.dumps(shadow_judge(args.corpus_dir, args.out_jsonl), indent=2, sort_keys=True))
+        return
+    if args.command == "review":
+        policy = json.loads(Path(args.policy_json).read_bytes().decode())
+        print(json.dumps(review_verdicts(args.verdicts_jsonl, policy), indent=2, sort_keys=True))
         return
     bundle = read_bundle(args.bundle)
     print(json.dumps(judge(bundle["case"], bundle["evidences"], bundle["allegations"],
