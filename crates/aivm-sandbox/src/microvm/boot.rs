@@ -414,7 +414,18 @@ fn between(log: &str, begin: &str, end: &str) -> String {
     let Some(b) = rest.find(end) else {
         return String::new();
     };
-    rest[..b].trim_matches('\n').to_string()
+    let raw = &rest[..b];
+    // ถ้ามีบรรทัดที่ขึ้นต้นด้วย { (JSON) ให้ใช้เฉพาะบรรทัด JSON ล่าสุด
+    // (กัน kernel boot messages ปนมาระหว่าง markers)
+    let json_lines: Vec<_> = raw
+        .lines()
+        .filter(|line| line.trim_start().starts_with('{'))
+        .collect();
+    if json_lines.is_empty() {
+        raw.trim_matches('\n').to_string()
+    } else {
+        json_lines.last().unwrap().to_string()
+    }
 }
 
 fn capture_stdout(
@@ -619,7 +630,7 @@ fn boot_and_run_inner(
         observer.is_some(),
     );
     let init_sh = format!(
-        "#!/bin/sh\nmkdir -p /mnt/data\nmount -t tmpfs tmpfs /tmp 2>/dev/null\nmount -t ext4 -o ro /dev/vdb /mnt/data || {{ echo \"{fail}\"; poweroff -f; }}\n{capture}\necho \"{err_b}\"; cat {err_tmp}; echo \"{err_e}\"\necho \"{exit}$CODE\"\npoweroff -f\n",
+        "#!/bin/sh\nmkdir -p /mnt/data\nmount -t proc proc /proc 2>/dev/null\necho 0 > /proc/sys/kernel/printk 2>/dev/null\nmount -t tmpfs tmpfs /tmp 2>/dev/null\nmount -t ext4 -o ro /dev/vdb /mnt/data || {{ echo \"{fail}\"; poweroff -f; }}\n{capture}\necho \"{err_b}\"; cat {err_tmp}; echo \"{err_e}\"\necho \"{exit}$CODE\"\npoweroff -f\n",
         fail = dna.fail_mount, err_tmp = dna.err_tmp, err_b = dna.err_b, err_e = dna.err_e, exit = dna.exit,
     );
     let init_host = scratch.join("aivm-init");
