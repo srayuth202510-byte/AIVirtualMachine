@@ -8,6 +8,7 @@
 //! (เปิดด้วย `--features llama`)
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub mod providers;
@@ -93,6 +94,9 @@ impl ModelConfig {
 pub struct LocalModelConfig {
     /// พาธไฟล์โมเดล (.gguf)
     pub model_path: String,
+    /// sha256 hex (64 ตัว) ของไฟล์โมเดลที่อนุญาต ("": ไม่ pin — โหลดได้แต่ต้องรายงานใน degraded)
+    #[serde(default)]
+    pub model_sha256: String,
     /// จำนวนชั้นที่ยกไป GPU (-1 = ทั้งหมด)
     #[serde(default)]
     pub gpu_layers: i32,
@@ -154,6 +158,7 @@ impl Default for LocalModelConfig {
     fn default() -> Self {
         Self {
             model_path: "".into(),
+            model_sha256: "".into(),
             gpu_layers: -1,
             ctx_size: default_ctx_size(),
             threads: default_threads(),
@@ -167,6 +172,51 @@ impl Default for LocalModelConfig {
             embedding: false,
         }
     }
+}
+
+/// เพดานไฟล์โมเดลที่ verify (70B Q4 ~40GB ยังผ่าน เกินนี้ operator ต้องตั้งใจแบ่งเอง)
+pub const MAX_MODEL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// ตรวจ supply chain ของไฟล์โมเดลก่อนโหลด (mirror `aivm_sandbox::verify_artifact`)
+/// `expected` ว่าง = ไม่ pin (โหลดได้ แต่ caller ควรรายงานใน degraded)
+/// ไม่ตรง/รูปแบบผิด/อ่านไม่ได้ = Err เสมอ ไม่มีการโหลดไฟล์นั้น
+pub fn verify_model_file(path: &str, expected_sha256_hex: &str) -> Result<(), ModelError> {
+    let bad = |m: &str| ModelError::LoadFailed(m.to_string());
+    if expected_sha256_hex.is_empty() {
+        return Ok(());
+    }
+    // hex ต้องยาว 64 ตัว (32 ไบต์) และเป็น [0-9a-fA-F] เท่านั้น
+    if expected_sha256_hex.len() != 64
+        || !expected_sha256_hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(bad("bad model hash (must be 64 hex chars)"));
+    }
+    let mut expected = [0u8; 32];
+    for (i, chunk) in expected_sha256_hex.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| bad("bad hex"))?;
+        let lo = (chunk[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| bad("bad hex"))?;
+        expected[i] = ((hi << 4) | lo) as u8;
+    }
+    let meta = std::fs::metadata(path).map_err(|_| bad("model not statable"))?;
+    if !meta.is_file() {
+        return Err(bad("model is not a file"));
+    }
+    if meta.len() > MAX_MODEL_BYTES {
+        return Err(bad("model too large"));
+    }
+    // อ่านแบบ stream กันไฟล์ใหญ่กินหน่วยความจำ
+    let mut file = std::fs::File::open(path).map_err(|_| bad("model not readable"))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).map_err(|_| bad("model not readable"))?;
+    let digest = hasher.finalize();
+    if digest.as_slice() != expected {
+        return Err(bad("model sha256 mismatch (refusing to load)"));
+    }
+    Ok(())
 }
 
 pub trait Model: Send + Sync {
@@ -219,6 +269,8 @@ impl LocalLlamaModel {
         if config.model_path.is_empty() {
             return Err(ModelError::LoadFailed("model_path is required".into()));
         }
+        // supply chain มาก่อนโหลด: hash ไม่ตรง = ไม่แตะไฟล์นั้นเลย
+        verify_model_file(&config.model_path, &config.model_sha256)?;
 
         let backend = LlamaBackend::init().map_err(|e| ModelError::Backend(e.to_string()))?;
 
@@ -528,5 +580,47 @@ mod tests {
             }),
         };
         assert!(create_model(&cfg).is_err());
+    }
+
+    // supply chain ของไฟล์โมเดล: ตรงผ่าน ไม่ตรง/รูปแบบผิด/อ่านไม่ได้ = ไม่โหลด
+    #[test]
+    fn model_file_pin_accepts_match_and_rejects_the_rest() {
+        let dir = std::env::temp_dir().join(format!("aivm-model-pin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tiny.gguf");
+        std::fs::write(&file, b"fake-gguf-bytes").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        // hash จริงของไฟล์นี้ (คำนวณด้วย sha256 ของ bytes เดียวกัน)
+        let mut hasher = Sha256::new();
+        hasher.update(b"fake-gguf-bytes");
+        let good = format!("{:x}", hasher.finalize());
+        assert!(verify_model_file(&path, &good).is_ok());
+        // ว่าง = ไม่ pin (โหลดได้ แต่ต้องรายงาน degraded ที่ caller)
+        assert!(verify_model_file(&path, "").is_ok());
+        // hash ผิด/รูปแบบผิด/ไฟล์หาย = ปฏิเสธทั้งหมด
+        assert!(verify_model_file(&path, &"00".repeat(32)).is_err());
+        assert!(verify_model_file(&path, "zz").is_err());
+        assert!(verify_model_file(&path, "abcd").is_err());
+        assert!(verify_model_file(dir.join("missing.gguf").to_str().unwrap(), &good).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // pin ผิดต้องตายตั้งแต่ก่อนโหลดโมเดล (ไม่เปลืองเวลา init backend)
+    #[cfg(feature = "llama")]
+    #[test]
+    fn local_model_with_wrong_pin_fails_before_load() {
+        let cfg = LocalModelConfig {
+            model_path: "/tmp/definitely-not-a-model.gguf".into(),
+            model_sha256: "00".repeat(32),
+            ..Default::default()
+        };
+        let err = LocalLlamaModel::new(cfg)
+            .err()
+            .expect("must fail")
+            .to_string();
+        assert!(
+            err.contains("mismatch") || err.contains("statable"),
+            "{err}"
+        );
     }
 }

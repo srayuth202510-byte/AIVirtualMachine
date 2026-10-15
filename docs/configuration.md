@@ -19,6 +19,8 @@ model:
   name: echo
   # local:             # ใช้เมื่อ provider: local
   #   model_path: /models/model.gguf
+  #   model_sha256: "<sha256 64 hex>"  # pin supply chain ของน้ำหนัก (ไม่ตรง = ไม่โหลด)
+  #                                  # ไม่ตั้ง = โหลดได้แต่ถือว่า unpinned (ดู sha ด้วย sha256sum)
   #   ctx_size: 8192
   #   gpu_layers: 0    # -1 = ยกทุกชั้นไป GPU
   #   threads: 0       # 0 = อัตโนมัติ

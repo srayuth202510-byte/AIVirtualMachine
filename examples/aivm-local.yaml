@@ -16,6 +16,8 @@ model:
   name: qwen2.5-coder-1.5b
   local:
     model_path: /home/USER/Downloads/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf  # แก้เป็น path เครื่องนี้
+    # model_sha256: "<sha256 64 hex ของไฟล์ข้างบน>"  # ตั้งไว้ = โหลดเฉพาะไฟล์ที่ตรง
+    #   ไม่ตั้ง = โหลดได้แต่ต้องถือว่า unpinned (ดู sha ด้วย: sha256sum <ไฟล์>)
     ctx_size: 4096
     gpu_layers: 0      # -1 = ยกทุกชั้นไป GPU (ถ้ามี)
     threads: 4         # ล็อกไว้เพื่อให้ replay ได้
