@@ -1,7 +1,7 @@
 # ทางลัดนักพัฒนา AIVM ดูรายการด้วย `make help`
 # ทุก target คือ cargo ธรรมดา ใช้ `rtk make <target>` ได้เหมือนกัน
 
-.PHONY: help build check test test-adv test-coding test-microvm test-hardware test-container check-microvm check-hardware check-ci demo e2e llama-smoke clippy fmt fmt-check verify ci clean bench setup-host pins query path explain graph-update debug-test
+.PHONY: help build check test test-adv test-coding test-microvm test-hardware test-container check-microvm check-hardware check-ci demo e2e llama-smoke clippy fmt fmt-check verify ci clean bench setup-host pins audit-pack query path explain graph-update debug-test
 
 help: ## แสดงวิธีใช้นี้
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS=":.*?## "} {printf "  %-10s %s\n", $$1, $$2}'
@@ -20,6 +20,7 @@ test: ## เทสต์ unit + integration ทั้งหมด
 	python3 -m unittest discover -s scripts -p 'test_immunity.py'
 	python3 -m unittest discover -s scripts -p 'test_pins.py'
 	python3 -m unittest discover -s scripts -p 'test_security_court.py'
+	python3 -m unittest discover -s scripts -p 'test_fuzz_seeded.py'
 	python3 scripts/eval-qwen-audit.py
 	python3 scripts/smoke-qwen-watch.py
 
@@ -86,6 +87,9 @@ setup-host: ## ตรวจ host แบบอ่านอย่างเดี�
 
 pins: ## สร้าง pins.json จากไฟล์จริง: make pins KERNEL=.. ROOTFS=.. FC=.. OUT=.. (FC=- = โหมด hardware)
 	sh scripts/make-pins.sh "$(KERNEL)" "$(ROOTFS)" "$(FC)" "$(OUT)"
+
+audit-pack: ## รวมหลักฐานเตรียม external audit: make audit-pack [OUT=dir]
+	sh scripts/audit-pack.sh "$(or $(OUT),./target/audit-pack-$(shell date -u +%F))"
 
 # --- ค้นหา: ถามกราฟก่อน ค่อย grep (กราฟมีหลักฐาน file:line) ---
 query: ## ค้นกราฟ: make query Q="..."

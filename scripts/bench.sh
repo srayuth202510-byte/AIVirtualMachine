@@ -2,43 +2,53 @@
 # bench เริ่มต้นแบบไม่พึ่ง dependency เพิ่ม (วัด wall-time ของของที่มีอยู่แล้ว)
 # ครอบคลุม: demo (enforcement ALLOW/DENY + audit verify) + adversarial must-deny + audit crate
 # วิธีใช้: sh scripts/bench.sh [output.md]  (หรือ: make bench)
+# ROUNDS=N รันซ้ำหลายรอบแล้วรายงาน mean/min/max (default 1 เร็วสุด)
 # หมายเหตุ: ตัวเลขนี้คือ smoke-bench ไว้จับ regression คร่าวๆ ไม่ใช่ criterion ที่กัน noise เต็มรูป
 set -eu
 
 OUT="${1:-}"
+ROUNDS="${ROUNDS:-1}"
+case "$ROUNDS" in
+  ''|*[!0-9]*|0) echo "ROUNDS must be a positive integer" >&2; exit 2 ;;
+esac
 # เวลานาโนวินาทีแบบ portable บน GNU date (Ubuntu runner ใช้ได้)
 now_ns() { date +%s%N; }
 
-# รันคำสั่งแล้วคืนวินาทีทศนิยม 3 ตำแหน่ง เก็บ exit code ไว้กันบังเอิญเขียวปลอม
-run_timed() {
+# เก็บ ms ทุกรอบแล้วสรุป mean/min/max (ตัด noise แบบง่าย ไม่ใช่สถิติเต็มรูป)
+bench_case() {
   # $1 = ชื่อ, $2... = คำสั่ง
   name="$1"
   shift
-  start="$(now_ns)"
-  # shellcheck disable=SC2068
-  if $@ >/dev/null 2>&1; then
-    status="pass"
-  else
-    status="FAIL"
-  fi
-  end="$(now_ns)"
-  ms="$(( (end - start) / 1000000 ))"
-  # แปลงเป็นวินาทีทศนิยมด้วย awk (มีทุกเครื่อง ไม่ต้องพึ่ง python)
-  secs="$(awk "BEGIN {printf \"%.3f\", $ms/1000}")"
-  printf '%s|%s|%s\n' "$name" "$secs" "$status"
+  samples=""
+  status="pass"
+  i=0
+  while [ "$i" -lt "$ROUNDS" ]; do
+    start="$(now_ns)"
+    # shellcheck disable=SC2068
+    if $@ >/dev/null 2>&1; then
+      :
+    else
+      status="FAIL"
+    fi
+    end="$(now_ns)"
+    samples="$samples $(( (end - start) / 1000000 ))"
+    i=$(( i + 1 ))
+  done
+  stats="$(awk -v s="$samples" 'BEGIN{n=split(s,a); sum=0; min=a[1]; max=a[1];
+    for(i=1;i<=n;i++){sum+=a[i]; if(a[i]<min)min=a[i]; if(a[i]>max)max=a[i]}
+    printf "%.3f|%.3f|%.3f", sum/n/1000, min/1000, max/1000}')"
+  printf '%s|%s|%s\n' "$name" "$stats" "$status"
 }
 
-echo "== AIVM smoke-bench ==" >&2
+DEMO="$(bench_case demo cargo run -q -p aivm-cli -- demo)"
+ADV="$(bench_case adversarial cargo test -q -p aivm-adversarial)"
+AUDIT="$(bench_case audit cargo test -q -p aivm-audit)"
 
-DEMO="$(run_timed demo cargo run -q -p aivm-cli -- demo)"
-ADV="$(run_timed adversarial cargo test -q -p aivm-adversarial)"
-AUDIT="$(run_timed audit cargo test -q -p aivm-audit)"
-
-TABLE="| case | secs | result |
-|---|---|---|
-| demo (14-case enforcement + audit verify) | $(printf '%s' "$DEMO" | cut -d'|' -f2) | $(printf '%s' "$DEMO" | cut -d'|' -f3) |
-| adversarial must-deny (§38) | $(printf '%s' "$ADV" | cut -d'|' -f2) | $(printf '%s' "$ADV" | cut -d'|' -f3) |
-| audit (hash chain + rotate) | $(printf '%s' "$AUDIT" | cut -d'|' -f2) | $(printf '%s' "$AUDIT" | cut -d'|' -f3) |"
+TABLE="| case | mean | min | max | result |
+|---|---|---|---|---|
+| demo (14-case enforcement + audit verify) | $(printf '%s' "$DEMO" | cut -d'|' -f2) | $(printf '%s' "$DEMO" | cut -d'|' -f3) | $(printf '%s' "$DEMO" | cut -d'|' -f4) | $(printf '%s' "$DEMO" | cut -d'|' -f5) |
+| adversarial must-deny (§38) | $(printf '%s' "$ADV" | cut -d'|' -f2) | $(printf '%s' "$ADV" | cut -d'|' -f3) | $(printf '%s' "$ADV" | cut -d'|' -f4) | $(printf '%s' "$ADV" | cut -d'|' -f5) |
+| audit (hash chain + rotate) | $(printf '%s' "$AUDIT" | cut -d'|' -f2) | $(printf '%s' "$AUDIT" | cut -d'|' -f3) | $(printf '%s' "$AUDIT" | cut -d'|' -f4) | $(printf '%s' "$AUDIT" | cut -d'|' -f5) |"
 
 printf '%s\n' "$TABLE"
 
