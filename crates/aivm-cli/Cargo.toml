@@ -24,3 +24,5 @@ aivm-sandbox = { path = "../aivm-sandbox" }
 llama = ["aivm-runtime/llama", "aivm-supervisor/llama"]
 # เปิด MicroVM backend (config + skeleton) ทั้งสาย cli -> runtime -> tools -> sandbox
 microvm = ["aivm-runtime/microvm"]
+# เปิด Hardware Isolation backend (config + skeleton) ทั้งสาย cli -> runtime -> tools -> sandbox
+hardware = ["aivm-runtime/hardware"]

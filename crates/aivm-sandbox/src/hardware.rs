@@ -34,7 +34,7 @@ const LAUNCH_TIMEOUT_MIN_SECS: u64 = 10;
 const LAUNCH_TIMEOUT_MAX_SECS: u64 = 1800;
 
 /// ประเภท TEE ที่รองรับ
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TeeType {
     /// AMD SEV-SNP
@@ -42,31 +42,21 @@ pub enum TeeType {
     /// Intel TDX
     Tdx,
     /// Generic TEE (fallback, attestation จะข้าม)
+    #[default]
     Generic,
 }
 
-impl Default for TeeType {
-    fn default() -> Self {
-        TeeType::Generic
-    }
-}
-
 /// โหมดการตรวจสอบ Remote Attestation
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AttestationMode {
     /// ต้องการ attestation ผ่าน (fail-closed)
+    #[default]
     Strict,
     /// พยายาม attestation แต่ไม่บล็อกถ้า host ไม่รองรับ (degraded)
     BestEffort,
     /// ข้าม attestation (เฉพาะ dev/test)
     None,
-}
-
-impl Default for AttestationMode {
-    fn default() -> Self {
-        AttestationMode::Strict
-    }
 }
 
 /// การตั้งค่า GPU/NPU isolation
@@ -327,6 +317,25 @@ impl HardwareConfig {
                     ));
                 }
             }
+            // คีย์ผูก vTPM แต่ปิด vTPM = config เป็นไปไม่ได้ (fail-closed
+            // ตั้งแต่ shape ไม่ใช่ไปตายตอน guest บูตไม่ขึ้น)
+            if self.disk_encryption.key_source == "vtpm" && !self.vtpm.enabled {
+                return Err(bad(
+                    "hardware disk_encryption.key_source=vtpm needs vtpm.enabled",
+                ));
+            }
+        }
+        // Measured boot อ่าน PCR ผ่าน vTPM — ไม่มี vTPM คือ config เป็นไปไม่ได้
+        if self.measured_boot.enabled && !self.vtpm.enabled {
+            return Err(bad("hardware measured_boot.enabled needs vtpm.enabled"));
+        }
+        // GPU passthrough ยังไม่ implement (กันเงียบผ่าน: เปิดไว้ต้องตาย
+        // ตั้งแต่ shape พร้อมบอกว่ายังไม่รองรับ — workload จะได้ไม่รันแบบ
+        // ขาด GPU ที่ operator คาดไว้โดยไม่มีใครรู้)
+        if self.gpu.mig_enabled || self.gpu.sriov_enabled || self.gpu.vgpu_enabled {
+            return Err(bad(
+                "hardware gpu passthrough not implemented yet (mig/sriov/vgpu must stay off)",
+            ));
         }
         Ok(())
     }
@@ -426,13 +435,25 @@ pub fn run_in_hardware(
             ));
         }
 
-        // หา QEMU binary
+        // Strict attestation บน generic (โหมดจำลอง) เป็น config ที่เป็นไปไม่ได้
+        // (ไม่มี TEE จริงให้ attest) — ตายตั้งแต่ประตูก่อน spawn ใด ๆ
+        if cfg.tee_type == TeeType::Generic && cfg.attestation_mode == AttestationMode::Strict {
+            return Err((
+                SandboxError::Disabled(
+                    "strict attestation needs a real TEE (SEV-SNP/TDX); generic is simulation-only"
+                        .into(),
+                ),
+                RunVerdict::Clean,
+            ));
+        }
+
+        // หา QEMU binary (ทางเดียวผ่าน `find_qemu` — ไม่แยก logic ซ้ำซ้อน)
         let qemu_bin = if cfg.qemu_path.as_os_str().is_empty() {
-            which::which("qemu-system-x86_64").or_else(|_| {
-                Err((
+            super::find_qemu().ok_or_else(|| {
+                (
                     SandboxError::Disabled("hardware needs qemu-system-x86_64 in PATH".into()),
                     RunVerdict::Clean,
-                ))
+                )
             })?
         } else {
             cfg.qemu_path.clone()
@@ -623,6 +644,10 @@ mod tests {
     // TEE type validation: device ต้องมี (ถ้าไม่ใช่ generic)
     #[test]
     fn missing_tee_device_fails_closed_as_disabled() {
+        if std::path::Path::new("/dev/sev").exists() {
+            eprintln!("skip: เครื่องนี้มี /dev/sev (SEV host จริง)");
+            return;
+        }
         let (spec, policy, mut cfg, ws) = fixture("teedev");
         cfg.tee_type = TeeType::Sevsnp;
         cfg.attestation_mode = AttestationMode::Strict;
@@ -633,5 +658,140 @@ mod tests {
             assert!(matches!(e, SandboxError::Disabled(_)));
         }
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // Strict attestation บน generic (โหมดจำลอง) เป็นไปไม่ได้ — ต้อง Disabled
+    // ตั้งแต่ประตูก่อน spawn (verdict Clean) ไม่ใช่ผ่านแบบเงียบ ๆ
+    #[test]
+    fn generic_strict_attestation_is_impossible() {
+        let (spec, policy, mut cfg, ws) = fixture("genstrict");
+        cfg.tee_type = TeeType::Generic;
+        cfg.attestation_mode = AttestationMode::Strict;
+        assert!(matches!(
+            run_in_hardware(&spec, &policy, &cfg),
+            Err((SandboxError::Disabled(_), RunVerdict::Clean))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // measured boot ไม่มี vTPM = config เป็นไปไม่ได้ → Invalid ตั้งแต่ shape
+    #[test]
+    fn measured_boot_without_vtpm_fails_closed() {
+        let (spec, policy, mut cfg, ws) = fixture("meas");
+        cfg.measured_boot.enabled = true;
+        cfg.vtpm.enabled = false;
+        assert!(matches!(
+            run_in_hardware(&spec, &policy, &cfg),
+            Err((SandboxError::Invalid(_), RunVerdict::Clean))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // disk encryption ผูกคีย์ vTPM แต่ปิด vTPM = config เป็นไปไม่ได้
+    #[test]
+    fn vtpm_key_without_vtpm_fails_closed() {
+        let (spec, policy, mut cfg, ws) = fixture("vtpmkey");
+        cfg.disk_encryption.enabled = true;
+        cfg.disk_encryption.key_source = "vtpm".into();
+        cfg.vtpm.enabled = false;
+        assert!(matches!(
+            run_in_hardware(&spec, &policy, &cfg),
+            Err((SandboxError::Invalid(_), RunVerdict::Clean))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // GPU passthrough ยังไม่ implement — เปิดไว้ต้องตายตั้งแต่ shape
+    // (กัน workload รันแบบขาด GPU ที่ operator คาดไว้โดยไม่มีใครรู้)
+    #[test]
+    fn gpu_passthrough_fails_closed_as_unimplemented() {
+        for (tag, mk) in [
+            (
+                "mig",
+                Box::new(|c: &mut HardwareConfig| c.gpu.mig_enabled = true)
+                    as Box<dyn Fn(&mut HardwareConfig)>,
+            ),
+            (
+                "sriov",
+                Box::new(|c: &mut HardwareConfig| c.gpu.sriov_enabled = true),
+            ),
+            (
+                "vgpu",
+                Box::new(|c: &mut HardwareConfig| c.gpu.vgpu_enabled = true),
+            ),
+        ] {
+            let (spec, policy, mut cfg, ws) = fixture(tag);
+            mk(&mut cfg);
+            assert!(
+                matches!(
+                    run_in_hardware(&spec, &policy, &cfg),
+                    Err((SandboxError::Invalid(_), RunVerdict::Clean))
+                ),
+                "{tag} ต้องตายตั้งแต่ shape"
+            );
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+    }
+
+    // บูตจริงแบบ end-to-end (ต้องมี KVM + QEMU + debugfs + mkfs.ext4 + pins)
+    // ข้าม (แต่ยังเขียว) เมื่อรันใน CI ที่ไม่มีของพวกนี้: ตั้ง
+    // `AIVM_HARDWARE_PINS=/path/pins.json` เพื่อเปิดเทสต์นี้
+    #[test]
+    fn real_boot_runs_true_and_false() {
+        let pins_path = std::env::var("AIVM_HARDWARE_PINS").unwrap_or_default();
+        if pins_path.is_empty() {
+            eprintln!("skip: ตั้ง AIVM_HARDWARE_PINS เพื่อทดสอบบูตจริง");
+            return;
+        }
+        if !super::super::kvm_available() || super::super::find_qemu().is_none() {
+            eprintln!("skip: เครื่องนี้ไม่มี KVM/QEMU");
+            return;
+        }
+        for tool in ["debugfs", "mkfs.ext4", "ldd"] {
+            if which::which(tool).is_err() {
+                eprintln!("skip: เครื่องนี้ไม่มี {tool}");
+                return;
+            }
+        }
+        let text = std::fs::read_to_string(&pins_path).expect("อ่าน pins.json ได้");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("pins.json เป็น JSON");
+        let kernel = v["kernel"]["path"].as_str().expect("มี kernel.path");
+        let ksha = v["kernel"]["sha256"].as_str().expect("มี kernel.sha256");
+        let rootfs = v["rootfs"]["path"].as_str().expect("มี rootfs.path");
+        let rsha = v["rootfs"]["sha256"].as_str().expect("มี rootfs.sha256");
+        for (exe, want) in [("/bin/true", 0), ("/bin/false", 1)] {
+            let ws = test_ws("realboot");
+            let real = std::fs::canonicalize(exe).unwrap();
+            let policy = Policy::from_yaml(&format!(
+                "name: t\nprocess:\n  allow: [\"{}\"]\n  deny: []\n",
+                real.display()
+            ))
+            .unwrap();
+            let spec = ExecSpec {
+                exe: PathBuf::from(exe),
+                args: vec![],
+                cwd: ws.clone(),
+                workspace: ws.clone(),
+                env_extra: vec![],
+                timeout_ms: 30000,
+                build: None,
+                limits: crate::ResourceLimits::default(),
+            };
+            let cfg = HardwareConfig {
+                kernel_path: PathBuf::from(kernel),
+                kernel_sha256: ksha.into(),
+                rootfs_path: PathBuf::from(rootfs),
+                rootfs_sha256: rsha.into(),
+                tee_type: TeeType::Generic,
+                attestation_mode: AttestationMode::None,
+                ..HardwareConfig::default()
+            };
+            let out = run_in_hardware(&spec, &policy, &cfg)
+                .unwrap_or_else(|e| panic!("บูตจริงต้องผ่าน {exe}: {e:?}"));
+            assert_eq!(out.code, Some(want), "{exe} ต้อง exit {want}");
+            assert!(out.applied.contains(&"qemu-kvm-launch".to_string()));
+            assert!(out.applied.contains(&"no-guest-network".to_string()));
+            let _ = std::fs::remove_dir_all(&ws);
+        }
     }
 }

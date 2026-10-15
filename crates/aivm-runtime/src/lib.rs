@@ -76,6 +76,12 @@ pub struct VmConfig {
     #[cfg(feature = "microvm")]
     #[serde(default)]
     pub microvm: Option<aivm_sandbox::microvm::MicroVmConfig>,
+    /// บล็อก `hardware:` (TEE pins + quota) ใช้เมื่อเปิดฟีเจอร์
+    /// `hardware` เท่านั้น — บิลด์ปกติไม่รู้จักฟิลด์นี้และเมินบล็อกทิ้ง
+    /// (serde เมิน unknown fields) พฤติกรรมจึงคงเดิมทุกประการ
+    #[cfg(feature = "hardware")]
+    #[serde(default)]
+    pub hardware: Option<aivm_sandbox::hardware::HardwareConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,6 +383,13 @@ impl Runtime {
         #[cfg(feature = "microvm")]
         {
             gateway.microvm_cfg = config.microvm.clone();
+        }
+        // ส่ง config Hardware Isolation ลง gateway (เฉพาะบิลด์ที่เปิดฟีเจอร์)
+        // ไม่มีบล็อก `hardware:` ใน yaml (= `None`) gateway จะใช้ค่า default
+        // ที่ deny ตั้งแต่ artifact หาย — ไม่มีทางรันโดยไม่ตั้งใจ
+        #[cfg(feature = "hardware")]
+        {
+            gateway.hardware_cfg = config.hardware.clone();
         }
         let sandbox = Sandbox::new(level, gateway.limits.clone());
         let model_cfg = ModelConfig {
@@ -1187,6 +1200,50 @@ microvm:
         // ไม่มีบล็อก = None (deny ตั้งแต่ artifact หาย)
         let (rt2, base2) = test_runtime("ucfg-none");
         assert!(rt2.gateway.microvm_cfg.is_none());
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(&base);
+        aivm_audit::clear_flags(&base2);
+        let _ = std::fs::remove_dir_all(&base2);
+    }
+
+    // Level 3 (ฟีเจอร์ hardware): บล็อก `hardware:` ใน yaml ผูกถึง gateway
+    // ไม่มีบล็อก (= `None`) gateway ต้องไม่มี config (deny ตั้งแต่ artifact หาย)
+    #[cfg(feature = "hardware")]
+    #[test]
+    fn hardware_block_reaches_gateway() {
+        let cfg = VmConfig::from_yaml(
+            r#"
+name: t
+runtime:
+  isolation: hardware
+hardware:
+  tee_type: generic
+  attestation_mode: none
+  kernel_path: /boot/vmlinux
+  kernel_sha256: "aa"
+  rootfs_path: /img/rootfs.ext4
+  rootfs_sha256: "bb"
+  vcpu_count: 2
+  mem_mb: 2048
+"#,
+        )
+        .unwrap();
+        let m = cfg.hardware.clone().expect("ต้อง parse บล็อก hardware ได้");
+        assert_eq!(m.vcpu_count, 2);
+        assert_eq!(m.mem_mb, 2048);
+        let base = std::env::temp_dir().join(format!(
+            "aivm-rt-hwcfg-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rt = Runtime::init(cfg, base.clone()).unwrap();
+        assert_eq!(rt.gateway.level, SandboxLevel::Hardware);
+        assert!(rt.gateway.hardware_cfg.is_some());
+        // ไม่มีบล็อก = None (deny ตั้งแต่ artifact หาย)
+        let (rt2, base2) = test_runtime("hwcfg-none");
+        assert!(rt2.gateway.hardware_cfg.is_none());
         aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);
         aivm_audit::clear_flags(&base2);

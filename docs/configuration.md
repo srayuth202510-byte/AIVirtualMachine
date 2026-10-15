@@ -106,25 +106,25 @@ policy:
 #   mem_mb: 2048                  # 1024..=1048576 (default 2048)
 #   max_artifact_bytes: 1073741824  # เพดานไฟล์ artifact (default 1GiB, ต้อง > 0)
 #   launch_timeout_secs: 120      # 10..=1800 (default 120)
-#   gpu:
-#     mig_enabled: false          # MIG (Multi-Instance GPU) — ต้องการ NVIDIA A100/H100
-#     mig_profile: ""             # 1g.5gb, 2g.10gb, 3g.20gb, 7g.40gb
-#     sriov_enabled: false        # SR-IOV Virtual Functions
+#   gpu:                          # ทั้งบล็อกต้องปิดไว้ทั้งหมด (true ตัวใดตัวหนึ่ง = บูตไม่ขึ้น)
+#     mig_enabled: false          # MIG — ยังไม่ implement (เปิด = Invalid)
+#     mig_profile: ""
+#     sriov_enabled: false        # SR-IOV — ยังไม่ implement (เปิด = Invalid)
 #     sriov_num_vfs: 0
-#     vgpu_enabled: false         # vGPU mediated device — ต้องการ NVIDIA vGPU license
-#     vgpu_type: ""               # nvidia-222, nvidia-223, etc.
-#   disk_encryption:
-#     enabled: false              # LUKS2 + vTPM-sealed key
-#     key_source: vtpm            # vtpm | tpm2 | passphrase (dev only)
+#     vgpu_enabled: false         # vGPU — ยังไม่ implement (เปิด = Invalid)
+#     vgpu_type: ""
+#   disk_encryption:              # host ไม่ฉีดคีย์ให้ guest — initrd ของ guest ต้อง unlock เอง
+#     enabled: false              # ขอ disk encryption (รายงานใน degraded — host ไม่ unlock ให้)
+#     key_source: vtpm            # vtpm (ต้อง vtpm.enabled) | tpm2 | passphrase (dev only)
 #     pcr_policy: "0,1,2,3,4,7"   # PCR indices สำหรับ unseal
 #     cipher: aes-xts-plain64
 #     key_size: 512
-#   measured_boot:
-#     enabled: false              # PCR measurements + secure boot
-#     expected_pcrs: {}           # map PCR index -> expected sha256 hex
+#   measured_boot:                # เปิดได้เฉพาะเมื่อ vtpm.enabled = true
+#     enabled: false              # ขอ measured boot (PCR compare ยังไม่ implement — รายงานใน degraded)
+#     expected_pcrs: {}           # map PCR index -> expected sha256 hex (ยังไม่ถูกเทียบ)
 #     firmware: ovmf              # ovmf | sev-firmware
-#     secure_boot: false          # verify kernel/initrd signature
-#     cert_paths: []              # DB/DBX/KEK certificates
+#     secure_boot: false          # verify kernel/initrd signature (ยังไม่ implement)
+#     cert_paths: []
 #   vtpm:
 #     enabled: false              # swtpm + QEMU vTPM device
 #     swtpm_path: ""              # path to swtpm binary (default: PATH)

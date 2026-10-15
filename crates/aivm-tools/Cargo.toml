@@ -26,6 +26,9 @@ default = []
 # ส่งต่อฟีเจอร์ MicroVM backend ไปยัง aivm-sandbox (config + skeleton)
 # ปิดไว้โดยปริยายเพื่อให้ `make verify` เบาและไม่พึ่ง KVM ใน CI
 microvm = ["aivm-sandbox/microvm"]
+# ส่งต่อฟีเจอร์ Hardware Isolation (TEE skeleton) ไปยัง aivm-sandbox
+# ปิดไว้โดยปริยายเพื่อให้ `make verify` เบาและไม่พึ่ง KVM/QEMU ใน CI
+hardware = ["aivm-sandbox/hardware"]
 
 [dev-dependencies]
 sha2 = { workspace = true }

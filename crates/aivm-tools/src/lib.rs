@@ -119,6 +119,11 @@ pub struct ToolGateway {
     /// (= `None`) จะใช้ค่า default ที่ deny ตั้งแต่ artifact หาย
     #[cfg(feature = "microvm")]
     pub microvm_cfg: Option<aivm_sandbox::microvm::MicroVmConfig>,
+    /// config Hardware Isolation (TEE pins + quota) ใช้เมื่อเปิดฟีเจอร์
+    /// `hardware` และ `level` เป็น Hardware เท่านั้น — ไม่มี config
+    /// (= `None`) จะใช้ค่า default ที่ deny ตั้งแต่ artifact หาย
+    #[cfg(feature = "hardware")]
+    pub hardware_cfg: Option<aivm_sandbox::hardware::HardwareConfig>,
     pub container_cfg: aivm_sandbox::container::ContainerConfig,
     pub limits: ResourceLimits,
     pub state_path: Option<PathBuf>,
@@ -236,6 +241,8 @@ impl ToolGateway {
             level: SandboxLevel::Process,
             #[cfg(feature = "microvm")]
             microvm_cfg: None,
+            #[cfg(feature = "hardware")]
+            hardware_cfg: None,
             container_cfg: aivm_sandbox::container::ContainerConfig::default(),
             limits: ResourceLimits::default(),
             state_path: None,
@@ -940,6 +947,23 @@ impl ToolGateway {
         let mut run_result = if self.level == SandboxLevel::Container {
             aivm_sandbox::container::run(&spec, &self.policy, &self.container_cfg)
                 .map_err(|e| (e, aivm_sandbox::RunVerdict::Clean))
+        } else if self.level == SandboxLevel::Hardware {
+            // ระดับ Hardware: มี config จริงใช้ config นั้น ไม่มีใช้ default
+            // ที่ deny ตั้งแต่ artifact หาย (fail-closed ไม่มีทางรันโดยไม่ตั้งใจ)
+            #[cfg(feature = "hardware")]
+            {
+                match &self.hardware_cfg {
+                    Some(cfg) => aivm_sandbox::run_checked_with_level_and_cfg_hardware(
+                        &spec,
+                        &self.policy,
+                        self.level,
+                        cfg,
+                    ),
+                    None => aivm_sandbox::run_checked_with_level(&spec, &self.policy, self.level),
+                }
+            }
+            #[cfg(not(feature = "hardware"))]
+            aivm_sandbox::run_checked_with_level(&spec, &self.policy, self.level)
         } else {
             #[cfg(feature = "microvm")]
             {
@@ -2091,6 +2115,70 @@ network: {{allow: [], deny: []}}
             "ต้อง audit การ deny ระดับ level"
         );
         assert!(log.contains("\"decision\":\"deny\""));
+    }
+
+    // Level 3 (Hardware): ไม่ว่าเปิดฟีเจอร์หรือไม่ ต้อง DENY พร้อม audit
+    // ไม่มีฟีเจอร์ = Disabled (level-disabled); มีฟีเจอร์ + config default
+    // (= `None`) = Invalid ตั้งแต่ artifact หาย (level-invalid) — deny +
+    // audit เหมือนกัน (I-7)
+    #[test]
+    fn exec_denied_on_hardware_level_with_audit() {
+        let (mut gw, mut cube, dir) = exec_harness();
+        gw.level = SandboxLevel::Hardware;
+        let r = gw.dispatch(
+            &mut cube,
+            &ToolRequest {
+                tool: "process.exec".into(),
+                path: "/bin/true".into(),
+                content: Some("[]".into()),
+            },
+        );
+        assert!(matches!(r, Err(ToolError::Denied(_))));
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(
+            log.contains("level-disabled") || log.contains("level-invalid"),
+            "ต้อง audit การ deny ระดับ hardware"
+        );
+        assert!(log.contains("\"decision\":\"deny\""));
+    }
+
+    // Level 3 (ฟีเจอร์ hardware): artifact ปลอมต้อง DENY พร้อม audit
+    // (deterministic ทุกเครื่อง — supply chain ตายก่อนถึงขั้น launch)
+    #[cfg(feature = "hardware")]
+    #[test]
+    fn exec_with_tampered_hardware_artifact_denied_with_audit() {
+        let (mut gw, mut cube, dir) = exec_harness();
+        let kern = dir.join("vmlinux");
+        let rootfs = dir.join("rootfs.ext4");
+        std::fs::write(&kern, b"k").unwrap();
+        std::fs::write(&rootfs, b"r").unwrap();
+        gw.level = SandboxLevel::Hardware;
+        gw.hardware_cfg = Some(aivm_sandbox::hardware::HardwareConfig {
+            kernel_path: kern,
+            // hash ผิดเจตนา (ของจริงคือ sha256 ของ b"k")
+            kernel_sha256: "00".repeat(32),
+            rootfs_path: rootfs,
+            rootfs_sha256: "11".repeat(32),
+            tee_type: aivm_sandbox::hardware::TeeType::Generic,
+            attestation_mode: aivm_sandbox::hardware::AttestationMode::None,
+            ..aivm_sandbox::hardware::HardwareConfig::default()
+        });
+        let r = gw.dispatch(
+            &mut cube,
+            &ToolRequest {
+                tool: "process.exec".into(),
+                path: "/bin/true".into(),
+                content: Some("[]".into()),
+            },
+        );
+        assert!(matches!(r, Err(ToolError::Denied(_))));
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(log.contains("level-invalid"));
+        assert!(log.contains("\"decision\":\"deny\""));
+        assert!(
+            log.contains("verdict:clean:no-interference-evidence"),
+            "deny ตั้งแต่ประตูต้องลง verdict: {log}"
+        );
     }
 
     #[test]
