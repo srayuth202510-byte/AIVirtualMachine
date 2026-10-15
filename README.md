@@ -133,6 +133,7 @@ crates/
 
 ## เอกสาร
 
+- [`docs/audit-rotation.md`](./docs/audit-rotation.md) — ลำดับ rotate, recovery หลัง process หยุด และพฤติกรรมเมื่อเกิด error
 - [`docs/audit-watcher.md`](./docs/audit-watcher.md) — เฝ้าดู audit ต่อเนื่อง พร้อมตรวจ partial writes/rotation และให้ Qwen ทบทวนเบื้องหลัง
 - [`docs/recovery-supervisor.md`](./docs/recovery-supervisor.md) — controller ภายนอกสำหรับงานบนเครื่องเดียว: dry-run, กักกัน, สร้างทดแทน, จำกัดการเกิดใหม่ และ drain
 - [`docs/detection-evaluation.md`](./docs/detection-evaluation.md) — พิสูจน์ขอบเขตการตรวจจับด้วย 30 สถานการณ์ วัด false positives/misses แยกจากการทำตาม policy

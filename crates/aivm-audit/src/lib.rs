@@ -12,6 +12,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+mod rotation;
+
 #[derive(Debug, Error)]
 pub enum AuditError {
     #[error("io: {0}")]
@@ -160,11 +162,12 @@ pub struct AuditWriter {
 impl AuditWriter {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditError> {
         let path = path.as_ref().to_path_buf();
+        rotation::recover(&path, &mut |_| Ok(()))?;
         // กู้ปลาย chain เดิม เพื่อให้ rotate/restart แล้วต่อเนื่องกัน
         if path.exists() {
             Self::verify(&path)?;
         }
-        let (seq, prev_hash) = read_tip(&path);
+        let (seq, prev_hash) = read_tip(&path)?;
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|e| AuditError::Io(e.to_string()))?;
@@ -190,51 +193,65 @@ impl AuditWriter {
         self
     }
 
-    /// หมุนไฟล์อย่างปลอดภัย (สเปก §25.2 ข้อ 9): เขียน seal record ปิดไฟล์
-    /// เก่า เปลี่ยนชื่อเป็น archive แล้วเปิดไฟล์ใหม่ที่ chain ต่อจาก tip
-    /// เดิม (seq เริ่ม 0 ใหม่ แต่ hash ผูกกันข้ามไฟล์)
+    /// Rotate with a durable recovery journal. The new log begins with a
+    /// continuation record linking it to the sealed archive, including on restart.
+    /// Callers must serialize writers to this path (the supervisor uses a lease).
     pub fn rotate(&mut self, suffix: &str) -> Result<PathBuf, AuditError> {
-        let stem = self
-            .path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "audit".to_string());
-        let archived = self.path.with_file_name(format!("{stem}.{suffix}.jsonl"));
-        if archived.exists() {
-            return Err(AuditError::Io("archive already exists".into()));
+        self.rotate_with_hook(suffix, &mut |_| Ok(()))
+    }
+
+    fn rotate_with_hook(
+        &mut self,
+        suffix: &str,
+        hook: &mut impl FnMut(&str) -> Result<(), AuditError>,
+    ) -> Result<PathBuf, AuditError> {
+        self.recover_rotation()?;
+        let archived = rotation::archive_path(&self.path, suffix)?;
+        // symlink_metadata also detects dangling symlinks before any seal.
+        match std::fs::symlink_metadata(&archived) {
+            Ok(_) => return Err(AuditError::Io("archive already exists".into())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(AuditError::Io(e.to_string())),
         }
-        // Preflight collision before writing the seal. A repeated suffix must
-        // leave the active chain untouched.
-        let path_str = self.path.to_string_lossy();
         let mut seal = AuditRecord::new(
             0,
-            &self.agent.clone(),
-            &self.session.clone(),
+            &self.agent,
+            &self.session,
             &format!("seal_{}", self.seq),
             "AUDIT",
             "seal",
-            &path_str,
+            &self.path.to_string_lossy(),
             "allow",
-            &self.policy.clone(),
+            &self.policy,
         );
         seal.result = format!("tip:{}", self.prev_hash);
-        self.append(seal)?;
-        // hard_link is an atomic create-if-absent on the same directory and
-        // cannot replace an archive created by a concurrent rotator.
-        std::fs::hard_link(&self.path, &archived).map_err(|e| AuditError::Io(e.to_string()))?;
-        std::fs::remove_file(&self.path).map_err(|e| AuditError::Io(e.to_string()))?;
-        // ผนึก archive (immutable เมื่อ FS รองรับ): rotate ซ้ำด้วย suffix
-        // เดิมจะล้มแบบ fail-closed แทนที่จะเขียนทับของที่ผนึกแล้ว
-        let _ = std::process::Command::new("chattr")
-            .arg("+i")
-            .arg(&archived)
-            .output();
-        // ไฟล์ใหม่: seq เริ่มใหม่ แต่ prev_hash ยังชี้ tip ที่ seal แล้ว
-        // ทำให้ verify_sequence ตรวจความต่อเนื่องข้ามไฟล์ได้
-        self.seq = 0;
-        std::fs::write(&self.path, "").map_err(|e| AuditError::Io(e.to_string()))?;
-        harden_file(&self.path);
+        let seal = self.append(seal)?;
+        hook("sealed")?;
+        rotation::publish(&self.path, &archived, seal, hook)?;
+        hook("journal")?;
+        let recovery = rotation::recover(&self.path, hook);
+        let tip = read_tip(&self.path);
+        if let Ok((seq, hash)) = &tip {
+            self.seq = *seq;
+            self.prev_hash = hash.clone();
+        }
+        recovery?;
+        tip?;
         Ok(archived)
+    }
+
+    fn recover_rotation(&mut self) -> Result<(), AuditError> {
+        let recovery = rotation::recover(&self.path, &mut |_| Ok(()));
+        if !matches!(recovery, Ok(false)) {
+            let tip = read_tip(&self.path);
+            if let Ok((seq, hash)) = &tip {
+                self.seq = *seq;
+                self.prev_hash = hash.clone();
+            }
+            recovery?;
+            tip?;
+        }
+        Ok(())
     }
 
     /// ปลาย chain ปัจจุบัน (ใช้ผูกไฟล์ rotate หรือรายงานใน CLI)
@@ -243,6 +260,7 @@ impl AuditWriter {
     }
 
     pub fn append(&mut self, mut rec: AuditRecord) -> Result<AuditRecord, AuditError> {
+        self.recover_rotation()?;
         rec.seq = self.seq;
         rec.seal(&self.prev_hash);
         let line = serde_json::to_string(&rec).map_err(|e| AuditError::Ser(e.to_string()))?;
@@ -318,32 +336,35 @@ impl AuditWriter {
     }
 }
 
-fn read_tip(path: &Path) -> (u64, String) {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return (0, String::new());
+fn read_tip(path: &Path) -> Result<(u64, String), AuditError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, String::new())),
+        Err(e) => return Err(AuditError::Io(e.to_string())),
     };
     let mut seq = 0u64;
     let mut prev = String::new();
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(rec) = serde_json::from_str::<AuditRecord>(line) {
-            seq = rec.seq + 1;
-            prev = rec.hash_entry;
-        }
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let rec: AuditRecord =
+            serde_json::from_str(line).map_err(|e| AuditError::Ser(e.to_string()))?;
+        seq = rec
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| AuditError::Ser("audit sequence overflow".into()))?;
+        prev = rec.hash_entry;
     }
-    (seq, prev)
+    Ok((seq, prev))
 }
 
 /// ล้าง flag append-only/immutable ใต้ไดเรกทอรีแบบ best-effort
 /// (ให้ลบ temp dir ได้แม้ FS จะรองรับ chattr — ใช้ตอน cleanup เท่านั้น)
 pub fn clear_flags(dir: &Path) {
-    let _ = std::process::Command::new("chattr")
-        .arg("-R")
-        .arg("-a")
-        .arg(dir)
-        .output();
+    for flag in ["-i", "-a"] {
+        let _ = std::process::Command::new("chattr")
+            .args(["-R", flag])
+            .arg(dir)
+            .output();
+    }
 }
 
 /// เสริมความแข็งไฟล์ล็อก (สเปก §25.2 ข้อ 2-3): สิทธิ์อ่านเขียนเฉพาะเจ้าของ
@@ -484,11 +505,10 @@ mod tests {
         let archived = w.rotate("20260101").unwrap();
         assert!(archived.exists());
         test_record(&mut w, "r3");
-        // ไฟล์ archive มี 3 แถว (2 record + seal) ไฟล์ live มี 1 แถว
+        // archive: two actions + seal; live: continuation + action.
         assert_eq!(AuditWriter::verify(&archived).unwrap(), 3);
-        assert_eq!(AuditWriter::verify(&p).unwrap(), 1);
-        // สายทั้งหมดต่อเนื่องกัน: 2 + seal + 1
-        assert_eq!(verify_sequence(&[archived, p]).unwrap(), 4);
+        assert_eq!(AuditWriter::verify(&p).unwrap(), 2);
+        assert_eq!(verify_sequence(&[archived, p]).unwrap(), 5);
         // seq ของไฟล์ใหม่เริ่ม 0 ใหม่ แต่ hash ผูกกับ tip เก่า
         let text = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
         let first: AuditRecord = serde_json::from_str(text.lines().next().unwrap()).unwrap();
@@ -568,7 +588,307 @@ mod tests {
         assert!(writer.rotate("same").is_err());
         assert_eq!(std::fs::read(&archive).unwrap(), old);
         assert_eq!(std::fs::read(&path).unwrap(), active_before);
-        assert_eq!(AuditWriter::verify(&path).unwrap(), 1);
+        assert_eq!(AuditWriter::verify(&path).unwrap(), 2);
+        clean(&dir);
+    }
+
+    #[test]
+    fn restart_after_rotation_preserves_the_archive_link() {
+        let dir = test_dir("rotate-restart");
+        let path = dir.join("audit.jsonl");
+        let mut writer = AuditWriter::open(&path).unwrap();
+        test_record(&mut writer, "before");
+        let archive = writer.rotate("01").unwrap();
+        let archived_bytes = std::fs::read(&archive).unwrap();
+        drop(writer);
+        let mut writer = AuditWriter::open(&path).unwrap();
+        test_record(&mut writer, "after");
+        assert_eq!(std::fs::read(&archive).unwrap(), archived_bytes);
+        assert_eq!(verify_sequence(&[archive, path]).unwrap(), 4);
+        clean(&dir);
+    }
+
+    // Invoked only by rotation_recovers_after_process_exit_at_each_stage.
+    #[test]
+    #[ignore = "subprocess helper for the rotation crash test"]
+    fn rotation_crash_worker() {
+        let path = PathBuf::from(std::env::var_os("AIVM_AUDIT_CRASH_PATH").unwrap());
+        let target = std::env::var("AIVM_AUDIT_CRASH_STAGE").unwrap();
+        let mut writer = AuditWriter::open(&path).unwrap();
+        writer
+            .rotate_with_hook("01", &mut |stage| {
+                if stage == target {
+                    // Exit immediately without unwinding or running Rust destructors.
+                    std::process::exit(77);
+                }
+                Ok(())
+            })
+            .unwrap();
+        panic!("crash stage was not reached: {target}");
+    }
+
+    #[test]
+    fn rotation_recovers_after_process_exit_at_each_stage() {
+        use std::os::unix::fs::PermissionsExt;
+        for stage in [
+            "sealed",
+            "journal_prepared",
+            "journal_published",
+            "journal",
+            "archive",
+            "prepared",
+            "unhardened",
+            "swapped",
+            "committed",
+        ] {
+            let dir = test_dir(stage);
+            let path = dir.join("audit.jsonl");
+            let mut writer = AuditWriter::open(&path).unwrap();
+            test_record(&mut writer, "before");
+            drop(writer);
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::rotation_crash_worker", "--ignored"])
+                .env("AIVM_AUDIT_CRASH_PATH", &path)
+                .env("AIVM_AUDIT_CRASH_STAGE", stage)
+                .output()
+                .unwrap()
+                .status;
+            assert_eq!(status.code(), Some(77), "{stage}");
+            let archive = dir.join("audit.01.jsonl");
+            let before = std::fs::read(&archive).ok();
+            let mut writer = AuditWriter::open(&path).unwrap();
+            if let Some(bytes) = before {
+                assert_eq!(std::fs::read(&archive).unwrap(), bytes, "{stage}");
+            }
+            let archive_bytes = std::fs::read(&archive).ok();
+            test_record(&mut writer, "after");
+            if let Some(bytes) = archive_bytes {
+                assert_eq!(std::fs::read(&archive).unwrap(), bytes, "{stage}");
+                assert_eq!(
+                    verify_sequence(&[archive.clone(), path.clone()]).unwrap(),
+                    4,
+                    "{stage}"
+                );
+                assert_eq!(
+                    std::fs::metadata(archive).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            } else {
+                // Before journal publication, the sealed log remains active.
+                assert!(matches!(stage, "sealed" | "journal_prepared"));
+                assert_eq!(AuditWriter::verify(&path).unwrap(), 3);
+            }
+            assert!(!dir.join("audit.jsonl.rotation").exists(), "{stage}");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            clean(&dir);
+        }
+    }
+
+    #[test]
+    fn failed_rotation_can_resume_on_the_same_writer() {
+        let dir = test_dir("rotate-error");
+        let path = dir.join("audit.jsonl");
+        let mut writer = AuditWriter::open(&path).unwrap();
+        test_record(&mut writer, "before");
+        // A directory in place of the staging file forces a real I/O failure
+        // after the archive has been published, before the active-file swap.
+        let obstacle = dir.join("audit.jsonl.rotation-next");
+        std::fs::create_dir(&obstacle).unwrap();
+        assert!(writer.rotate("01").is_err());
+        let archive = dir.join("audit.01.jsonl");
+        let bytes = std::fs::read(&archive).unwrap();
+        std::fs::remove_dir(obstacle).unwrap();
+        test_record(&mut writer, "after");
+        assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+        assert_eq!(verify_sequence(&[archive, path]).unwrap(), 4);
+        clean(&dir);
+    }
+
+    #[test]
+    fn recovery_refuses_a_corrupt_journal_without_changing_the_log() {
+        let dir = test_dir("rotate-corrupt");
+        let path = dir.join("audit.jsonl");
+        let mut writer = AuditWriter::open(&path).unwrap();
+        test_record(&mut writer, "before");
+        let before = std::fs::read(&path).unwrap();
+        std::fs::write(dir.join("audit.jsonl.rotation"), "{partial").unwrap();
+        assert!(AuditWriter::open(&path).is_err());
+        assert!(writer
+            .append(AuditRecord::new(
+                0, "a", "s", "r", "AUDIT", "read", "p", "allow", "p"
+            ))
+            .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!dir.join("audit.01.jsonl").exists());
+        clean(&dir);
+    }
+
+    #[test]
+    fn recovery_refuses_an_unrelated_archive() {
+        let dir = test_dir("rotate-conflict");
+        let path = dir.join("audit.jsonl");
+        let mut writer = AuditWriter::open(&path).unwrap();
+        test_record(&mut writer, "before");
+        assert!(writer
+            .rotate_with_hook("01", &mut |stage| {
+                if stage == "journal" {
+                    return Err(AuditError::Io("injected failure".into()));
+                }
+                Ok(())
+            })
+            .is_err());
+        let archive = dir.join("audit.01.jsonl");
+        std::fs::write(&archive, "unrelated evidence").unwrap();
+        let active = std::fs::read(&path).unwrap();
+        assert!(AuditWriter::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), active);
+        assert_eq!(std::fs::read(&archive).unwrap(), b"unrelated evidence");
+        clean(&dir);
+    }
+
+    #[test]
+    fn multiple_rotations_remain_continuous_after_restart() {
+        let dir = test_dir("rotate-multiple");
+        let path = dir.join("audit.jsonl");
+        let mut writer = AuditWriter::open(&path).unwrap();
+        test_record(&mut writer, "before");
+        let first = writer.rotate("01").unwrap();
+        drop(writer);
+        let mut writer = AuditWriter::open(&path).unwrap();
+        let second = writer.rotate("02").unwrap();
+        drop(writer);
+        let mut writer = AuditWriter::open(&path).unwrap();
+        test_record(&mut writer, "after");
+        assert_eq!(verify_sequence(&[first, second, path]).unwrap(), 6);
+        clean(&dir);
+    }
+
+    #[test]
+    fn invalid_or_dangling_archive_names_leave_the_chain_untouched() {
+        let dir = test_dir("rotate-invalid");
+        let path = dir.join("audit.jsonl");
+        let mut writer = AuditWriter::open(&path).unwrap();
+        test_record(&mut writer, "before");
+        let before = std::fs::read(&path).unwrap();
+        for suffix in ["", "../outside", "a/b", "a\\b"] {
+            assert!(writer.rotate(suffix).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        let archive = dir.join("audit.link.jsonl");
+        std::os::unix::fs::symlink(dir.join("missing"), &archive).unwrap();
+        assert!(writer.rotate("link").is_err());
+        assert!(std::fs::symlink_metadata(archive)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        clean(&dir);
+    }
+
+    #[test]
+    fn recovery_rebuilds_partial_staging_or_a_missing_active_log() {
+        for missing_active in [false, true] {
+            let dir = test_dir("rotate-staging");
+            let path = dir.join("audit.jsonl");
+            let mut writer = AuditWriter::open(&path).unwrap();
+            test_record(&mut writer, "before");
+            assert!(writer
+                .rotate_with_hook("01", &mut |stage| {
+                    if stage == "prepared" {
+                        return Err(AuditError::Io("interrupted".into()));
+                    }
+                    Ok(())
+                })
+                .is_err());
+            drop(writer);
+            let archive = dir.join("audit.01.jsonl");
+            let bytes = std::fs::read(&archive).unwrap();
+            std::fs::write(dir.join("audit.jsonl.rotation-next"), "{partial").unwrap();
+            if missing_active {
+                clear_flags(&dir);
+                std::fs::remove_file(&path).unwrap();
+            }
+            let mut writer = AuditWriter::open(&path).unwrap();
+            test_record(&mut writer, "after");
+            assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+            assert_eq!(verify_sequence(&[archive, path]).unwrap(), 4);
+            clean(&dir);
+        }
+    }
+
+    #[test]
+    fn recovery_preserves_a_partial_active_record_and_stops() {
+        let dir = test_dir("rotate-partial-active");
+        let path = dir.join("audit.jsonl");
+        let mut writer = AuditWriter::open(&path).unwrap();
+        test_record(&mut writer, "before");
+        assert!(writer
+            .rotate_with_hook("01", &mut |stage| {
+                if stage == "journal" {
+                    return Err(AuditError::Io("interrupted".into()));
+                }
+                Ok(())
+            })
+            .is_err());
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{partial")
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(AuditWriter::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!dir.join("audit.01.jsonl").exists());
+        assert!(dir.join("audit.jsonl.rotation").exists());
+        clean(&dir);
+    }
+
+    #[test]
+    fn rotation_errors_after_swap_refresh_the_same_writer() {
+        for target in ["swapped", "committed"] {
+            let dir = test_dir("rotate-after-swap");
+            let path = dir.join("audit.jsonl");
+            let mut writer = AuditWriter::open(&path).unwrap();
+            test_record(&mut writer, "before");
+            assert!(writer
+                .rotate_with_hook("01", &mut |stage| {
+                    if stage == target {
+                        return Err(AuditError::Io("interrupted".into()));
+                    }
+                    Ok(())
+                })
+                .is_err());
+            test_record(&mut writer, "after");
+            assert_eq!(
+                verify_sequence(&[dir.join("audit.01.jsonl"), path]).unwrap(),
+                4
+            );
+            clean(&dir);
+        }
+    }
+
+    #[test]
+    fn recovery_stops_if_archive_is_missing_after_swap() {
+        let dir = test_dir("rotate-missing-archive");
+        let path = dir.join("audit.jsonl");
+        let mut writer = AuditWriter::open(&path).unwrap();
+        test_record(&mut writer, "before");
+        assert!(writer
+            .rotate_with_hook("01", &mut |stage| {
+                if stage == "swapped" {
+                    return Err(AuditError::Io("interrupted".into()));
+                }
+                Ok(())
+            })
+            .is_err());
+        std::fs::remove_file(dir.join("audit.01.jsonl")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(AuditWriter::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         clean(&dir);
     }
 }

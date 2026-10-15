@@ -85,6 +85,8 @@ guard ต่อขอบ: `confidence` (→MODIFY), `tests_passed` (→VALIDATE)
 - ทุก request + decision + outcome ลง `audit.jsonl` **นอก** boundary ที่ agent แตะถึง
 - append-only + hash chain (`verify_sequence`, `aivm audit`) + `rotate()`
   (archive ถูกผนึก ห้ามเขียนทับ)
+- Rotate มี recovery journal และ `resume` record เพื่อรักษารอยต่อหลัง restart;
+  ดู [ลำดับการเขียนและการกู้คืน](audit-rotation.md)
 - decision ที่ deny (รวมระดับ level) มี record ครบ — เงียบหายไม่ได้
 
 Hash chain ตรวจความสอดคล้องและการแก้ไขภายในลำดับ log ที่มีจุดเริ่มต้น/ปลายทาง
