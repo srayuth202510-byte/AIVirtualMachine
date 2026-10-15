@@ -4,3 +4,4 @@ audit.log*
 /vms/
 /graphify-out/
 __pycache__/
+scripts/events.db
