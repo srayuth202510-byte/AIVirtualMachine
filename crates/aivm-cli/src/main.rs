@@ -335,21 +335,41 @@ fn main() -> Result<(), AnyErr> {
         Cmd::ModelStatus { config, json } => {
             let config = VmConfig::from_file(&config).map_err(err)?;
             let local = config.model.local.as_ref();
-            let (actual_sha256, status) = if config.model.provider != "local" {
-                (None, "not-applicable".to_string())
+            let (actual_sha256, status, manifest) = if config.model.provider != "local" {
+                (
+                    None,
+                    "not-applicable".to_string(),
+                    ManifestStatus::not_applicable(),
+                )
             } else if let Some(local) = local {
-                match aivm_model::model_file_sha256(&local.model_path) {
-                    Ok(actual) if local.model_sha256.is_empty() => {
-                        (Some(actual), "unpinned".to_string())
-                    }
-                    Ok(actual) if actual.eq_ignore_ascii_case(&local.model_sha256) => {
-                        (Some(actual), "verified".to_string())
-                    }
-                    Ok(actual) => (Some(actual), "mismatch".to_string()),
-                    Err(_) => (None, "unavailable".to_string()),
-                }
+                let (actual_sha256, model_status) =
+                    match aivm_model::model_file_sha256(&local.model_path) {
+                        Ok(actual) if local.model_sha256.is_empty() => {
+                            (Some(actual), "unpinned".to_string())
+                        }
+                        Ok(actual) if actual.eq_ignore_ascii_case(&local.model_sha256) => {
+                            (Some(actual), "verified".to_string())
+                        }
+                        Ok(actual) => (Some(actual), "mismatch".to_string()),
+                        Err(_) => (None, "unavailable".to_string()),
+                    };
+                let manifest = inspect_manifest(local, config.security.profile == "production");
+                let status = if model_status != "verified" {
+                    model_status
+                } else if manifest.status != "verified" && manifest.status != "not-configured" {
+                    format!("manifest-{}", manifest.status)
+                } else if config.security.profile == "production" && manifest.status != "verified" {
+                    "manifest-unpinned".to_string()
+                } else {
+                    model_status
+                };
+                (actual_sha256, status, manifest)
             } else {
-                (None, "missing-config".to_string())
+                (
+                    None,
+                    "missing-config".to_string(),
+                    ManifestStatus::not_applicable(),
+                )
             };
             let report = ModelArtifactStatus {
                 profile: config.security.profile,
@@ -359,6 +379,7 @@ fn main() -> Result<(), AnyErr> {
                 expected_sha256: local.map(|m| m.model_sha256.clone()),
                 actual_sha256,
                 status,
+                manifest,
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&report).map_err(err)?);
@@ -380,10 +401,21 @@ fn main() -> Result<(), AnyErr> {
                     "actual sha256: {}",
                     report.actual_sha256.as_deref().unwrap_or("(unavailable)")
                 );
+                println!("manifest: {}", report.manifest.status);
+                if let Some(path) = &report.manifest.path {
+                    println!("manifest path: {path}");
+                }
+                if let Some(expected) = &report.manifest.expected_sha256 {
+                    println!("manifest expected sha256: {expected}");
+                }
+                if let Some(actual) = &report.manifest.actual_sha256 {
+                    println!("manifest actual sha256: {actual}");
+                }
                 println!("status: {}", report.status);
             }
             if report.status == "mismatch"
                 || (report.profile == "production" && report.status == "unpinned")
+                || report.status.starts_with("manifest-")
                 || report.status == "unavailable"
                 || report.status == "missing-config"
             {
@@ -492,6 +524,104 @@ struct ModelArtifactStatus {
     expected_sha256: Option<String>,
     actual_sha256: Option<String>,
     status: String,
+    manifest: ManifestStatus,
+}
+
+#[derive(serde::Serialize)]
+struct ManifestStatus {
+    path: Option<String>,
+    expected_sha256: Option<String>,
+    actual_sha256: Option<String>,
+    declared_model_sha256: Option<String>,
+    status: String,
+}
+
+impl ManifestStatus {
+    fn not_applicable() -> Self {
+        Self {
+            path: None,
+            expected_sha256: None,
+            actual_sha256: None,
+            declared_model_sha256: None,
+            status: "not-applicable".to_string(),
+        }
+    }
+}
+
+fn inspect_manifest(local: &aivm_model::LocalModelConfig, production: bool) -> ManifestStatus {
+    let (path, expected) = match (&local.manifest_path, &local.manifest_sha256) {
+        (None, None) => {
+            return ManifestStatus {
+                path: None,
+                expected_sha256: None,
+                actual_sha256: None,
+                declared_model_sha256: None,
+                status: if production {
+                    "required"
+                } else {
+                    "not-configured"
+                }
+                .to_string(),
+            }
+        }
+        (Some(path), Some(expected)) => (path, expected),
+        _ => {
+            return ManifestStatus {
+                path: local.manifest_path.clone(),
+                expected_sha256: local.manifest_sha256.clone(),
+                actual_sha256: None,
+                declared_model_sha256: None,
+                status: "invalid".to_string(),
+            }
+        }
+    };
+    let actual = match aivm_model::model_file_sha256(path) {
+        Ok(value) => value,
+        Err(_) => {
+            return ManifestStatus {
+                path: Some(path.clone()),
+                expected_sha256: Some(expected.clone()),
+                actual_sha256: None,
+                declared_model_sha256: None,
+                status: "unavailable".to_string(),
+            }
+        }
+    };
+    if expected.is_empty() || !actual.eq_ignore_ascii_case(expected) {
+        return ManifestStatus {
+            path: Some(path.clone()),
+            expected_sha256: Some(expected.clone()),
+            actual_sha256: Some(actual),
+            declared_model_sha256: None,
+            status: if expected.is_empty() {
+                "unpinned"
+            } else {
+                "mismatch"
+            }
+            .to_string(),
+        };
+    }
+    let declared_model_sha256 = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .get("model_sha256")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    let status = match &declared_model_sha256 {
+        Some(value) if value.eq_ignore_ascii_case(&local.model_sha256) => "verified",
+        Some(_) => "model-mismatch",
+        None => "invalid",
+    };
+    ManifestStatus {
+        path: Some(path.clone()),
+        expected_sha256: Some(expected.clone()),
+        actual_sha256: Some(actual),
+        declared_model_sha256,
+        status: status.to_string(),
+    }
 }
 
 fn err<E: std::fmt::Display>(e: E) -> AnyErr {
