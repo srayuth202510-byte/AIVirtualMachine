@@ -724,8 +724,10 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut local = LocalModelConfig::default();
-        local.worker_path = Some(script.to_string_lossy().into_owned());
+        let local = LocalModelConfig {
+            worker_path: Some(script.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
         let config = ModelConfig {
             provider: "local".into(),
             name: "worker-test".into(),
