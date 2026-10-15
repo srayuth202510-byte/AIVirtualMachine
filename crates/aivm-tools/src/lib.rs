@@ -1191,6 +1191,9 @@ impl ToolGateway {
         if body.len() as u64 > limit {
             return Err(ToolError::Denied("response size limit exceeded".into()));
         }
+        // บันทึกไบต์จริงเข้าเพดานสะสม (I-8: ครั้งต่อไปที่ล้นเพดาน = DENY)
+        self.caps.account_bytes(idx, body.len() as u64);
+        self.checkpoint(cube)?;
         let output =
             String::from_utf8(body).map_err(|_| ToolError::Io("response is not UTF-8".into()))?;
         self.audit_decision(

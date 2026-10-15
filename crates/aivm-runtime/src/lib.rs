@@ -181,6 +181,12 @@ pub struct FilesystemBlock {
 pub struct NetworkBlock {
     #[serde(default)]
     pub allow: Vec<String>,
+    /// เพดานจำนวนครั้งต่อ lease เน็ตเวิร์ก (None = ไม่จำกัดด้วยจำนวนครั้ง)
+    #[serde(default)]
+    pub max_calls: Option<u32>,
+    /// เพดานไบต์สะสมต่อ lease เน็ตเวิร์ก (None = ไม่จำกัดด้วยยอดรวม)
+    #[serde(default)]
+    pub max_total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -470,7 +476,7 @@ impl Runtime {
         for cap in state_grants(
             next,
             &self.workspace,
-            &self.config.network.allow,
+            &self.config.network,
             &self.policy.process.allow,
         ) {
             let label = format!("{}:{}", cap.action, cap.scope);
@@ -651,7 +657,7 @@ impl Runtime {
 fn state_grants(
     next: AgentState,
     workspace: &Path,
-    network_allow: &[String],
+    network: &NetworkBlock,
     process_allow: &[String],
 ) -> Vec<Capability> {
     let ws = workspace.to_string_lossy().to_string();
@@ -678,7 +684,7 @@ fn state_grants(
         }
     }
     if next == AgentState::Validate {
-        for host in network_allow {
+        for host in &network.allow {
             let scope = if host.contains(':') {
                 host.clone()
             } else {
@@ -697,6 +703,9 @@ fn state_grants(
                     .next()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(443)];
+                // เพดานต่อ task จาก config (operator กำหนด ไม่มี = ไม่จำกัดข้อนั้น)
+                net.constraints.max_calls = network.max_calls;
+                net.constraints.max_total_bytes = network.max_total_bytes;
                 net.expiration = Some(aivm_capability::now_secs() + NETWORK_LEASE_SECS);
                 out.push(net);
             }
@@ -1717,15 +1726,74 @@ secrets:
         let _ = std::fs::remove_dir_all(base);
     }
 
+    // บัญชีสะสมต้องรอด restart: restart แล้วต้องเหลือเพดานเท่าเดิม
+    // (state.json เสียไม่ได้ทำให้ task budget กลับมาใช้ใหม่ — fail-closed)
+    #[test]
+    fn consumed_byte_budget_survives_restart() {
+        use aivm_capability::AuthorizationContext;
+        let (mut rt, base) = test_runtime("budget-restart");
+        std::fs::create_dir_all(rt.workspace.join("src")).unwrap();
+        std::fs::write(rt.workspace.join("src/seed.txt"), "seed").unwrap();
+        let mut cap = Capability::new("network:fetch", "network", "example.com:443")
+            .with_constraints(aivm_capability::Constraints::new().with_max_total_bytes(100));
+        cap.account_bytes(60); // ใช้ไป 60 จาก 100 เหลือ 40
+        let read = Capability::new("read", "filesystem", &rt.workspace.display().to_string());
+        rt.gateway.caps = CapabilitySet::new(vec![read, cap]);
+        // อ่านไฟล์ธรรมดาเพื่อให้ persist บัญชีสดใหม่ลง state
+        rt.gateway.read(&mut rt.cube, "src/seed.txt").unwrap();
+        let cfg = rt.config.clone();
+        drop(rt);
+        let mut restored = Runtime::init(cfg, base.clone()).unwrap();
+        let ctx = AuthorizationContext {
+            request_bytes: Some(50),
+            ..Default::default()
+        };
+        // เหลือ 40 ขอ 50 = DENY (งบไม่กลับมาเพราะ restart)
+        assert!(matches!(
+            restored.gateway.caps.authorize_with_context(
+                "network:fetch",
+                "network",
+                "example.com:443",
+                &ctx
+            ),
+            Err(aivm_capability::CapabilityError::BudgetExceeded(_))
+        ));
+        // เหลือ 40 ขอ 40 = ผ่านพอดี
+        assert!(restored
+            .gateway
+            .caps
+            .authorize_with_context(
+                "network:fetch",
+                "network",
+                "example.com:443",
+                &AuthorizationContext {
+                    request_bytes: Some(40),
+                    ..Default::default()
+                },
+            )
+            .is_ok());
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn validate_grants_network_actions_with_tls_and_matching_ports() {
+        use crate::NetworkBlock;
         let ws = std::path::Path::new("/workspace");
-        let caps = state_grants(AgentState::Validate, ws, &["api.example.com".into()], &[]);
+        let network = NetworkBlock {
+            allow: vec!["api.example.com".into()],
+            max_calls: Some(5),
+            max_total_bytes: Some(1024),
+        };
+        let caps = state_grants(AgentState::Validate, ws, &network, &[]);
         for action in ["network:fetch", "network:connect"] {
             let cap = caps.iter().find(|c| c.action == action).unwrap();
             assert_eq!(cap.scope, "api.example.com:443");
             assert!(cap.constraints.require_tls);
             assert_eq!(cap.constraints.allowed_ports, vec![443]);
+            // เพดานต่อ task จาก config ต้องติดไปกับ lease ทุกใบ
+            assert_eq!(cap.constraints.max_calls, Some(5));
+            assert_eq!(cap.constraints.max_total_bytes, Some(1024));
         }
     }
 }

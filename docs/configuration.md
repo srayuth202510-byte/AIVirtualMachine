@@ -41,6 +41,10 @@ filesystem:
 
 network:
   allow: [github.com, crates.io]   # นอกนี้ + deny list บังคับ = DENY
+  # เพดานต่อ lease เน็ตเวิร์ก (operator กำหนด ไม่ตั้ง = ไม่จำกัดข้อนั้น)
+  # ใช้ตอน state VALIDATE จำกัดทั้งจำนวนครั้งและ _bytes สะสม_
+  # max_calls: 20
+  # max_total_bytes: 10485760     # 10 MiB ต่อ lease (ดูดทีละน้อยแล้วเกินก็ DENY)
 
 tools:
   allow:                           # ชื่อ tool ที่ agent เรียกได้

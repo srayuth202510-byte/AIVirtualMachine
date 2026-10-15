@@ -4,7 +4,7 @@
 //! รันด้วย `cargo test -p aivm-adversarial` (integration) หรือ `cargo test`
 
 use aivm_audit::{AuditRecord, AuditWriter};
-use aivm_capability::{Capability, CapabilitySet};
+use aivm_capability::{AuthorizationContext, Capability, CapabilitySet, Constraints};
 use aivm_cube::{AgentState, Cube, TransitionGuards};
 use aivm_policy::{Decision, EvalContext, Policy};
 use aivm_sandbox::SandboxLevel;
@@ -888,4 +888,31 @@ fn build_traversal_and_unlisted_artifacts_must_deny() {
     assert!(gateway.dispatch(&mut cube, &req).is_err());
     assert!(AuditWriter::verify(dir.join("audit.jsonl")).is_ok());
     adv_clean(&dir);
+}
+
+// ดูดทีละน้อยแต่รวมกันเกินเพดานต้อง DENY (slow exfiltration ผ่าน response เล็กๆ หลายครั้ง)
+#[test]
+fn slow_exfiltration_via_small_fetches_must_deny() {
+    let mut caps = CapabilitySet::new(vec![Capability::new(
+        "network:fetch",
+        "network",
+        "example.com:443",
+    )
+    .with_constraints(Constraints::new().with_max_total_bytes(100))]);
+    let ctx = AuthorizationContext {
+        request_bytes: Some(10),
+        ..Default::default()
+    };
+    // 10 ครั้ง × 10 ไบต์ = ครบเพดาน (แต่ละครั้งผ่านเพราะยังไม่ล้น)
+    for _ in 0..10 {
+        let idx = caps
+            .authorize_with_context("network:fetch", "network", "example.com:443", &ctx)
+            .expect("within budget");
+        caps.account_bytes(idx, 10);
+    }
+    // ครั้งที่ 11 = DENY งบหมด (ไม่ใช่ Mismatch — caller แยกแยะได้)
+    assert!(matches!(
+        caps.authorize_with_context("network:fetch", "network", "example.com:443", &ctx),
+        Err(aivm_capability::CapabilityError::BudgetExceeded(_))
+    ));
 }

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CapabilityError {
     #[error("capability expired")]
     Expired,
@@ -75,6 +75,9 @@ pub struct Constraints {
     /// Network-specific: max response size
     #[serde(default)]
     pub max_response_bytes: Option<u64>,
+    /// เพดานสะสม (bytes) ตลอดอายุ lease (กันดูดทีละน้อยแต่รวมกันมาก)
+    #[serde(default)]
+    pub max_total_bytes: Option<u64>,
     /// Network-specific: require TLS
     #[serde(default)]
     pub require_tls: bool,
@@ -116,6 +119,11 @@ impl Constraints {
         self
     }
 
+    pub fn with_max_total_bytes(mut self, bytes: u64) -> Self {
+        self.max_total_bytes = Some(bytes);
+        self
+    }
+
     pub fn with_require_tls(mut self, require: bool) -> Self {
         self.require_tls = require;
         self
@@ -153,6 +161,9 @@ pub struct Capability {
     pub max_uses: Option<u64>,
     #[serde(default)]
     pub used_count: u64,
+    /// ไบต์สะสมที่ใช้ไปแล้วตลอดอายุ lease (เทียบกับ max_total_bytes)
+    #[serde(default)]
+    pub used_bytes: u64,
 }
 
 /// ข้อมูลสำหรับตรวจ constraints และ consume สิทธิ์ครั้งเดียว
@@ -176,6 +187,7 @@ impl Capability {
             expiration: None,
             max_uses: None,
             used_count: 0,
+            used_bytes: 0,
         }
     }
 
@@ -215,7 +227,25 @@ impl Capability {
                 return Err(CapabilityError::BudgetExceeded(max));
             }
         }
+        // เพดานสะสมหมดแล้ว = ใช้ไม่ได้อีก แม้ request 0 ไบต์
+        if let Some(max) = self.constraints.max_total_bytes {
+            if self.used_bytes >= max {
+                return Err(CapabilityError::BudgetExceeded(max));
+            }
+        }
         Ok(())
+    }
+
+    /// บันทึกไบต์ที่ใช้จริงหลัง side effect (saturating กัน overflow)
+    /// เรียกเฉพาะหลัง authorize สำเร็จเท่านั้น
+    pub fn account_bytes(&mut self, bytes: u64) {
+        self.used_bytes = self.used_bytes.saturating_add(bytes);
+    }
+
+    pub fn bytes_remaining(&self) -> Option<u64> {
+        self.constraints
+            .max_total_bytes
+            .map(|m| m.saturating_sub(self.used_bytes))
     }
 
     /// ตรวจสอบ constraints (max_bytes, max_calls, timeout_ms, network constraints)
@@ -232,6 +262,13 @@ impl Capability {
                 if bytes > max_bytes {
                     return Err(CapabilityError::BudgetExceeded(max_bytes));
                 }
+            }
+        }
+        // เพดานสะสม: request นี้จะล้นเพดาน = ปฏิเสธก่อน side effect
+        if let Some(max) = self.constraints.max_total_bytes {
+            let want = request_bytes.unwrap_or(0);
+            if self.used_bytes.saturating_add(want) > max {
+                return Err(CapabilityError::BudgetExceeded(max));
             }
         }
         if let Some(max_calls) = self.constraints.max_calls {
@@ -424,8 +461,16 @@ impl CapabilitySet {
         scope: &str,
         ctx: &AuthorizationContext<'_>,
     ) -> Result<usize, CapabilityError> {
+        // จำเหตุผลงบหมดไว้คืนแทน Mismatch (caller แยกแยะ deny งบหมดออกจากผิด scope ได้)
+        let mut budget_err: Option<CapabilityError> = None;
         for (index, cap) in self.caps.iter_mut().enumerate() {
-            if cap.check_usable().is_err() || !cap.covers(action, resource, scope) {
+            if let Err(e) = cap.check_usable() {
+                if matches!(e, CapabilityError::BudgetExceeded(_)) {
+                    budget_err = Some(e);
+                }
+                continue;
+            }
+            if !cap.covers(action, resource, scope) {
                 continue;
             }
             if cap
@@ -435,16 +480,16 @@ impl CapabilitySet {
             {
                 continue;
             }
-            if cap
-                .check_constraints(
-                    ctx.request_bytes,
-                    None,
-                    ctx.protocol,
-                    ctx.port,
-                    ctx.response_bytes,
-                )
-                .is_err()
-            {
+            if let Err(e) = cap.check_constraints(
+                ctx.request_bytes,
+                None,
+                ctx.protocol,
+                ctx.port,
+                ctx.response_bytes,
+            ) {
+                if matches!(e, CapabilityError::BudgetExceeded(_)) {
+                    budget_err = Some(e);
+                }
                 continue;
             }
             if cap
@@ -452,12 +497,23 @@ impl CapabilitySet {
                 .max_calls
                 .is_some_and(|max| cap.used_count >= u64::from(max))
             {
+                budget_err = Some(CapabilityError::BudgetExceeded(
+                    cap.constraints.max_calls.unwrap() as u64,
+                ));
                 continue;
             }
             cap.used_count += 1;
             return Ok(index);
         }
-        Err(CapabilityError::Mismatch)
+        Err(budget_err.unwrap_or(CapabilityError::Mismatch))
+    }
+
+    /// บันทึกไบต์ที่ใช้จริงหลัง side effect สำเร็จ (index จาก authorize_with_context)
+    /// saturating ทั้งคู่ กัน overflow พาเพดานแตก
+    pub fn account_bytes(&mut self, index: usize, bytes: u64) {
+        if let Some(cap) = self.caps.get_mut(index) {
+            cap.account_bytes(bytes);
+        }
     }
 
     /// เพิกถอนใบที่ condition ผูกกับ state ที่เราไม่ได้อยู่แล้ว (§14.3)
@@ -633,5 +689,81 @@ mod tests {
             cap.authorize("read", "filesystem", "/workspace/c.rs"),
             Err(CapabilityError::BudgetExceeded(_))
         ));
+    }
+
+    // เพดานสะสม: ดูดทีละน้อยแต่รวมกันเกิน = DENY (กัน slow exfiltration)
+    #[test]
+    fn cumulative_byte_budget_exhausts() {
+        use crate::AuthorizationContext;
+        let mut set = CapabilitySet::new(vec![Capability::new(
+            "network:fetch",
+            "network",
+            "example.com:443",
+        )
+        .with_constraints(Constraints::new().with_max_total_bytes(100))]);
+        let ctx = AuthorizationContext {
+            request_bytes: Some(10),
+            ..Default::default()
+        };
+        // 10 ครั้ง × 10 ไบต์ = ครบ 100 พอดี
+        for _ in 0..10 {
+            let idx = set
+                .authorize_with_context("network:fetch", "network", "example.com:443", &ctx)
+                .expect("within budget");
+            set.account_bytes(idx, 10);
+        }
+        // ครั้งที่ 11 = DENY แม้ request แค่ 10 ไบต์ (เพดานหมดแล้ว)
+        assert!(matches!(
+            set.authorize_with_context("network:fetch", "network", "example.com:443", &ctx),
+            Err(CapabilityError::BudgetExceeded(_))
+        ));
+    }
+
+    // request เดียวที่จะล้นเพดาน = ปฏิเสธก่อน side effect (ไม่ต้องรอให้เกิดก่อน)
+    #[test]
+    fn single_request_overflowing_budget_denied_prefetch() {
+        use crate::AuthorizationContext;
+        let mut set = CapabilitySet::new(vec![Capability::new(
+            "network:fetch",
+            "network",
+            "example.com:443",
+        )
+        .with_constraints(Constraints::new().with_max_total_bytes(100))]);
+        let idx = set
+            .authorize_with_context(
+                "network:fetch",
+                "network",
+                "example.com:443",
+                &AuthorizationContext {
+                    request_bytes: Some(60),
+                    ..Default::default()
+                },
+            )
+            .expect("first fits");
+        set.account_bytes(idx, 60);
+        // เหลือ 40 ขอ 50 = DENY ก่อนส่ง
+        assert!(set
+            .authorize_with_context(
+                "network:fetch",
+                "network",
+                "example.com:443",
+                &AuthorizationContext {
+                    request_bytes: Some(50),
+                    ..Default::default()
+                },
+            )
+            .is_err());
+        // เหลือ 40 ขอ 40 = ผ่านพอดี
+        assert!(set
+            .authorize_with_context(
+                "network:fetch",
+                "network",
+                "example.com:443",
+                &AuthorizationContext {
+                    request_bytes: Some(40),
+                    ..Default::default()
+                },
+            )
+            .is_ok());
     }
 }
