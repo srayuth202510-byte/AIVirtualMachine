@@ -50,6 +50,12 @@ Container backend บังคับ namespaces + Landlock/seccomp + cgroups v2 
 - State/leases ใช้ไฟล์ 0600 ตั้งแต่สร้าง เขียนไฟล์ชั่วคราวแล้ว atomic rename + fsync; consume โควต้า/lease ลงดิสก์ก่อน side effect เพื่อป้องกันใช้ซ้ำหลัง crash
 - Supervisor ใช้ flock ป้องกันการ run/transition/approve พร้อมกัน สถานะเก็บบนดิสก์ และ pause/stop/kill ส่งสัญญาณผ่าน pidfd ไปยัง process จริง ตรวจ PID + start time ก่อนควบคุม
 
+## Policy และเครือข่าย (เพิ่มเติมหลังรอบ review)
+
+- `process.allow` ต้องเป็น absolute path ที่ชัดเจน ห้ามมี wildcard glob เพื่อป้องกัน interpreter ที่ถูกคัดลอก/เปลี่ยนชื่อ หลุด semantic ban (F-4)
+- Capability scope ของ filesystem ที่เป็น root/empty/wildcard (`/`, `*`) จะถูกปฏิเสธก่อน grant (F-9) ลดข้ามขอบเขตแฝง
+- `network_pattern` ให้ hostname allow ใช้ได้เฉพาะ default port (443) เว้นแต่จะระบุ port ชัดเจน (`github.com:8443`) (F-8)
+
 ## Policy และเครือข่าย
 
 - Predicate/pattern ที่ parse ไม่ได้ทำให้ policy ทั้งชุดถูกปฏิเสธ ไม่มี fallback glob เป็น substring
