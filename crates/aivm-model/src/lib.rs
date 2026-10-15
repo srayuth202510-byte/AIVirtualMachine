@@ -878,17 +878,29 @@ mod tests {
     #[cfg(feature = "llama")]
     #[test]
     fn local_model_with_wrong_pin_fails_before_load() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "aivm-model-wrong-pin-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("tiny.gguf");
+        // Intentionally invalid GGUF: reaching the loader would fail for a
+        // different reason, so only the pin-mismatch error satisfies this test.
+        std::fs::write(&file, b"fake-gguf-bytes").unwrap();
         let cfg = LocalModelConfig {
-            model_path: "/tmp/definitely-not-a-model.gguf".into(),
+            model_path: file.to_str().unwrap().into(),
             model_sha256: "00".repeat(32),
             ..Default::default()
         };
-        let err = LocalLlamaModel::new(cfg)
-            .err()
-            .expect("must fail")
-            .to_string();
+        let err = LocalLlamaModel::new(cfg).err().expect("must fail");
+        std::fs::remove_dir_all(&dir).unwrap();
         assert!(
-            err.contains("mismatch") || err.contains("statable"),
+            matches!(&err, ModelError::LoadFailed(message)
+                if message == "model sha256 mismatch (refusing to load)"),
             "{err}"
         );
     }
