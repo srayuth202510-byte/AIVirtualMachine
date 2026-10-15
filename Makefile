@@ -15,6 +15,7 @@ check: ## ตรวจ type เร็ว ไม่สร้างโค้ด
 test: ## เทสต์ unit + integration ทั้งหมด
 	cargo test --workspace
 	python3 -m unittest discover -s scripts -p 'test_qwen_*.py'
+	python3 -m unittest discover -s scripts -p 'test_supervisor.py'
 	python3 scripts/eval-qwen-audit.py
 	python3 scripts/smoke-qwen-watch.py
 

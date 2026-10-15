@@ -35,6 +35,7 @@ jobs:
       - name: ทดสอบตัวตรวจคำตอบและ audit reviewer (ไม่ต้องใช้โมเดล)
         run: |
           python3 -m unittest discover -s scripts -p 'test_qwen_*.py'
+          python3 -m unittest discover -s scripts -p 'test_supervisor.py'
           python3 scripts/eval-qwen-audit.py
           python3 scripts/smoke-qwen-watch.py
 

@@ -108,6 +108,7 @@ crates/
 ## เอกสาร
 
 - [`docs/audit-watcher.md`](./docs/audit-watcher.md) — เฝ้าดู audit ต่อเนื่อง พร้อมตรวจ partial writes/rotation และให้ Qwen ทบทวนเบื้องหลัง
+- [`docs/recovery-supervisor.md`](./docs/recovery-supervisor.md) — controller ภายนอกสำหรับงานบนเครื่องเดียว: dry-run, กักกัน, สร้างทดแทน, จำกัดการเกิดใหม่ และ drain
 
 - [`docs/audit-reviewer.md`](./docs/audit-reviewer.md) — วิเคราะห์ audit แบบอ่านอย่างเดียว ด้วยกฎและคำแนะนำจาก Qwen
 

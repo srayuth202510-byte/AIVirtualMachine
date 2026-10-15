@@ -1,5 +1,8 @@
 # Audit watcher: ตรวจ log ต่อเนื่องแบบแจ้งเตือนเท่านั้น
 
+สำหรับการกักกันและสร้าง instance ทดแทนผ่าน controller ภายนอก ดู
+[recovery-supervisor.md](recovery-supervisor.md) watcher นี้ยังคงแจ้งเตือนอย่างเดียว
+
 ต่อจาก [audit reviewer](audit-reviewer.md) โดยอ่านข้อมูลที่เพิ่มเข้ามาเป็นช่วง
 จำประวัติสำหรับกฎตรวจ DENY ถี่ และให้ Qwen ทบทวนเบื้องหลัง ไม่มีการกัก,
 หยุด process, grant/revoke หรือแก้ policy อัตโนมัติ
