@@ -406,6 +406,24 @@ pub fn run_in_hardware(
 
     #[cfg(target_os = "linux")]
     {
+        // หา QEMU binary (ทางเดียวผ่าน `find_qemu` — ไม่แยก logic ซ้ำซ้อน)
+        let qemu_bin = if cfg.qemu_path.as_os_str().is_empty() {
+            super::find_qemu().ok_or_else(|| {
+                (
+                    SandboxError::Disabled("hardware needs qemu-system-x86_64 in PATH".into()),
+                    RunVerdict::Clean,
+                )
+            })?
+        } else {
+            cfg.qemu_path.clone()
+        };
+
+        // supply chain ของ VMM เอง: pin ไว้ก็ต้องตรง
+        if !cfg.qemu_sha256.is_empty() {
+            verify_artifact(&qemu_bin, &cfg.qemu_sha256, cfg.max_artifact_bytes)
+                .map_err(|e| (e, RunVerdict::Clean))?;
+        }
+
         // ตรวจ KVM
         if !super::kvm_available() {
             return Err((
@@ -445,24 +463,6 @@ pub fn run_in_hardware(
                 ),
                 RunVerdict::Clean,
             ));
-        }
-
-        // หา QEMU binary (ทางเดียวผ่าน `find_qemu` — ไม่แยก logic ซ้ำซ้อน)
-        let qemu_bin = if cfg.qemu_path.as_os_str().is_empty() {
-            super::find_qemu().ok_or_else(|| {
-                (
-                    SandboxError::Disabled("hardware needs qemu-system-x86_64 in PATH".into()),
-                    RunVerdict::Clean,
-                )
-            })?
-        } else {
-            cfg.qemu_path.clone()
-        };
-
-        // supply chain ของ VMM เอง: pin ไว้ก็ต้องตรง
-        if !cfg.qemu_sha256.is_empty() {
-            verify_artifact(&qemu_bin, &cfg.qemu_sha256, cfg.max_artifact_bytes)
-                .map_err(|e| (e, RunVerdict::Clean))?;
         }
 
         // 5. Launch จริงพร้อม TEE + Attestation + Measured Boot
@@ -561,12 +561,9 @@ mod tests {
     // pin ของ QEMU ไม่ตรงต้องตายด้วย Invalid
     #[test]
     fn wrong_qemu_pin_fails_closed_as_invalid() {
-        // ข้ามถ้าไม่มี QEMU (ยังไม่ถึงขั้นตรวจ pin = Disabled)
-        if which::which("qemu-system-x86_64").is_err() {
-            eprintln!("skip: เครื่องนี้ไม่มี qemu-system-x86_64");
-            return;
-        }
         let (spec, policy, mut cfg, ws) = fixture("qemupin");
+        cfg.qemu_path = ws.join("fake-qemu");
+        std::fs::write(&cfg.qemu_path, b"untrusted-qemu").unwrap();
         cfg.qemu_sha256 = "00".repeat(32);
         assert!(matches!(
             run_in_hardware(&spec, &policy, &cfg),

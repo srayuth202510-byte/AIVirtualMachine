@@ -23,6 +23,7 @@ fn sanitize(api_key: &str, msg: String) -> String {
 // ---------- OpenAI ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OpenAIConfig {
     pub api_key_env: String, // ชื่อ env var ที่เก็บ API key
     pub model: String,       // เช่น "gpt-4o-mini"
@@ -88,23 +89,26 @@ impl OpenAIProvider {
             .map_err(|_| ModelError::Backend(format!("env {} not set", config.api_key_env)))?;
         Ok(Self { config, api_key })
     }
-}
 
-impl Model for OpenAIProvider {
-    fn reason(&self, context: &str) -> Result<String, ModelError> {
-        let body = OpenAIRequest {
+    fn request_body(&self, context: &str) -> OpenAIRequest {
+        OpenAIRequest {
             model: self.config.model.clone(),
             messages: vec![OpenAIMessage {
                 role: "user".into(),
                 content: context.to_string(),
             }],
             max_tokens: 2048,
-        };
+        }
+    }
+}
+
+impl Model for OpenAIProvider {
+    fn reason(&self, context: &str) -> Result<String, ModelError> {
         let resp: OpenAIResponse = ureq::post(OPENAI_URL)
             .set("Authorization", &format!("Bearer {}", self.api_key))
             .set("Content-Type", "application/json")
             .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .send_json(serde_json::to_value(&body).unwrap())
+            .send_json(serde_json::to_value(self.request_body(context)).unwrap())
             .map_err(|e| ModelError::Backend(sanitize(&self.api_key, e.to_string())))?
             .into_json()
             .map_err(|e| ModelError::Backend(sanitize(&self.api_key, e.to_string())))?;
@@ -127,6 +131,7 @@ impl Model for OpenAIProvider {
 // ---------- Anthropic ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AnthropicConfig {
     pub api_key_env: String,
     pub model: String, // เช่น "claude-sonnet-4-20250514"
@@ -187,24 +192,27 @@ impl AnthropicProvider {
             .map_err(|_| ModelError::Backend(format!("env {} not set", config.api_key_env)))?;
         Ok(Self { config, api_key })
     }
-}
 
-impl Model for AnthropicProvider {
-    fn reason(&self, context: &str) -> Result<String, ModelError> {
-        let body = AnthropicRequest {
+    fn request_body(&self, context: &str) -> AnthropicRequest {
+        AnthropicRequest {
             model: self.config.model.clone(),
             max_tokens: 2048,
             messages: vec![AnthropicMessage {
                 role: "user".into(),
                 content: context.to_string(),
             }],
-        };
+        }
+    }
+}
+
+impl Model for AnthropicProvider {
+    fn reason(&self, context: &str) -> Result<String, ModelError> {
         let resp: AnthropicResponse = ureq::post(ANTHROPIC_URL)
             .set("x-api-key", &self.api_key)
             .set("anthropic-version", "2023-06-01")
             .set("Content-Type", "application/json")
             .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .send_json(serde_json::to_value(&body).unwrap())
+            .send_json(serde_json::to_value(self.request_body(context)).unwrap())
             .map_err(|e| ModelError::Backend(sanitize(&self.api_key, e.to_string())))?
             .into_json()
             .map_err(|e| ModelError::Backend(sanitize(&self.api_key, e.to_string())))?;
@@ -227,6 +235,42 @@ impl Model for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_openai_model_reaches_request_payload() {
+        let config = crate::ModelConfig {
+            provider: "openai".into(),
+            name: "selected-openai".into(),
+            ..Default::default()
+        };
+        let provider = OpenAIProvider {
+            config: config.openai_config(),
+            api_key: "test-only".into(),
+        };
+        let request = serde_json::to_value(provider.request_body("hello")).unwrap();
+        assert_eq!(request["model"], "selected-openai");
+        assert_eq!(request["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn selected_anthropic_model_reaches_request_payload() {
+        let config = crate::ModelConfig {
+            provider: "anthropic".into(),
+            name: "echo".into(),
+            anthropic: Some(AnthropicConfig {
+                model: "selected-anthropic".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let provider = AnthropicProvider {
+            config: config.anthropic_config(),
+            api_key: "test-only".into(),
+        };
+        let request = serde_json::to_value(provider.request_body("hello")).unwrap();
+        assert_eq!(request["model"], "selected-anthropic");
+        assert_eq!(request["messages"][0]["content"], "hello");
+    }
 
     #[test]
     fn openai_config_default() {

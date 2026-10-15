@@ -165,6 +165,9 @@ pub fn parse_intent(raw: &str) -> Result<Intent, String> {
                 path: request.path,
                 content,
             };
+            if request.tool == "filesystem.write" && request.content.is_none() {
+                return Err("filesystem.write requires content".into());
+            }
             if request.tool == "process.exec"
                 && (request.content.is_none() || request.path.chars().any(char::is_whitespace))
             {
@@ -690,6 +693,24 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::Mutex;
+
+    #[test]
+    fn write_intents_require_explicit_content() {
+        for raw in [
+            r#"{"tool":"filesystem.write","path":"src/a.rs"}"#,
+            r#"{"tool":"filesystem.write","path":"src/a.rs","content":null}"#,
+        ] {
+            assert!(parse_intent(raw).is_err());
+        }
+        for content in ["\"\"", "[]", r#"["line"]"#] {
+            let raw =
+                format!(r#"{{"tool":"filesystem.write","path":"src/a.rs","content":{content}}}"#);
+            assert!(
+                parse_intent(&raw).is_ok(),
+                "explicit content must parse: {raw}"
+            );
+        }
+    }
 
     /// โมเดลสคริปต์: คืนข้อความที่กำหนดตามลำดับ (ไว้ทดสอบ loop แบบ deterministic)
     struct ScriptedModel {

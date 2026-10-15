@@ -63,6 +63,31 @@ impl Default for ModelConfig {
     }
 }
 
+impl ModelConfig {
+    // An explicit shared name wins over provider defaults/overrides. Legacy
+    // echo/provider placeholders retain provider-specific model defaults.
+    fn cloud_model_name(&self) -> Option<&str> {
+        (!self.name.is_empty() && self.name != "echo" && self.name != self.provider)
+            .then_some(self.name.as_str())
+    }
+
+    fn openai_config(&self) -> providers::OpenAIConfig {
+        let mut config = self.openai.clone().unwrap_or_default();
+        if let Some(name) = self.cloud_model_name() {
+            config.model = name.into();
+        }
+        config
+    }
+
+    fn anthropic_config(&self) -> providers::AnthropicConfig {
+        let mut config = self.anthropic.clone().unwrap_or_default();
+        if let Some(name) = self.cloud_model_name() {
+            config.model = name.into();
+        }
+        config
+    }
+}
+
 /// การตั้งค่าซิงสำหรับแบ็กเอนด์ local (GGUF)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalModelConfig {
@@ -352,10 +377,10 @@ pub fn create_model(config: &ModelConfig) -> Result<Box<dyn Model>, ModelError> 
         })),
         "local" => create_local_model(config),
         "openai" => Ok(Box::new(providers::OpenAIProvider::new(
-            config.openai.clone().unwrap_or_default(),
+            config.openai_config(),
         )?)),
         "anthropic" => Ok(Box::new(providers::AnthropicProvider::new(
-            config.anthropic.clone().unwrap_or_default(),
+            config.anthropic_config(),
         )?)),
         other => Err(ModelError::Backend(format!("unknown provider: {other}"))),
     }
@@ -380,6 +405,49 @@ fn create_local_model(_config: &ModelConfig) -> Result<Box<dyn Model>, ModelErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_model_selection_respects_names_and_provider_overrides() {
+        let mut config = ModelConfig {
+            provider: "openai".into(),
+            name: "chosen-openai-model".into(),
+            ..Default::default()
+        };
+        assert_eq!(config.openai_config().model, "chosen-openai-model");
+        config.openai = Some(providers::OpenAIConfig {
+            api_key_env: "CUSTOM_OPENAI_KEY".into(),
+            model: "nested-model".into(),
+        });
+        assert_eq!(config.openai_config().model, "chosen-openai-model");
+        assert_eq!(config.openai_config().api_key_env, "CUSTOM_OPENAI_KEY");
+        config.name = "echo".into();
+        assert_eq!(config.openai_config().model, "nested-model");
+        config.provider = "anthropic".into();
+        config.name = "chosen-anthropic-model".into();
+        assert_eq!(config.anthropic_config().model, "chosen-anthropic-model");
+        config.anthropic = Some(providers::AnthropicConfig {
+            api_key_env: "CUSTOM_ANTHROPIC_KEY".into(),
+            model: "nested-anthropic".into(),
+        });
+        assert_eq!(config.anthropic_config().model, "chosen-anthropic-model");
+        assert_eq!(
+            config.anthropic_config().api_key_env,
+            "CUSTOM_ANTHROPIC_KEY"
+        );
+        config.name = "echo".into();
+        assert_eq!(config.anthropic_config().model, "nested-anthropic");
+        config.openai = None;
+        config.anthropic = None;
+        config.name = "echo".into();
+        assert_eq!(
+            config.openai_config().model,
+            providers::OpenAIConfig::default().model
+        );
+        assert_eq!(
+            config.anthropic_config().model,
+            providers::AnthropicConfig::default().model
+        );
+    }
 
     // echo เป็นค่าเริ่มต้น: ต้องสร้างได้และตอบแบบ deterministic
     #[test]

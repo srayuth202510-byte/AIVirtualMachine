@@ -542,6 +542,10 @@ impl ToolGateway {
         self.check_quarantine(cube, "read", path)?;
         let (canon, cap_index) = self.enforce(cube, "read", path)?;
         if let Some(content) = self.read_cache.get(&canon).cloned() {
+            if let Err(error) = self.check_file_size(cap_index, content.len() as u64) {
+                self.audit_decision(cube, "read", path, "deny", "size-constraint", "error")?;
+                return Err(error);
+            }
             self.audit_decision(cube, "read", path, "allow", "cache-hit", "success")?;
             return Ok(ToolResult {
                 ok: true,
@@ -792,17 +796,17 @@ impl ToolGateway {
             Path::new(exe).parent() == Some(self.workspace.join(build::DIRECTORY).as_path());
         // secret ระดับ microvm ยัง inject ไม่ได้ (guest ไม่รับ env_extra) —
         // fail-closed ตั้งแต่ต้น ไม่เงียบทิ้ง (G4)
-        if lease_id.is_some() && self.level == SandboxLevel::MicroVm {
-            self.audit_decision(
-                cube,
-                "execute",
-                exe,
-                "deny",
-                "secret-unsupported-microvm",
-                "error",
-            )?;
+        if lease_id.is_some()
+            && matches!(self.level, SandboxLevel::MicroVm | SandboxLevel::Hardware)
+        {
+            let rule = if self.level == SandboxLevel::MicroVm {
+                "secret-unsupported-microvm"
+            } else {
+                "secret-unsupported-hardware"
+            };
+            self.audit_decision(cube, "execute", exe, "deny", rule, "error")?;
             return Err(ToolError::Denied(
-                "secret injection not supported at microvm level".into(),
+                "secret injection not supported at this isolation level".into(),
             ));
         }
         if (!outputs.is_empty() || artifact_executable)
@@ -1336,9 +1340,22 @@ impl ToolGateway {
         // มีแค่ tool ที่ผ่านตัวกลางตามรายการ อย่างอื่นคือ DENY
         match req.tool.as_str() {
             "filesystem.read" => self.read(cube, &req.path),
-            "filesystem.write" => {
-                self.write(cube, &req.path, req.content.as_deref().unwrap_or_default())
-            }
+            "filesystem.write" => match req.content.as_deref() {
+                Some(content) => self.write(cube, &req.path, content),
+                None => {
+                    self.audit_decision(
+                        cube,
+                        "write",
+                        &req.path,
+                        "deny",
+                        "missing-content",
+                        "error",
+                    )?;
+                    Err(ToolError::Denied(
+                        "filesystem.write requires content".into(),
+                    ))
+                }
+            },
             "code.search" => self.search(cube, &req.path),
             "process.exec" => {
                 // A build or test command can change any workspace file.
@@ -1891,6 +1908,112 @@ fn zeroize_env(env: &mut [(String, String)]) {
 mod tests {
     use super::*;
     use aivm_capability::Capability;
+
+    #[test]
+    fn cached_reads_enforce_current_size_constraints() {
+        let (mut gw, mut cube, dir) = harness();
+        std::fs::write(dir.join("src/data.txt"), "0123456789").unwrap();
+        gw.read(&mut cube, "src/data.txt").unwrap();
+        gw.caps
+            .caps
+            .iter_mut()
+            .find(|c| c.action == "read")
+            .unwrap()
+            .constraints
+            .max_bytes = Some(1);
+        assert!(matches!(
+            gw.read(&mut cube, "src/data.txt"),
+            Err(ToolError::Denied(_))
+        ));
+        assert!(std::fs::read_to_string(dir.join("audit.jsonl"))
+            .unwrap()
+            .contains("size-constraint"));
+
+        // A write must not prime a cache entry that bypasses a limited read.
+        gw.write(&mut cube, "src/data.txt", "more data").unwrap();
+        assert!(gw.read(&mut cube, "src/data.txt").is_err());
+        gw.write(&mut cube, "src/data.txt", "x").unwrap();
+        assert_eq!(gw.read(&mut cube, "src/data.txt").unwrap().output, "x");
+        aivm_audit::clear_flags(&dir);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_write_content_never_truncates_a_file() {
+        let (mut gw, mut cube, dir) = harness();
+        std::fs::write(dir.join("src/data.txt"), "keep me").unwrap();
+        for json in [
+            r#"{"tool":"filesystem.write","path":"src/data.txt"}"#,
+            r#"{"tool":"filesystem.write","path":"src/data.txt","content":null}"#,
+        ] {
+            let request: ToolRequest = serde_json::from_str(json).unwrap();
+            assert!(matches!(
+                gw.dispatch(&mut cube, &request),
+                Err(ToolError::Denied(_))
+            ));
+            assert_eq!(
+                std::fs::read_to_string(dir.join("src/data.txt")).unwrap(),
+                "keep me"
+            );
+        }
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert_eq!(log.matches("missing-content").count(), 2);
+        gw.dispatch(
+            &mut cube,
+            &ToolRequest {
+                tool: "filesystem.write".into(),
+                path: "src/data.txt".into(),
+                content: Some(String::new()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.join("src/data.txt")).unwrap().len(),
+            0
+        );
+        aivm_audit::clear_flags(&dir);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unsupported_guest_secret_injection_preserves_the_lease() {
+        for (level, rule) in [
+            (SandboxLevel::MicroVm, "secret-unsupported-microvm"),
+            (SandboxLevel::Hardware, "secret-unsupported-hardware"),
+        ] {
+            let (mut gw, mut cube, dir) = secret_harness();
+            let response = gw
+                .dispatch(
+                    &mut cube,
+                    &ToolRequest {
+                        tool: "secret.request".into(),
+                        path: "-".into(),
+                        content: Some(secret_body("process.exec", "test_token", "read", "low")),
+                    },
+                )
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&response.output).unwrap();
+            let id = value["lease_id"].as_str().unwrap();
+            gw.level = level;
+            let result = gw.dispatch(
+                &mut cube,
+                &ToolRequest {
+                    tool: "process.exec".into(),
+                    path: "/bin/true".into(),
+                    content: Some(serde_json::json!({"argv": [], "secret": id}).to_string()),
+                },
+            );
+            assert!(matches!(result, Err(ToolError::Denied(_))));
+            let broker = gw.secret_broker_mut().unwrap();
+            assert_eq!(broker.get_lease(id).unwrap().uses, 0);
+            assert_eq!(broker.use_lease(id).unwrap(), "TOP-SECRET-XYZ");
+            assert!(std::fs::read_to_string(dir.join("audit.jsonl"))
+                .unwrap()
+                .contains(rule));
+            aivm_audit::clear_flags(&dir);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 
     fn harness() -> (ToolGateway, Cube, PathBuf) {
         let dir = std::env::temp_dir().join(format!(

@@ -17,6 +17,10 @@
 
 ## Secrets
 
+MicroVM และ Hardware backend ยังไม่ส่ง environment เข้า guest คำขอ exec
+ที่แนบ secret lease จึงถูกปฏิเสธก่อน consume/checkpoint เพื่อรักษา one-time lease
+ไว้ใช้กับ backend ที่รองรับ
+
 คำขอ `risk: low` ลดระดับเองไม่ได้ ต้องตรง `secrets.low_risk_allow` ที่ operator กำหนด เช่น:
 
 ```yaml
@@ -33,6 +37,11 @@ Container backend บังคับ namespaces + Landlock/seccomp + cgroups v2 
 ผ่าน `cgroup.kill` ดูข้อกำหนดและข้อจำกัดใน [`container.md`](./container.md)
 
 ## Audit และ state
+
+- State เดิมที่ parse ไม่ได้หรืออ่านไม่ได้ทำให้ Runtime ไม่บูต ไม่มีการคืน
+  initial capabilities เพื่อกลบข้อผิดพลาดและทำให้ quota ที่หมดแล้วกลับมาใช้ได้
+- Supervisor จอง directory ด้วย atomic create และเผยแพร่ config หลัง init/persist
+  สำเร็จ เมื่อ create ผิดพลาดจะ cleanup เฉพาะ directory ที่ตัวเองจองสำเร็จ
 
 - เขียน audit ไม่ได้ = action ไม่เริ่ม authorization และ outcome มี record แยกกัน
 - Hash version 2 ครอบคลุมทุกฟิลด์หลักฐาน รวม result, rule, capability และ transition ใช้ serialization ที่ไม่กำกวม

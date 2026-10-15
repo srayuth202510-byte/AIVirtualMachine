@@ -101,17 +101,39 @@ impl Supervisor {
             return Err(SupervisorError::Exists(name.into()));
         }
         let dir = self.vm_dir(name);
-        std::fs::create_dir_all(dir.join("workspace/src"))
-            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
-        config.name = name.into();
-        let _lease = lifecycle::Lease::acquire(&dir, false)?;
-        let yaml =
-            serde_yaml::to_string(&config).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
-        std::fs::write(dir.join("aivm.yaml"), yaml)
-            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
-        // ตรวจว่า runtime บูตแบบ fail-closed ได้ก่อนค่อยลงทะเบียน
-        Runtime::init(config, dir.clone()).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
-        lifecycle::save_status(&dir, &VmStatus::Created)?;
+        std::fs::create_dir_all(&self.root).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        // Reserve the name atomically. Only this operation owns the new
+        // directory, so a failed create cannot delete another creator's VM.
+        std::fs::create_dir(&dir).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                SupervisorError::Exists(name.into())
+            } else {
+                SupervisorError::Runtime(e.to_string())
+            }
+        })?;
+        let result = (|| {
+            let _lease = lifecycle::Lease::acquire(&dir, false)?;
+            std::fs::create_dir_all(dir.join("workspace/src"))
+                .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+            config.name = name.into();
+            let yaml = serde_yaml::to_string(&config)
+                .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+            let rt = Runtime::init(config, dir.clone())
+                .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+            rt.persist()
+                .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+            lifecycle::save_status(&dir, &VmStatus::Created)?;
+            // Publish the discovery marker last, after validation and state.
+            aivm_tools::state_store::write_private(&dir.join("aivm.yaml"), &yaml)
+                .map_err(|e| SupervisorError::Runtime(e.to_string()))
+        })();
+        if let Err(error) = result {
+            aivm_audit::clear_flags(&dir);
+            std::fs::remove_dir_all(&dir).map_err(|cleanup| {
+                SupervisorError::Runtime(format!("{error}; create cleanup failed: {cleanup}"))
+            })?;
+            return Err(error);
+        }
         self.vms.insert(name.to_string(), (VmStatus::Created, dir));
         Ok(())
     }
@@ -267,5 +289,79 @@ impl Supervisor {
 
     pub fn status(&self, name: &str) -> Option<VmStatus> {
         self.vms.get(name).map(|(_, dir)| lifecycle::status(dir))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "aivm-create-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn failed_create_removes_partial_vm_and_allows_retry() {
+        let root = root("retry");
+        let mut supervisor = Supervisor::new(root.clone());
+        let config = VmConfig::from_yaml("name: test").unwrap();
+        let mut bad = config.clone();
+        bad.runtime.isolation = "invalid".into();
+        assert!(supervisor.create("vm", bad).is_err());
+        assert!(!root.join("vm").exists());
+        assert!(Supervisor::new(root.clone()).status("vm").is_none());
+        supervisor.create("vm", config.clone()).unwrap();
+        assert_eq!(
+            Supervisor::new(root.clone()).status("vm"),
+            Some(VmStatus::Created)
+        );
+        assert!(root.join("vm/state.json").is_file());
+        assert!(matches!(
+            supervisor.create("vm", config),
+            Err(SupervisorError::Exists(_))
+        ));
+        aivm_audit::clear_flags(&root);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_creators_cannot_overwrite_each_other() {
+        let root = root("concurrent");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let creators: Vec<_> = (0..2)
+            .map(|i| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut supervisor = Supervisor::new(root);
+                    let config =
+                        VmConfig::from_yaml(&format!("name: test\nresources:\n  cpu: {}", i + 1))
+                            .unwrap();
+                    barrier.wait();
+                    supervisor.create("vm", config).map(|()| i + 1)
+                })
+            })
+            .collect();
+        let results: Vec<_> = creators.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Err(SupervisorError::Exists(_))))
+                .count(),
+            1
+        );
+        let winner = results.into_iter().find_map(Result::ok).unwrap();
+        let config = VmConfig::from_file(&root.join("vm/aivm.yaml")).unwrap();
+        assert_eq!(config.resources.cpu, winner);
+        assert!(Runtime::init(config, root.join("vm")).is_ok());
+        aivm_audit::clear_flags(&root);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

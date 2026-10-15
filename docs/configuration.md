@@ -141,6 +141,29 @@ policy:
 
 ## โปรไฟล์เสถียรภาพโมเดล (Model Stability)
 
+### Cloud providers
+
+ชื่อโมเดลใน `model.name` ถูกส่งไปยัง provider จริง และตั้งชื่อ environment
+variable ของ API key แยกตาม provider ได้ เช่น:
+
+```yaml
+model:
+  provider: openai
+  name: your-openai-model
+  openai:
+    api_key_env: AIVM_OPENAI_KEY
+```
+
+สำหรับ Anthropic ใช้ `provider: anthropic` และบล็อก `anthropic.api_key_env`
+ค่า API key อยู่ใน environment เท่านั้น ไม่ใส่ใน YAML
+
+ลำดับเลือกชื่อคือ `model.name` ที่ระบุเอง → `model.openai.model` หรือ
+`model.anthropic.model` → default ของ provider ค่า name ว่าง, `echo` หรือชื่อ
+provider (`openai`/`anthropic`) ถือเป็น placeholder เดิมและใช้ลำดับ fallback
+บล็อก provider ระบุเฉพาะ `api_key_env` ได้ โดยไม่เปลี่ยน `model.name` ที่เลือกไว้
+
+### Local models
+
 ตั้งค่า `model.local` ต่อไปนี้สำหรับ production ที่ต้องการ deterministic output:
 
 ```yaml
@@ -173,6 +196,16 @@ model:
 > เหมาะสำหรับ coding tasks, structured output, regression testing
 
 ## หมายเหตุการบังคับใช้
+
+- `state.json` ที่เสียหรืออ่านไม่ได้ทำให้ Runtime ปฏิเสธการบูต ไม่มีการ reset
+  quotas/capabilities กลับ INIT อัตโนมัติ ให้ operator เก็บไฟล์ที่เสียไว้ตรวจสอบ
+  และกู้จาก backup ที่เชื่อถือได้ การลบ state จะทำให้เริ่มสิทธิ์ใหม่ จึงไม่ควรใช้
+  เป็นวิธีแก้ข้อผิดพลาดการอ่าน state ตามปกติ
+- คำสั่ง `filesystem.write` ต้องมี `content` เสมอ (missing/null = DENY)
+  ใช้ `content: ""` เมื่อตั้งใจล้างไฟล์
+- MicroVM และ Hardware ยังไม่รองรับ secret injection จึงปฏิเสธก่อน consume lease
+- การสร้าง VM จะเผยแพร่ `aivm.yaml` หลัง validate และ persist สำเร็จเท่านั้น
+  เมื่อ create ล้มเหลวจะลบ directory ที่ operation นั้นสร้างไว้เพื่อให้ลองชื่อเดิมใหม่ได้
 
 - runtime สร้าง enforcement policy จาก config + **deny list บังคับ** (เช่น
   `**/.env*`, `**/secrets/**`, `/bin/sh`, `/bin/bash`, เน็ตวงใน `10/8`,

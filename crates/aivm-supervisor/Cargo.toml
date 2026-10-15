@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 libc = "0.2"
 serde_json = { workspace = true }
 aivm-tools = { path = "../aivm-tools" }
+aivm-audit = { path = "../aivm-audit" }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }

@@ -115,6 +115,10 @@ pub struct ModelBlock {
     /// การตั้งค่าแบ็กเอนด์ local (ใช้เมื่อ provider = "local")
     #[serde(default)]
     pub local: Option<LocalModelConfig>,
+    #[serde(default)]
+    pub openai: Option<aivm_model::providers::OpenAIConfig>,
+    #[serde(default)]
+    pub anthropic: Option<aivm_model::providers::AnthropicConfig>,
 }
 
 // default ต้องตรงกับ serde default (echo) ไม่ใช่ค่าว่าง เพื่อให้ผู้ที่สร้าง
@@ -125,6 +129,8 @@ impl Default for ModelBlock {
             provider: default_provider(),
             name: default_model(),
             local: None,
+            openai: None,
+            anthropic: None,
         }
     }
 }
@@ -349,17 +355,31 @@ impl Runtime {
         gateway = gateway.with_secret_broker(broker);
         let mut cube = Cube::new(&format!("task_{}", config.name));
         // กู้ state แบบ dynamic (transition ที่ validate แล้ว + lease ที่ยังใช้ได้)
-        // ไฟล์ state ที่เสีย/แปลกปลอมจะถูกเมินแบบ fail-closed: VM จะ
-        // เริ่มใหม่ด้วยสิทธิ์ INIT ขั้นต่ำ ไม่เคยได้สิทธิ์เกิน
+        // Only a missing state file represents a fresh runtime. Corrupt or
+        // unreadable state must never reset consumed quotas or revocations.
         let state_path = base_dir.join(STATE_FILE);
-        if let Ok(text) = std::fs::read_to_string(&state_path) {
-            if let Ok(saved) = serde_json::from_str::<PersistedState>(&text) {
+        match std::fs::read_to_string(&state_path) {
+            Ok(text) => {
+                let saved: PersistedState = serde_json::from_str(&text)
+                    .map_err(|e| RuntimeError::Config(format!("invalid persisted state: {e}")))?;
                 cube = saved.cube;
                 gateway.caps = saved.caps;
                 // G4b: ฟื้น leases ที่ยังใช้ได้ (หมดอายุ/หมดโควต้า/จบแล้วทิ้ง)
                 if let Some(broker) = gateway.secret_broker_mut() {
                     broker.restore(saved.leases);
                 }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink is not a fresh state file.
+                match std::fs::symlink_metadata(&state_path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => return Err(RuntimeError::Io("persisted state is inaccessible".into())),
+                }
+            }
+            Err(e) => {
+                return Err(RuntimeError::Io(format!(
+                    "cannot read persisted state: {e}"
+                )))
             }
         }
         let memory = Memory::new(base_dir.join("memory"));
@@ -396,7 +416,8 @@ impl Runtime {
             provider: config.model.provider.clone(),
             name: config.model.name.clone(),
             local: config.model.local.clone(),
-            ..ModelConfig::default()
+            openai: config.model.openai.clone(),
+            anthropic: config.model.anthropic.clone(),
         };
         // สร้างโมเดลผ่าน factory — provider ที่ไม่รู้จัก/ไม่มีฟีเจอร์จะ fail-closed
         let model: Box<dyn Model> =
@@ -998,6 +1019,38 @@ capabilities:
     }
 
     #[test]
+    fn cloud_provider_blocks_reach_the_runtime_model_factory() {
+        for (provider, key) in [
+            ("openai", "AIVM_RUNTIME_TEST_OPENAI_CONFIG_KEY"),
+            ("anthropic", "AIVM_RUNTIME_TEST_ANTHROPIC_CONFIG_KEY"),
+        ] {
+            std::env::set_var(key, "test-only");
+            let config = VmConfig::from_yaml(&format!(
+                "name: cloud\nmodel:\n  provider: {provider}\n  {provider}:\n    api_key_env: {key}\n    model: selected-model\n"
+            )).unwrap();
+            let (rt, base) = test_runtime(provider);
+            drop(rt);
+            let rt = Runtime::init(config, base.clone()).unwrap();
+            let (model, env) = if provider == "openai" {
+                let config = rt.model_cfg.openai.as_ref().unwrap();
+                (&config.model, &config.api_key_env)
+            } else {
+                let config = rt.model_cfg.anthropic.as_ref().unwrap();
+                (&config.model, &config.api_key_env)
+            };
+            assert_eq!(model, "selected-model");
+            assert_eq!(env, key);
+            let roundtrip =
+                VmConfig::from_yaml(&serde_yaml::to_string(&rt.config).unwrap()).unwrap();
+            assert_eq!(roundtrip.model.provider, provider);
+            drop(rt);
+            std::env::remove_var(key);
+            aivm_audit::clear_flags(&base);
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+
+    #[test]
     fn write_denied_before_modify_grant() {
         let (mut rt, base) = test_runtime("deny");
         let r = rt.gateway.write(&mut rt.cube, "src/a.rs", "x");
@@ -1090,16 +1143,54 @@ capabilities:
     }
 
     #[test]
-    fn corrupt_state_file_fails_closed_to_init() {
+    fn corrupt_state_file_prevents_boot_without_resetting_quotas() {
         let (mut rt, base) = test_runtime("corrupt");
-        rt.transition_to(AgentState::Analyze, &TransitionGuards::default())
-            .unwrap();
+        std::fs::write(rt.workspace.join("data.txt"), "data").unwrap();
+        rt.gateway.caps = CapabilitySet::new(vec![Capability::new(
+            "read",
+            "filesystem",
+            &rt.workspace.to_string_lossy(),
+        )
+        .with_max_uses(1)]);
+        rt.gateway.read(&mut rt.cube, "data.txt").unwrap();
         rt.persist().unwrap();
+        drop(rt);
+        let mut restored = Runtime::init(test_config(), base.clone()).unwrap();
+        assert!(restored
+            .gateway
+            .read(&mut restored.cube, "data.txt")
+            .is_err());
+        drop(restored);
         std::fs::write(base.join(STATE_FILE), "{not json").unwrap();
-        let rt2 = Runtime::init(test_config(), base.clone()).unwrap();
-        assert_eq!(rt2.cube.current_state(), AgentState::Init);
+        assert!(matches!(
+            Runtime::init(test_config(), base.clone()),
+            Err(RuntimeError::Config(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(base.join(STATE_FILE)).unwrap(),
+            "{not json"
+        );
         aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn inaccessible_state_is_not_treated_as_a_new_runtime() {
+        let (rt, base) = test_runtime("inaccessible-state");
+        drop(rt);
+        std::fs::create_dir(base.join(STATE_FILE)).unwrap();
+        assert!(matches!(
+            Runtime::init(test_config(), base.clone()),
+            Err(RuntimeError::Io(_))
+        ));
+        std::fs::remove_dir(base.join(STATE_FILE)).unwrap();
+        std::os::unix::fs::symlink(base.join("missing-state"), base.join(STATE_FILE)).unwrap();
+        assert!(matches!(
+            Runtime::init(test_config(), base.clone()),
+            Err(RuntimeError::Io(_))
+        ));
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     // Phase 7: `runtime.isolation` แปลกต้องบูตไม่ขึ้น (fail-closed ไม่เงียบ

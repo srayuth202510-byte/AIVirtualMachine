@@ -170,6 +170,7 @@ dependencies = [
 name = "aivm-supervisor"
 version = "0.1.0"
 dependencies = [
+ "aivm-audit",
  "aivm-cube",
  "aivm-runtime",
  "aivm-tools",
