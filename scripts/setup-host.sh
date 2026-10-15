@@ -115,6 +115,7 @@ if cargo run -q -p aivm-cli -- probe 2>/dev/null | head -n 100; then
   echo "== สรุป Tier =="
   echo "Tier1 process: ดู probe.userns/seccomp_install ข้างบน (true = พร้อม)"
   echo "Tier1 container: ดู probe.container.* (bwrap/init/cgroup quotas)"
+  echo "  container เต็มรูป: sh scripts/test-container-host.sh (user delegation ไม่ต้อง sudo)"
   echo "Tier2 microvm: ต้อง probe.kvm + probe.firecracker = true + มี pins"
   echo "Tier3 hardware: experimental — ดู probe qemu/sev/tdx/swtpm ประกอบ"
 else
