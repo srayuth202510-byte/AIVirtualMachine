@@ -1,5 +1,8 @@
 # Audit reviewer: กฎตรวจพื้นฐาน + Qwen แบบอ่านอย่างเดียว
 
+หากต้องการติดตาม records ที่เพิ่มเข้ามาและ correlate ข้าม poll/rotation
+ดู [audit-watcher.md](audit-watcher.md)
+
 วิเคราะห์ snapshot ของ audit JSONL แล้วแจ้งเหตุการณ์ที่ควรตรวจต่อ
 ไม่มีคำตอบแบบ ALLOW/DENY จากตัว reviewer และไม่มีการ grant/revoke/execute
 ตามคำแนะนำของโมเดล Policy/Gateway ของ VM เดิมยังเป็นผู้บังคับใช้

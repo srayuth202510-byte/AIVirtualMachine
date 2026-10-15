@@ -80,6 +80,18 @@ if $BIN verify-audit "$ROOT/audit-snapshot.jsonl" >/dev/null 2>&1; then
     echo "FAIL: tampered audit accepted"
     exit 1
 fi
+if python3 scripts/qwen-audit-watch.py "$ROOT/audit-snapshot.jsonl" --polls 1 > "$ROOT/watch-error.jsonl"; then
+    echo "FAIL: watcher accepted tampered audit"
+    exit 1
+fi
+python3 - "$ROOT/watch-error.jsonl" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as file:
+    reports = [json.loads(line) for line in file]
+assert any(row["type"] == "monitor_error" for row in reports)
+assert not any(row["type"] == "events" for row in reports)
+PY
 
 echo "== demo =="
 cargo run -q -p aivm-cli -- demo

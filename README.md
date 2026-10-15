@@ -107,6 +107,8 @@ crates/
 
 ## เอกสาร
 
+- [`docs/audit-watcher.md`](./docs/audit-watcher.md) — เฝ้าดู audit ต่อเนื่อง พร้อมตรวจ partial writes/rotation และให้ Qwen ทบทวนเบื้องหลัง
+
 - [`docs/audit-reviewer.md`](./docs/audit-reviewer.md) — วิเคราะห์ audit แบบอ่านอย่างเดียว ด้วยกฎและคำแนะนำจาก Qwen
 
 - [`docs/qwen-assistant.md`](./docs/qwen-assistant.md) — สคริปต์ช่วย Qwen อ่านไฟล์ ตรวจคำตอบ และ retry เมื่อไม่ตรงหลักฐาน

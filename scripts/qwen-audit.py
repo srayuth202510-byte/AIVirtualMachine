@@ -49,40 +49,55 @@ def load_records(raw):
     return records
 
 
+class RuleTracker:
+    """In-memory correlation across batches; callers provide chronological records."""
+    def __init__(self):
+        self.windows = defaultdict(deque)
+        self.last_burst = {}
+
+    def feed(self, records):
+        alerts = []
+        for record in records:
+            now = record["timestamp"]
+            for actor in list(self.windows):
+                while self.windows[actor] and now - self.windows[actor][0][0] > 60:
+                    self.windows[actor].popleft()
+                if not self.windows[actor]:
+                    del self.windows[actor]
+                    self.last_burst.pop(actor, None)
+            seq = record["seq"]
+            resource = record["resource"].lower()
+            rule = record["rule_matched"].lower()
+            denied = record["decision"] == "deny"
+            def alert(category, reason, severity="high", ids=None):
+                alerts.append({"category": category, "severity": severity,
+                               "event_ids": ids if ids is not None else [seq], "reason": reason})
+            if denied and any(tag in rule for tag in ["path-traversal", "symlink-escape", "boundary-write"]):
+                alert("boundary_violation", "Gateway denied an attempt outside the permitted boundary.")
+            if denied and (any(tag in resource for tag in [".env", "/secrets/", "secrets.yaml"])
+                           or rule.startswith(("secret-", "lease-", "hitl-required"))):
+                alert("sensitive_access", "A sensitive resource or secret lease request was denied.")
+            if record["action"] == "intent" and any(
+                text in resource for text in ["ignore previous", "ignore all instructions", "disable policy", "bypass policy"]
+            ):
+                alert("prompt_injection", "Intent text contains an instruction-override cue.", "medium")
+            if denied:
+                actor = (record["agent"], record["session_id"])
+                window = self.windows[actor]
+                now = record["timestamp"]
+                while window and now - window[0][0] > 60:
+                    window.popleft()
+                window.append((now, seq))
+                if len(window) >= 20 and now - self.last_burst.get(actor, now - 60) >= 60:
+                    alert("deny_burst", "At least 20 denied records for one actor within 60 seconds.",
+                          ids=[event for _, event in window])
+                    self.last_burst[actor] = now
+        return alerts
+
+
 def inspect_records(records):
     """Rules describe observable risk signals, not confirmed attacker intent."""
-    alerts = []
-    windows = defaultdict(deque)
-    last_burst = {}
-    for record in sorted(records, key=lambda row: (row["timestamp"], row["seq"])):
-        seq = record["seq"]
-        resource = record["resource"].lower()
-        rule = record["rule_matched"].lower()
-        denied = record["decision"] == "deny"
-        def alert(category, reason, severity="high", ids=None):
-            alerts.append({"category": category, "severity": severity,
-                           "event_ids": ids if ids is not None else [seq], "reason": reason})
-        if denied and any(tag in rule for tag in ["path-traversal", "symlink-escape", "boundary-write"]):
-            alert("boundary_violation", "Gateway denied an attempt outside the permitted boundary.")
-        if denied and (any(tag in resource for tag in [".env", "/secrets/", "secrets.yaml"])
-                       or rule.startswith(("secret-", "lease-", "hitl-required"))):
-            alert("sensitive_access", "A sensitive resource or secret lease request was denied.")
-        if record["action"] == "intent" and any(
-            text in resource for text in ["ignore previous", "ignore all instructions", "disable policy", "bypass policy"]
-        ):
-            alert("prompt_injection", "Intent text contains an instruction-override cue.", "medium")
-        if denied:
-            actor = (record["agent"], record["session_id"])
-            window = windows[actor]
-            now = record["timestamp"]
-            while window and now - window[0][0] > 60:
-                window.popleft()
-            window.append((now, seq))
-            if len(window) >= 20 and now - last_burst.get(actor, now - 60) >= 60:
-                alert("deny_burst", "At least 20 denied records for one actor within 60 seconds.",
-                      ids=[event for _, event in window])
-                last_burst[actor] = now
-    return alerts
+    return RuleTracker().feed(sorted(records, key=lambda row: (row["timestamp"], row["seq"])))
 
 
 def model_events(records, alerts):

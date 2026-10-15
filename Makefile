@@ -16,6 +16,7 @@ test: ## เทสต์ unit + integration ทั้งหมด
 	cargo test --workspace
 	python3 -m unittest discover -s scripts -p 'test_qwen_*.py'
 	python3 scripts/eval-qwen-audit.py
+	python3 scripts/smoke-qwen-watch.py
 
 test-adv: ## ชุด must-deny อย่างเดียว (สเปก §38)
 	cargo test -p aivm-adversarial

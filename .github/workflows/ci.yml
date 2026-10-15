@@ -36,6 +36,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p 'test_qwen_*.py'
           python3 scripts/eval-qwen-audit.py
+          python3 scripts/smoke-qwen-watch.py
 
       - name: lint โค้ดหลังฟีเจอร์ microvm (กันแก้พังเงียบ)
         run: cargo clippy -p aivm-sandbox -p aivm-tools -p aivm-runtime -p aivm-cli --all-targets --features microvm -- -D warnings
