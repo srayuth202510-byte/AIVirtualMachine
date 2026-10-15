@@ -12,6 +12,20 @@ cargo run -q -p aivm-cli -- demo   # พิสูจน์เส้น enforceme
 sh scripts/bench.sh            # วัด demo/audit/adversarial คร่าวๆ (ไม่ต้องมี KVM)
 ```
 
+## 0b. Local model (GGUF) — ทางหลักของงานนี้ ไม่ต้องมี TEE
+
+```bash
+cargo build -p aivm-cli --features llama   # ครั้งแรกคอมไพล์ llama.cpp หลายนาที
+sh scripts/llama-smoke.sh ~/Downloads/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
+python3 -m unittest discover -s scripts -p 'test_llama_replay.py'  # seed เดิมต้องตอบตรงกัน
+```
+
+config สำเร็จรูป: `examples/aivm-local.yaml` (provider local + Tier1 sandbox +
+ตัดเน็ตทั้งหมด + secret HITL) แก้ `model_path` เป็น path เครื่องนี้แล้วสร้างด้วย
+บิลด์ llama (`create` ด้วยบิลด์ปกติจะ fail-closed ว่า provider นี้ต้องใช้ฟีเจอร์ llama)
+ตั้ง `AIVM_GGUF=/path/model.gguf` ได้ถ้าไม่อยากใช้ path ดีฟอลต์ ไม่มีไฟล์/ไม่มี
+cmake = เทสต์ replay **skip อย่างซื่อสัตย์** (เหมือนบูตจริงที่ไม่มี KVM)
+
 ## 1. Rust (บังคับ)
 
 Rust stable + `clippy` + `rustfmt` (CI ใช้สามอย่างนี้ล็อกเกต):

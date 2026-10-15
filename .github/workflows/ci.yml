@@ -41,6 +41,7 @@ jobs:
           python3 -m unittest discover -s scripts -p 'test_pins.py'
           python3 -m unittest discover -s scripts -p 'test_security_court.py'
           python3 -m unittest discover -s scripts -p 'test_fuzz_seeded.py'
+          python3 -m unittest discover -s scripts -p 'test_llama_replay.py'
           python3 scripts/eval-qwen-audit.py
           python3 scripts/smoke-qwen-watch.py
 

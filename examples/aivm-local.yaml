@@ -1,0 +1,61 @@
+# AIVM สำหรับ local model (ไม่ต้องมีเน็ต/KVM/TEE)
+# ใช้กับบิลด์ `--features llama` + ไฟล์ .gguf (ดู docs/setup.md ข้อ 0)
+# สร้างด้วย: cargo run -q -p aivm-cli --features llama -- --root ./vms create local --config ./examples/aivm-local.yaml
+name: local
+
+runtime:
+  isolation: sandbox   # ค่าเริ่มต้น Tier1 (zero-deps); พร้อมแล้วค่อยเปลี่ยนเป็น container
+  # isolation: container  # ต้องติดตั้ง helper + delegate cgroups (ดู docs/container.md)
+  # container:
+  #   bubblewrap: /usr/bin/bwrap
+  #   init: /usr/libexec/aivm-container-init
+  #   cgroup_root: /sys/fs/cgroup/aivm
+
+model:
+  provider: local
+  name: qwen2.5-coder-1.5b
+  local:
+    model_path: /home/USER/Downloads/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf  # แก้เป็น path เครื่องนี้
+    ctx_size: 4096
+    gpu_layers: 0      # -1 = ยกทุกชั้นไป GPU (ถ้ามี)
+    threads: 4         # ล็อกไว้เพื่อให้ replay ได้
+    seed: 42           # deterministic seed (ห้ามเปลี่ยนระหว่าง replay test)
+    temperature: 0.0   # greedy/deterministic
+    top_p: 0.1
+    top_k: 1           # greedy
+    max_tokens: 512
+
+resources:
+  cpu: 2
+  memory: 4GB          # โมเดล 1.5B Q4 ~1GB + context เผื่อไว้
+  storage: 5GB
+
+filesystem:
+  read:
+    - ./workspace
+  write:
+    - ./workspace/src
+
+network:
+  allow: []            # local-first = ตัดเน็ตทั้งหมด (deny-by-default อยู่แล้ว ขีดเส้นให้ชัด)
+
+tools:
+  allow:
+    - filesystem.read
+    - filesystem.write
+    - code.search
+    - process.exec     # agent เขียน/คอมไพล์โค้ดได้ แต่รันผ่าน sandbox + allowlist exe เสมอ
+
+capabilities:
+  initial:
+    - read:workspace
+    - search:code
+
+policy:
+  require_test_before_network: true
+
+# นโยบาย secrets (G4 §26): values อยู่ใน <vm-dir>/secrets.yaml (0600) ไม่มีไฟล์ = deny หมด
+# secrets:
+#   allow: ["github_token:read"]
+#   low_risk_allow: ["github_token:read"]
+#   hitl_required_for: ["high"]
