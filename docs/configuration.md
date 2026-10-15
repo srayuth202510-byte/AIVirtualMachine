@@ -183,6 +183,10 @@ pin เพิ่มเติมได้ด้วย `*_path` และ `*_sha25
 ตั้ง `worker_path` เพื่อให้ runtime และคำสั่ง `aivm reason` ส่ง inference ผ่าน
 standalone worker process; หากไม่ตั้งค่า จะใช้ backend ใน process เดิมเพื่อความเข้ากันได้ย้อนหลัง
 
+การใช้ container หรือ MicroVM สำหรับ worker ต้องผ่าน launcher ที่ operator เตรียมไว้
+และตรวจด้วย `aivm probe` ก่อนใช้งาน ระบบจะปฏิเสธก่อน spawn/boot เมื่อ prerequisite
+ไม่ครบ และจะไม่ลดระดับกลับมาใช้ process โดยอัตโนมัติ
+
 ตั้งค่า `model.local` ต่อไปนี้สำหรับ production ที่ต้องการ deterministic output:
 
 ```yaml

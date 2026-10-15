@@ -6,7 +6,7 @@
 
 use super::ModelConfig;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -31,7 +31,7 @@ pub struct InferenceLimits {
 }
 
 fn default_memory_mb() -> u64 {
-    1024
+    4096
 }
 
 fn default_cpu_seconds() -> u64 {
@@ -173,7 +173,7 @@ impl WorkerClient {
             .arg(config_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .env_clear();
         #[cfg(unix)]
         {
@@ -217,6 +217,15 @@ impl WorkerClient {
             .stdout
             .take()
             .ok_or_else(|| WorkerError::Failed("worker stdout unavailable".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| WorkerError::Failed("worker stderr unavailable".into()))?;
+        let stderr_reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = BufReader::new(stderr).read_to_string(&mut text);
+            text
+        });
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let mut line = String::new();
@@ -238,7 +247,7 @@ impl WorkerClient {
             let _ = sender.send(result);
         });
         let timeout = Duration::from_millis(request.timeout_ms.min(limits.timeout_ms));
-        let response = match receiver.recv_timeout(timeout) {
+        let response_result = match receiver.recv_timeout(timeout) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let _ = child.kill();
@@ -248,10 +257,19 @@ impl WorkerClient {
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(WorkerError::Failed("worker response channel closed".into()))
             }
-        }?;
+        };
         let status = child
             .wait()
             .map_err(|e| WorkerError::Failed(format!("wait worker: {e}")))?;
+        let stderr = stderr_reader.join().unwrap_or_default();
+        let response = response_result.map_err(|error| {
+            let detail = stderr.trim();
+            if detail.is_empty() {
+                WorkerError::Failed(format!("{error}; worker exited with {status}"))
+            } else {
+                WorkerError::Failed(format!("{error}; worker exited with {status}: {detail}"))
+            }
+        })?;
         if !status.success() {
             return Err(WorkerError::Failed(format!("worker exited with {status}")));
         }

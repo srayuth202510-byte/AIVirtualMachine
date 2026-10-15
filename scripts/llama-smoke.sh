@@ -15,6 +15,13 @@ fi
 [ -f "$MODEL" ] || { echo "FAIL: model not found: $MODEL"; exit 2; }
 PROMPT="${2:-Once upon a time}"
 
+WORKER="${AIVM_MODEL_WORKER:-}"
+WORKER_YAML=""
+if [ -n "$WORKER" ]; then
+    [ -x "$WORKER" ] || { echo "FAIL: worker not executable: $WORKER"; exit 2; }
+    WORKER_YAML="    worker_path: $WORKER"
+fi
+
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/aivm-llama-XXXXXX")"
 trap 'rm -rf "$ROOT"' EXIT INT TERM
 CFG="$ROOT/localtest.yaml"
@@ -26,6 +33,7 @@ model:
   name: $(basename "$MODEL")
   local:
     model_path: $MODEL
+${WORKER_YAML}
     ctx_size: 512
     threads: 4
     temperature: 0.9
@@ -44,6 +52,9 @@ EOF
 
 echo "== build (--features llama) =="
 cargo build -q -p aivm-cli --features llama
+if [ -n "$WORKER" ]; then
+    cargo build -q -p aivm-model-worker --features llama
+fi
 
 BIN="cargo run -q -p aivm-cli --features llama -- --root $ROOT"
 
@@ -51,8 +62,12 @@ echo "== create (loads GGUF) =="
 $BIN create localtest --config "$CFG" >/dev/null
 
 echo "== run (real inference) =="
-OUT="$($BIN run localtest --prompt "$PROMPT" 2>/dev/null)"
+OUT="$($BIN run localtest --prompt "$PROMPT")"
 printf '%s\n' "$OUT"
 [ -n "$OUT" ] || { echo "FAIL: empty model output"; exit 1; }
 
-echo "llama-smoke: all green"
+if [ -n "$WORKER" ]; then
+    echo "llama-smoke: worker-backed inference green"
+else
+    echo "llama-smoke: inline inference green"
+fi

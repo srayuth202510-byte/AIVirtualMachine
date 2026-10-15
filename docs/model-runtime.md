@@ -53,6 +53,24 @@ syscalls และ environment ถูกล้างก่อน spawn การ
 และคำสั่ง `aivm reason` แล้ว โดยยังต้องเลือก executable ที่ผ่านการติดตั้งและตรวจสอบ
 โดย operator เอง
 
+สำหรับการทดสอบ GGUF จริง ใช้ `AIVM_MODEL_WORKER=/absolute/path/aivm-model-worker`
+ร่วมกับ `scripts/llama-smoke.sh`; หากไม่ตั้งค่าจะทดสอบ inline backend ตามเดิม
+
+## Launcher contract
+
+ทุก isolation tier ต้องเปิด worker ด้วย executable เดียวกันและส่ง config ผ่าน
+ไฟล์ชั่วคราวที่มี permission `0600`:
+
+| tier | กลไกที่ต้องบังคับ | prerequisite | พฤติกรรมเมื่อไม่พร้อม |
+|---|---|---|---|
+| `process` | no-new-privs, parent-death kill, rlimit, worker seccomp | Linux seccomp | ใช้งานได้ตาม process limits |
+| `container` | bubblewrap, Landlock/seccomp, cgroup v2 CPU/RAM/PIDs, no network | bubblewrap + delegated cgroup | ปฏิเสธก่อน spawn |
+| `microvm` | pinned kernel/rootfs/firecracker, guest channel, no network | `/dev/kvm` + Firecracker + image pins | ปฏิเสธก่อน boot |
+
+การเลือก tier ต้องมาจาก operator configuration เท่านั้น worker หรือ model output
+เปลี่ยน tier เองไม่ได้ Launcher ต้องรายงาน tier ที่ใช้จริงและ prerequisite ที่ขาด
+ลง audit ทุกครั้ง
+
 ## ขอบเขตความเชื่อถือ
 
 การออกแบบ baseline เชื่อถือ host, kernel และ operator ตาม threat model ปัจจุบัน
