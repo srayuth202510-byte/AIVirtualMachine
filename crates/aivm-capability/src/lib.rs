@@ -410,6 +410,16 @@ pub fn scope_covers(cap_scope: &str, requested: &str) -> bool {
     req.starts_with(&format!("{base}/"))
 }
 
+/// ตรวจ scope ที่กว้างเกินไปสำหรับ filesystem (root/empty/wildcard) —
+/// ห้ามใช้ในการให้สิทธิ์ anything goes (F-9)
+pub fn broad_fs_scope(scope: &str) -> bool {
+    let base = scope
+        .trim_end_matches("/**")
+        .trim_end_matches("/*")
+        .trim_end_matches('/');
+    base.is_empty() || base == "*"
+}
+
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -439,6 +449,11 @@ impl CapabilitySet {
         // ลองทีละใบ ใบแรกที่ผ่านทั้ง usability + coverage ชนะ ข้ามใบที่หมดอายุ/หมดโควต้า
         let mut mismatch: Option<CapabilityError> = None;
         for (i, cap) in self.caps.iter_mut().enumerate() {
+            // fail-closed: lease ที่ scope กว้างเกินไป (root) ไม่ถือว่าใช้ได้
+            // (กัน priviledge escalation ถึงแม้ถูก grant มา)
+            if cap.resource == "filesystem" && broad_fs_scope(&cap.scope) {
+                continue;
+            }
             if cap.check_usable().is_err() {
                 continue;
             }
@@ -464,6 +479,9 @@ impl CapabilitySet {
         // จำเหตุผลงบหมดไว้คืนแทน Mismatch (caller แยกแยะ deny งบหมดออกจากผิด scope ได้)
         let mut budget_err: Option<CapabilityError> = None;
         for (index, cap) in self.caps.iter_mut().enumerate() {
+            if cap.resource == "filesystem" && broad_fs_scope(&cap.scope) {
+                continue;
+            }
             if let Err(e) = cap.check_usable() {
                 if matches!(e, CapabilityError::BudgetExceeded(_)) {
                     budget_err = Some(e);
@@ -535,6 +553,9 @@ impl CapabilitySet {
     /// ให้สิทธิ์แบบ idempotent: ข้ามถ้ามีใบที่ใช้ได้ครอบคลุมอยู่แล้ว
     /// คืน true เมื่อเพิ่ม lease ใหม่จริง
     pub fn grant(&mut self, cap: Capability) -> bool {
+        if cap.resource == "filesystem" && broad_fs_scope(&cap.scope) {
+            return false;
+        }
         let usable_exists = self
             .caps
             .iter()
