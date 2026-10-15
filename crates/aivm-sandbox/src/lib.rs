@@ -623,6 +623,76 @@ unsafe fn install_dangerous_filter(filter: &[libc::sock_filter]) -> std::io::Res
     Ok(())
 }
 
+/// Install a small worker-specific filter that blocks network and socket
+/// syscalls while leaving ordinary model runtime syscalls available. The
+/// filter is intentionally narrower than the process-exec profile so model
+/// backends can evolve their memory/thread syscall usage independently.
+#[cfg(target_os = "linux")]
+pub fn install_worker_network_seccomp() -> std::io::Result<()> {
+    let denied: &[libc::c_long] = &[
+        libc::SYS_socket,
+        libc::SYS_socketpair,
+        libc::SYS_connect,
+        libc::SYS_bind,
+        libc::SYS_listen,
+        libc::SYS_accept,
+        libc::SYS_accept4,
+        libc::SYS_sendto,
+        libc::SYS_sendmsg,
+        libc::SYS_recvfrom,
+        libc::SYS_recvmsg,
+        libc::SYS_sendmmsg,
+        libc::SYS_recvmmsg,
+        libc::SYS_getsockopt,
+        libc::SYS_setsockopt,
+        libc::SYS_shutdown,
+    ];
+    let kill = libc::sock_filter {
+        code: 0x06,
+        jt: 0,
+        jf: 0,
+        k: 0x00000000,
+    };
+    let allow = libc::sock_filter {
+        code: 0x06,
+        jt: 0,
+        jf: 0,
+        k: 0x7fff0000,
+    };
+    let mut filter = vec![
+        libc::sock_filter {
+            code: 0x20,
+            jt: 0,
+            jf: 0,
+            k: 4,
+        },
+        libc::sock_filter {
+            code: 0x15,
+            jt: 1,
+            jf: 0,
+            k: 0xc000003e,
+        },
+        kill,
+        libc::sock_filter {
+            code: 0x20,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+    ];
+    for (index, syscall) in denied.iter().enumerate() {
+        filter.push(libc::sock_filter {
+            code: 0x15,
+            jt: (denied.len() - index) as u8,
+            jf: 0,
+            k: *syscall as u32,
+        });
+    }
+    filter.push(allow);
+    filter.push(kill);
+    unsafe { install_dangerous_filter(&filter) }
+}
+
 /// ไบนารีที่ห้ามเด็ดขาดใน MVP-B แม้ policy จะอนุญาต (กัน interpreter
 /// กลายเป็น shell ทางอ้อม) เทียบด้วย basename หลัง canonicalize แล้ว
 /// (เช่น /bin/sh ที่เป็น symlink ไป dash ก็โดน)

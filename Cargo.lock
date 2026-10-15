@@ -104,6 +104,7 @@ name = "aivm-model-worker"
 version = "0.1.0"
 dependencies = [
  "aivm-model",
+ "aivm-sandbox",
  "serde_json",
  "thiserror 1.0.69",
 ]

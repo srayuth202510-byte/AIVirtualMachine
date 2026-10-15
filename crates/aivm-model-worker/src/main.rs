@@ -25,6 +25,9 @@ fn run() -> Result<(), WorkerError> {
         .map_err(|e| WorkerError::Failed(format!("read model config: {e}")))?;
     let config: ModelConfig = serde_json::from_str(&config_text)
         .map_err(|e| WorkerError::Failed(format!("parse model config JSON: {e}")))?;
+    #[cfg(target_os = "linux")]
+    aivm_sandbox::install_worker_network_seccomp()
+        .map_err(|e| WorkerError::Failed(format!("install worker network filter: {e}")))?;
     // The worker must load the backend inline. Clearing worker_path prevents
     // recursive worker spawning when the control plane configured a worker.
     let mut config = config;

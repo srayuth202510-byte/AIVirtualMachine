@@ -6,6 +6,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 aivm-model = { path = "../aivm-model" }
+aivm-sandbox = { path = "../aivm-sandbox" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 

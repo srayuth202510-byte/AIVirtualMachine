@@ -15,7 +15,8 @@ Control plane รับผิดชอบ model registry, manifest verification,
 Worker รับผิดชอบการโหลด backend, tokenize, generate และรายงาน usage
 
 worker ไม่มีสิทธิ์อ่าน secrets, audit writer, supervisor socket หรือ workspace ที่ไม่อยู่ใน
-ขอบเขตที่กำหนด Network ถูกปิดโดยปริยาย การเข้าถึง GPU/device ต้องระบุใน deployment policy
+ขอบเขตที่กำหนด Network ถูกปิดด้วย seccomp filter สำหรับ socket/connect/send/receive
+syscalls และ environment ถูกล้างก่อน spawn การเข้าถึง GPU/device ต้องระบุใน deployment policy
 
 ## Worker protocol
 
