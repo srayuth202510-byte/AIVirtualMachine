@@ -99,6 +99,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aivm-model-worker"
+version = "0.1.0"
+dependencies = [
+ "aivm-model",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "aivm-network"
 version = "0.1.0"
 dependencies = [

@@ -424,6 +424,35 @@ fn main() -> Result<(), AnyErr> {
         }
         Cmd::Reason { config, prompt } => {
             let config = VmConfig::from_file(&config).map_err(err)?;
+            if let Some(local) = config.model.local.as_ref() {
+                if let Some(worker_path) = local.worker_path.as_deref() {
+                    let request = aivm_model::worker::InferenceRequest {
+                        protocol_version: aivm_model::worker::PROTOCOL_VERSION,
+                        request_id: format!("reason-{}", std::process::id()),
+                        model_id: config.model.name.clone(),
+                        prompt,
+                        max_output_tokens: local.max_tokens,
+                        timeout_ms: 120_000,
+                    };
+                    let limits = aivm_model::worker::InferenceLimits {
+                        max_context_tokens: local.ctx_size,
+                        max_output_tokens: local.max_tokens,
+                        timeout_ms: 120_000,
+                    };
+                    let model_config = aivm_model::ModelConfig {
+                        provider: config.model.provider.clone(),
+                        name: config.model.name.clone(),
+                        local: config.model.local.clone(),
+                        openai: config.model.openai.clone(),
+                        anthropic: config.model.anthropic.clone(),
+                    };
+                    let response = aivm_model::worker::WorkerClient::new(worker_path)
+                        .infer(&model_config, request, &limits)
+                        .map_err(err)?;
+                    println!("{}", response.output.unwrap_or_default());
+                    return Ok(());
+                }
+            }
             let model_config = aivm_model::ModelConfig {
                 provider: config.model.provider,
                 name: config.model.name,

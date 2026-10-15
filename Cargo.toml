@@ -9,6 +9,7 @@ members = [
     "crates/aivm-network",
     "crates/aivm-sandbox",
     "crates/aivm-model",
+    "crates/aivm-model-worker",
     "crates/aivm-runtime",
     "crates/aivm-supervisor",
     "crates/aivm-cli",

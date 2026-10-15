@@ -20,6 +20,7 @@ model:
     #   ไม่ตั้ง = โหลดได้แต่ต้องถือว่า unpinned (ดู sha ด้วย: sha256sum <ไฟล์>)
     # manifest_path: /path/to/model.manifest.json
     # manifest_sha256: "<sha256 64 hex>"  # production ต้องตั้งคู่กับ model_sha256
+    # worker_path: /path/to/aivm-model-worker  # route reason ผ่าน worker process
     ctx_size: 4096
     gpu_layers: 0      # -1 = ยกทุกชั้นไป GPU (ถ้ามี)
     threads: 4         # ล็อกไว้เพื่อให้ replay ได้

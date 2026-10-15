@@ -113,6 +113,9 @@ pub struct LocalModelConfig {
     pub config_path: Option<String>,
     #[serde(default)]
     pub config_sha256: Option<String>,
+    /// Optional standalone worker executable for isolated inference.
+    #[serde(default)]
+    pub worker_path: Option<String>,
     /// จำนวนชั้นที่ยกไป GPU (-1 = ทั้งหมด)
     #[serde(default)]
     pub gpu_layers: i32,
@@ -181,6 +184,7 @@ impl Default for LocalModelConfig {
             tokenizer_sha256: None,
             config_path: None,
             config_sha256: None,
+            worker_path: None,
             gpu_layers: -1,
             ctx_size: default_ctx_size(),
             threads: default_threads(),
