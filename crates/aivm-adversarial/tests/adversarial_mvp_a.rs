@@ -276,7 +276,7 @@ fn state_gate_holds_despite_capability() {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     let ws = dir.canonicalize().unwrap();
     let policy = Policy::from_yaml(&format!(
-        "name: gated\nfilesystem:\n  read: [{}]\n  write: [{}/src]\n  deny: []\nrules:\n  - id: allow_write_src\n    action: write\n    resource: filesystem\n    scope: {}/src/**\n    when: \"state in {{'MODIFY', 'VALIDATE'}} && confidence >= 0.8\"\n",
+        "name: gated\nfilesystem:\n  read: [{}]\n  write: [{}/src]\n  deny: []\nrules:\n  - id: allow_write_src\n    action: write\n    resource: filesystem\n    scope: {}/src/**\n    when: \"state in ['MODIFY', 'VALIDATE'] && confidence >= 0.8\"\n",
         ws.display(), ws.display(), ws.display()
     ))
     .unwrap();

@@ -5,6 +5,7 @@
 //! MVP: allowlist ใน YAML + deny list ที่ระบุชัดเจน
 
 use aivm_capability::CapabilitySet;
+use cel::{Context, Env, Value};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -132,7 +133,7 @@ impl Policy {
                 return Err(PolicyError::Parse("unknown rule effect".into()));
             }
             if let Some(when) = &rule.when {
-                eval_when(when, &EvalContext::default()).map_err(PolicyError::Parse)?;
+                eval_cel(when, &EvalContext::default()).map_err(PolicyError::Parse)?;
             }
         }
         for pattern in self
@@ -402,63 +403,42 @@ fn network_pattern(pattern: &str, target: &str) -> bool {
 fn rule_matches(rule: &Rule, ctx: &EvalContext) -> bool {
     match &rule.when {
         None => true,
-        Some(w) => eval_when(w, ctx).unwrap_or(false),
+        Some(w) => eval_cel(w, ctx).unwrap_or(false),
     }
 }
 
-/// ตัวประเมิน `&&` อย่างง่ายสำหรับ MVP (อนาคตใช้ CEL เต็ม)
-fn eval_when(when: &str, ctx: &EvalContext) -> Result<bool, String> {
-    let mut matches = true;
-    for clause in when.split("&&") {
-        matches &= eval_clause(clause.trim(), ctx)?;
+/// ประเมิน CEL expression กับ EvalContext (fail-closed: error = false/deny)
+fn eval_cel(expr: &str, ctx: &EvalContext) -> Result<bool, String> {
+    // สร้าง CEL environment พร้อม standard library
+    let env = Env::stdlib();
+
+    // compile expression
+    let program = env
+        .compile(expr)
+        .map_err(|e| format!("CEL compile error: {e}"))?;
+
+    // สร้าง context พร้อม variables
+    let mut context = Context::with_env(std::sync::Arc::new(env));
+    context
+        .add_variable("state", ctx.state.clone())
+        .map_err(|e| format!("CEL add var error: {e}"))?;
+    context
+        .add_variable("confidence", ctx.confidence)
+        .map_err(|e| format!("CEL add var error: {e}"))?;
+    context
+        .add_variable("tests_passed", ctx.tests_passed)
+        .map_err(|e| format!("CEL add var error: {e}"))?;
+
+    // ประเมิน
+    let result = program
+        .execute(&context)
+        .map_err(|e| format!("CEL eval error: {e}"))?;
+
+    // ต้องได้ bool
+    match result {
+        Value::Bool(b) => Ok(b),
+        _ => Err("CEL expression must evaluate to bool".into()),
     }
-    Ok(matches)
-}
-fn eval_clause(c: &str, ctx: &EvalContext) -> Result<bool, String> {
-    let bad = || format!("invalid policy predicate: {c}");
-    let state = |text: &str| -> Result<String, String> {
-        let t = text.trim();
-        if t.len() < 2
-            || !(t.starts_with('\'') && t.ends_with('\'') || t.starts_with('"') && t.ends_with('"'))
-        {
-            return Err(bad());
-        }
-        let value = &t[1..t.len() - 1];
-        if !matches!(value, "INIT" | "ANALYZE" | "MODIFY" | "VALIDATE" | "DEPLOY") {
-            return Err(bad());
-        }
-        Ok(value.into())
-    };
-    if let Some(rest) = c.strip_prefix("state ==") {
-        return Ok(ctx.state == state(rest)?);
-    }
-    if let Some(rest) = c.strip_prefix("state in") {
-        let rest = rest
-            .trim()
-            .strip_prefix('{')
-            .and_then(|s| s.strip_suffix('}'))
-            .ok_or_else(bad)?;
-        let mut matched = false;
-        for item in rest.split(',') {
-            matched |= ctx.state == state(item)?;
-        }
-        return Ok(matched);
-    }
-    if let Some(rest) = c.strip_prefix("confidence >=") {
-        let value = rest.trim().parse::<f64>().map_err(|_| bad())?;
-        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-            return Err(bad());
-        }
-        return Ok(ctx.confidence.is_finite() && ctx.confidence >= value);
-    }
-    if let Some(rest) = c.strip_prefix("tests_passed ==") {
-        return match rest.trim() {
-            "true" => Ok(ctx.tests_passed),
-            "false" => Ok(!ctx.tests_passed),
-            _ => Err(bad()),
-        };
-    }
-    Err(bad())
 }
 
 /// Policy Document ที่มี metadata สำหรับ versioning
@@ -937,7 +917,7 @@ rules:
     action: write
     resource: filesystem
     scope: /workspace/src/**
-    when: "state in {'MODIFY', 'VALIDATE'} && confidence >= 0.8"
+    when: "state in ['MODIFY', 'VALIDATE'] && confidence >= 0.8"
   - id: deny_network_during_analyze
     action: network
     resource: network

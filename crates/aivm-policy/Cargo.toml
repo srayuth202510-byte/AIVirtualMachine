@@ -10,3 +10,4 @@ serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 aivm-capability = { path = "../aivm-capability" }
 glob = { workspace = true }
+cel = "0.15"
