@@ -35,6 +35,8 @@ AIVM คือ runtime สำหรับรัน AI Agent โดยเฉพ�
 
 รายละเอียดการบังคับใช้และพฤติกรรมที่เปลี่ยนหลัง security review: [`docs/security-hardening.md`](./docs/security-hardening.md)
 
+เป้าหมายและลำดับพัฒนาเพื่อรัน open-weight models อย่างปลอดภัย: [`docs/open-weight-security-roadmap.md`](./docs/open-weight-security-roadmap.md)
+
 ## เริ่มใช้ใน 5 นาที
 
 ```bash

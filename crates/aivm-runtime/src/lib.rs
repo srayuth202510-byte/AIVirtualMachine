@@ -51,6 +51,8 @@ pub struct VmConfig {
     #[serde(default)]
     pub runtime: RuntimeBlock,
     #[serde(default)]
+    pub security: SecurityBlock,
+    #[serde(default)]
     pub model: ModelBlock,
     #[serde(default)]
     pub resources: ResourceBlock,
@@ -82,6 +84,26 @@ pub struct VmConfig {
     #[cfg(feature = "hardware")]
     #[serde(default)]
     pub hardware: Option<aivm_sandbox::hardware::HardwareConfig>,
+}
+
+/// Deployment posture. Development remains the backward-compatible default;
+/// production requires verified hashes for local open-weight model files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityBlock {
+    #[serde(default = "default_security_profile")]
+    pub profile: String,
+}
+
+impl Default for SecurityBlock {
+    fn default() -> Self {
+        Self {
+            profile: default_security_profile(),
+        }
+    }
+}
+
+fn default_security_profile() -> String {
+    "development".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +270,7 @@ struct PersistedState {
 impl Runtime {
     /// init แบบ fail-closed: config/policy เสียได้ Err VM ปฏิเสธสตาร์ต
     pub fn init(config: VmConfig, base_dir: PathBuf) -> Result<Self, RuntimeError> {
+        validate_model_security(&config)?;
         let workspace = base_dir.join("workspace");
         std::fs::create_dir_all(&workspace).map_err(|e| RuntimeError::Io(e.to_string()))?;
         // ทำ workspace ให้เป็น absolute เพื่อให้ scope ของ capability
@@ -870,7 +893,7 @@ fn resolve_scope(base_dir: &Path, workspace: &Path, scope: &str) -> String {
 
 /// Config Loader และ Validator
 pub mod config {
-    use super::{resolve_runtime_tool, RuntimeError, VmConfig};
+    use super::{resolve_runtime_tool, validate_model_security, RuntimeError, VmConfig};
     use aivm_policy::{Policy, PolicyManager};
     use std::path::Path;
 
@@ -910,6 +933,8 @@ pub mod config {
             return Err(RuntimeError::Config("vm name is required".into()));
         }
 
+        validate_model_security(config)?;
+
         // Resources validation
         if config.resources.cpu == 0 {
             warnings.push("cpu not set, defaulting to 2".into());
@@ -948,15 +973,18 @@ pub mod config {
         }
 
         // Local model ที่ไม่ pin hash = น้ำหนักสลับไม่ได้จับ (I-8 ระดับ supply chain)
-        if config.model.provider == "local" {
-            match &config.model.local {
-                Some(local) if !local.model_sha256.is_empty() => {}
-                _ => warnings.push(
-                    "local model is unpinned (set model.local.model_sha256) - weights can be \
-                     swapped without detection"
-                        .into(),
-                ),
-            }
+        if config.model.provider == "local"
+            && config
+                .model
+                .local
+                .as_ref()
+                .is_none_or(|m| m.model_sha256.is_empty())
+        {
+            warnings.push(
+                "local model is unpinned (set model.local.model_sha256) - weights can be \
+                 swapped without detection"
+                    .into(),
+            );
         }
 
         Ok(())
@@ -1003,6 +1031,33 @@ pub mod config {
             require_test_before_network: config.policy.require_test_before_network,
         }
     }
+}
+
+fn validate_model_security(config: &VmConfig) -> Result<(), RuntimeError> {
+    match config.security.profile.as_str() {
+        "development" | "production" => {}
+        other => {
+            return Err(RuntimeError::Config(format!(
+                "unknown security.profile: {other}"
+            )))
+        }
+    }
+    if config.model.provider != "local" {
+        return Ok(());
+    }
+    let local = config.model.local.as_ref().ok_or_else(|| {
+        RuntimeError::Config("model.local is required when model.provider is local".into())
+    })?;
+    if config.security.profile == "production" && local.model_sha256.is_empty() {
+        return Err(RuntimeError::Config(
+            "security.profile=production requires model.local.model_sha256 for local models".into(),
+        ));
+    }
+    if !local.model_sha256.is_empty() {
+        aivm_model::verify_model_file(&local.model_path, &local.model_sha256)
+            .map_err(|e| RuntimeError::Config(format!("local model verification failed: {e}")))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

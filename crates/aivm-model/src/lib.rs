@@ -201,22 +201,30 @@ pub fn verify_model_file(path: &str, expected_sha256_hex: &str) -> Result<(), Mo
             .ok_or_else(|| bad("bad hex"))?;
         expected[i] = ((hi << 4) | lo) as u8;
     }
-    let meta = std::fs::metadata(path).map_err(|_| bad("model not statable"))?;
+    let expected = expected_sha256_hex.to_ascii_lowercase();
+    let actual = model_file_sha256(path)?;
+    if actual != expected {
+        return Err(bad("model sha256 mismatch (refusing to load)"));
+    }
+    Ok(())
+}
+
+/// Compute the SHA-256 of a model artifact without loading it into memory.
+pub fn model_file_sha256(path: &str) -> Result<String, ModelError> {
+    let bad = |m: &str| ModelError::LoadFailed(m.to_string());
+    let mut file = std::fs::File::open(path).map_err(|_| bad("model not readable"))?;
+    let meta = file.metadata().map_err(|_| bad("model not statable"))?;
     if !meta.is_file() {
-        return Err(bad("model is not a file"));
+        return Err(bad("model is not a regular file"));
     }
     if meta.len() > MAX_MODEL_BYTES {
         return Err(bad("model too large"));
     }
     // อ่านแบบ stream กันไฟล์ใหญ่กินหน่วยความจำ
-    let mut file = std::fs::File::open(path).map_err(|_| bad("model not readable"))?;
     let mut hasher = Sha256::new();
     std::io::copy(&mut file, &mut hasher).map_err(|_| bad("model not readable"))?;
     let digest = hasher.finalize();
-    if digest.as_slice() != expected {
-        return Err(bad("model sha256 mismatch (refusing to load)"));
-    }
-    Ok(())
+    Ok(format!("{digest:x}"))
 }
 
 pub trait Model: Send + Sync {

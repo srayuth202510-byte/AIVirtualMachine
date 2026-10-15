@@ -121,6 +121,14 @@ enum Cmd {
     VerifyAudit {
         path: PathBuf,
     },
+    /// Inspect the configured local model artifact and compare its SHA-256 pin.
+    ModelStatus {
+        #[arg(long)]
+        config: PathBuf,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Model-only inference: output is returned as text and never dispatched as a tool.
     Reason {
         #[arg(long)]
@@ -324,6 +332,65 @@ fn main() -> Result<(), AnyErr> {
             let count = aivm_audit::AuditWriter::verify(path)?;
             println!("audit snapshot: {count} entries, chain verified");
         }
+        Cmd::ModelStatus { config, json } => {
+            let config = VmConfig::from_file(&config).map_err(err)?;
+            let status = if config.model.provider != "local" {
+                "not-applicable".to_string()
+            } else if let Some(local) = &config.model.local {
+                let actual = aivm_model::model_file_sha256(&local.model_path).map_err(err)?;
+                if local.model_sha256.is_empty() {
+                    "unpinned".to_string()
+                } else if actual.eq_ignore_ascii_case(&local.model_sha256) {
+                    "verified".to_string()
+                } else {
+                    "mismatch".to_string()
+                }
+            } else {
+                "missing-config".to_string()
+            };
+            let local = config.model.local.as_ref();
+            let actual_sha256 = local
+                .map(|m| aivm_model::model_file_sha256(&m.model_path))
+                .transpose()
+                .map_err(err)?;
+            let report = ModelArtifactStatus {
+                profile: config.security.profile,
+                provider: config.model.provider,
+                model: config.model.name,
+                model_path: local.map(|m| m.model_path.clone()),
+                expected_sha256: local.map(|m| m.model_sha256.clone()),
+                actual_sha256,
+                status,
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report).map_err(err)?);
+            } else {
+                println!("profile: {}", report.profile);
+                println!("model: {} ({})", report.model, report.provider);
+                if let Some(path) = &report.model_path {
+                    println!("path: {path}");
+                }
+                println!(
+                    "expected sha256: {}",
+                    report
+                        .expected_sha256
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("(not set)")
+                );
+                println!(
+                    "actual sha256: {}",
+                    report.actual_sha256.as_deref().unwrap_or("(unavailable)")
+                );
+                println!("status: {}", report.status);
+            }
+            if report.status == "mismatch"
+                || (report.profile == "production" && report.status == "unpinned")
+                || report.status == "missing-config"
+            {
+                std::process::exit(1);
+            }
+        }
         Cmd::Reason { config, prompt } => {
             let config = VmConfig::from_file(&config).map_err(err)?;
             let model_config = aivm_model::ModelConfig {
@@ -416,6 +483,18 @@ fn main() -> Result<(), AnyErr> {
 }
 
 type AnyErr = Box<dyn std::error::Error>;
+
+#[derive(serde::Serialize)]
+struct ModelArtifactStatus {
+    profile: String,
+    provider: String,
+    model: String,
+    model_path: Option<String>,
+    expected_sha256: Option<String>,
+    actual_sha256: Option<String>,
+    status: String,
+}
+
 fn err<E: std::fmt::Display>(e: E) -> AnyErr {
     Box::<dyn std::error::Error>::from(format!("{e}"))
 }
