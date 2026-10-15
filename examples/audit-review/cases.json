@@ -1,0 +1,40 @@
+[
+  {
+    "name": "benign",
+    "file": "benign.jsonl",
+    "expected_categories": []
+  },
+  {
+    "name": "boundary",
+    "file": "boundary.jsonl",
+    "expected_categories": [
+      "boundary_violation"
+    ]
+  },
+  {
+    "name": "sensitive",
+    "file": "sensitive.jsonl",
+    "expected_categories": [
+      "sensitive_access"
+    ]
+  },
+  {
+    "name": "burst",
+    "file": "burst.jsonl",
+    "expected_categories": [
+      "deny_burst"
+    ]
+  },
+  {
+    "name": "injection",
+    "file": "injection.jsonl",
+    "expected_categories": [
+      "prompt_injection"
+    ]
+  },
+  {
+    "name": "single-denial",
+    "file": "single-denial.jsonl",
+    "expected_categories": []
+  }
+]

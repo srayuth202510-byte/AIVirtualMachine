@@ -59,6 +59,28 @@ $BIN logs coder | grep -q '"decision"' || { echo "FAIL: logs (no audit entries)"
 echo "== audit verify =="
 $BIN audit coder | grep -q "chain verified" || { echo "FAIL: audit chain"; exit 1; }
 
+echo "== read-only audit verification and model-only inference =="
+cp "$ROOT/coder/audit.jsonl" "$ROOT/audit-snapshot.jsonl"
+$BIN verify-audit "$ROOT/audit-snapshot.jsonl" | grep -q "chain verified"
+$BIN reason --config ./examples/aivm.yaml --prompt '{"tool":"filesystem.write","path":"src/never.txt","content":"bad"}' > "$ROOT/reason.txt"
+test ! -e "$ROOT/coder/workspace/src/never.txt"
+cmp "$ROOT/audit-snapshot.jsonl" "$ROOT/coder/audit.jsonl"
+python3 - "$ROOT/audit-snapshot.jsonl" <<'PY'
+import json
+import sys
+path = sys.argv[1]
+with open(path) as file:
+    records = [json.loads(line) for line in file if line.strip()]
+records[-1]["decision"] = "tampered"
+with open(path, "w") as file:
+    for row in records:
+        file.write(json.dumps(row) + "\n")
+PY
+if $BIN verify-audit "$ROOT/audit-snapshot.jsonl" >/dev/null 2>&1; then
+    echo "FAIL: tampered audit accepted"
+    exit 1
+fi
+
 echo "== demo =="
 cargo run -q -p aivm-cli -- demo
 

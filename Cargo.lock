@@ -57,6 +57,7 @@ version = "0.1.0"
 dependencies = [
  "aivm-audit",
  "aivm-cube",
+ "aivm-model",
  "aivm-runtime",
  "aivm-sandbox",
  "aivm-supervisor",

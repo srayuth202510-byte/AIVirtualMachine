@@ -32,8 +32,10 @@ jobs:
       - name: เทสต์ทั้ง workspace (รวม adversarial)
         run: cargo test --workspace
 
-      - name: ทดสอบตัวตรวจคำตอบ Qwen (ไม่ต้องใช้โมเดล)
-        run: python3 -m unittest discover -s scripts -p 'test_qwen_read.py'
+      - name: ทดสอบตัวตรวจคำตอบและ audit reviewer (ไม่ต้องใช้โมเดล)
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_qwen_*.py'
+          python3 scripts/eval-qwen-audit.py
 
       - name: lint โค้ดหลังฟีเจอร์ microvm (กันแก้พังเงียบ)
         run: cargo clippy -p aivm-sandbox -p aivm-tools -p aivm-runtime -p aivm-cli --all-targets --features microvm -- -D warnings

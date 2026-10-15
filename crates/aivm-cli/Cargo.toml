@@ -14,6 +14,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 aivm-runtime = { path = "../aivm-runtime" }
+aivm-model = { path = "../aivm-model" }
 aivm-supervisor = { path = "../aivm-supervisor" }
 aivm-cube = { path = "../aivm-cube" }
 aivm-audit = { path = "../aivm-audit" }

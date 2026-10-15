@@ -14,7 +14,8 @@ check: ## ตรวจ type เร็ว ไม่สร้างโค้ด
 
 test: ## เทสต์ unit + integration ทั้งหมด
 	cargo test --workspace
-	python3 -m unittest discover -s scripts -p 'test_qwen_read.py'
+	python3 -m unittest discover -s scripts -p 'test_qwen_*.py'
+	python3 scripts/eval-qwen-audit.py
 
 test-adv: ## ชุด must-deny อย่างเดียว (สเปก §38)
 	cargo test -p aivm-adversarial
