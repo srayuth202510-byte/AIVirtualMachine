@@ -503,7 +503,7 @@ unsafe fn build_hybrid_filter(mode: SeccompMode) -> Vec<libc::sock_filter> {
     let default_action = match mode {
         SeccompMode::Hybrid => 0x7fff0000, // ALLOW after explicit allow/deny checks
         SeccompMode::Audit => 0x7ff00000,  // TRACE (ENOSYS + notify tracer)
-        _ => 0x00000000,                   // KILL_PROCESS
+        SeccompMode::DenylistOnly => 0x7fff0000, // legacy denylist defaults to ALLOW
     };
 
     let mut filter = vec![
@@ -630,6 +630,9 @@ unsafe fn install_dangerous_filter(filter: &[libc::sock_filter]) -> std::io::Res
 #[cfg(target_os = "linux")]
 pub fn install_worker_network_seccomp() -> std::io::Result<()> {
     let denied: &[libc::c_long] = &[
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
         libc::SYS_socket,
         libc::SYS_socketpair,
         libc::SYS_connect,
@@ -651,7 +654,7 @@ pub fn install_worker_network_seccomp() -> std::io::Result<()> {
         code: 0x06,
         jt: 0,
         jf: 0,
-        k: 0x00000000,
+        k: 0x80000000,
     };
     let allow = libc::sock_filter {
         code: 0x06,
@@ -680,6 +683,14 @@ pub fn install_worker_network_seccomp() -> std::io::Result<()> {
             k: 0,
         },
     ];
+    // x32 shares AUDIT_ARCH_X86_64 but uses a different syscall number space.
+    filter.push(libc::sock_filter {
+        code: 0x35,
+        jt: 0,
+        jf: 1,
+        k: 0x40000000,
+    });
+    filter.push(kill);
     for (index, syscall) in denied.iter().enumerate() {
         filter.push(libc::sock_filter {
             code: 0x15,
@@ -690,7 +701,24 @@ pub fn install_worker_network_seccomp() -> std::io::Result<()> {
     }
     filter.push(allow);
     filter.push(kill);
-    unsafe { install_dangerous_filter(&filter) }
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        install_dangerous_filter(&filter)
+    }
+}
+
+/// Enter an empty network namespace; failure is fatal to a requested namespace tier.
+#[cfg(target_os = "linux")]
+pub fn enter_worker_network_namespace() -> std::io::Result<()> {
+    unsafe {
+        enter_user_ns()?;
+        if libc::unshare(libc::CLONE_NEWNET) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        drop_capabilities()
+    }
 }
 
 /// ไบนารีที่ห้ามเด็ดขาดใน MVP-B แม้ policy จะอนุญาต (กัน interpreter

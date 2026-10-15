@@ -22,6 +22,9 @@ model:
     # manifest_sha256: "<sha256 64 hex>"  # production ต้องตั้งคู่กับ model_sha256
     # worker_path: /path/to/aivm-model-worker  # route reason ผ่าน worker process
     # worker_sha256: "<sha256 64 hex>"          # production ต้อง pin worker ด้วย
+    # worker_launcher:
+    #   tier: process_namespace  # ต้องมี user/net namespace; ไม่รองรับ = reject
+    # หรือ tier: container พร้อม config (ดู docs/model-runtime.md)
     ctx_size: 4096
     gpu_layers: 0      # -1 = ยกทุกชั้นไป GPU (ถ้ามี)
     threads: 4         # ล็อกไว้เพื่อให้ replay ได้

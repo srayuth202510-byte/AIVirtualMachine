@@ -14,9 +14,10 @@ client → control plane → verifier/policy/quota → inference worker → resp
 Control plane รับผิดชอบ model registry, manifest verification, policy, lifecycle และ audit
 Worker รับผิดชอบการโหลด backend, tokenize, generate และรายงาน usage
 
-worker ไม่มีสิทธิ์อ่าน secrets, audit writer, supervisor socket หรือ workspace ที่ไม่อยู่ใน
-ขอบเขตที่กำหนด Network ถูกปิดด้วย seccomp filter สำหรับ socket/connect/send/receive
-syscalls และ environment ถูกล้างก่อน spawn การเข้าถึง GPU/device ต้องระบุใน deployment policy
+Process worker ยังใช้ filesystem และ UID ของ operator จึงควรใช้กับ development บน host ที่เชื่อถือได้
+Container worker mount เฉพาะไฟล์ที่อนุญาต ส่วน MicroVM รับไฟล์ผ่าน read-only data drive
+Network ถูกปิดด้วย worker seccomp รวม x32 และ io_uring; environment ถูกล้างก่อน spawn
+GPU/device passthrough ยังไม่รองรับใน launcher สองระดับนี้
 
 ## Worker protocol
 
@@ -64,6 +65,7 @@ syscalls และ environment ถูกล้างก่อน spawn การ
 | tier | กลไกที่ต้องบังคับ | prerequisite | พฤติกรรมเมื่อไม่พร้อม |
 |---|---|---|---|
 | `process` | no-new-privs, parent-death kill, rlimit, worker seccomp | Linux seccomp | ใช้งานได้ตาม process limits |
+| `process_namespace` | user/network namespace + process hardening | unprivileged user namespace | ปฏิเสธก่อน exec |
 | `container` | bubblewrap, Landlock/seccomp, cgroup v2 CPU/RAM/PIDs, no network | bubblewrap + delegated cgroup | ปฏิเสธก่อน spawn |
 | `microvm` | pinned kernel/rootfs/firecracker, guest channel, no network | `/dev/kvm` + Firecracker + image pins | ปฏิเสธก่อน boot |
 
@@ -75,3 +77,67 @@ syscalls และ environment ถูกล้างก่อน spawn การ
 
 การออกแบบ baseline เชื่อถือ host, kernel และ operator ตาม threat model ปัจจุบัน
 TEE เป็น optional deployment tier สำหรับกรณีที่ต้องการลดความเชื่อถือใน host เพิ่มเติม
+
+## เลือก launcher ที่ใช้งานจริง
+
+กำหนด `model.local.worker_launcher` แยกจาก `runtime.isolation` ของ agent tools:
+
+```yaml
+model:
+  provider: local
+  name: qwen
+  local:
+    model_path: /models/model.gguf
+    worker_path: /opt/aivm/aivm-model-worker
+    worker_launcher:
+      tier: container
+      config:
+        bubblewrap: /usr/bin/bwrap
+        init: /usr/libexec/aivm-container-init
+        cgroup_root: /sys/fs/cgroup/aivm
+```
+
+`{tier: process}` เป็นค่า default; `{tier: process_namespace}` บังคับ empty network namespace
+หากต้องการ `tier: microvm` ให้ build CLI ด้วย `--features microvm` และกำหนด `config`
+ตาม `MicroVmConfig` ใน [microvm.md](microvm.md) โดยต้องมี `fc_sha256` ด้วย
+เมื่อไม่เปิด feature การ parse tier นี้จะล้มเหลว ไม่มี fallback
+
+Container copy model/dependencies เข้า private staging directory ก่อน mount แบบอ่านอย่างเดียว
+MicroVM stage เฉพาะ file grants ไม่ copy directory จาก host ทั้งก้อน และตรวจ storage quota
+ข้อมูล config/request อยู่ใน directory `0700` และไฟล์ `0600`; ล้างเมื่อ request จบ
+
+## Streaming, cancellation และ verification
+
+`aivm reason --config model.yaml --prompt 'Hello' --stream` ส่ง delta จาก worker
+Process ใช้ stdout pipe, container ใช้ stdout observer และ MicroVM ใช้ JSONL ภายใน serial markers
+Client ตรวจ request ID/version ทุก frame และตรวจ streamed output ให้ตรงกับ final output
+Delta ที่แสดงก่อน final response ยังไม่มีผลยืนยันความสำเร็จของ inference
+
+Rust API ใช้ `WorkerClient::infer_stream` พร้อม callback และ
+`WorkerClient::cancellation_token()` เพื่อ clone `Arc<AtomicBool>` ไปยัง thread ควบคุม
+ตั้ง token เป็น `true` เพื่อยกเลิก client นั้น; เริ่มงานใหม่ด้วย client ใหม่
+Callback ที่คืน error จะหยุดงานและ cleanup เช่นกัน
+Process ฆ่าทั้ง process group, container ใช้ `cgroup.kill`, MicroVM ยุติ VMM
+การยกเลิกระหว่าง staging/hash/setup จะถูกรับเมื่อจบขั้นตอนปัจจุบัน; ไม่มี hard deadline
+ครอบ syscall สำหรับ copy/hash/host-tool setup ทั้งหมดในรุ่นนี้
+
+Response ถูกตรวจ identity, termination, output budget, frame bytes และ exit status
+Client คำนวณ SHA-256 ของ output และคืน `verification` ที่เขียนทับค่าจาก worker เสมอ
+`verified` หมายถึง protocol/execution evidence ผ่านและมี model/worker pins;
+หากไม่มี pins จะเป็น `unverified` ส่วน response ผิดเงื่อนไขคืน typed error
+สถานะนี้ไม่ใช่การพิสูจน์ความถูกต้องเชิงเนื้อหาของคำตอบโมเดล
+
+## การยืนยันบน host
+
+CI ตรวจ process streaming/cancellation, forged responses, deadline, network syscalls
+และ fail-closed ของ container/MicroVM ที่ prerequisite ไม่ครบ
+การทดสอบ host จริงเรียกแยกด้วย config JSON (`ModelConfig`) ที่ operator เตรียมและ pin แล้ว:
+
+```bash
+AIVM_WORKER_HOST_CONFIG=/path/to/model-config.json \
+  cargo test -p aivm-model-worker --features llama,microvm \
+  --test worker real_isolated_worker_host_validation -- --exact --ignored --nocapture
+```
+
+ทดสอบสองครั้งโดยสลับ `worker_launcher` เป็น container และ microvm
+คำสั่งนี้ fail เมื่อ config/prerequisite ขาด; ไม่ skip หรืออ้างว่า host validation ผ่าน

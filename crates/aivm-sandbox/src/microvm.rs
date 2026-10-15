@@ -191,6 +191,30 @@ pub fn run_in_microvm(
     policy: &Policy,
     cfg: &MicroVmConfig,
 ) -> Result<ExecOutcome, (SandboxError, super::RunVerdict)> {
+    run_in_microvm_cancellable(
+        spec,
+        policy,
+        cfg,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+pub fn run_in_microvm_cancellable(
+    spec: &ExecSpec,
+    policy: &Policy,
+    cfg: &MicroVmConfig,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<ExecOutcome, (SandboxError, super::RunVerdict)> {
+    run_in_microvm_observed(spec, policy, cfg, cancelled, None)
+}
+
+pub fn run_in_microvm_observed(
+    spec: &ExecSpec,
+    policy: &Policy,
+    cfg: &MicroVmConfig,
+    cancelled: &std::sync::atomic::AtomicBool,
+    observer: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+) -> Result<ExecOutcome, (SandboxError, super::RunVerdict)> {
     use super::RunVerdict;
     // 1. ประตูสเปกเดียวกับ Process (exe/policy/arg/env/cwd)
     if spec.build.is_some() {
@@ -248,7 +272,7 @@ pub fn run_in_microvm(
             verify_artifact(&fc, &cfg.fc_sha256, cfg.max_artifact_bytes)
                 .map_err(|e| (e, RunVerdict::Clean))?;
         }
-        boot::boot_and_run(spec, &canon, cfg, &fc)
+        boot::boot_and_run(spec, &canon, cfg, &fc, policy, cancelled, observer)
     }
 }
 

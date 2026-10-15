@@ -122,6 +122,8 @@ pub struct LocalModelConfig {
     /// Optional SHA-256 pin for the worker executable.
     #[serde(default)]
     pub worker_sha256: Option<String>,
+    #[serde(default)]
+    pub worker_launcher: worker::WorkerLauncher,
     /// จำนวนชั้นที่ยกไป GPU (-1 = ทั้งหมด)
     #[serde(default)]
     pub gpu_layers: i32,
@@ -192,6 +194,7 @@ impl Default for LocalModelConfig {
             config_sha256: None,
             worker_path: None,
             worker_sha256: None,
+            worker_launcher: worker::WorkerLauncher::default(),
             gpu_layers: -1,
             ctx_size: default_ctx_size(),
             threads: default_threads(),
@@ -271,6 +274,16 @@ pub trait Model: Send + Sync {
     ) -> Result<String, ModelError> {
         self.reason(context)
     }
+    fn reason_stream(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+        on_delta: &mut dyn FnMut(&str) -> Result<(), ModelError>,
+    ) -> Result<String, ModelError> {
+        let output = self.reason_with_max_output(context, max_output_tokens)?;
+        on_delta(&output)?;
+        Ok(output)
+    }
     /// ส่ง system instruction แยกจาก user/context เมื่อ backend รองรับ
     /// backend ทั่วไปคง compatibility ด้วยการต่อข้อความก่อนเรียก reason()
     fn reason_with_system(&self, system: &str, context: &str) -> Result<String, ModelError> {
@@ -315,6 +328,7 @@ impl Model for WorkerModel {
             request_id: format!("infer-{}", uuid_like_id()),
             model_id: self.config.name.clone(),
             prompt: context.to_string(),
+            stream: false,
             max_output_tokens: self.limits.max_output_tokens,
             timeout_ms: self.limits.timeout_ms,
         };
@@ -326,6 +340,32 @@ impl Model for WorkerModel {
                     .output
                     .ok_or_else(|| ModelError::InferenceFailed("worker returned no output".into()))
             })
+    }
+
+    fn reason_stream(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+        on_delta: &mut dyn FnMut(&str) -> Result<(), ModelError>,
+    ) -> Result<String, ModelError> {
+        let request = worker::InferenceRequest {
+            protocol_version: worker::PROTOCOL_VERSION,
+            request_id: format!("infer-{}", uuid_like_id()),
+            model_id: self.config.name.clone(),
+            prompt: context.into(),
+            stream: true,
+            max_output_tokens: max_output_tokens.min(self.limits.max_output_tokens),
+            timeout_ms: self.limits.timeout_ms,
+        };
+        let response = self
+            .client
+            .infer_stream(&self.config, request, &self.limits, &mut |delta| {
+                on_delta(delta).map_err(|e| worker::WorkerError::Failed(e.to_string()))
+            })
+            .map_err(|e| ModelError::InferenceFailed(e.to_string()))?;
+        response
+            .output
+            .ok_or_else(|| ModelError::InferenceFailed("worker returned no output".into()))
     }
 
     fn token_count(&self, text: &str) -> usize {
@@ -454,10 +494,19 @@ impl LocalLlamaModel {
                 .collect::<Vec<_>>()
                 .join("\n\n")
         };
-        self.generate(&prompt, max_output_tokens.min(self.config.max_tokens))
+        self.generate(
+            &prompt,
+            max_output_tokens.min(self.config.max_tokens),
+            &mut |_| Ok(()),
+        )
     }
 
-    fn generate(&self, prompt: &str, max_output_tokens: usize) -> Result<String, ModelError> {
+    fn generate(
+        &self,
+        prompt: &str,
+        max_output_tokens: usize,
+        on_delta: &mut dyn FnMut(&str) -> Result<(), ModelError>,
+    ) -> Result<String, ModelError> {
         let n_ctx = self.config.ctx_size as u32;
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx).or(NonZeroU32::new(512)))
@@ -496,6 +545,7 @@ impl LocalLlamaModel {
         ]);
 
         let mut generated: Vec<LlamaToken> = Vec::new();
+        let mut emitted = 0;
         while generated.len() < max_output_tokens {
             let token = sampler.sample(&ctx, -1);
             if vocab.is_eog(token) {
@@ -505,6 +555,18 @@ impl LocalLlamaModel {
 
             let pos = (tokens.len() + generated.len()) as i32;
             generated.push(token);
+            let decoded = vocab.detokenize(&generated, true, true);
+            let valid = match std::str::from_utf8(&decoded) {
+                Ok(text) => text.len(),
+                Err(error) => error.valid_up_to(),
+            };
+            if valid > emitted {
+                on_delta(
+                    std::str::from_utf8(&decoded[emitted..valid])
+                        .map_err(|e| ModelError::Tokenizer(e.to_string()))?,
+                )?;
+                emitted = valid;
+            }
 
             batch.clear();
             batch
@@ -515,7 +577,11 @@ impl LocalLlamaModel {
         }
 
         let bytes = vocab.detokenize(&generated, true, true);
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        let output = String::from_utf8_lossy(&bytes).into_owned();
+        if output.len() > emitted {
+            on_delta(&output[emitted..])?;
+        }
+        Ok(output)
     }
 }
 
@@ -531,6 +597,28 @@ impl Model for LocalLlamaModel {
         max_output_tokens: usize,
     ) -> Result<String, ModelError> {
         self.reason_with_messages_limit(&[("user", context)], max_output_tokens)
+    }
+
+    fn reason_stream(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+        on_delta: &mut dyn FnMut(&str) -> Result<(), ModelError>,
+    ) -> Result<String, ModelError> {
+        let prompt = if let Some(template) = &self.chat_template {
+            let message = llama_cpp_2::model::LlamaChatMessage::new("user".into(), context.into())
+                .map_err(|e| ModelError::Tokenizer(e.to_string()))?;
+            self.model
+                .apply_chat_template(template, &[message], true)
+                .map_err(|e| ModelError::Tokenizer(e.to_string()))?
+        } else {
+            context.to_string()
+        };
+        self.generate(
+            &prompt,
+            max_output_tokens.min(self.config.max_tokens),
+            on_delta,
+        )
     }
 
     fn reason_with_system(&self, system: &str, context: &str) -> Result<String, ModelError> {
@@ -760,7 +848,7 @@ mod tests {
         let script = dir.join("worker.sh");
         std::fs::write(
             &script,
-            "#!/bin/sh\nread request\nprintf '%s\\n' '{\"protocol_version\":1,\"request_id\":\"test\",\"output\":\"worker-ok\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"elapsed_ms\":0},\"termination\":\"completed\",\"artifact_verified\":true,\"applied_limits\":[],\"audit_id\":null}'\n",
+            "#!/bin/sh\nread request\nrequest_id=$(printf '%s' \"$request\" | sed -n 's/.*\"request_id\":\"\\([^\"]*\\)\".*/\\1/p')\nprintf '%s\\n' '{\"protocol_version\":1,\"request_id\":\"'$request_id'\",\"output\":\"worker-ok\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"elapsed_ms\":0},\"termination\":\"completed\",\"artifact_verified\":true,\"applied_limits\":[],\"audit_id\":null}'\n",
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -768,10 +856,17 @@ mod tests {
             worker_path: Some(script.to_string_lossy().into_owned()),
             ..Default::default()
         };
+        // RLIMIT_NPROC นับต่อ UID ทั้งระบบ: ค่าเล็กกว่าจำนวน process ของ
+        // uid นี้อยู่แล้วจะทำให้ worker ที่ fork ไม่ได้ (test flaky บน
+        // เครื่อง dev) — ขอเพดานสูงสำหรับ transport test
         let config = ModelConfig {
             provider: "local".into(),
             name: "worker-test".into(),
             local: Some(local),
+            worker_limits: Some(worker::InferenceLimits {
+                pids_max: 8192,
+                ..worker::InferenceLimits::default()
+            }),
             ..Default::default()
         };
         let model = create_model(&config).unwrap();

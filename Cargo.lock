@@ -90,6 +90,8 @@ dependencies = [
 name = "aivm-model"
 version = "0.1.0"
 dependencies = [
+ "aivm-policy",
+ "aivm-sandbox",
  "libc",
  "llama-cpp-2",
  "serde",

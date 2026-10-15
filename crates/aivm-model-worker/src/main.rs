@@ -35,12 +35,31 @@ fn run() -> Result<(), WorkerError> {
         local.worker_path = None;
     }
     let model = create_model(&config).map_err(|e| WorkerError::Failed(e.to_string()))?;
-    let limits = InferenceLimits::default();
-    let stdin = io::stdin();
+    let limits = config.worker_limits.clone().unwrap_or_default();
+    let mut input: Box<dyn BufRead> = if let Some(path) = argument("--request") {
+        Box::new(io::BufReader::new(std::fs::File::open(path).map_err(
+            |e| WorkerError::Failed(format!("request file: {e}")),
+        )?))
+    } else {
+        Box::new(io::BufReader::new(io::stdin()))
+    };
     let mut stdout = io::BufWriter::new(io::stdout().lock());
 
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|e| WorkerError::Failed(format!("read request: {e}")))?;
+    loop {
+        use std::io::Read;
+        let mut line = String::new();
+        let maximum = aivm_model::worker::MAX_PROMPT_BYTES * 6 + 4096;
+        let n = input
+            .by_ref()
+            .take((maximum + 1) as u64)
+            .read_line(&mut line)
+            .map_err(|e| WorkerError::Failed(format!("read request: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        if n > maximum {
+            return Err(WorkerError::LimitExceeded("request frame bytes".into()));
+        }
         if line.trim().is_empty() {
             continue;
         }
@@ -56,6 +75,14 @@ fn run() -> Result<(), WorkerError> {
             }
         };
         let request_id = request.request_id.clone();
+        if request.model_id != config.name {
+            write_error(
+                &mut stdout,
+                Some(&request_id),
+                WorkerError::InvalidRequest("model_id does not match loaded model".into()),
+            )?;
+            continue;
+        }
         let token_count = model.token_count(&request.prompt);
         let effective_limits = InferenceLimits {
             max_context_tokens: limits.max_context_tokens.min(model.max_context()),
@@ -66,8 +93,16 @@ fn run() -> Result<(), WorkerError> {
             continue;
         }
         let started = Instant::now();
-        let output = match model.reason_with_max_output(&request.prompt, request.max_output_tokens)
-        {
+        let generation = if request.stream {
+            model.reason_stream(&request.prompt, request.max_output_tokens, &mut |delta| {
+                let event = serde_json::json!({"protocol_version": aivm_model::worker::PROTOCOL_VERSION, "request_id": request_id, "delta": delta});
+                serde_json::to_writer(&mut stdout, &event).map_err(|e| aivm_model::ModelError::InferenceFailed(e.to_string()))?;
+                stdout.write_all(b"\n").and_then(|_| stdout.flush()).map_err(|e| aivm_model::ModelError::InferenceFailed(e.to_string()))
+            })
+        } else {
+            model.reason_with_max_output(&request.prompt, request.max_output_tokens)
+        };
+        let output = match generation {
             Ok(output) => output,
             Err(error) => {
                 write_error(
@@ -78,27 +113,43 @@ fn run() -> Result<(), WorkerError> {
                 continue;
             }
         };
+        let output_tokens = model.token_count(&output);
+        if output_tokens > request.max_output_tokens {
+            write_error(
+                &mut stdout,
+                Some(&request_id),
+                WorkerError::LimitExceeded("output tokens".into()),
+            )?;
+            continue;
+        }
         let response = InferenceResponse {
             protocol_version: aivm_model::worker::PROTOCOL_VERSION,
             request_id,
             usage: InferenceUsage {
                 input_tokens: token_count,
-                output_tokens: model.token_count(&output),
+                output_tokens,
                 elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             },
             output: Some(output),
-            termination: "completed".into(),
+            termination: if output_tokens == request.max_output_tokens {
+                "length"
+            } else {
+                "completed"
+            }
+            .into(),
             artifact_verified: config.provider != "local"
                 || config
                     .local
                     .as_ref()
                     .is_some_and(|local| !local.model_sha256.is_empty()),
             applied_limits: vec![
+                "worker-network-seccomp".into(),
                 "context-tokens".into(),
                 "output-tokens".into(),
                 "timeout-request-bound".into(),
             ],
             audit_id: None,
+            verification: Default::default(),
         };
         serde_json::to_writer(&mut stdout, &response)
             .map_err(|e| WorkerError::Failed(format!("write response: {e}")))?;
@@ -147,4 +198,11 @@ fn write_error(
         .flush()
         .map_err(|e| WorkerError::Failed(format!("flush error: {e}")))?;
     Ok(())
+}
+
+fn argument(name: &str) -> Option<PathBuf> {
+    let args: Vec<_> = std::env::args_os().collect();
+    args.windows(2)
+        .find(|pair| pair[0] == name)
+        .map(|pair| PathBuf::from(&pair[1]))
 }

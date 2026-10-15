@@ -417,12 +417,31 @@ fn between(log: &str, begin: &str, end: &str) -> String {
     rest[..b].trim_matches('\n').to_string()
 }
 
+fn capture_stdout(
+    invoke: &str,
+    out_tmp: &str,
+    err_tmp: &str,
+    out_b: &str,
+    out_e: &str,
+    streaming: bool,
+) -> String {
+    if streaming {
+        format!("echo \"{out_b}\"\n{invoke} 2>{err_tmp}\nCODE=$?\necho \"{out_e}\"")
+    } else {
+        format!("{invoke} >{out_tmp} 2>{err_tmp}\nCODE=$?\necho \"{out_b}\"; cat {out_tmp}; echo \"{out_e}\"")
+    }
+}
+
 /// boot + รัน + จับผล (เรียกหลังผ่านประตู spec/shape/supply chain/host แล้ว)
+#[allow(clippy::too_many_arguments)]
 pub(super) fn boot_and_run(
     spec: &ExecSpec,
     canon: &Path,
     cfg: &MicroVmConfig,
     fc_bin: &Path,
+    policy: &aivm_policy::Policy,
+    cancelled: &std::sync::atomic::AtomicBool,
+    observer: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 ) -> BootResult<ExecOutcome> {
     let spawn_err = |what: &str, e: std::io::Error| {
         clean_err(SandboxError::Spawn(format!("microvm {what} failed: {e}")))
@@ -438,7 +457,9 @@ pub(super) fn boot_and_run(
     );
     let scratch = std::env::temp_dir().join(format!("aivm-uvm-run-{nonce}"));
     std::fs::create_dir_all(&scratch).map_err(|e| spawn_err("scratch", e))?;
-    let r = boot_and_run_inner(spec, canon, cfg, fc_bin, &scratch, &nonce);
+    let r = boot_and_run_inner(
+        spec, canon, cfg, fc_bin, &scratch, &nonce, policy, cancelled, observer,
+    );
     // ล้าง scratch แบบ best-effort (ผลลัพธ์ parse ไว้หมดแล้ว)
     // ตั้ง AIVM_MICROVM_KEEP_SCRATCH=1 เพื่อเก็บไว้ดีบัก serial log
     if std::env::var("AIVM_MICROVM_KEEP_SCRATCH").is_err() {
@@ -449,7 +470,7 @@ pub(super) fn boot_and_run(
     r
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn boot_and_run_inner(
     spec: &ExecSpec,
     canon: &Path,
@@ -457,6 +478,9 @@ fn boot_and_run_inner(
     fc_bin: &Path,
     scratch: &Path,
     nonce: &str,
+    policy: &aivm_policy::Policy,
+    cancelled: &std::sync::atomic::AtomicBool,
+    observer: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 ) -> BootResult<ExecOutcome> {
     let spawn_err = |what: &str, e: std::io::Error| {
         clean_err(SandboxError::Spawn(format!("microvm {what} failed: {e}")))
@@ -531,6 +555,31 @@ fn boot_and_run_inner(
         }
         stage_file(&staging, lib)?;
     }
+    // Stage only explicit file grants, never recursively copy a host directory.
+    let mut staged_bytes = 0u64;
+    for grant in &policy.filesystem.read {
+        let path = Path::new(grant);
+        if !path.is_absolute() || !path.is_file() {
+            continue;
+        }
+        if policy
+            .evaluate_fs("read", grant, &aivm_policy::EvalContext::default())
+            .0
+            != aivm_policy::Decision::Allow
+        {
+            continue;
+        }
+        let metadata = std::fs::metadata(path).map_err(|e| spawn_err("input metadata", e))?;
+        staged_bytes = staged_bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| clean_err(SandboxError::Invalid("staged input size overflow".into())))?;
+        if staged_bytes > spec.limits.storage_mb.saturating_mul(1024 * 1024) {
+            return Err(clean_err(SandboxError::Invalid(
+                "staged inputs exceed storage quota".into(),
+            )));
+        }
+        stage_file(&staging, path)?;
+    }
     // guest path = /mnt/data + absolute เดิม
     let guest = |p: &Path| format!("/mnt/data{}", p.display());
     let libpath = {
@@ -561,16 +610,17 @@ fn boot_and_run_inner(
         invoke.push_str(&sh_escape(a));
     }
     // 3. init script (args ฝังแบบ escape แล้วทั้งก้อน, marker/tmp ตาม DNA)
+    let capture = capture_stdout(
+        &invoke,
+        &dna.out_tmp,
+        &dna.err_tmp,
+        &dna.out_b,
+        &dna.out_e,
+        observer.is_some(),
+    );
     let init_sh = format!(
-        "#!/bin/sh\nmkdir -p /mnt/data\nmount -t tmpfs tmpfs /tmp 2>/dev/null\nmount -t ext4 -o ro /dev/vdb /mnt/data || {{ echo \"{fail}\"; poweroff -f; }}\n{invoke} >{out_tmp} 2>{err_tmp}\nCODE=$?\necho \"{out_b}\"; cat {out_tmp}; echo \"{out_e}\"\necho \"{err_b}\"; cat {err_tmp}; echo \"{err_e}\"\necho \"{exit}$CODE\"\npoweroff -f\n",
-        fail = dna.fail_mount,
-        out_tmp = dna.out_tmp,
-        err_tmp = dna.err_tmp,
-        out_b = dna.out_b,
-        out_e = dna.out_e,
-        err_b = dna.err_b,
-        err_e = dna.err_e,
-        exit = dna.exit,
+        "#!/bin/sh\nmkdir -p /mnt/data\nmount -t tmpfs tmpfs /tmp 2>/dev/null\nmount -t ext4 -o ro /dev/vdb /mnt/data || {{ echo \"{fail}\"; poweroff -f; }}\n{capture}\necho \"{err_b}\"; cat {err_tmp}; echo \"{err_e}\"\necho \"{exit}$CODE\"\npoweroff -f\n",
+        fail = dna.fail_mount, err_tmp = dna.err_tmp, err_b = dna.err_b, err_e = dna.err_e, exit = dna.exit,
     );
     let init_host = scratch.join("aivm-init");
     std::fs::write(&init_host, init_sh.as_bytes()).map_err(|e| spawn_err("init write", e))?;
@@ -600,7 +650,9 @@ fn boot_and_run_inner(
 
     // 4. data image จาก staging (mkfs ไม่ต้อง root)
     let bytes = dir_size_bytes(&staging);
-    let size_mb = ((bytes / (1024 * 1024)) + DATA_IMAGE_SPARE_MB).max(DATA_IMAGE_MIN_MB);
+    // Ext4 journal, inode tables and reserved blocks scale with image size.
+    let payload_mb = bytes.div_ceil(1024 * 1024);
+    let size_mb = (payload_mb + payload_mb / 8 + DATA_IMAGE_SPARE_MB + 64).max(DATA_IMAGE_MIN_MB);
     let data_img = scratch.join("data.img");
     host_tool(
         "mkfs.ext4",
@@ -669,9 +721,31 @@ fn boot_and_run_inner(
     // 7. รอ marker (เส้นตายรวมจาก config) ระหว่างนั้นถ้า VMM ตายก่อน = ล้มแบบดัง
     // verdict (G3): VMM ตายก่อน marker = หลักฐานละเมิด boundary → `Compromise`
     // เกินเส้นตาย = ผิดปกติแบบอธิบายได้ → `Suspect`
-    let deadline = Instant::now() + Duration::from_secs(cfg.boot_timeout_secs);
+    let deadline =
+        Instant::now() + Duration::from_millis(spec.timeout_ms.min(cfg.boot_timeout_secs * 1000));
     let exit_mark = dna.exit.clone();
+    let mut observed_bytes = 0;
     loop {
+        if let Some(observer) = &observer {
+            let log = read_capped(&serial_log, MAX_SERIAL_BYTES);
+            if let Some((_, rest)) = log.rsplit_once(&dna.out_b) {
+                let rest = rest.trim_start_matches(['\r', '\n']);
+                let payload = rest.split(&dna.out_e).next().unwrap_or("");
+                if let Some(end) = payload.rfind('\n') {
+                    let end = end + 1;
+                    if end > observed_bytes {
+                        let _ = observer.send(payload.as_bytes()[observed_bytes..end].to_vec());
+                        observed_bytes = end;
+                    }
+                }
+            }
+        }
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err((
+                SandboxError::Spawn("inference cancelled".into()),
+                RunVerdict::Clean,
+            ));
+        }
         if serial_file_contains(&serial_log, &exit_mark, MAX_SERIAL_BYTES) {
             break;
         }
@@ -936,6 +1010,15 @@ mod tests {
 
     // quota guest = ค่าน้อยสุดระหว่าง cfg ระดับ VM กับ limits ระดับ task
     // (task ไม่มีทางได้เกินโควตาตัวเอง; ค่าประหลาดถูกบีบเข้าช่วง boot ได้)
+    #[test]
+    fn streaming_marker_precedes_execution_and_does_not_buffer_stdout() {
+        let script = capture_stdout("worker", "/tmp/out", "/tmp/err", "BEGIN", "END", true);
+        assert!(script.find("BEGIN").unwrap() < script.find("worker").unwrap());
+        assert!(script.find("worker").unwrap() < script.find("END").unwrap());
+        assert!(!script.contains(">/tmp/out"));
+        assert!(script.contains("CODE=$?"));
+    }
+
     #[test]
     fn quota_clamp_takes_minimum() {
         let cfg = MicroVmConfig {

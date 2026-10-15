@@ -240,6 +240,32 @@ impl VmConfig {
     }
 }
 
+impl VmConfig {
+    /// Model-only configuration uses the same security gate and quotas as the agent runtime.
+    pub fn inference_model_config(&self) -> Result<ModelConfig, RuntimeError> {
+        validate_model_security(self)?;
+        let resources = resource_limits(&self.resources)?;
+        Ok(ModelConfig {
+            provider: self.model.provider.clone(),
+            name: self.model.name.clone(),
+            local: self.model.local.clone(),
+            openai: self.model.openai.clone(),
+            anthropic: self.model.anthropic.clone(),
+            worker_limits: self.model.local.as_ref().map(|local| {
+                aivm_model::worker::InferenceLimits {
+                    max_context_tokens: local.ctx_size,
+                    max_output_tokens: local.max_tokens,
+                    timeout_ms: 120_000,
+                    memory_mb: resources.memory_mb,
+                    cpu_seconds: u64::from(resources.cpu) * 60,
+                    pids_max: resources.pids_max,
+                    storage_mb: resources.storage_mb,
+                }
+            }),
+        })
+    }
+}
+
 pub struct Runtime {
     pub config: VmConfig,
     pub base_dir: PathBuf,
@@ -441,23 +467,7 @@ impl Runtime {
             gateway.hardware_cfg = config.hardware.clone();
         }
         let sandbox = Sandbox::new(level, gateway.limits.clone());
-        let model_cfg = ModelConfig {
-            provider: config.model.provider.clone(),
-            name: config.model.name.clone(),
-            local: config.model.local.clone(),
-            openai: config.model.openai.clone(),
-            anthropic: config.model.anthropic.clone(),
-            worker_limits: config.model.local.as_ref().map(|local| {
-                aivm_model::worker::InferenceLimits {
-                    max_context_tokens: local.ctx_size,
-                    max_output_tokens: local.max_tokens,
-                    timeout_ms: 120_000,
-                    memory_mb: gateway.limits.memory_mb,
-                    cpu_seconds: u64::from(gateway.limits.cpu).saturating_mul(60),
-                    pids_max: gateway.limits.pids_max,
-                }
-            }),
-        };
+        let model_cfg = config.inference_model_config()?;
         // สร้างโมเดลผ่าน factory — provider ที่ไม่รู้จัก/ไม่มีฟีเจอร์จะ fail-closed
         let model: Box<dyn Model> =
             create_model(&model_cfg).map_err(|e| RuntimeError::Config(e.to_string()))?;

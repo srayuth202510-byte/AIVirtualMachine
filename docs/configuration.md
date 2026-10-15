@@ -254,3 +254,11 @@ aivm transition <name> DEPLOY   --policy-approved       # VALIDATE → DEPLOY (H
 ## Build output profile (opt-in)
 
 `build.enabled` ค่าเริ่มต้น false, `max_files` ค่าเริ่มต้น 16 (1..64), `max_bytes` ค่าเริ่มต้น 16 MiB (1 KiB..512 MiB) งบแบ่งเท่ากันราย slot Artifact ที่ต้องรันต้องอยู่ใน `tools.allow` เช่น `build:tests` ด้วย ดู [build-workflow.md](build-workflow.md) และ `examples/build-c.yaml`
+
+### Inference worker launcher
+
+`model.local.worker_launcher` เลือก `tier: process` (default), `process_namespace`,
+`container` หรือ `microvm` (ต้อง build feature) ค่าอื่นและ unknown fields ถูกปฏิเสธ
+Container/MicroVM ใช้ config backend ภายใน field `config` และไม่ fallback เป็น process
+ดูตัวอย่างและ host validation ใน [model-runtime.md](model-runtime.md)
+คำสั่ง `reason --stream` ใช้ launcher เดียวกับ inference ปกติ

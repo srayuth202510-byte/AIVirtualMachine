@@ -45,8 +45,32 @@ pub fn run(
     policy: &Policy,
     cfg: &ContainerConfig,
 ) -> Result<ExecOutcome, SandboxError> {
+    run_cancellable(
+        spec,
+        policy,
+        cfg,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+pub fn run_cancellable(
+    spec: &ExecSpec,
+    policy: &Policy,
+    cfg: &ContainerConfig,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<ExecOutcome, SandboxError> {
+    run_observed(spec, policy, cfg, cancelled, None)
+}
+
+pub fn run_observed(
+    spec: &ExecSpec,
+    policy: &Policy,
+    cfg: &ContainerConfig,
+    cancelled: &std::sync::atomic::AtomicBool,
+    observer: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+) -> Result<ExecOutcome, SandboxError> {
     #[cfg(target_os = "linux")]
-    return linux::run(spec, policy, cfg);
+    return linux::run(spec, policy, cfg, cancelled, observer);
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (spec, policy, cfg);
@@ -310,6 +334,7 @@ mod linux {
 
     fn drain(
         mut pipe: impl Read + Send + 'static,
+        observer: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     ) -> std::thread::JoinHandle<std::io::Result<(String, bool)>> {
         std::thread::spawn(move || {
             let mut saved = Vec::new();
@@ -321,6 +346,11 @@ mod linux {
                     break;
                 }
                 let keep = n.min((MAX_OUTPUT as usize).saturating_sub(saved.len()));
+                if let Some(observer) = &observer {
+                    if keep > 0 {
+                        let _ = observer.send(buffer[..keep].to_vec());
+                    }
+                }
                 saved.extend_from_slice(&buffer[..keep]);
                 truncated |= keep != n;
             }
@@ -349,6 +379,8 @@ mod linux {
         spec: &ExecSpec,
         policy: &Policy,
         cfg: &ContainerConfig,
+        cancelled: &std::sync::atomic::AtomicBool,
+        observer: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     ) -> Result<ExecOutcome, SandboxError> {
         let exe = validate(spec, policy)?;
         if !cfg.bubblewrap.is_absolute() {
@@ -582,15 +614,20 @@ mod linux {
                 .stdout
                 .take()
                 .ok_or_else(|| spawn_error("stdout pipe missing"))?,
+            observer,
         );
         let stderr = drain(
             child
                 .stderr
                 .take()
                 .ok_or_else(|| spawn_error("stderr pipe missing"))?,
+            None,
         );
         let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms());
         let result = loop {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                break Err(spawn_error("inference cancelled"));
+            }
             match child.try_wait() {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) if Instant::now() < deadline => {

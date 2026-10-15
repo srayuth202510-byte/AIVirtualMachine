@@ -13,8 +13,12 @@ thiserror = { workspace = true }
 llama-cpp-2 = { version = "0.1.159", default-features = false, optional = true }
 ureq = { version = "2.9", features = ["json", "charset", "cookies", "tls"] }
 
+aivm-sandbox = { path = "../aivm-sandbox" }
+aivm-policy = { path = "../aivm-policy" }
+
 [features]
 default = []
+microvm = ["aivm-sandbox/microvm"]
 # แบ็กเอนด์ local (GGUF ผ่าน llama.cpp) — เปิดใช้เมื่อมี cmake + toolchain C++
 # ปิดไว้โดยปริยายเพื่อให้ `make verify` เบาและไม่พึ่ง cmake ใน CI
 llama = ["dep:llama-cpp-2"]
