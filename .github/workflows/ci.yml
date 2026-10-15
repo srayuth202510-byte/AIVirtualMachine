@@ -54,7 +54,7 @@ jobs:
       - name: เทสต์ Hardware Isolation แบบมีฟีเจอร์ (บูตจริงข้ามเมื่อไม่มี KVM)
         run: make test-hardware
 
-      - name: self-test เส้น enforcement (12 เคส ALLOW/DENY)
+      - name: self-test เส้น enforcement (14 เคส ALLOW/DENY)
         run: cargo run -q -p aivm-cli -- demo
 
       - name: วงจร CLI ครบ (create/transition/inspect/run/logs)

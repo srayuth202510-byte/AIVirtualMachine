@@ -1,7 +1,7 @@
 # ทางลัดนักพัฒนา AIVM ดูรายการด้วย `make help`
 # ทุก target คือ cargo ธรรมดา ใช้ `rtk make <target>` ได้เหมือนกัน
 
-.PHONY: help build check test test-adv test-coding test-microvm test-hardware test-container check-microvm check-hardware demo e2e llama-smoke clippy fmt fmt-check verify ci clean bench setup-host pins query path explain graph-update debug-test
+.PHONY: help build check test test-adv test-coding test-microvm test-hardware test-container check-microvm check-hardware check-ci demo e2e llama-smoke clippy fmt fmt-check verify ci clean bench setup-host pins query path explain graph-update debug-test
 
 help: ## แสดงวิธีใช้นี้
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS=":.*?## "} {printf "  %-10s %s\n", $$1, $$2}'
@@ -46,6 +46,9 @@ test-hardware: ## เทสต์ Hardware Isolation ทั้งสาย (บ�
 
 check-hardware: ## lint โค้ดหลังฟีเจอร์ hardware ทั้งสาย (กันแก้พังเงียบ)
 	cargo clippy -p aivm-sandbox -p aivm-tools -p aivm-runtime -p aivm-cli --all-targets --features hardware -- -D warnings
+
+check-ci: ## กัน CI/docs drift (make ci ตรงกับ .github/workflows/ci.yml)
+	python3 scripts/check-ci-parity.py
 
 demo: ## self-test เส้น enforcement ครั้งเดียว (ตาราง ALLOW/DENY, temp dir)
 	cargo run -q -p aivm-cli -- demo
