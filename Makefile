@@ -1,7 +1,7 @@
 # ทางลัดนักพัฒนา AIVM ดูรายการด้วย `make help`
 # ทุก target คือ cargo ธรรมดา ใช้ `rtk make <target>` ได้เหมือนกัน
 
-.PHONY: help build check test test-adv test-coding test-microvm test-hardware test-container check-microvm check-hardware demo e2e llama-smoke clippy fmt fmt-check verify ci clean bench setup-host query path explain graph-update debug-test
+.PHONY: help build check test test-adv test-coding test-microvm test-hardware test-container check-microvm check-hardware demo e2e llama-smoke clippy fmt fmt-check verify ci clean bench setup-host pins query path explain graph-update debug-test
 
 help: ## แสดงวิธีใช้นี้
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS=":.*?## "} {printf "  %-10s %s\n", $$1, $$2}'
@@ -78,6 +78,9 @@ bench: ## วัด demo/adversarial/audit คร่าวๆ (smoke-bench ก�
 
 setup-host: ## ตรวจ host แบบอ่านอย่างเดียว สรุป Tier1/2/3
 	sh scripts/setup-host.sh
+
+pins: ## สร้าง pins.json จากไฟล์จริง: make pins KERNEL=.. ROOTFS=.. FC=.. OUT=.. (FC=- = โหมด hardware)
+	sh scripts/make-pins.sh "$(KERNEL)" "$(ROOTFS)" "$(FC)" "$(OUT)"
 
 # --- ค้นหา: ถามกราฟก่อน ค่อย grep (กราฟมีหลักฐาน file:line) ---
 query: ## ค้นกราฟ: make query Q="..."

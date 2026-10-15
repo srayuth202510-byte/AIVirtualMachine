@@ -27,6 +27,8 @@ curl -sSOL https://s3.amazonaws.com/spec.ccfc.min/img/hello/fsfiles/hello-rootfs
 # firecracker: แตก tgz แล้ววางไบนารีใน PATH (เช่น ~/.local/bin) + ตรวจ sha กับ upstream
 sha256sum vmlinux.bin hello-rootfs.ext4 ~/.local/bin/firecracker
 # ประกอบ pins.json ตาม schema ข้างล่างด้วย hash ที่ได้
+# หรือใช้สคริปต์ (คำนวณ hash + ตรวจ 64 hex + chmod 600 ให้เอง):
+sh scripts/make-pins.sh vmlinux.bin hello-rootfs.ext4 ~/.local/bin/firecracker pins.json
 ```
 
 schema ของ `pins.json` (เครื่องมืออ่านแค่ `kernel.*`, `rootfs.*`, `binary.sha256`):

@@ -6,6 +6,14 @@ AIVM คือ runtime สำหรับรัน AI Agent โดยเฉพ�
 
 «The AI may think, but the AI does not own the machine.»
 
+> English summary: AIVM is a fail-closed runtime for AI agents. The model proposes
+> intents (strict JSON); a state machine (`INIT→DEPLOY` with operator guards), capability
+> checks, and a deny-by-default policy engine decide ALLOW/DENY before any tool runs.
+> Tools (`filesystem/network/process.exec`) go through a gateway into a sandbox
+> (Tier1 process/container by default, Tier2 Firecracker MicroVM, Tier3 TEE skeleton).
+> Every decision is append-only audited with a hash chain. Full spec is in Thai:
+> [`AI Virtual Machine.md`](./AI%20Virtual%20Machine.md). Start with `cargo run -p aivm-cli -- demo`.
+
 สเปกฉบับเต็ม (ภาษาไทย): [`AI Virtual Machine.md`](./AI%20Virtual%20Machine.md)
 
 ## สถานะ
