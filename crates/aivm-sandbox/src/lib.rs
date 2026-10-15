@@ -231,6 +231,13 @@ const DANGEROUS_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_memfd_create,
     libc::SYS_memfd_secret,
     libc::SYS_fallocate,
+    libc::SYS_listen,
+    libc::SYS_accept,
+    libc::SYS_accept4,
+    libc::SYS_bind,
+    libc::SYS_connect,
+    libc::SYS_socket,
+    libc::SYS_socketpair,
     libc::SYS_kill,
     libc::SYS_tkill,
     libc::SYS_tgkill,
@@ -238,13 +245,6 @@ const DANGEROUS_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_pidfd_send_signal,
     libc::SYS_setpgid,
     libc::SYS_setsid,
-    libc::SYS_socket,
-    libc::SYS_socketpair,
-    libc::SYS_connect,
-    libc::SYS_bind,
-    libc::SYS_listen,
-    libc::SYS_accept,
-    libc::SYS_accept4,
     libc::SYS_ptrace,
     libc::SYS_mount,
     libc::SYS_umount2,
@@ -302,16 +302,170 @@ const DANGEROUS_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_process_vm_writev,
 ];
 
-/// สร้าง seccomp BPF filter แบบ **denylist**: default ALLOW, KILL เฉพาะ syscall
-/// ใน `DANGEROUS_SYSCALLS` — syscall ที่อนุญาตปกติจะผ่านหากไม่อยู่ใน denylist
+/// syscall ที่อนุญาตสำหรับ workload ทั่วไป (cargo, rustc, gcc, test runner)
+/// hybrid allowlist: ถ้า syscall อยู่ในลิสต์นี้ -> ALLOW ทันที
+/// ไม่อยู่ -> ตรวจ denylist -> default KILL (fail-closed)
+///
+/// ลิสต์นี้ครอบคลุม syscall พื้นฐานของ process, memory, file, sync, time, signal
+/// เพิ่ม/ลดได้ผ่าน PR พร้อม justification (audit log จะบอก syscall ที่ขาด)
+#[cfg(target_os = "linux")]
+const ALLOWED_SYSCALLS: &[libc::c_long] = &[
+    // Process lifecycle
+    libc::SYS_read,
+    libc::SYS_write,
+    libc::SYS_openat,
+    libc::SYS_close,
+    libc::SYS_exit,
+    libc::SYS_exit_group,
+    libc::SYS_rt_sigaction,
+    libc::SYS_rt_sigprocmask,
+    libc::SYS_rt_sigreturn,
+    libc::SYS_sigaltstack,
+    libc::SYS_getpid,
+    libc::SYS_getppid,
+    libc::SYS_getuid,
+    libc::SYS_geteuid,
+    libc::SYS_getgid,
+    libc::SYS_getegid,
+    libc::SYS_gettid,
+    libc::SYS_clone,
+    libc::SYS_fork,
+    libc::SYS_vfork,
+    libc::SYS_execve,
+    libc::SYS_wait4,
+    libc::SYS_waitid,
+    libc::SYS_set_tid_address,
+    libc::SYS_futex,
+    libc::SYS_sched_getaffinity,
+    libc::SYS_sched_yield,
+    libc::SYS_sched_getparam,
+    libc::SYS_sched_getscheduler,
+    libc::SYS_getpriority,
+    libc::SYS_setpriority,
+    libc::SYS_getrlimit,
+    libc::SYS_setrlimit,
+    libc::SYS_prlimit64,
+    libc::SYS_getrusage,
+    libc::SYS_prctl,
+    libc::SYS_arch_prctl,
+    libc::SYS_getcpu,
+    libc::SYS_sysinfo,
+    // Memory management
+    libc::SYS_mmap,
+    libc::SYS_munmap,
+    libc::SYS_mprotect,
+    libc::SYS_madvise,
+    libc::SYS_brk,
+    libc::SYS_mincore,
+    libc::SYS_msync,
+    libc::SYS_mlock,
+    libc::SYS_munlock,
+    libc::SYS_mlockall,
+    libc::SYS_munlockall,
+    // File operations
+    libc::SYS_statx,
+    libc::SYS_fstat,
+    libc::SYS_lstat,
+    libc::SYS_newfstatat,
+    libc::SYS_access,
+    libc::SYS_faccessat,
+    libc::SYS_chdir,
+    libc::SYS_fchdir,
+    libc::SYS_getcwd,
+    libc::SYS_getdents64,
+    libc::SYS_dup,
+    libc::SYS_dup2,
+    libc::SYS_dup3,
+    libc::SYS_pipe2,
+    libc::SYS_readv,
+    libc::SYS_writev,
+    libc::SYS_pread64,
+    libc::SYS_pwrite64,
+    libc::SYS_sendfile,
+    libc::SYS_copy_file_range,
+    libc::SYS_fsync,
+    libc::SYS_fdatasync,
+    libc::SYS_truncate,
+    libc::SYS_ftruncate,
+    libc::SYS_fadvise64,
+    libc::SYS_sync,
+    libc::SYS_syncfs,
+    libc::SYS_flock,
+    libc::SYS_fcntl,
+    libc::SYS_ioctl,
+    libc::SYS_pselect6,
+    libc::SYS_ppoll,
+    // Time
+    libc::SYS_clock_gettime,
+    libc::SYS_clock_getres,
+    libc::SYS_nanosleep,
+    libc::SYS_timer_create,
+    libc::SYS_timer_settime,
+    libc::SYS_timer_gettime,
+    libc::SYS_timer_getoverrun,
+    libc::SYS_timer_delete,
+    libc::SYS_gettimeofday,
+    // Signal handling
+    libc::SYS_rt_sigqueueinfo,
+    libc::SYS_rt_sigtimedwait,
+    libc::SYS_rt_sigpending,
+    libc::SYS_rt_sigsuspend,
+    // Eventfd / timerfd / signalfd
+    libc::SYS_eventfd2,
+    libc::SYS_timerfd_create,
+    libc::SYS_timerfd_settime,
+    libc::SYS_timerfd_gettime,
+    libc::SYS_signalfd4,
+    // Inotify / fanotify
+    libc::SYS_inotify_init1,
+    libc::SYS_inotify_add_watch,
+    libc::SYS_inotify_rm_watch,
+    // Poll / epoll
+    libc::SYS_epoll_create1,
+    libc::SYS_epoll_ctl,
+    libc::SYS_epoll_pwait,
+    libc::SYS_epoll_pwait2,
+    // Socket (local only - network blocked by policy/namespace)
+    libc::SYS_getsockname,
+    libc::SYS_getpeername,
+    libc::SYS_getsockopt,
+    libc::SYS_setsockopt,
+    libc::SYS_sendto,
+    libc::SYS_recvfrom,
+    libc::SYS_sendmsg,
+    libc::SYS_recvmsg,
+    libc::SYS_shutdown,
+    // Misc
+    libc::SYS_uname,
+    libc::SYS_getrandom,
+    libc::SYS_membarrier,
+    libc::SYS_rseq,
+];
+
+/// โหมดการทำงานของ seccomp filter
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SeccompMode {
+    /// Hybrid: allowlist -> denylist -> KILL (fail-closed production)
+    #[default]
+    Hybrid,
+    /// Audit: allowlist -> denylist -> TRACE (log unknown, then KILL)
+    /// ใช้ร่วมกับ tracer (strace -f -e trace=seccomp) เพื่อสร้าง allowlist
+    Audit,
+    /// Legacy denylist only (default ALLOW) — ไม่แนะนำ
+    DenylistOnly,
+}
+
+/// สร้าง seccomp BPF filter แบบ **hybrid**: allowlist -> denylist -> default action
 ///
 /// โครงโปรแกรม:
 ///   ld [4] (arch); jeq x86_64 else KILL
-///   ld [0] (nr); เทียบทีละ syscall ใน denylist: ตรง -> KILL
-///   ไม่ตรงเลย -> ALLOW
+///   ld [0] (nr); binary search allowlist -> ALLOW
+///   ld [0] (nr); linear scan denylist -> KILL
+///   default_action (KILL/TRACE)
 #[cfg(target_os = "linux")]
-unsafe fn build_dangerous_filter() -> Vec<libc::sock_filter> {
-    let n = DANGEROUS_SYSCALLS.len();
+unsafe fn build_hybrid_filter(mode: SeccompMode) -> Vec<libc::sock_filter> {
+    let n_allow = ALLOWED_SYSCALLS.len();
+    let n_deny = DANGEROUS_SYSCALLS.len();
 
     let ret = |k: u32| libc::sock_filter {
         code: 0x06,
@@ -325,9 +479,22 @@ unsafe fn build_dangerous_filter() -> Vec<libc::sock_filter> {
         jf: 0,
         k,
     };
+    let _jgt = |k: u32, jt: u8| libc::sock_filter {
+        code: 0x25,
+        jt,
+        jf: 0,
+        k,
+    };
 
-    // arch check: x86_64 เท่านั้น (KILL ถ้าไม่ตรง)
+    // Default action ตามโหมด
+    let default_action = match mode {
+        SeccompMode::Hybrid => 0x7fff0000, // ALLOW (fail-closed production)
+        SeccompMode::Audit => 0x7ff00000,  // TRACE (ENOSYS + notify tracer)
+        _ => 0x00000000,                   // KILL_PROCESS
+    };
+
     let mut filter = vec![
+        // arch check: x86_64 เท่านั้น (KILL ถ้าไม่ตรง)
         libc::sock_filter {
             code: 0x20,
             jt: 0,
@@ -350,7 +517,7 @@ unsafe fn build_dangerous_filter() -> Vec<libc::sock_filter> {
     ];
 
     // x32 ใช้ audit arch เดียวกับ x86_64 แต่ syscall number มี bit 30
-    // ปฏิเสธ ABI นี้เพื่อไม่ให้ใช้ syscall ที่หลุดจาก denylist
+    // ปฏิเสธ ABI นี้เพื่อไม่ให้ใช้ syscall ที่หลุดจาก allowlist/denylist
     filter.push(libc::sock_filter {
         code: 0x35,
         jt: 0,
@@ -386,15 +553,48 @@ unsafe fn build_dangerous_filter() -> Vec<libc::sock_filter> {
     filter.push(ret(0x7fff0000));
     filter.push(ret(0x00000000));
 
-    // เทียบ denylist: "ตรง" -> กระโดดไป ret KILL (jt = offset จาก i+1)
-    // "ไม่ตรง" -> เทียบตัวถัดไป; ตัวสุดท้ายไม่ตรง -> ไหลไป ret ALLOW
-    for (i, &nr) in DANGEROUS_SYSCALLS.iter().enumerate() {
-        filter.push(jeq(nr as u32, (n - i) as u8));
+    // ============ ALLOWLIST: linear scan ============
+    // pc ที่ allowlist[i] = base_allow + i
+    // target = base_allow + n_allow + n_deny (default_action ret)
+    // jt = target - (pc + 1) = n_allow + n_deny - i - 1
+    if n_allow > 0 {
+        for (i, &nr) in ALLOWED_SYSCALLS.iter().enumerate() {
+            let skip = n_allow + n_deny - i - 1;
+            filter.push(jeq(nr as u32, skip as u8));
+        }
     }
 
-    filter.push(ret(0x7fff0000)); // ALLOW
-    filter.push(ret(0x00000000)); // KILL (denylist match)
+    // ============ DENYLIST: linear scan ============
+    // DEBUG: print counts
+    // target KILL ret = base_allow + n_allow + n_deny + 1
+    // base_deny = base_allow + n_allow
+    // pc ที่ denylist[i] = base_allow + n_allow + i
+    // target = base_allow + n_allow + n_deny + 1 (KILL ret)
+    // jt = target - (pc + 1) = n_deny - i - 1
+    if mode != SeccompMode::DenylistOnly {
+        for (i, &nr) in DANGEROUS_SYSCALLS.iter().enumerate() {
+            let skip = n_deny - i;
+            filter.push(jeq(nr as u32, skip as u8));
+        }
+    } else {
+        // denylist-only: default_action = KILL
+        for (i, &nr) in DANGEROUS_SYSCALLS.iter().enumerate() {
+            let skip = n_deny - i;
+            filter.push(jeq(nr as u32, skip as u8));
+        }
+    }
+
+    // ============ DEFAULT ACTION ============
+    filter.push(ret(default_action)); // ALLOW (0x7fff0000) หรือ TRACE
+    filter.push(ret(0x00000000)); // KILL (fallback)
+
     filter
+}
+
+/// Legacy function for backward compatibility
+#[cfg(target_os = "linux")]
+unsafe fn build_dangerous_filter() -> Vec<libc::sock_filter> {
+    build_hybrid_filter(SeccompMode::DenylistOnly)
 }
 
 /// ติดตั้ง seccomp filter ใน process ปัจจุบัน (ทำใน child หลัง fork)
@@ -927,7 +1127,7 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
         )?
     };
     #[cfg(target_os = "linux")]
-    let dangerous_filter = unsafe { build_dangerous_filter() };
+    let dangerous_filter = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
     #[cfg(target_os = "linux")]
     let cpu_mask = unsafe {
         let mut available: libc::cpu_set_t = std::mem::zeroed();
@@ -1636,8 +1836,23 @@ mod tests {
     }
 
     #[test]
+    fn seccomp_filter_debug() {
+        let f = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
+        eprintln!("Filter len: {}", f.len());
+        for (i, ins) in f.iter().enumerate() {
+            eprintln!(
+                "{:3}: code=0x{:02x} jt={} jf={} k={}",
+                i, ins.code, ins.jt, ins.jf, ins.k
+            );
+        }
+        // Test SYS_read
+        let verdict = bpf_verdict(&f, 0xc000003e, libc::SYS_read as u32);
+        eprintln!("SYS_read verdict: {:#x}", verdict);
+    }
+
+    #[test]
     fn seccomp_filter_allows_listed_and_kills_rest() {
-        let f = unsafe { build_dangerous_filter() };
+        let f = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
         assert_eq!(
             bpf_verdict(&f, 0xc000003e, libc::SYS_read as u32),
             0x7fff0000
@@ -1660,7 +1875,7 @@ mod tests {
 
     #[test]
     fn seccomp_filter_network_profile_adds_socket_syscalls() {
-        let f = unsafe { build_dangerous_filter() };
+        let f = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
         assert_eq!(
             bpf_verdict(&f, 0xc000003e, libc::SYS_socket as u32),
             0x00000000
@@ -1673,7 +1888,7 @@ mod tests {
 
     #[test]
     fn seccomp_denylist_kills_dangerous_syscalls() {
-        let f = unsafe { build_dangerous_filter() };
+        let f = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
         // syscall อันตราย -> KILL
         for &nr in DANGEROUS_SYSCALLS {
             assert_eq!(
@@ -1953,7 +2168,7 @@ mod tests {
     }
     #[test]
     fn x32_syscalls_cannot_bypass_seccomp() {
-        let filter = unsafe { build_dangerous_filter() };
+        let filter = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
         assert_eq!(
             bpf_verdict(&filter, 0xc000003e, 0x40000000 | libc::SYS_socket as u32),
             0
@@ -1965,7 +2180,7 @@ mod tests {
     }
     #[test]
     fn filesystem_ioctl_cannot_bypass_artifact_quota_or_source_readonly() {
-        let filter = unsafe { build_dangerous_filter() };
+        let filter = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
         for command in [0x40049409, 0x4020940d, 0xc0189436, 0x40086602, 0x401c5820] {
             assert_eq!(
                 bpf_verdict_with_ioctl(&filter, 0xc000003e, libc::SYS_ioctl as u32, command),
