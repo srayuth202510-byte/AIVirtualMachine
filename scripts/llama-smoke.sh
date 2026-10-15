@@ -41,6 +41,10 @@ ${WORKER_YAML}
     top_p: 0.95
     max_tokens: 48
     gpu_layers: 0
+resources:
+  cpu: 4
+  memory: 4GB
+  storage: 5GB
 filesystem:
   read: [./workspace]
   write: [./workspace/src]

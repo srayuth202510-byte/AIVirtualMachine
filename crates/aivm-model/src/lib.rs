@@ -52,6 +52,8 @@ pub struct ModelConfig {
     pub openai: Option<providers::OpenAIConfig>,
     #[serde(default)]
     pub anthropic: Option<providers::AnthropicConfig>,
+    #[serde(default)]
+    pub worker_limits: Option<worker::InferenceLimits>,
 }
 
 impl Default for ModelConfig {
@@ -62,6 +64,7 @@ impl Default for ModelConfig {
             local: None,
             openai: None,
             anthropic: None,
+            worker_limits: None,
         }
     }
 }
@@ -116,6 +119,9 @@ pub struct LocalModelConfig {
     /// Optional standalone worker executable for isolated inference.
     #[serde(default)]
     pub worker_path: Option<String>,
+    /// Optional SHA-256 pin for the worker executable.
+    #[serde(default)]
+    pub worker_sha256: Option<String>,
     /// จำนวนชั้นที่ยกไป GPU (-1 = ทั้งหมด)
     #[serde(default)]
     pub gpu_layers: i32,
@@ -185,6 +191,7 @@ impl Default for LocalModelConfig {
             config_path: None,
             config_sha256: None,
             worker_path: None,
+            worker_sha256: None,
             gpu_layers: -1,
             ctx_size: default_ctx_size(),
             threads: default_threads(),
@@ -255,6 +262,15 @@ pub fn model_file_sha256(path: &str) -> Result<String, ModelError> {
 
 pub trait Model: Send + Sync {
     fn reason(&self, context: &str) -> Result<String, ModelError>;
+    /// Generate with a per-request output cap. Backends without native
+    /// generation controls retain their compatibility behavior.
+    fn reason_with_max_output(
+        &self,
+        context: &str,
+        _max_output_tokens: usize,
+    ) -> Result<String, ModelError> {
+        self.reason(context)
+    }
     /// ส่ง system instruction แยกจาก user/context เมื่อ backend รองรับ
     /// backend ทั่วไปคง compatibility ด้วยการต่อข้อความก่อนเรียก reason()
     fn reason_with_system(&self, system: &str, context: &str) -> Result<String, ModelError> {
@@ -278,12 +294,15 @@ impl WorkerModel {
         })?;
         Ok(Self {
             client: worker::WorkerClient::new(worker_path),
-            limits: worker::InferenceLimits {
-                max_context_tokens: local.ctx_size,
-                max_output_tokens: local.max_tokens,
-                timeout_ms: 120_000,
-                ..worker::InferenceLimits::default()
-            },
+            limits: config
+                .worker_limits
+                .clone()
+                .unwrap_or_else(|| worker::InferenceLimits {
+                    max_context_tokens: local.ctx_size,
+                    max_output_tokens: local.max_tokens,
+                    timeout_ms: 120_000,
+                    ..worker::InferenceLimits::default()
+                }),
             config,
         })
     }
@@ -406,6 +425,14 @@ impl LocalLlamaModel {
     }
 
     fn reason_with_messages(&self, messages: &[(&str, &str)]) -> Result<String, ModelError> {
+        self.reason_with_messages_limit(messages, self.config.max_tokens)
+    }
+
+    fn reason_with_messages_limit(
+        &self,
+        messages: &[(&str, &str)],
+        max_output_tokens: usize,
+    ) -> Result<String, ModelError> {
         let prompt = if let Some(template) = &self.chat_template {
             let messages = messages
                 .iter()
@@ -427,10 +454,10 @@ impl LocalLlamaModel {
                 .collect::<Vec<_>>()
                 .join("\n\n")
         };
-        self.generate(&prompt)
+        self.generate(&prompt, max_output_tokens.min(self.config.max_tokens))
     }
 
-    fn generate(&self, prompt: &str) -> Result<String, ModelError> {
+    fn generate(&self, prompt: &str, max_output_tokens: usize) -> Result<String, ModelError> {
         let n_ctx = self.config.ctx_size as u32;
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx).or(NonZeroU32::new(512)))
@@ -469,7 +496,7 @@ impl LocalLlamaModel {
         ]);
 
         let mut generated: Vec<LlamaToken> = Vec::new();
-        while generated.len() < self.config.max_tokens {
+        while generated.len() < max_output_tokens {
             let token = sampler.sample(&ctx, -1);
             if vocab.is_eog(token) {
                 break;
@@ -496,6 +523,14 @@ impl LocalLlamaModel {
 impl Model for LocalLlamaModel {
     fn reason(&self, context: &str) -> Result<String, ModelError> {
         self.reason_with_messages(&[("user", context)])
+    }
+
+    fn reason_with_max_output(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+    ) -> Result<String, ModelError> {
+        self.reason_with_messages_limit(&[("user", context)], max_output_tokens)
     }
 
     fn reason_with_system(&self, system: &str, context: &str) -> Result<String, ModelError> {
@@ -628,6 +663,7 @@ mod tests {
             local: None,
             openai: None,
             anthropic: None,
+            worker_limits: None,
         };
         assert!(create_model(&cfg).is_err());
     }
@@ -640,6 +676,7 @@ mod tests {
             local: None,
             openai: None,
             anthropic: None,
+            worker_limits: None,
         };
         assert!(create_model(&cfg).is_err());
 
@@ -649,6 +686,7 @@ mod tests {
             local: Some(LocalModelConfig::default()),
             openai: None,
             anthropic: None,
+            worker_limits: None,
         };
         assert!(create_model(&cfg_empty_path).is_err());
     }
@@ -667,6 +705,7 @@ mod tests {
                 model: "gpt-4o-mini".into(),
             }),
             anthropic: None,
+            worker_limits: None,
         };
         assert!(create_model(&cfg).is_err());
     }
@@ -684,6 +723,7 @@ mod tests {
                 api_key_env: env.into(),
                 model: "claude-sonnet-4-20250514".into(),
             }),
+            worker_limits: None,
         };
         assert!(create_model(&cfg).is_err());
     }

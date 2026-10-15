@@ -446,6 +446,7 @@ fn main() -> Result<(), AnyErr> {
                         local: config.model.local.clone(),
                         openai: config.model.openai.clone(),
                         anthropic: config.model.anthropic.clone(),
+                        worker_limits: None,
                     };
                     let response = aivm_model::worker::WorkerClient::new(worker_path)
                         .infer(&model_config, request, &limits)
@@ -460,6 +461,7 @@ fn main() -> Result<(), AnyErr> {
                 local: config.model.local,
                 openai: config.model.openai,
                 anthropic: config.model.anthropic,
+                worker_limits: None,
             };
             let model = aivm_model::create_model(&model_config)?;
             println!("{}", model.reason_with_system(

@@ -66,7 +66,8 @@ fn run() -> Result<(), WorkerError> {
             continue;
         }
         let started = Instant::now();
-        let output = match model.reason(&request.prompt) {
+        let output = match model.reason_with_max_output(&request.prompt, request.max_output_tokens)
+        {
             Ok(output) => output,
             Err(error) => {
                 write_error(

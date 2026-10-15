@@ -155,6 +155,16 @@ impl WorkerClient {
     ) -> Result<InferenceResponse, WorkerError> {
         let token_count = request.prompt.split_whitespace().count();
         request.validate(limits, token_count)?;
+        if let Some(local) = config.local.as_ref() {
+            if let Some(expected) = local.worker_sha256.as_deref() {
+                let path = self
+                    .executable
+                    .to_str()
+                    .ok_or_else(|| WorkerError::Failed("worker path is not UTF-8".into()))?;
+                crate::verify_model_file(path, expected)
+                    .map_err(|e| WorkerError::Failed(format!("worker verification failed: {e}")))?;
+            }
+        }
         let config_path = write_ephemeral_config(config)?;
         let result = self.infer_with_config(&config_path, request, limits);
         let _ = std::fs::remove_file(&config_path);

@@ -447,6 +447,16 @@ impl Runtime {
             local: config.model.local.clone(),
             openai: config.model.openai.clone(),
             anthropic: config.model.anthropic.clone(),
+            worker_limits: config.model.local.as_ref().map(|local| {
+                aivm_model::worker::InferenceLimits {
+                    max_context_tokens: local.ctx_size,
+                    max_output_tokens: local.max_tokens,
+                    timeout_ms: 120_000,
+                    memory_mb: gateway.limits.memory_mb,
+                    cpu_seconds: u64::from(gateway.limits.cpu).saturating_mul(60),
+                    pids_max: gateway.limits.pids_max,
+                }
+            }),
         };
         // สร้างโมเดลผ่าน factory — provider ที่ไม่รู้จัก/ไม่มีฟีเจอร์จะ fail-closed
         let model: Box<dyn Model> =
@@ -612,10 +622,18 @@ impl Runtime {
     /// แล้วรัน filesystem read ผ่าน gateway คืนข้อความของโมเดล
     pub fn step(&mut self, context: &str) -> Result<String, RuntimeError> {
         let _mem = self.memory.retrieve(&self.cube);
-        let intent = self
-            .model
-            .reason(context)
-            .map_err(|e| RuntimeError::Config(e.to_string()))?;
+        let model_name = self.model_cfg.name.clone();
+        self.audit_op("inference", &model_name, "started", "step")?;
+        let intent = match self.model.reason(context) {
+            Ok(intent) => {
+                self.audit_op("inference", &model_name, "completed", "step")?;
+                intent
+            }
+            Err(error) => {
+                self.audit_op("inference", &model_name, "failed", &error.to_string())?;
+                return Err(RuntimeError::Config(format!("inference failed: {error}")));
+            }
+        };
         // สาธิตการผ่านตัวกลาง: ค้น workspace ด้วย search (ถูก audit ทุกครั้ง)
         let req = ToolRequest {
             tool: "code.search".into(),
@@ -640,6 +658,8 @@ impl Runtime {
         max_steps: usize,
         workspace: Option<&std::path::Path>,
     ) -> Result<agent::AgentRun, RuntimeError> {
+        let model_name = self.model_cfg.name.clone();
+        self.audit_op("inference", &model_name, "started", "agent")?;
         // RAG อ่านจาก gateway workspace ที่ runtime เป็นเจ้าของเท่านั้น
         let rag_index = if workspace.is_some() {
             Some(
@@ -649,14 +669,19 @@ impl Runtime {
         } else {
             None
         };
-        agent::run_loop(
+        let result = agent::run_loop(
             &*self.model,
             &mut self.gateway,
             &mut self.cube,
             task,
             max_steps,
             rag_index.as_ref(),
-        )
+        );
+        match &result {
+            Ok(_) => self.audit_op("inference", &model_name, "completed", "agent")?,
+            Err(error) => self.audit_op("inference", &model_name, "failed", &error.to_string())?,
+        }
+        result
     }
 
     pub fn inspect(&self) -> String {
@@ -1054,6 +1079,29 @@ fn validate_model_security(config: &VmConfig) -> Result<(), RuntimeError> {
         ));
     }
     verify_artifact_pin("model", &local.model_path, &local.model_sha256)?;
+    match (&local.worker_path, &local.worker_sha256) {
+        (Some(path), Some(hash)) if !hash.is_empty() => {
+            verify_artifact_pin("worker", path, hash)?;
+        }
+        (Some(_), Some(_)) if config.security.profile == "production" => {
+            return Err(RuntimeError::Config(
+                "production worker_sha256 must be a non-empty hash".into(),
+            ));
+        }
+        (Some(_), None) if config.security.profile == "production" => {
+            return Err(RuntimeError::Config(
+                "security.profile=production requires model.local.worker_sha256 when worker_path is set".into(),
+            ));
+        }
+        (Some(_), None) => {}
+        (Some(_), Some(_)) => {}
+        (None, Some(_)) => {
+            return Err(RuntimeError::Config(
+                "worker_sha256 requires worker_path".into(),
+            ));
+        }
+        (None, None) => {}
+    }
     verify_optional_artifact_pin("tokenizer", &local.tokenizer_path, &local.tokenizer_sha256)?;
     verify_optional_artifact_pin("config", &local.config_path, &local.config_sha256)?;
     match (&local.manifest_path, &local.manifest_sha256) {
