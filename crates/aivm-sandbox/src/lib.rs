@@ -604,12 +604,6 @@ unsafe fn build_hybrid_filter(mode: SeccompMode) -> Vec<libc::sock_filter> {
     filter
 }
 
-/// Legacy function for backward compatibility
-#[cfg(target_os = "linux")]
-unsafe fn build_dangerous_filter() -> Vec<libc::sock_filter> {
-    build_hybrid_filter(SeccompMode::DenylistOnly)
-}
-
 /// ติดตั้ง seccomp filter ใน process ปัจจุบัน (ทำใน child หลัง fork)
 #[cfg(target_os = "linux")]
 unsafe fn install_dangerous_filter(filter: &[libc::sock_filter]) -> std::io::Result<()> {

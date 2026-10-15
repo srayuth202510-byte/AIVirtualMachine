@@ -469,7 +469,7 @@ mod linux {
         seal(&mut plan)?;
         let cgroup = Cgroup::create(&cfg.cgroup_root, &spec.limits)?;
         let mut filter = memfile(c"aivm-container-seccomp")?;
-        for instruction in unsafe { crate::build_dangerous_filter() } {
+        for instruction in unsafe { crate::build_hybrid_filter(crate::SeccompMode::Hybrid) } {
             filter
                 .write_all(&instruction.code.to_ne_bytes())
                 .map_err(spawn_error)?;
