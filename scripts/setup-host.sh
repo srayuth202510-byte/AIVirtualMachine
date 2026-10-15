@@ -102,6 +102,9 @@ else
   miss "unshare userns ไม่ได้ — ดู hint ท้ายสคริปต์ (ต้องแก้ด้วย sudo/host-admin)"
   grep -H . /etc/subuid /etc/subgid 2>/dev/null || info "/etc/subuid|subgid ไม่มี ($USER)"
   sysctl -n kernel.unprivileged_userns_clone 2>/dev/null | sed 's/^/info: unprivileged_userns_clone=/' || true
+  # Ubuntu 24.04+: ตัวบล็อกจริงคือ apparmor_restrict_unprivileged_userns=1
+  # (dmesg จะฟ้อง DENIED operation=userns_create profile=unprivileged_userns)
+  sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null | sed 's/^/info: apparmor_restrict_unprivileged_userns=/' || true
   # nested container (LXD/docker) มักบล็อก userns ซ้อน — เช็คแบบอ่านอย่างเดียว
   (command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt 2>/dev/null || true) | sed 's/^/info: virt=/' || true
 fi
@@ -122,8 +125,11 @@ fi
 # 6. hint สำหรับ host-admin (สคริปต์นี้ไม่รัน sudo เอง — ให้คนมีสิทธิ์ทำด้วยมือ)
 cat <<'HINT'
 == host-admin hints (manual, ต้อง sudo) ==
-- userns ถูกบล็อก: เช็ค AppArmor (dmesg | grep -i apparmor), ถ้าอยู่ใน LXD/docker
-  ต้องเปิด nesting/security.nesting=true หรือรันบน host จริง แล้วลองใหม่
+- userns ถูกบล็อก (dmesg ฟ้อง DENIED profile=unprivileged_userns):
+  Ubuntu 24.04+ เปิด kernel.apparmor_restrict_unprivileged_userns=1 ไว้
+  แก้ชั่วคราว: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+  แก้ถาวร: echo kernel.apparmor_restrict_unprivileged_userns=0 | sudo tee /etc/sysctl.d/99-aivm-userns.conf
+  แล้วยืนยันด้วย: unshare --user --map-root-user /bin/true && cargo run -q -p aivm-cli -- probe
 - cgroup delegate (container quotas): ให้ service manager ตั้ง
   Delegate=cpu memory pids ให้ scope ของรันไทม์ แล้วชี้ cgroup_root ไป subtree ว่าง
 - swtpm (Tier3 vtpm): sudo apt install swtpm (Ubuntu)
