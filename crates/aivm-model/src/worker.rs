@@ -164,10 +164,11 @@ pub struct InferenceVerification {
     pub output_sha256: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationStatus {
     Verified,
+    Failed,
     #[default]
     Unverified,
 }
@@ -193,6 +194,100 @@ impl InferenceResponse {
         }
         Ok(())
     }
+
+    /// ตรวจผล inference ทุกมิติ: output length, termination, usage, artifact
+    /// คืน VerificationResult ที่ระบุสถานะ verified / failed / unverified
+    pub fn verify(&self, request: &InferenceRequest, pinned: bool) -> VerificationResult {
+        use sha2::{Digest, Sha256};
+        let mut checks = Vec::new();
+        let mut failures = Vec::new();
+
+        // 1. Output length
+        match &self.output {
+            Some(out) if out.len() <= MAX_RESPONSE_BYTES => {
+                checks.push("output-length:ok".into());
+            }
+            Some(_) => {
+                checks.push("output-length:exceeded".into());
+                failures.push("output exceeds MAX_RESPONSE_BYTES".into());
+            }
+            None => {
+                checks.push("output-length:missing".into());
+                failures.push("output is missing".into());
+            }
+        }
+
+        // 2. Termination reason
+        match self.termination.as_str() {
+            "completed" | "length" => {
+                checks.push("termination:valid".into());
+            }
+            other => {
+                checks.push(format!("termination:invalid:{other}"));
+                failures.push("termination reason is not completed/length".into());
+            }
+        }
+
+        // 3. Usage
+        if self.usage.output_tokens <= request.max_output_tokens {
+            checks.push("usage-output-tokens:ok".into());
+        } else {
+            checks.push("usage-output-tokens:exceeded".into());
+            failures.push("output tokens exceed request limit".into());
+        }
+        if self.usage.elapsed_ms <= request.timeout_ms {
+            checks.push("usage-elapsed-ms:ok".into());
+        } else {
+            checks.push("usage-elapsed-ms:exceeded".into());
+            failures.push("elapsed time exceeds request timeout".into());
+        }
+        checks.push(format!("usage-input-tokens:{}", self.usage.input_tokens));
+
+        // 4. Artifact evidence
+        if self.artifact_verified {
+            checks.push("artifact-evidence:verified".into());
+        } else {
+            checks.push("artifact-evidence:unverified".into());
+            if pinned {
+                failures.push("pinned model artifact not verified".into());
+            }
+        }
+
+        // 5. Identity
+        if self.protocol_version == PROTOCOL_VERSION && self.request_id == request.request_id {
+            checks.push("identity:match".into());
+        } else {
+            checks.push("identity:mismatch".into());
+            failures.push("response identity mismatch".into());
+        }
+
+        let status = if !failures.is_empty() {
+            VerificationStatus::Failed
+        } else if pinned && self.artifact_verified {
+            VerificationStatus::Verified
+        } else {
+            VerificationStatus::Unverified
+        };
+
+        VerificationResult {
+            status,
+            checks,
+            failures,
+            output_sha256: self
+                .output
+                .as_ref()
+                .map(|text| format!("{:x}", Sha256::digest(text.as_bytes()))),
+        }
+    }
+}
+
+/// ผลการตรวจ inference ทุกมิติ
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationResult {
+    pub status: VerificationStatus,
+    pub checks: Vec<String>,
+    pub failures: Vec<String>,
+    pub output_sha256: Option<String>,
 }
 
 #[derive(Debug, Error, Clone, Serialize, Deserialize)]
@@ -307,7 +402,6 @@ impl WorkerClient {
                     ));
                 }
             }
-            use sha2::{Digest, Sha256};
             let pinned = config.local.as_ref().is_some_and(|local| {
                 !local.model_sha256.is_empty()
                     && local
@@ -315,23 +409,11 @@ impl WorkerClient {
                         .as_ref()
                         .is_some_and(|hash| !hash.is_empty())
             });
+            let result = response.verify(&request, pinned);
             response.verification = InferenceVerification {
-                status: if pinned && response.artifact_verified {
-                    VerificationStatus::Verified
-                } else {
-                    VerificationStatus::Unverified
-                },
-                checks: vec![
-                    "protocol-version".into(),
-                    "request-id".into(),
-                    "termination".into(),
-                    "output-budget".into(),
-                    "worker-exit".into(),
-                ],
-                output_sha256: response
-                    .output
-                    .as_ref()
-                    .map(|text| format!("{:x}", Sha256::digest(text.as_bytes()))),
+                status: result.status,
+                checks: result.checks,
+                output_sha256: result.output_sha256,
             };
             Ok(response)
         });
