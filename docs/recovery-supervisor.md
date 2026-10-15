@@ -1,5 +1,8 @@
 # External recovery supervisor (single host)
 
+ดู [detection-evaluation.md](detection-evaluation.md) สำหรับผลการทดสอบ
+false positives/misses รวมกรณี config ผิดที่ทำให้ containment ทำงานเกินเหตุ
+
 `scripts/aivm-supervisor.py` เพิ่ม reconciliation loop นอก runtime ของ agent
 ใช้ desired replicas, durable state และ systemd user services เพื่อควบคุมงาน
 เริ่มด้วยแผนเท่านั้น ต้องระบุ `--apply` จึงจะสร้างหรือหยุด workload จริง
