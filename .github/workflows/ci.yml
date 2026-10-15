@@ -38,6 +38,7 @@ jobs:
           python3 -m unittest discover -s scripts -p 'test_supervisor.py'
           python3 -m unittest discover -s scripts -p 'test_detection.py'
           python3 -m unittest discover -s scripts -p 'test_immunity.py'
+          python3 -m unittest discover -s scripts -p 'test_pins.py'
           python3 scripts/eval-qwen-audit.py
           python3 scripts/smoke-qwen-watch.py
 
@@ -58,3 +59,35 @@ jobs:
 
       - name: วงจร CLI ครบ (create/transition/inspect/run/logs)
         run: sh scripts/smoke.sh
+
+  # บูตจริงต้องมี KVM — รันเฉพาะ runner ที่ติดป้าย kvm และเปิด vars.AIVM_ENABLE_KVM=1
+  # (GitHub-hosted ไม่มี KVM งานนี้จะ skip ไปเลย ไม่ทำให้ main แดง)
+  kvm-real-boot:
+    runs-on: [self-hosted, linux, kvm]
+    if: vars.AIVM_ENABLE_KVM == '1'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: ติดตั้ง Rust stable + clippy + rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: ตรวจ host (อ่านอย่างเดียว)
+        run: sh scripts/setup-host.sh
+
+      - name: บูต MicroVM จริง (ต้องมี AIVM_MICROVM_PINS บน runner)
+        run: |
+          if [ -z "${AIVM_MICROVM_PINS:-}" ]; then
+            echo "no AIVM_MICROVM_PINS — skip honestly (no real boot claimed)"
+            exit 0
+          fi
+          make test-microvm
+
+      - name: บูต Hardware generic จริง (ถ้ามี pins)
+        run: |
+          if [ -z "${AIVM_HARDWARE_PINS:-}" ]; then
+            echo "no AIVM_HARDWARE_PINS — skip honestly"
+            exit 0
+          fi
+          make test-hardware
