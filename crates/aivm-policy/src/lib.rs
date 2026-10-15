@@ -149,6 +149,15 @@ impl Policy {
         {
             glob::Pattern::new(pattern).map_err(|e| PolicyError::Parse(e.to_string()))?;
         }
+        // process.allow ต้องเป็น concrete path เท่านั้น — ห้าม wildcard แบบ glob
+        // (กัน renamed/copied interpreter หลุด semantic ban + TOCTOU สนับสนุน F-4)
+        for pat in &self.process.allow {
+            if pat.contains(['*', '?', '[']) {
+                return Err(PolicyError::Parse(
+                    "process allow entries must be concrete paths".into(),
+                ));
+            }
+        }
         Ok(())
     }
 

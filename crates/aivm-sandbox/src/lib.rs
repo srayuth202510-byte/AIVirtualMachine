@@ -226,6 +226,10 @@ const SANDBOX_PATH: &str = "/usr/bin:/bin";
 #[cfg(target_os = "linux")]
 const DANGEROUS_SYSCALLS: &[libc::c_long] = &[
     // process ที่ไม่ไว้วางใจห้ามส่งสัญญาณไปยัง host processes
+    // กัน exec ทางอ้อมที่หลบ Landlock file-grant (memfd/procfd)
+    libc::SYS_execveat,
+    libc::SYS_memfd_create,
+    libc::SYS_memfd_secret,
     libc::SYS_fallocate,
     libc::SYS_kill,
     libc::SYS_tkill,

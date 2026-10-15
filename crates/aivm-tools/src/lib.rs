@@ -481,21 +481,39 @@ impl ToolGateway {
         }
 
         // ผูก constraints กับใบที่ consume จริง ไม่ใช้ใบอื่นที่หมดอายุ/หมดโควต้า
-        let cap_index = match self.caps.authorize(action, "filesystem", &scope) {
-            Ok(index) => index,
-            Err(_) if action == "search" => match self.caps.authorize("read", "filesystem", &scope)
+        // ใช้ context-aware authorize เพื่อบังคับ constraint ทั้ง max_bytes/max_calls/
+        // timeout/cumulative budget ให้ครบทุก tool (ไม่ใช่แค่ network)
+        let auth_ctx = aivm_capability::AuthorizationContext::default();
+        let cap_index =
+            match self
+                .caps
+                .authorize_with_context(action, "filesystem", &scope, &auth_ctx)
             {
                 Ok(index) => index,
+                Err(_) if action == "search" => {
+                    match self
+                        .caps
+                        .authorize_with_context("read", "filesystem", &scope, &auth_ctx)
+                    {
+                        Ok(index) => index,
+                        Err(_) => {
+                            self.audit_decision(
+                                cube,
+                                action,
+                                &scope,
+                                "deny",
+                                "no-capability",
+                                "error",
+                            )?;
+                            return Err(ToolError::Denied("no capability".into()));
+                        }
+                    }
+                }
                 Err(_) => {
                     self.audit_decision(cube, action, &scope, "deny", "no-capability", "error")?;
                     return Err(ToolError::Denied("no capability".into()));
                 }
-            },
-            Err(_) => {
-                self.audit_decision(cube, action, &scope, "deny", "no-capability", "error")?;
-                return Err(ToolError::Denied("no capability".into()));
-            }
-        };
+            };
 
         // เช็ก policy (fail-closed)
         let policy_action = if action == "search" { "read" } else { action };
@@ -546,6 +564,7 @@ impl ToolGateway {
                 self.audit_decision(cube, "read", path, "deny", "size-constraint", "error")?;
                 return Err(error);
             }
+            self.caps.account_bytes(cap_index, content.len() as u64);
             self.audit_decision(cube, "read", path, "allow", "cache-hit", "success")?;
             return Ok(ToolResult {
                 ok: true,
@@ -577,6 +596,7 @@ impl ToolGateway {
             if result.is_ok() { "success" } else { "error" },
         )?;
         let content = result?;
+        self.caps.account_bytes(cap_index, content.len() as u64);
         self.read_cache.insert(canon, content.clone());
         Ok(ToolResult {
             ok: true,
@@ -613,6 +633,7 @@ impl ToolGateway {
             })
             .is_some_and(|existing| existing == content.as_bytes());
         if unchanged {
+            self.caps.account_bytes(cap_index, content.len() as u64);
             self.read_cache.insert(canon, content.to_string());
             self.audit_decision(cube, "write", path, "allow", "unchanged", "success")?;
             return Ok(ToolResult {
@@ -658,6 +679,7 @@ impl ToolGateway {
             if result.is_ok() { "success" } else { "error" },
         )?;
         result?;
+        self.caps.account_bytes(cap_index, content.len() as u64);
         self.read_cache.insert(canon, content.to_string());
         Ok(ToolResult {
             ok: true,
@@ -842,7 +864,12 @@ impl ToolGateway {
                 .unwrap_or_else(|| ToolError::Denied(e.to_string()))
         })?;
         let scope = canon.to_string_lossy().to_string();
-        if self.caps.authorize("execute", "process", &scope).is_err() {
+        let auth_ctx = aivm_capability::AuthorizationContext::default();
+        if self
+            .caps
+            .authorize_with_context("execute", "process", &scope, &auth_ctx)
+            .is_err()
+        {
             self.audit_decision(cube, "execute", &scope, "deny", "no-capability", "error")?;
             return Err(ToolError::Denied("no capability".into()));
         }
