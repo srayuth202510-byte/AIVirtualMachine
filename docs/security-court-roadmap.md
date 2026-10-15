@@ -56,9 +56,11 @@ watcher/supervisor เดิม โดยเฉพาะกรณี config ผ�
 
 ## ลำดับการพัฒนา
 
-- [ ] **ระยะ 1 — นิยามกฎและสัญญาข้อมูล**
+- [x] **ระยะ 1 — นิยามกฎและสัญญาข้อมูล**
   กำหนด schemas ของ case, evidence, allegation, objection, vote และ verdict
   พร้อม decision table และตัวอย่างที่ควรอนุญาต/ปฏิเสธ
+  (ทำแล้วใน `scripts/security-court.py` + `scripts/test_security_court.py`:
+  `decision-table`, unanimous-override ปฏิเสธ, หลักฐานเสียถูกแยก, replay ซ้ำได้)
 - [ ] **ระยะ 2 — ผู้พิพากษาแบบ deterministic**
   เริ่มจากลูกขุนจำลอง ทดสอบกฎสูงสุด, หลักฐานขาด, คะแนนเท่ากัน,
   timeout, ข้อมูลซ้ำ และโหวตเอกฉันท์ที่ขัดกฎ

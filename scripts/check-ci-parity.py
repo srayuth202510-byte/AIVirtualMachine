@@ -35,6 +35,7 @@ def main():
         "test_detection.py",
         "test_immunity.py",
         "test_pins.py",
+        "test_security_court.py",
         "eval-qwen-audit.py",
         "smoke-qwen-watch.py",
         "make test-microvm",
@@ -50,9 +51,10 @@ def main():
     if "12 เคส" in ci:
         ok = fail("ci.yml ยังเขียน 12 เคส (demo ปัจจุบัน 14 เคส)") and False
 
-    # 4. Makefile test ต้องมี pins test (เพิ่มใน P2 ห้ามหลุดเงียบ)
-    if "test_pins.py" not in mk:
-        ok = fail("Makefile test ขาด test_pins.py") and False
+    # 4. Makefile test ต้องมี pins + court test (เพิ่มใน P2/P7 ห้ามหลุดเงียบ)
+    for need in ("test_pins.py", "test_security_court.py"):
+        if need not in mk:
+            ok = fail(f"Makefile test ขาด {need}") and False
 
     print("parity: all green" if ok else "parity: FAILED")
     return 0 if ok else 1
