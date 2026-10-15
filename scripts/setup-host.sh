@@ -94,6 +94,18 @@ for dev in /dev/sev /dev/sev-guest /dev/tdx_guest; do
   fi
 done
 
+# 4b. วินิจฉัย userns แบบอ่านอย่างเดียว (probe.userns=false บ่อยเพราะข้อนี้)
+# ไม่แตะ sysctl/AppArmor เอง — แค่บอกสาเหตุกับคำสั่งที่ต้องใช้ sudo ด้านล่าง
+if unshare --user --map-root-user /bin/true 2>/dev/null; then
+  ok "unshare userns ได้ (subuid/subgid + AppArmor เปิดทาง)"
+else
+  miss "unshare userns ไม่ได้ — ดู hint ท้ายสคริปต์ (ต้องแก้ด้วย sudo/host-admin)"
+  grep -H . /etc/subuid /etc/subgid 2>/dev/null || info "/etc/subuid|subgid ไม่มี ($USER)"
+  sysctl -n kernel.unprivileged_userns_clone 2>/dev/null | sed 's/^/info: unprivileged_userns_clone=/' || true
+  # nested container (LXD/docker) มักบล็อก userns ซ้อน — เช็คแบบอ่านอย่างเดียว
+  (command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt 2>/dev/null || true) | sed 's/^/info: virt=/' || true
+fi
+
 # 5. สรุปด้วย aivm probe ตัวจริง (รายงานซื่อสัตย์จาก syscall ฝั่ง host)
 echo "== aivm probe =="
 if cargo run -q -p aivm-cli -- probe 2>/dev/null | head -n 100; then
@@ -106,3 +118,13 @@ else
   miss "รัน aivm probe ไม่สำเร็จ — ลอง cargo build -p aivm-cli ก่อน"
   exit 1
 fi
+
+# 6. hint สำหรับ host-admin (สคริปต์นี้ไม่รัน sudo เอง — ให้คนมีสิทธิ์ทำด้วยมือ)
+cat <<'HINT'
+== host-admin hints (manual, ต้อง sudo) ==
+- userns ถูกบล็อก: เช็ค AppArmor (dmesg | grep -i apparmor), ถ้าอยู่ใน LXD/docker
+  ต้องเปิด nesting/security.nesting=true หรือรันบน host จริง แล้วลองใหม่
+- cgroup delegate (container quotas): ให้ service manager ตั้ง
+  Delegate=cpu memory pids ให้ scope ของรันไทม์ แล้วชี้ cgroup_root ไป subtree ว่าง
+- swtpm (Tier3 vtpm): sudo apt install swtpm (Ubuntu)
+HINT
