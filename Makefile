@@ -17,6 +17,7 @@ test: ## เทสต์ unit + integration ทั้งหมด
 	python3 -m unittest discover -s scripts -p 'test_qwen_*.py'
 	python3 -m unittest discover -s scripts -p 'test_supervisor.py'
 	python3 -m unittest discover -s scripts -p 'test_detection.py'
+	python3 -m unittest discover -s scripts -p 'test_immunity.py'
 	python3 scripts/eval-qwen-audit.py
 	python3 scripts/smoke-qwen-watch.py
 
