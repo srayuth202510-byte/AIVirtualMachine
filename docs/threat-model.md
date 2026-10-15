@@ -109,7 +109,7 @@ DNA ทุกครั้งต้องลง audit (ไม่รวม secret)
 ## 4. Non-goals (ไม่กัน ไม่แกล้งว่ามี)
 
 - A6: host/operator compromise (trust root)
-- Hardware side-channel (Level 3 เป็น skeleton อยู่ — side-channel ยังไม่กัน)
+- Hardware side-channel และ confidential-computing guarantees (TEE เป็น optional Tier และยังไม่ใช่ baseline)
 - โมเดลโกหกเรื่อง confidence/justification (กันด้วย guard ฝั่ง operator แทน)
 - Availability ภายใต้ DoS จากภายนอก (fail-closed อาจปฏิเสธงานตัวเอง — ยอมรับ)
 

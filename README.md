@@ -10,7 +10,7 @@ AIVM คือ runtime สำหรับรัน AI Agent โดยเฉพ�
 > intents (strict JSON); a state machine (`INIT→DEPLOY` with operator guards), capability
 > checks, and a deny-by-default policy engine decide ALLOW/DENY before any tool runs.
 > Tools (`filesystem/network/process.exec`) go through a gateway into a sandbox
-> (Tier1 process/container by default, Tier2 Firecracker MicroVM, Tier3 TEE skeleton).
+> (Tier1 process/container by default, Tier2 Firecracker MicroVM; TEE เป็น optional Tier3)
 > Every decision is append-only audited with a hash chain. Full spec is in Thai:
 > [`AI Virtual Machine.md`](./AI%20Virtual%20Machine.md). Start with `cargo run -p aivm-cli -- demo`.
 
@@ -29,7 +29,7 @@ AIVM คือ runtime สำหรับรัน AI Agent โดยเฉพ�
 | 7 — MicroVM (Level 2) | บูต guest จริงผ่าน Firecracker/KVM (หลังฟีเจอร์ `microvm`) | Tier2 | ✅ |
 | MVP-C | `network.fetch`/`network.connect` แบบมี policy | Tier1 | ✅ |
 | Level 1 — Container | bubblewrap + Landlock/seccomp + cgroups v2 CPU/RAM/PIDs (ต้องเตรียม host) | Tier1 | ✅ |
-| Level 3 — Hardware isolation | TEE skeleton (fail-closed, ยังไม่ e2e — ดู `docs/hardware.md`) | Tier3 experimental | 🚧 |
+| Level 3 — Hardware isolation | TEE skeleton แบบ optional (ยังไม่ e2e — ดู `docs/hardware.md`) | Tier3 experimental | 🚧 |
 
 กฎเหล็ก: **fail-closed** — parse/eval/context error ใด ๆ → `DENY` เสมอ ไม่มี default-allow
 

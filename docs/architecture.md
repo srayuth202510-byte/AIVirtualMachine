@@ -46,7 +46,7 @@ approve = DENY (`lease-not-approved`)
 | Tier1 stable | `sandbox` / `process` | Landlock ABI >= 3 + seccomp (บังคับ), user/mount/net namespace แบบ best-effort พร้อมรายงานจริง, rlimit, CPU affinity, deadline, process group cleanup | default (MVP-B) — `make verify` ต้องเขียวด้วย Tier นี้เสมอ |
 | Tier1 stable | `container` | bubblewrap + Landlock/seccomp + namespaces บังคับ + cgroups v2 CPU/RAM/PIDs | ต้องติดตั้ง helper และ delegate cgroups (ดู [`container.md`](./container.md)); setup ผิด → DENY |
 | Tier2 hardening | `microvm` | บูต guest จริงต่อครั้ง (Firecracker/KVM, drive-stuffing, ไม่มีเน็ต) | ต้องเปิดฟีเจอร์ `microvm` + บล็อก pins (ดู `docs/microvm.md`); CI ไม่มี KVM = skip อย่างซื่อสัตย์ |
-| Tier3 experimental | `hardware` | TEE skeleton (QEMU/KVM + drive-stuffing, fail-closed ทุกระดับ) — ยังไม่ e2e | ต้องเปิดฟีเจอร์ `hardware` + บล็อก pins (ดู `docs/hardware.md`); ห้ามบล็อก `make verify` |
+| Tier3 optional | `hardware` | TEE skeleton (QEMU/KVM + drive-stuffing, fail-closed ทุกระดับ) — ยังไม่ e2e และไม่ใช่ baseline | ใช้เฉพาะ deployment ที่ต้องการ confidential computing; ต้องเปิดฟีเจอร์ `hardware` + บล็อก pins (ดู `docs/hardware.md`) |
 | — | ค่าอื่น | config ผิด → บูตไม่ขึ้น | fail-closed ไม่เงียบไปใช้ sandbox |
 
 ## State machine + dynamic capability (§14)

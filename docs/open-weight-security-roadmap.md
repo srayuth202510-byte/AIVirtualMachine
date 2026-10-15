@@ -2,7 +2,12 @@
 
 เป้าหมายของ AIVM คือเป็น runtime ที่ช่วยให้ผู้ดูแลนำ open-weight models มารัน
 และมอบงานให้ agent ได้ โดยมีขอบเขตสิทธิ์ที่ตรวจสอบได้ และไม่ให้ความน่าเชื่อถือ
-ของโมเดลกลายเป็นสิทธิ์เข้าถึง host โดยปริยาย
+ของโมเดลกลายเป็นสิทธิ์เข้าถึง host โดยปริยาย ระบบนี้เชื่อถือ host, kernel และ
+operator; การป้องกันหลักคือการแยก model/agent ออกจาก host ด้วย process,
+container หรือ MicroVM
+
+TEE และ confidential computing เป็นความสามารถเสริมสำหรับ deployment ที่ต้อง
+ป้องกัน host/operator หรือพิสูจน์สถานะการรัน ไม่ใช่เงื่อนไขของ runtime หลัก
 
 ## หลักการ
 
@@ -60,7 +65,11 @@
 - agent จะรายงานว่างานผ่านได้ต่อเมื่อ verifier ที่กำหนดตรวจพบหลักฐานตรงกัน มิฉะนั้นรายงาน `unverified` หรือ `failed`
 - การทดสอบแยกผลของ unit/plumbing ออกจากการทดสอบบน host จริง และไม่อ้างว่า Generic VM คือ TEE/attestation
 
-## ข้อจำกัดที่ยอมรับในปัจจุบัน
+## ขอบเขตความเชื่อถือและข้อจำกัด
+
+- Host, kernel และ operator เป็น trust root หากถูกยึด ระบบนี้ไม่รับประกันความลับหรือความถูกต้องของงาน
+- Process/container/MicroVM ป้องกัน model และ agent จาก host resources ตามระดับที่เลือก
+- TEE เป็น optional Tier เพิ่มเติม ไม่ใช่ baseline และ generic QEMU ไม่ใช่หลักฐานของ TEE หรือ attestation
 
 Hardware/TEE ยังเป็น experimental และ generic QEMU ไม่ได้ยืนยัน confidential computing;
 host/operator compromise อยู่นอก threat model; และความถูกต้องของคำตอบโมเดลต้องวัดตามงาน

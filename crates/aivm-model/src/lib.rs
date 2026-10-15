@@ -97,6 +97,20 @@ pub struct LocalModelConfig {
     /// sha256 hex (64 ตัว) ของไฟล์โมเดลที่อนุญาต ("": ไม่ pin — โหลดได้แต่ต้องรายงานใน degraded)
     #[serde(default)]
     pub model_sha256: String,
+    /// Optional manifest describing the complete model artifact set.
+    #[serde(default)]
+    pub manifest_path: Option<String>,
+    #[serde(default)]
+    pub manifest_sha256: Option<String>,
+    /// Optional tokenizer/config files covered by the manifest.
+    #[serde(default)]
+    pub tokenizer_path: Option<String>,
+    #[serde(default)]
+    pub tokenizer_sha256: Option<String>,
+    #[serde(default)]
+    pub config_path: Option<String>,
+    #[serde(default)]
+    pub config_sha256: Option<String>,
     /// จำนวนชั้นที่ยกไป GPU (-1 = ทั้งหมด)
     #[serde(default)]
     pub gpu_layers: i32,
@@ -159,6 +173,12 @@ impl Default for LocalModelConfig {
         Self {
             model_path: "".into(),
             model_sha256: "".into(),
+            manifest_path: None,
+            manifest_sha256: None,
+            tokenizer_path: None,
+            tokenizer_sha256: None,
+            config_path: None,
+            config_sha256: None,
             gpu_layers: -1,
             ctx_size: default_ctx_size(),
             threads: default_threads(),

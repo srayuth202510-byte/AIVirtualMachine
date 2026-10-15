@@ -1053,11 +1053,61 @@ fn validate_model_security(config: &VmConfig) -> Result<(), RuntimeError> {
             "security.profile=production requires model.local.model_sha256 for local models".into(),
         ));
     }
-    if !local.model_sha256.is_empty() {
-        aivm_model::verify_model_file(&local.model_path, &local.model_sha256)
-            .map_err(|e| RuntimeError::Config(format!("local model verification failed: {e}")))?;
+    verify_artifact_pin("model", &local.model_path, &local.model_sha256)?;
+    verify_optional_artifact_pin("tokenizer", &local.tokenizer_path, &local.tokenizer_sha256)?;
+    verify_optional_artifact_pin("config", &local.config_path, &local.config_sha256)?;
+    match (&local.manifest_path, &local.manifest_sha256) {
+        (Some(path), Some(hash)) => {
+            verify_artifact_pin("manifest", path, hash)?;
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| RuntimeError::Config(format!("manifest unreadable: {e}")))?;
+            let manifest: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|e| RuntimeError::Config(format!("manifest is not valid JSON: {e}")))?;
+            let declared = manifest
+                .get("model_sha256")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| RuntimeError::Config("manifest must declare model_sha256".into()))?;
+            if !declared.eq_ignore_ascii_case(&local.model_sha256) {
+                return Err(RuntimeError::Config(
+                    "manifest model_sha256 does not match model.local.model_sha256".into(),
+                ));
+            }
+        }
+        (None, None) if config.security.profile == "production" => {
+            return Err(RuntimeError::Config(
+                "security.profile=production requires model.local.manifest_path and manifest_sha256".into(),
+            ));
+        }
+        (None, None) => {}
+        _ => {
+            return Err(RuntimeError::Config(
+                "manifest_path and manifest_sha256 must be provided together".into(),
+            ));
+        }
     }
     Ok(())
+}
+
+fn verify_artifact_pin(kind: &str, path: &str, hash: &str) -> Result<(), RuntimeError> {
+    if hash.is_empty() {
+        return Ok(());
+    }
+    aivm_model::verify_model_file(path, hash)
+        .map_err(|e| RuntimeError::Config(format!("{kind} artifact verification failed: {e}")))
+}
+
+fn verify_optional_artifact_pin(
+    kind: &str,
+    path: &Option<String>,
+    hash: &Option<String>,
+) -> Result<(), RuntimeError> {
+    match (path, hash) {
+        (None, None) => Ok(()),
+        (Some(path), Some(hash)) if !hash.is_empty() => verify_artifact_pin(kind, path, hash),
+        _ => Err(RuntimeError::Config(format!(
+            "{kind}_path and {kind}_sha256 must be provided together"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -1078,6 +1128,28 @@ capabilities:
 "#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn production_local_model_requires_matching_manifest() {
+        let dir = std::env::temp_dir().join(format!("aivm-manifest-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("model.gguf");
+        let manifest = dir.join("model.manifest.json");
+        std::fs::write(&model, b"model-bytes").unwrap();
+        let model_hash = aivm_model::model_file_sha256(model.to_str().unwrap()).unwrap();
+        std::fs::write(&manifest, format!("{{\"model_sha256\":\"{model_hash}\"}}")).unwrap();
+        let manifest_hash = aivm_model::model_file_sha256(manifest.to_str().unwrap()).unwrap();
+        let yaml = format!(
+            "name: production\nsecurity:\n  profile: production\nmodel:\n  provider: local\n  local:\n    model_path: {}\n    model_sha256: {}\n    manifest_path: {}\n    manifest_sha256: {}\n",
+            model.display(), model_hash, manifest.display(), manifest_hash
+        );
+        let cfg = VmConfig::from_yaml(&yaml).unwrap();
+        assert!(validate_model_security(&cfg).is_ok());
+        std::fs::write(&manifest, b"{\"model_sha256\":\"bad\"}").unwrap();
+        assert!(validate_model_security(&cfg).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn test_runtime(tag: &str) -> (Runtime, PathBuf) {

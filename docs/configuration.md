@@ -21,6 +21,12 @@ model:
   #   model_path: /models/model.gguf
   #   model_sha256: "<sha256 64 hex>"  # pin supply chain ของน้ำหนัก (ไม่ตรง = ไม่โหลด)
   #                                  # ไม่ตั้ง = โหลดได้แต่ถือว่า unpinned (ดู sha ด้วย sha256sum)
+  #   manifest_path: /models/model.manifest.json
+  #   manifest_sha256: "<sha256 64 hex>" # production ต้องมี manifest
+  #   tokenizer_path: /models/tokenizer.json
+  #   tokenizer_sha256: "<sha256 64 hex>"
+  #   config_path: /models/config.json
+  #   config_sha256: "<sha256 64 hex>"
   #   ctx_size: 8192
   #   gpu_layers: 0    # -1 = ยกทุกชั้นไป GPU
   #   threads: 0       # 0 = อัตโนมัติ
@@ -169,6 +175,10 @@ provider (`openai`/`anthropic`) ถือเป็น placeholder เดิม�
 บล็อก provider ระบุเฉพาะ `api_key_env` ได้ โดยไม่เปลี่ยน `model.name` ที่เลือกไว้
 
 ### Local models
+
+ใน production ต้องตั้ง `model_sha256` และ manifest ที่ pin ด้วย hash โดย manifest
+ต้องเป็น JSON ที่มี field `model_sha256` ตรงกับ config; tokenizer/config สามารถ
+pin เพิ่มเติมได้ด้วย `*_path` และ `*_sha256` คู่กัน
 
 ตั้งค่า `model.local` ต่อไปนี้สำหรับ production ที่ต้องการ deterministic output:
 
