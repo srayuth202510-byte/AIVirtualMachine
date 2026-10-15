@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+pub mod worker;
+
 pub mod providers;
 
 #[cfg(feature = "llama")]

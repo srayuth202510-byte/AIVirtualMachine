@@ -1,7 +1,7 @@
 # เป้าหมาย: รัน Open-weight Models อย่างปลอดภัย
 
-เป้าหมายของ AIVM คือเป็น runtime ที่ช่วยให้ผู้ดูแลนำ open-weight models มารัน
-และมอบงานให้ agent ได้ โดยมีขอบเขตสิทธิ์ที่ตรวจสอบได้ และไม่ให้ความน่าเชื่อถือ
+เป้าหมายของ AIVM คือเป็น model runtime สำหรับให้ผู้ดูแลนำ open-weight models มารัน
+อย่างปลอดภัย โดยมี worker ที่แยกจาก control plane ขอบเขตสิทธิ์ที่ตรวจสอบได้ และไม่ให้ความน่าเชื่อถือ
 ของโมเดลกลายเป็นสิทธิ์เข้าถึง host โดยปริยาย ระบบนี้เชื่อถือ host, kernel และ
 operator; การป้องกันหลักคือการแยก model/agent ออกจาก host ด้วย process,
 container หรือ MicroVM
@@ -27,6 +27,13 @@ TEE และ confidential computing เป็นความสามารถ�
 - บันทึกแหล่งที่มา, license, format, ขนาด และผลตรวจในสถานะโมเดลที่ operator ตรวจดูได้
 - เพิ่มโหมด production ที่ปฏิเสธโมเดล unpinned; โหมดทดลองอาจอนุญาตพร้อมคำเตือนที่มองเห็นชัด
 
+### 1a. Model worker เป็น boundary หลัก
+
+- control plane ไม่โหลด model โดยตรงใน process เดียวกับ supervisor
+- request/response ผ่าน worker protocol ที่มี schema, request id และ quota ชัดเจน
+- backend แรกคือ llama.cpp; backend อื่นต้องผ่าน adapter contract เดียวกัน
+- worker ส่ง usage, applied limits และ verification status กลับมาพร้อมผลลัพธ์
+
 ### 2. แยก inference และจำกัดทรัพยากร
 
 - รัน model loader และ inference ด้วยสิทธิ์ขั้นต่ำ แยกจาก supervisor และ secret broker
@@ -50,12 +57,13 @@ TEE และ confidential computing เป็นความสามารถ�
 
 ## ลำดับความสำคัญ
 
-1. **Artifact pinning:** production mode ต้องมี `model_sha256`; เพิ่มคำสั่งตรวจและแสดงสถานะโมเดลที่อนุมัติ
-2. **Inference isolation:** แยก inference process และกำหนด resource/network boundary ที่ทดสอบได้
-3. **Evidence-backed completion:** กำหนดรูปแบบผลลัพธ์และ verifier สำหรับงานที่ agent รายงานว่าสำเร็จ
-4. **Operational evaluation:** เพิ่ม replay/evaluation สำหรับ prompt injection, artifact tampering,
+1. **Inference worker:** แยก model loader/inference ออกจาก control plane พร้อม protocol และ lifecycle
+2. **Artifact pinning:** production mode ต้องมี `model_sha256`; เพิ่มคำสั่งตรวจและแสดงสถานะโมเดลที่อนุมัติ
+3. **Inference isolation:** กำหนด resource/network boundary ที่ทดสอบได้
+4. **Evidence-backed completion:** กำหนดรูปแบบผลลัพธ์และ verifier สำหรับงานที่ agent รายงานว่าสำเร็จ
+5. **Operational evaluation:** เพิ่ม replay/evaluation สำหรับ prompt injection, artifact tampering,
    resource exhaustion และความไม่ตรงกันระหว่าง summary กับผลจริง
-5. **Artifact manifest:** ขยายการตรวจจาก weights เดี่ยวไปยัง dependencies และ provenance ที่เกี่ยวข้อง
+6. **Artifact manifest:** ขยายการตรวจจาก weights เดี่ยวไปยัง dependencies และ provenance ที่เกี่ยวข้อง
 
 ## เกณฑ์ความสำเร็จ
 

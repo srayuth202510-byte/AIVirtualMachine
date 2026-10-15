@@ -1,12 +1,16 @@
 # AI Virtual Machine (AIVM)
 
-«An isolated execution environment for autonomous AI agents, where the AI can reason freely but can only act within capabilities granted by the runtime.»
+«A secure model runtime for open-weight models, with optional agent capabilities layered above it.»
 
-AIVM คือ runtime สำหรับรัน AI Agent โดยเฉพาะ — AI คิดได้อย่างอิสระ แต่การกระทำทุกอย่างต้องผ่าน Runtime (capability → policy → tool → sandbox) หลักการสำคัญ:
+AIVM คือ runtime สำหรับรัน open-weight models โดยให้ model worker แยกจาก control plane,
+ตรวจสอบ artifact ก่อนโหลด, จำกัดทรัพยากรและ network และบันทึกผลการรันแบบตรวจสอบย้อนหลังได้
+ความสามารถด้าน agent และ tools เป็นชั้นเสริมที่ทำงานผ่าน capability, policy และ sandbox:
 
 «The AI may think, but the AI does not own the machine.»
 
-> English summary: AIVM is a fail-closed runtime for AI agents. The model proposes
+> English summary: AIVM is a fail-closed runtime for open-weight model inference. A verified
+> model package runs in a restricted worker with bounded resources and no network by default.
+> Agent capabilities are optional and remain mediated by the runtime. The model proposes
 > intents (strict JSON); a state machine (`INIT→DEPLOY` with operator guards), capability
 > checks, and a deny-by-default policy engine decide ALLOW/DENY before any tool runs.
 > Tools (`filesystem/network/process.exec`) go through a gateway into a sandbox
@@ -30,12 +34,15 @@ AIVM คือ runtime สำหรับรัน AI Agent โดยเฉพ�
 | MVP-C | `network.fetch`/`network.connect` แบบมี policy | Tier1 | ✅ |
 | Level 1 — Container | bubblewrap + Landlock/seccomp + cgroups v2 CPU/RAM/PIDs (ต้องเตรียม host) | Tier1 | ✅ |
 | Level 3 — Hardware isolation | TEE skeleton แบบ optional (ยังไม่ e2e — ดู `docs/hardware.md`) | Tier3 experimental | 🚧 |
+| Model Runtime — Worker boundary | model manifest + worker protocol + bounded inference | Tier1 | 🚧 |
 
 กฎเหล็ก: **fail-closed** — parse/eval/context error ใด ๆ → `DENY` เสมอ ไม่มี default-allow
 
 รายละเอียดการบังคับใช้และพฤติกรรมที่เปลี่ยนหลัง security review: [`docs/security-hardening.md`](./docs/security-hardening.md)
 
 เป้าหมายและลำดับพัฒนาเพื่อรัน open-weight models อย่างปลอดภัย: [`docs/open-weight-security-roadmap.md`](./docs/open-weight-security-roadmap.md)
+
+สถาปัตยกรรม model runner และ worker boundary: [`docs/model-runtime.md`](./docs/model-runtime.md)
 
 ## เริ่มใช้ใน 5 นาที
 
@@ -107,7 +114,7 @@ crates/
   aivm-audit         append-only log + hash chain       }  boundary
   aivm-tools         gateway (filesystem/network/exec)  /
   aivm-memory  aivm-network  aivm-sandbox  aivm-model    /
-  aivm-runtime       agent loop + demo (incl. runtime::demo)
+  aivm-runtime       model runtime + optional agent loop + demo
   aivm-supervisor    lifecycle + multi-VM root
   aivm-cli           คำสั่ง aivm
   aivm-adversarial   ชุด must-deny (สเปก §38)

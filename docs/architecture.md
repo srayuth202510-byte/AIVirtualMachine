@@ -1,6 +1,28 @@
 # Architecture — ภาพรวมระบบ
 
-## เส้นทางของหนึ่ง action
+## เส้นทางของ model inference
+
+```text
+Client request
+  │ request id + model id + bounded prompt/options
+  ▼
+Control plane
+  ├── manifest/artifact verification
+  ├── policy + quota validation
+  └── audit request
+  ▼
+Inference worker (separate process/container/MicroVM)
+  ├── verified model artifacts
+  ├── network disabled by default
+  ├── CPU/RAM/context/output/time limits
+  └── backend adapter (llama.cpp first)
+  ▼
+Response + usage + verification status + audit id
+```
+
+รายละเอียดของ worker contract อยู่ใน [`model-runtime.md`](./model-runtime.md)
+
+## เส้นทางของหนึ่ง agent action
 
 ```text
 AI (คิดอิสระ)
