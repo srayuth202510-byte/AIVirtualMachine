@@ -66,6 +66,25 @@ Container backend บังคับ namespaces + Landlock/seccomp + cgroups v2 
 - network.connect ทำ TLS handshake และตรวจ certificate ก่อนรายงาน tls-connected
 - จำกัด timeout, response size และปฏิเสธ headers ที่เปลี่ยน host/framing ของ request
 
+## By-design items (documented for auditors)
+
+### F-5: Process level ไม่มี PID namespace (by design)
+Process sandbox ไม่บังคับ `CLONE_NEWPID` เพื่อให้ compiler/test runner (cargo, gcc, pytest ฯลฯ) ที่ spawn subprocess ทำงานได้ปกติ
+- กลไกควบคุมแทน: `pdeathsig=SIGKILL`, `RLIMIT_NPROC`, `setpgid` cleanup, Landlock/seccomp
+- สำหรับ untrusted autonomous agents ต้องใช้ `isolation: container` หรือ `microvm` (มี PID namespace จริง)
+- `SandboxProbe` รายงาน `pid_namespace: false` อย่างโปร่งใส (`degraded` ใน `ExecOutcome`)
+
+### F-7: Audit row แรกยอมรับ `hash_prev` ใดก็ได้
+- ออกแบบเพื่อรองรับ genesis file และ rotation boundary (archive → live file)
+- `verify_sequence` ตรวจ boundary ข้ามไฟล์: `hash_prev` ของ record แรกในไฟล์ใหม่ ต้องตรงกับ tip ของไฟล์เก่า
+- Single-file tamper ของ row แรกถูกจับด้วย `verify_sequence` เมื่อมีหลายไฟล์; single-file only case ไม่มี threat model rotation
+
+### F-8: Network allow hostname default port 443
+- `network_pattern` ให้ scope แบบ hostname (ไม่มี port) match เฉพาะ target ที่ลงท้าย `:443`
+- ต้องการ port อื่น ต้องระบุชัดใน allowlist: `github.com:8443`
+- นโยบายนี้เป็น defense-in-depth: default HTTPS เท่านั้น ลดโอกาสโจมตีผ่าน HTTP plaintext
+
+
 ## การตรวจสอบ
 
 `make ci` ครอบคลุม formatting, strict Clippy, default/adversarial tests, demo, CLI smoke และ MicroVM feature tests
