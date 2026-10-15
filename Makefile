@@ -1,7 +1,7 @@
 # ทางลัดนักพัฒนา AIVM ดูรายการด้วย `make help`
 # ทุก target คือ cargo ธรรมดา ใช้ `rtk make <target>` ได้เหมือนกัน
 
-.PHONY: help build check test test-adv test-coding test-microvm test-hardware test-container check-microvm check-hardware demo e2e llama-smoke clippy fmt fmt-check verify ci clean query path explain graph-update debug-test
+.PHONY: help build check test test-adv test-coding test-microvm test-hardware test-container check-microvm check-hardware demo e2e llama-smoke clippy fmt fmt-check verify ci clean bench setup-host query path explain graph-update debug-test
 
 help: ## แสดงวิธีใช้นี้
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS=":.*?## "} {printf "  %-10s %s\n", $$1, $$2}'
@@ -72,6 +72,12 @@ ci: verify e2e check-microvm test-microvm check-hardware test-hardware ## เห
 clean: ## ลบ build artifact กับบ้าน VM เดโม
 	cargo clean
 	rm -rf ./vms
+
+bench: ## วัด demo/adversarial/audit คร่าวๆ (smoke-bench กัน regression)
+	sh scripts/bench.sh
+
+setup-host: ## ตรวจ host แบบอ่านอย่างเดียว สรุป Tier1/2/3
+	sh scripts/setup-host.sh
 
 # --- ค้นหา: ถามกราฟก่อน ค่อย grep (กราฟมีหลักฐาน file:line) ---
 query: ## ค้นกราฟ: make query Q="..."

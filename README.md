@@ -10,18 +10,18 @@ AIVM คือ runtime สำหรับรัน AI Agent โดยเฉพ�
 
 ## สถานะ
 
-| Phase | ขอบเขต | สถานะ |
-|---|---|---|
-| 1 — Mediated Workspace (MVP-A) | `filesystem.read/write` + `code.search` ผ่าน gateway | ✅ |
-| 2 — Policy and Capabilities | capability model, dynamic grant/revoke (§14) | ✅ |
-| 3 — Minimal State Machine | INIT→…→DEPLOY แบบ validate + guard | ✅ |
-| 4 — Sandboxed Process Tools (MVP-B) | `process.exec` ใน namespace/seccomp/microvm | ✅ |
-| 5 — Agent Runtime | observe → reason → intent → execute | ✅ |
-| 6 — CubeRAG | workspace retrieval (`index`/`search`) | ✅ |
-| 7 — MicroVM (Level 2) | บูต guest จริงผ่าน Firecracker/KVM (หลังฟีเจอร์ `microvm`) | ✅ |
-| MVP-C | `network.fetch`/`network.connect` แบบมี policy | ✅ |
-| Level 1 — Container | bubblewrap + Landlock/seccomp + cgroups v2 CPU/RAM/PIDs (ต้องเตรียม host) | ✅ |
-| Level 3 — Hardware isolation | TEE skeleton (fail-closed, ยังไม่ e2e — ดู `docs/hardware.md`) | 🚧 |
+| Phase | ขอบเขต | Tier | สถานะ |
+|---|---|---|---|
+| 1 — Mediated Workspace (MVP-A) | `filesystem.read/write` + `code.search` ผ่าน gateway | Tier1 | ✅ |
+| 2 — Policy and Capabilities | capability model, dynamic grant/revoke (§14) | Tier1 | ✅ |
+| 3 — Minimal State Machine | INIT→…→DEPLOY แบบ validate + guard | Tier1 | ✅ |
+| 4 — Sandboxed Process Tools (MVP-B) | `process.exec` ใน namespace/seccomp/microvm | Tier1 | ✅ |
+| 5 — Agent Runtime | observe → reason → intent → execute | Tier1 | ✅ |
+| 6 — CubeRAG | workspace retrieval (`index`/`search`) | Tier1 | ✅ |
+| 7 — MicroVM (Level 2) | บูต guest จริงผ่าน Firecracker/KVM (หลังฟีเจอร์ `microvm`) | Tier2 | ✅ |
+| MVP-C | `network.fetch`/`network.connect` แบบมี policy | Tier1 | ✅ |
+| Level 1 — Container | bubblewrap + Landlock/seccomp + cgroups v2 CPU/RAM/PIDs (ต้องเตรียม host) | Tier1 | ✅ |
+| Level 3 — Hardware isolation | TEE skeleton (fail-closed, ยังไม่ e2e — ดู `docs/hardware.md`) | Tier3 experimental | 🚧 |
 
 กฎเหล็ก: **fail-closed** — parse/eval/context error ใด ๆ → `DENY` เสมอ ไม่มี default-allow
 

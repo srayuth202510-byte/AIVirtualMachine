@@ -39,15 +39,15 @@ operator `approve-secret` ด้วย id ตรงตัว (audit ระบุ
 max_uses/TTL เดิม ข้าม restart ได้ (persist 0600, หมดอายุทิ้ง) ใช้ก่อน
 approve = DENY (`lease-not-approved`)
 
-## Isolation levels (`runtime.isolation`)
+## Isolation levels (`runtime.isolation` — แบ่ง Tier ตามความนิ่ง)
 
-| ค่า | backend | สถานะ |
-|---|---|---|
-| `sandbox` / `process` | Landlock ABI >= 3 + seccomp (บังคับ), user/mount/net namespace แบบ best-effort พร้อมรายงานจริง, rlimit, CPU affinity, deadline, process group cleanup | default (MVP-B) |
-| `microvm` | บูต guest จริงต่อครั้ง (Firecracker/KVM, drive-stuffing, ไม่มีเน็ต) | ต้องเปิดฟีเจอร์ `microvm` + บล็อก pins (ดู `docs/microvm.md`) |
-| `container` | bubblewrap + Landlock/seccomp + namespaces บังคับ + cgroups v2 CPU/RAM/PIDs | ต้องติดตั้ง helper และ delegate cgroups (ดู [`container.md`](./container.md)); setup ผิด → DENY |
-| `hardware` | TEE skeleton (QEMU/KVM + drive-stuffing, fail-closed ทุกระดับ) — ยังไม่ e2e | ต้องเปิดฟีเจอร์ `hardware` + บล็อก pins (ดู `docs/hardware.md`) |
-| ค่าอื่น | config ผิด → บูตไม่ขึ้น | fail-closed ไม่เงียบไปใช้ sandbox |
+| Tier | ค่า | backend | สถานะ |
+|---|---|---|---|
+| Tier1 stable | `sandbox` / `process` | Landlock ABI >= 3 + seccomp (บังคับ), user/mount/net namespace แบบ best-effort พร้อมรายงานจริง, rlimit, CPU affinity, deadline, process group cleanup | default (MVP-B) — `make verify` ต้องเขียวด้วย Tier นี้เสมอ |
+| Tier1 stable | `container` | bubblewrap + Landlock/seccomp + namespaces บังคับ + cgroups v2 CPU/RAM/PIDs | ต้องติดตั้ง helper และ delegate cgroups (ดู [`container.md`](./container.md)); setup ผิด → DENY |
+| Tier2 hardening | `microvm` | บูต guest จริงต่อครั้ง (Firecracker/KVM, drive-stuffing, ไม่มีเน็ต) | ต้องเปิดฟีเจอร์ `microvm` + บล็อก pins (ดู `docs/microvm.md`); CI ไม่มี KVM = skip อย่างซื่อสัตย์ |
+| Tier3 experimental | `hardware` | TEE skeleton (QEMU/KVM + drive-stuffing, fail-closed ทุกระดับ) — ยังไม่ e2e | ต้องเปิดฟีเจอร์ `hardware` + บล็อก pins (ดู `docs/hardware.md`); ห้ามบล็อก `make verify` |
+| — | ค่าอื่น | config ผิด → บูตไม่ขึ้น | fail-closed ไม่เงียบไปใช้ sandbox |
 
 ## State machine + dynamic capability (§14)
 

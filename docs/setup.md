@@ -1,5 +1,17 @@
 # Setup — ติดตั้งของที่ต้องใช้
 
+> แบ่ง 2 ทาง: **quickstart (0-deps)** ลอง Tier1 ได้ทันที กับ **full-isolation**
+> สำหรับ Tier2/3 ที่ต้องเตรียม host — สคริปต์ช่วยตรวจอยู่ใน
+> `scripts/setup-host.sh` (idempotent อ่านอย่างเดียว ไม่แก้ host ให้เอง)
+
+## 0. Quickstart — Tier1 อย่างเดียว (ไม่ต้องมี KVM/bwrap)
+
+```bash
+cargo build --workspace        # หรือ: make build
+cargo run -q -p aivm-cli -- demo   # พิสูจน์เส้น enforcement (~1 วินาที)
+sh scripts/bench.sh            # วัด demo/audit/adversarial คร่าวๆ (ไม่ต้องมี KVM)
+```
+
 ## 1. Rust (บังคับ)
 
 Rust stable + `clippy` + `rustfmt` (CI ใช้สามอย่างนี้ล็อกเกต):
@@ -32,6 +44,7 @@ cargo run -q -p aivm-cli -- demo   # พิสูจน์เส้น enforceme
 
 ```bash
 cargo run -q -p aivm-cli -- probe
+sh scripts/setup-host.sh   # สรุป Tier1/Tier2/Tier3 จาก probe + ของใน PATH (อ่านอย่างเดียว)
 ```
 
 Container backend ต้องมี bubblewrap, helper ที่ติดตั้งโดย root และ delegated cgroup v2
