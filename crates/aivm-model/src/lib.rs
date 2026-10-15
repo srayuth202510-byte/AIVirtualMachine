@@ -110,13 +110,13 @@ fn default_threads() -> i32 {
     0
 }
 fn default_temp() -> f32 {
-    0.7
+    0.0
 }
 fn default_top_p() -> f32 {
-    0.95
+    0.1
 }
 fn default_top_k() -> i32 {
-    40
+    1
 }
 fn default_max_tokens() -> usize {
     2048
@@ -132,7 +132,7 @@ impl Default for LocalModelConfig {
             gpu_layers: -1,
             ctx_size: default_ctx_size(),
             threads: default_threads(),
-            seed: 0,
+            seed: 42,
             temperature: default_temp(),
             top_p: default_top_p(),
             top_k: default_top_k(),

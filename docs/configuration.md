@@ -22,10 +22,10 @@ model:
   #   ctx_size: 8192
   #   gpu_layers: 0    # -1 = ยกทุกชั้นไป GPU
   #   threads: 0       # 0 = อัตโนมัติ
-  #   seed: 0
-  #   temperature: 0.7
-  #   top_p: 0.95
-  #   top_k: 40
+  #   seed: 42         # deterministic seed (default: 42)
+  #   temperature: 0.0 # deterministic (default: 0.0)
+  #   top_p: 0.1       # low = more focused (default: 0.1)
+  #   top_k: 1         # greedy sampling (default: 1)
   #   max_tokens: 2048
 
 resources:
@@ -138,6 +138,39 @@ policy:
 #   kds_cache_dir: ""             # AMD KDS certificate cache (SEV-SNP attestation)
 #   qemu_path: ""                 # path to qemu-system-x86_64 (default: PATH)
 ```
+
+## โปรไฟล์เสถียรภาพโมเดล (Model Stability)
+
+ตั้งค่า `model.local` ต่อไปนี้สำหรับ production ที่ต้องการ deterministic output:
+
+```yaml
+model:
+  provider: local
+  name: my-model
+  local:
+    model_path: /models/model.gguf
+    seed: 42                    # เมล็ดสุ่มตายตัว = ผลลัพธ์ซ้ำได้
+    temperature: 0.0            # greedy decoding = deterministic
+    top_p: 0.1                  # จำกัด token ใน nucleus sampling
+    top_k: 1                    # เลือก token ที่น่าจะเป็นมากสุด (greedy)
+    max_tokens: 2048
+    ctx_size: 8192
+    gpu_layers: -1              # -1 = ใช้ GPU ทั้งหมด
+    threads: 0                  # 0 = auto
+    use_mmap: true
+    use_mlock: true             # lock model ใน RAM (กัน swap)
+```
+
+| พารามิเตอร์ | ค่าเริ่มต้น | แนะนำสำหรับเสถียร | ผลกระทบ |
+|------------|------------|-------------------|----------|
+| `seed` | 42 | 42 (หรือค่าตายตัว) | ทำให้ sampling ซ้ำได้ |
+| `temperature` | 0.0 | 0.0 | 0 = deterministic, >0 = creative |
+| `top_p` | 0.1 | 0.0–0.1 | ต่ำ = focus, สูง = diverse |
+| `top_k` | 1 | 1 | 1 = greedy, >1 = sampling |
+| `use_mlock` | false | true | กัน model ถูก swap out |
+
+> **หมายเหตุ**: `temperature: 0.0` + `top_k: 1` = **fully deterministic** (greedy decoding)
+> เหมาะสำหรับ coding tasks, structured output, regression testing
 
 ## หมายเหตุการบังคับใช้
 
