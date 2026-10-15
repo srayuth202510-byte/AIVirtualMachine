@@ -833,7 +833,7 @@ pub fn validate_path_containment(
     }
     let remainder = normalized
         .strip_prefix(deepest_existing)
-        .map_err(|_| format!("internal prefix mismatch"))?;
+        .map_err(|_| "internal prefix mismatch".to_string())?;
     Ok(canonical_prefix.join(remainder))
 }
 
