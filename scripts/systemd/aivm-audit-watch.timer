@@ -1,0 +1,7 @@
+[Unit]
+Description=AIVM Audit Watcher Timer — run audit watcher every 5 minutes
+Ref=audit-watch.service
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true

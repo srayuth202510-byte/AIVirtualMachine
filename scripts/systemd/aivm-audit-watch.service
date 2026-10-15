@@ -1,0 +1,11 @@
+[Unit]
+Description=AIVM Audit Watcher — polls audit log for new decisions
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/lokis/Documents/AIVirtualMachine/scripts/qwen-audit-watch.py \
+  --audit /var/log/aivm/audit.log \
+  --interval 300
+StandardOutput=append:/var/log/aivm/audit-watch.log
+StandardError=journal:/journald/aivm-audit-watch.err
