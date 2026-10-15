@@ -947,6 +947,18 @@ pub mod config {
             );
         }
 
+        // Local model ที่ไม่ pin hash = น้ำหนักสลับไม่ได้จับ (I-8 ระดับ supply chain)
+        if config.model.provider == "local" {
+            match &config.model.local {
+                Some(local) if !local.model_sha256.is_empty() => {}
+                _ => warnings.push(
+                    "local model is unpinned (set model.local.model_sha256) - weights can be \
+                     swapped without detection"
+                        .into(),
+                ),
+            }
+        }
+
         Ok(())
     }
 
