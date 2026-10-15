@@ -87,6 +87,11 @@ guard ต่อขอบ: `confidence` (→MODIFY), `tests_passed` (→VALIDATE)
   (archive ถูกผนึก ห้ามเขียนทับ)
 - decision ที่ deny (รวมระดับ level) มี record ครบ — เงียบหายไม่ได้
 
+Hash chain ตรวจความสอดคล้องและการแก้ไขภายในลำดับ log ที่มีจุดเริ่มต้น/ปลายทาง
+เชื่อถือได้ แต่ไม่ใช่ลายเซ็นหรือ external authentication ผู้ควบคุม host ที่เขียน
+ไฟล์ได้อาจแก้ log และคำนวณ chain ใหม่ได้ หากต้องการหลักฐานต้านผู้ดูแล host
+ต้องส่ง checkpoint หรือสำเนา log ไปเก็บในระบบภายนอกที่แยกสิทธิ์และเชื่อถือได้.
+
 ## Invariants (สเปก §35, non-negotiable)
 
 I-1 ไม่มี direct host access · I-2 ทุก action ต้องมี capability ·

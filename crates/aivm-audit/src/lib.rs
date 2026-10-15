@@ -194,6 +194,17 @@ impl AuditWriter {
     /// เก่า เปลี่ยนชื่อเป็น archive แล้วเปิดไฟล์ใหม่ที่ chain ต่อจาก tip
     /// เดิม (seq เริ่ม 0 ใหม่ แต่ hash ผูกกันข้ามไฟล์)
     pub fn rotate(&mut self, suffix: &str) -> Result<PathBuf, AuditError> {
+        let stem = self
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "audit".to_string());
+        let archived = self.path.with_file_name(format!("{stem}.{suffix}.jsonl"));
+        if archived.exists() {
+            return Err(AuditError::Io("archive already exists".into()));
+        }
+        // Preflight collision before writing the seal. A repeated suffix must
+        // leave the active chain untouched.
         let path_str = self.path.to_string_lossy();
         let mut seal = AuditRecord::new(
             0,
@@ -208,16 +219,10 @@ impl AuditWriter {
         );
         seal.result = format!("tip:{}", self.prev_hash);
         self.append(seal)?;
-        let stem = self
-            .path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "audit".to_string());
-        let archived = self.path.with_file_name(format!("{stem}.{suffix}.jsonl"));
-        if archived.exists() {
-            return Err(AuditError::Io("archive already exists".into()));
-        }
-        std::fs::rename(&self.path, &archived).map_err(|e| AuditError::Io(e.to_string()))?;
+        // hard_link is an atomic create-if-absent on the same directory and
+        // cannot replace an archive created by a concurrent rotator.
+        std::fs::hard_link(&self.path, &archived).map_err(|e| AuditError::Io(e.to_string()))?;
+        std::fs::remove_file(&self.path).map_err(|e| AuditError::Io(e.to_string()))?;
         // ผนึก archive (immutable เมื่อ FS รองรับ): rotate ซ้ำด้วย suffix
         // เดิมจะล้มแบบ fail-closed แทนที่จะเขียนทับของที่ผนึกแล้ว
         let _ = std::process::Command::new("chattr")
@@ -559,8 +564,11 @@ mod tests {
         let archive = writer.rotate("same").unwrap();
         let old = std::fs::read(&archive).unwrap();
         test_record(&mut writer, "r2");
+        let active_before = std::fs::read(&path).unwrap();
         assert!(writer.rotate("same").is_err());
         assert_eq!(std::fs::read(&archive).unwrap(), old);
+        assert_eq!(std::fs::read(&path).unwrap(), active_before);
+        assert_eq!(AuditWriter::verify(&path).unwrap(), 1);
         clean(&dir);
     }
 }

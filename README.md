@@ -13,9 +13,12 @@ AIVM คือ runtime สำหรับรัน open-weight models โดย�
 > Agent capabilities are optional and remain mediated by the runtime. The model proposes
 > intents (strict JSON); a state machine (`INIT→DEPLOY` with operator guards), capability
 > checks, and a deny-by-default policy engine decide ALLOW/DENY before any tool runs.
-> Tools (`filesystem/network/process.exec`) go through a gateway into a sandbox
-> (Tier1 process/container by default, Tier2 Firecracker MicroVM; TEE เป็น optional Tier3)
-> Every decision is append-only audited with a hash chain. Full spec is in Thai:
+> Tools (`filesystem/network/process.exec`) go through a gateway into a sandbox.
+> Tier1 process is the default; container requires host setup. Tier2 Firecracker
+> MicroVM requires KVM and pinned guest artifacts. Hardware/TEE is experimental and
+> does not yet provide verified TEE attestation. Audit hash chains detect changes
+> against a trusted checkpoint; they do not authenticate logs against a host administrator.
+> Full spec is in Thai:
 > [`AI Virtual Machine.md`](./AI%20Virtual%20Machine.md). Start with `cargo run -p aivm-cli -- demo`.
 
 สเปกฉบับเต็ม (ภาษาไทย): [`AI Virtual Machine.md`](./AI%20Virtual%20Machine.md)
@@ -37,6 +40,12 @@ AIVM คือ runtime สำหรับรัน open-weight models โดย�
 | Model Runtime — Worker boundary | model manifest + worker protocol + bounded inference | Tier1 | 🚧 |
 
 กฎเหล็ก: **fail-closed** — parse/eval/context error ใด ๆ → `DENY` เสมอ ไม่มี default-allow
+
+สถานะ Tier หมายถึงระดับการรองรับในโค้ด ไม่ใช่การรับรองความปลอดภัยของ host ทุกเครื่อง:
+Tier1 process เป็นค่าเริ่มต้น; Container และ MicroVM ต้องเตรียม host ตามคู่มือและ
+ตรวจผล probe/host validation สำหรับเครื่องเป้าหมาย; Hardware ยังเป็น experimental
+และ Generic QEMU ไม่ได้ยืนยัน TEE หรือ attestation. ดู [ผล host validation](./docs/host-validation-2026-10-15.md)
+ซึ่งเป็น snapshot ณ 15 ตุลาคม 2026 ไม่ใช่ผลตรวจ host ปัจจุบันโดยอัตโนมัติ.
 
 รายละเอียดการบังคับใช้และพฤติกรรมที่เปลี่ยนหลัง security review: [`docs/security-hardening.md`](./docs/security-hardening.md)
 
