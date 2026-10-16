@@ -135,7 +135,9 @@ Echo ไม่ได้ทำงาน coding จริง ใช้ยืนย
 `vm_config.model` เป็น local config ตาม `examples/aivm.yaml` ใช้ model path
 แบบ absolute และเลือกงาน/จำนวน steps/timeout ให้เหมาะสม ก่อนเริ่ม deployment ใหม่
 ตัวอย่างนี้ไม่ส่ง seed workspace เข้าไป ตัวใหม่จึงเริ่มด้วย workspace ว่าง
-ถ้าต้องใช้ข้อมูลเริ่มต้นต้องเพิ่มช่องทาง restore ที่ตรวจสอบได้ก่อน
+ถ้าต้องกู้ข้อมูล operator ใช้ [workspace snapshots/restore](workspace-recovery.md)
+ลง VM ใหม่แยกต่างหากได้ Controller รุ่นนี้ยังไม่เลือก snapshot หรือเรียก restore
+ให้ instance ทดแทนอัตโนมัติ
 
 Spec รวม binary SHA256 ต้องตรงกับที่ persist ไว้ ถ้าเปลี่ยน template หรือ
 binary ให้ drain deployment เดิมและใช้ state directory ใหม่ ไม่แก้ config

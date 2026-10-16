@@ -11,6 +11,9 @@ aivm-tools = { path = "../aivm-tools" }
 aivm-audit = { path = "../aivm-audit" }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
 thiserror = { workspace = true }
 aivm-cube = { path = "../aivm-cube" }
 aivm-runtime = { path = "../aivm-runtime" }

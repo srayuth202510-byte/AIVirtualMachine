@@ -58,6 +58,37 @@ enum Cmd {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Operator: snapshot workspace data into a private store outside the VM root.
+    Snapshot {
+        name: String,
+        #[arg(long)]
+        store: PathBuf,
+    },
+    /// List recovery points (metadata only; use verify-snapshot to check payloads).
+    Snapshots {
+        #[arg(long)]
+        store: PathBuf,
+    },
+    /// Hash every snapshot file and check its manifest.
+    VerifySnapshot {
+        snapshot: String,
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        manifest_sha256: Option<String>,
+    },
+    /// Operator: restore workspace into a NEW VM with a current trusted config.
+    Restore {
+        snapshot: String,
+        name: String,
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        /// Expected digest recorded when the recovery point was created.
+        #[arg(long)]
+        manifest_sha256: String,
+    },
     /// รันหนึ่งก้าวแบบผ่านตัวกลาง
     Run {
         name: String,
@@ -193,6 +224,44 @@ fn main() -> Result<(), AnyErr> {
             // ลงทะเบียนเข้า root ของ supervisor เอง (create จะ validate การบูต)
             sup.create(&name, cfg).map_err(err)?;
             println!("created vm '{name}'");
+        }
+        Cmd::Snapshot { name, store } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&sup.snapshot(&name, &store).map_err(err)?)?
+            );
+        }
+        Cmd::Snapshots { store } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&sup.snapshots(&store).map_err(err)?)?
+            );
+        }
+        Cmd::VerifySnapshot {
+            snapshot,
+            store,
+            manifest_sha256,
+        } => {
+            let verified = sup
+                .verify_snapshot(&store, &snapshot, manifest_sha256.as_deref())
+                .map_err(err)?;
+            println!("{}", serde_json::to_string_pretty(&verified)?);
+        }
+        Cmd::Restore {
+            snapshot,
+            name,
+            store,
+            config,
+            manifest_sha256,
+        } => {
+            let config = VmConfig::from_file(&config).map_err(err)?;
+            let restored = sup
+                .restore_snapshot(&store, &snapshot, &manifest_sha256, &name, config)
+                .map_err(err)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({"vm":name,"snapshot":restored}))?
+            );
         }
         Cmd::Run { name, prompt } => {
             // `run` ต้อง `create` มาก่อน ถ้าไม่มีช่วยบอกให้ชัด

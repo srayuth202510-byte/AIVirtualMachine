@@ -2,6 +2,7 @@
 *.log
 audit.log*
 /vms/
+/backups/
 /graphify-out/
 __pycache__/
 scripts/events.db

@@ -87,6 +87,9 @@ cargo run -q -p aivm-cli -- audit coder
 | คำสั่ง | ใช้ทำอะไร |
 |---|---|
 | `create <name> --config <yaml>` | สร้าง VM จาก `aivm.yaml` (validate ก่อนบูต) |
+| `snapshot <name> --store <dir>` / `snapshots --store <dir>` | operator เก็บ/ดูหลายจุดกู้คืนของ workspace นอก VM root |
+| `verify-snapshot <id> --store <dir> [--manifest-sha256 <hash>]` | ตรวจ manifest และ hash ของ payload ครบทุกไฟล์ |
+| `restore <id> <new-name> --store <dir> --manifest-sha256 <hash> --config <yaml>` | กู้ workspace ลง VM ใหม่ด้วย config ปัจจุบัน ไม่คัดลอก security state เดิม |
 | `run <name> [--prompt …]` | รันหนึ่งก้าวแบบผ่านตัวกลาง |
 | `agent <name> <task> [--max-steps N]` | agent loop เต็มรอบ; งานโค้ดแบ่ง inspect/implement/verify/repair |
 | `transition <name> <STATE> [--confidence F] [--tests-passed] [--policy-approved]` | เปลี่ยน state + ให้/เพิกถอนสิทธิ์ |
@@ -133,6 +136,7 @@ crates/
 
 ## เอกสาร
 
+- [`docs/workspace-recovery.md`](./docs/workspace-recovery.md) — snapshot workspace, integrity verification และ operator restore ลง VM ใหม่
 - [`docs/audit-rotation.md`](./docs/audit-rotation.md) — ลำดับ rotate, recovery หลัง process หยุด และพฤติกรรมเมื่อเกิด error
 - [`docs/audit-watcher.md`](./docs/audit-watcher.md) — เฝ้าดู audit ต่อเนื่อง พร้อมตรวจ partial writes/rotation และให้ Qwen ทบทวนเบื้องหลัง
 - [`docs/recovery-supervisor.md`](./docs/recovery-supervisor.md) — controller ภายนอกสำหรับงานบนเครื่องเดียว: dry-run, กักกัน, สร้างทดแทน, จำกัดการเกิดใหม่ และ drain

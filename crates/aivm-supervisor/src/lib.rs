@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use thiserror::Error;
 mod lifecycle;
+mod snapshot;
+pub use snapshot::SnapshotSummary;
 
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -95,7 +97,16 @@ impl Supervisor {
         self.root.join(name)
     }
 
-    pub fn create(&mut self, name: &str, mut config: VmConfig) -> Result<(), SupervisorError> {
+    pub fn create(&mut self, name: &str, config: VmConfig) -> Result<(), SupervisorError> {
+        self.create_prepared(name, config, |_| Ok(()))
+    }
+
+    fn create_prepared(
+        &mut self,
+        name: &str,
+        mut config: VmConfig,
+        prepare: impl FnOnce(&std::path::Path) -> Result<(), SupervisorError>,
+    ) -> Result<(), SupervisorError> {
         Self::validate_name(name)?;
         if self.vms.contains_key(name) || self.vm_dir(name).exists() {
             return Err(SupervisorError::Exists(name.into()));
@@ -122,6 +133,7 @@ impl Supervisor {
                 .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
             rt.persist()
                 .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+            prepare(&dir)?;
             lifecycle::save_status(&dir, &VmStatus::Created)?;
             // Publish the discovery marker last, after validation and state.
             aivm_tools::state_store::write_private(&dir.join("aivm.yaml"), &yaml)
