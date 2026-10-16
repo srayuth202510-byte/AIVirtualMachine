@@ -49,5 +49,5 @@
 
 fmt → clippy strict → `cargo test --workspace` → clippy หลังฟีเจอร์ microvm →
 `make test-microvm` → clippy/test หลังฟีเจอร์ hardware → demo → smoke.sh
-runner คือ `ubuntu-latest` (ไม่มี KVM เทสต์บูตจริงจึง skip — unit/plumbing
+runner ระบุรุ่นเป็น `ubuntu-24.04` (เทสต์บูตจริงข้ามเมื่อไม่มี KVM/pins — unit/plumbing
 ที่เหลือยังจับของพังได้)

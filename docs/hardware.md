@@ -2,7 +2,7 @@
 
 สถานะ: 🚧 **skeleton** — ประตู fail-closed ครบทุกลำดับ (spec/shape/supply-chain/host)
 โค้ดรัน workload (drive-stuffing แบบเดียวกับ MicroVM) และ **บูต QEMU/KVM
-โหมด Generic จริงผ่านแล้ว** (ดู [รายงาน host validation](host-validation-2026-10-15.md)) แต่ยังไม่ได้ยืนยัน TEE จริง และ
+โหมด Generic จริงผ่านแล้ว** (ดู [รายงาน host validation](host-validation-2026-10-16.md)) แต่ยังไม่ได้ยืนยัน TEE จริง และ
 attestation/measured-boot/disk-encryption/GPU ยังเป็น stub ที่รายงานซื่อสัตย์
 ใน `degraded` (ดู "ข้อจำกัดที่รู้ตัว" ท้ายไฟล์)
 

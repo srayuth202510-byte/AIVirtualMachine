@@ -36,7 +36,7 @@ AIVM คือ runtime สำหรับรัน open-weight models โดย�
 | 7 — MicroVM (Level 2) | บูต guest จริงผ่าน Firecracker/KVM (หลังฟีเจอร์ `microvm`) | Tier2 | ✅ |
 | MVP-C | `network.fetch`/`network.connect` แบบมี policy | Tier1 | ✅ |
 | Level 1 — Container | bubblewrap + Landlock/seccomp + cgroups v2 CPU/RAM/PIDs (ต้องเตรียม host) | Tier1 | ✅ |
-| Level 3 — Hardware isolation | TEE skeleton แบบ optional (ยังไม่ e2e — ดู `docs/hardware.md`) | Tier3 experimental | 🚧 |
+| Level 3 — Hardware isolation | Generic QEMU บูตจริงได้; TEE/attestation ยังไม่ยืนยัน (ดู `docs/hardware.md`) | Tier3 experimental | 🚧 |
 | Model Runtime — Worker boundary | model manifest + worker protocol + bounded inference | Tier1 | 🚧 |
 
 กฎเหล็ก: **fail-closed** — parse/eval/context error ใด ๆ → `DENY` เสมอ ไม่มี default-allow
@@ -44,8 +44,8 @@ AIVM คือ runtime สำหรับรัน open-weight models โดย�
 สถานะ Tier หมายถึงระดับการรองรับในโค้ด ไม่ใช่การรับรองความปลอดภัยของ host ทุกเครื่อง:
 Tier1 process เป็นค่าเริ่มต้น; Container และ MicroVM ต้องเตรียม host ตามคู่มือและ
 ตรวจผล probe/host validation สำหรับเครื่องเป้าหมาย; Hardware ยังเป็น experimental
-และ Generic QEMU ไม่ได้ยืนยัน TEE หรือ attestation. ดู [ผล host validation](./docs/host-validation-2026-10-15.md)
-ซึ่งเป็น snapshot ณ 15 ตุลาคม 2026 ไม่ใช่ผลตรวจ host ปัจจุบันโดยอัตโนมัติ.
+และ Generic QEMU ไม่ได้ยืนยัน TEE หรือ attestation. ดู [ผล host validation](./docs/host-validation-2026-10-16.md)
+ซึ่งเป็น snapshot ณ 16 ตุลาคม 2026 ของ commit `4ac447d` ไม่ใช่ผลตรวจ host ปัจจุบันโดยอัตโนมัติ.
 
 รายละเอียดการบังคับใช้และพฤติกรรมที่เปลี่ยนหลัง security review: [`docs/security-hardening.md`](./docs/security-hardening.md)
 

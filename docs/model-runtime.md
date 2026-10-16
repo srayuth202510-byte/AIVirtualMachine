@@ -141,3 +141,6 @@ AIVM_WORKER_HOST_CONFIG=/path/to/model-config.json \
 
 ทดสอบสองครั้งโดยสลับ `worker_launcher` เป็น container และ microvm
 คำสั่งนี้ fail เมื่อ config/prerequisite ขาด; ไม่ skip หรืออ้างว่า host validation ผ่าน
+
+ผลทดสอบ pinned GGUF จริงผ่าน process namespace, Container และ MicroVM
+รวม streaming และ cancellation อยู่ใน [รายงาน host validation วันที่ 16 ตุลาคม 2026](host-validation-2026-10-16.md)
