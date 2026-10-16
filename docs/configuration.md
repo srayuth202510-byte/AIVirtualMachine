@@ -62,6 +62,8 @@ tools:
 
 capabilities:
   initial: [read:workspace, search:code]   # สิทธิ์ตั้งต้น state INIT (§14.2)
+  # secret capability ต้องระบุเจาะจง: "secret:<resource>:<scope>"
+  # เช่น initial: ["secret:github_token:repo:read"]
 
 policy:
   require_test_before_network: true        # false = เตือนตอน create (network ไม่ต้องมีเทสต์ก่อน)

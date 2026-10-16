@@ -556,6 +556,14 @@ impl ToolGateway {
             .map_err(|_| ToolError::Denied("file size constraint exceeded".into()))
     }
 
+    /// บันทึกโควต้าไบต์ก่อนคืนข้อมูลหรือเริ่มเขียน เพื่อไม่ให้ restart แล้ว
+    /// ทำให้ยอดสะสมของ capability กลับเป็นศูนย์
+    fn charge_bytes(&mut self, cube: &Cube, cap_index: usize, bytes: u64) -> Result<(), ToolError> {
+        self.check_file_size(cap_index, bytes)?;
+        self.caps.account_bytes(cap_index, bytes);
+        self.checkpoint(cube)
+    }
+
     pub fn read(&mut self, cube: &mut Cube, path: &str) -> Result<ToolResult, ToolError> {
         self.check_quarantine(cube, "read", path)?;
         let (canon, cap_index) = self.enforce(cube, "read", path)?;
@@ -564,7 +572,7 @@ impl ToolGateway {
                 self.audit_decision(cube, "read", path, "deny", "size-constraint", "error")?;
                 return Err(error);
             }
-            self.caps.account_bytes(cap_index, content.len() as u64);
+            self.charge_bytes(cube, cap_index, content.len() as u64)?;
             self.audit_decision(cube, "read", path, "allow", "cache-hit", "success")?;
             return Ok(ToolResult {
                 ok: true,
@@ -587,16 +595,18 @@ impl ToolGateway {
             self.check_file_size(cap_index, content.len() as u64)?;
             Ok::<_, ToolError>(content)
         })();
-        self.audit_decision(
-            cube,
-            "read",
-            path,
-            if result.is_ok() { "allow" } else { "deny" },
-            "outcome",
-            if result.is_ok() { "success" } else { "error" },
-        )?;
-        let content = result?;
-        self.caps.account_bytes(cap_index, content.len() as u64);
+        let content = match result {
+            Ok(content) => content,
+            Err(error) => {
+                self.audit_decision(cube, "read", path, "deny", "outcome", "error")?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.charge_bytes(cube, cap_index, content.len() as u64) {
+            self.audit_decision(cube, "read", path, "deny", "size-constraint", "error")?;
+            return Err(error);
+        }
+        self.audit_decision(cube, "read", path, "allow", "outcome", "success")?;
         self.read_cache.insert(canon, content.clone());
         Ok(ToolResult {
             ok: true,
@@ -633,7 +643,7 @@ impl ToolGateway {
             })
             .is_some_and(|existing| existing == content.as_bytes());
         if unchanged {
-            self.caps.account_bytes(cap_index, content.len() as u64);
+            self.charge_bytes(cube, cap_index, content.len() as u64)?;
             self.read_cache.insert(canon, content.to_string());
             self.audit_decision(cube, "write", path, "allow", "unchanged", "success")?;
             return Ok(ToolResult {
@@ -665,6 +675,8 @@ impl ToolGateway {
             {
                 return Err(ToolError::Denied("workspace storage quota exceeded".into()));
             }
+            // บันทึกโควต้าไบต์ก่อนแก้ไฟล์ เพื่อไม่ให้การทำงานซ้ำหลัง crash ใช้งบเดิม
+            self.charge_bytes(cube, cap_index, content.len() as u64)?;
             secure_fs::open(&self.workspace, &canon, true).and_then(|mut file| {
                 file.write_all(content.as_bytes())
                     .map_err(|e| ToolError::Io(e.to_string()))
@@ -679,7 +691,6 @@ impl ToolGateway {
             if result.is_ok() { "success" } else { "error" },
         )?;
         result?;
-        self.caps.account_bytes(cap_index, content.len() as u64);
         self.read_cache.insert(canon, content.to_string());
         Ok(ToolResult {
             ok: true,
@@ -864,7 +875,10 @@ impl ToolGateway {
                 .unwrap_or_else(|| ToolError::Denied(e.to_string()))
         })?;
         let scope = canon.to_string_lossy().to_string();
-        let auth_ctx = aivm_capability::AuthorizationContext::default();
+        let auth_ctx = aivm_capability::AuthorizationContext {
+            timeout_ms: Some(spec.timeout_ms),
+            ..Default::default()
+        };
         if self
             .caps
             .authorize_with_context("execute", "process", &scope, &auth_ctx)
@@ -1171,6 +1185,7 @@ impl ToolGateway {
         }
         // resolve ครั้งเดียว ตรวจทุก IP แล้วตรึง resolver; ไม่ตาม redirect
         let addresses = public_addresses(&host, port)?;
+        let request_bytes = req.body.as_ref().map_or(0, |body| body.len() as u64);
         self.audit_decision(
             cube,
             action,
@@ -1179,6 +1194,8 @@ impl ToolGateway {
             "network-authorized",
             "authorized",
         )?;
+        // หักไบต์ขาออกก่อนส่งคำขอ; นับเฉพาะคำตอบจะเปิดทางให้ส่งข้อมูลออกไม่จำกัด
+        self.caps.account_bytes(idx, request_bytes);
         self.checkpoint(cube)?;
         let agent = ureq::AgentBuilder::new()
             .redirects(0)
@@ -1218,7 +1235,19 @@ impl ToolGateway {
         if body.len() as u64 > limit {
             return Err(ToolError::Denied("response size limit exceeded".into()));
         }
-        // บันทึกไบต์จริงเข้าเพดานสะสม (I-8: ครั้งต่อไปที่ล้นเพดาน = DENY)
+        if self.caps.caps[idx]
+            .constraints
+            .max_total_bytes
+            .is_some_and(|max| {
+                self.caps.caps[idx]
+                    .used_bytes
+                    .saturating_add(body.len() as u64)
+                    > max
+            })
+        {
+            return Err(ToolError::Denied("network byte budget exceeded".into()));
+        }
+        // นับไบต์ขากลับด้วย เพื่อให้โควต้าเครือข่ายครอบคลุมทั้งสองทิศทาง
         self.caps.account_bytes(idx, body.len() as u64);
         self.checkpoint(cube)?;
         let output =
@@ -2244,6 +2273,22 @@ network: {{allow: [], deny: []}}
         assert!(matches!(r, Err(ToolError::Denied(_))));
     }
 
+    #[test]
+    fn exec_honors_capability_timeout_constraint() {
+        let (mut gw, mut cube, _dir) = harness();
+        let exe = std::fs::canonicalize("/bin/true").unwrap();
+        let exe = exe.to_string_lossy().to_string();
+        gw.policy.process.allow.push(exe.clone());
+        gw.caps.grant(
+            aivm_capability::Capability::new("execute", "process", &exe)
+                .with_constraints(aivm_capability::Constraints::new().with_timeout_ms(1)),
+        );
+        assert!(matches!(
+            gw.exec(&mut cube, &exe, &[]),
+            Err(ToolError::Denied(_))
+        ));
+    }
+
     // Phase 7: ระดับที่ยังไม่มี backend ต้อง DENY พร้อม audit (I-7)
     // แม้ policy + capability จะอนุญาตครบ (ประตู level มาก่อน execute)
     // หมายเหตุ: เปิดฟีเจอร์ `microvm` แล้วเคสนี้ตายด้วย Invalid (artifact
@@ -2760,6 +2805,36 @@ network: {{allow: [], deny: []}}
         assert!(gw.read(&mut cube, "src/large.rs").is_err());
         assert!(gw.write(&mut cube, "src/new.rs", "too large").is_err());
         assert!(!dir.join("src/new.rs").exists());
+    }
+
+    #[test]
+    fn consumed_read_bytes_are_checkpointed_before_returning_content() {
+        let (mut gw, mut cube, dir) = harness();
+        let path = gw.workspace.join("src/budget.txt");
+        std::fs::write(&path, "123456").unwrap();
+        gw.state_path = Some(dir.join("state.json"));
+        let read_cap = gw
+            .caps
+            .caps
+            .iter_mut()
+            .find(|cap| cap.action == "read")
+            .unwrap();
+        read_cap.constraints.max_total_bytes = Some(100);
+
+        assert_eq!(
+            gw.read(&mut cube, "src/budget.txt").unwrap().output,
+            "123456"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+        let saved_cap = saved["caps"]["caps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|cap| cap["action"] == "read")
+            .unwrap();
+        assert_eq!(saved_cap["used_bytes"], 6);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

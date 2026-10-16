@@ -162,6 +162,16 @@ impl Policy {
         Ok(())
     }
 
+    /// CEL ที่ประเมินพลาดใน context จริงต้อง DENY; ตรวจตอนโหลดอย่างเดียว
+    /// ไม่พอสำหรับ error ที่ขึ้นกับค่าของคำขอ
+    fn rules_are_evaluable(&self, ctx: &EvalContext) -> bool {
+        self.rules.iter().all(|rule| {
+            rule.when
+                .as_deref()
+                .is_none_or(|when| eval_cel(when, ctx).is_ok())
+        })
+    }
+
     /// ประเมิน action บน filesystem เทียบกับ policy
     /// ลำดับ: deny ที่ระบุชัด (glob) มาก่อนเสมอ (deny-overrides) แล้วค่อยดู
     /// allow list แล้วค่อย rule แบบมีเงื่อนไข ไม่ตรงอะไรเลยคือ Deny
@@ -173,6 +183,9 @@ impl Policy {
     ) -> (Decision, Option<String>) {
         if self.validate_syntax().is_err() {
             return (Decision::Deny, Some("invalid-policy".into()));
+        }
+        if !self.rules_are_evaluable(ctx) {
+            return (Decision::Deny, Some("policy-evaluation-error".into()));
         }
         // 1. deny list ชนะเสมอ
         for pat in &self.filesystem.deny {
@@ -243,6 +256,9 @@ impl Policy {
     pub fn evaluate_network(&self, host: &str, ctx: &EvalContext) -> (Decision, Option<String>) {
         if self.validate_syntax().is_err() {
             return (Decision::Deny, Some("invalid-policy".into()));
+        }
+        if !self.rules_are_evaluable(ctx) {
+            return (Decision::Deny, Some("policy-evaluation-error".into()));
         }
         // เครือข่ายส่วนตัว/loopback/metadata ปฏิเสธเสมอ (defense in depth §18)
         if is_blocked_network(host) {
@@ -1165,6 +1181,31 @@ system:
             Decision::Deny
         );
         assert!(Policy::from_yaml(&serde_yaml::to_string(&policy).unwrap()).is_err());
+    }
+
+    #[test]
+    fn context_dependent_cel_error_denies_instead_of_skipping_a_deny_rule() {
+        let mut policy = Policy::default();
+        policy.filesystem.read = vec!["/workspace".into()];
+        policy.rules.push(Rule {
+            id: "deny-at-boundary-confidence".into(),
+            action: "read".into(),
+            resource: "filesystem".into(),
+            scope: "/workspace/**".into(),
+            when: Some("state == 'MODIFY' && 1 / (confidence - 0.8) > 0".into()),
+            effect: Some("deny".into()),
+        });
+        // expression ใช้ได้ใน context เริ่มต้น แต่หารด้วยศูนย์ในคำขอนี้
+        // error ระหว่างประเมินต้องไม่มีทางลบผลของ deny rule
+        let context = EvalContext {
+            state: "MODIFY".into(),
+            confidence: 0.8,
+            ..Default::default()
+        };
+        assert_eq!(
+            policy.evaluate_fs("read", "/workspace/file", &context),
+            (Decision::Deny, Some("policy-evaluation-error".into()))
+        );
     }
 
     #[test]

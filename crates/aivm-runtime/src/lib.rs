@@ -380,6 +380,25 @@ impl Runtime {
                     "filesystem",
                     &format!("{ws_str}/src"),
                 )),
+                value if value.starts_with("secret:") => {
+                    let scope = value.trim_start_matches("secret:");
+                    let Some((resource, requested_scope)) = scope.split_once(':') else {
+                        return Err(RuntimeError::Config(format!(
+                            "invalid initial secret capability: {value}"
+                        )));
+                    };
+                    if resource.is_empty()
+                        || requested_scope.is_empty()
+                        || scope.chars().any(|c| {
+                            !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+                        })
+                    {
+                        return Err(RuntimeError::Config(format!(
+                            "invalid initial secret capability: {value}"
+                        )));
+                    }
+                    caps.push(Capability::new("use", "secret", scope));
+                }
                 _ => {
                     return Err(RuntimeError::Config(format!(
                         "unknown initial capability: {c}"
@@ -1679,6 +1698,8 @@ microvm:
 name: t
 runtime:
   isolation: sandbox
+capabilities:
+  initial: ["secret:test_tok:read"]
 secrets:
   allow: ["test_tok:read"]
   low_risk_allow: ["test_tok:read"]
@@ -1689,11 +1710,6 @@ secrets:
         // ไม่มีไฟล์ = บูตได้ แต่ secret.request ถูก deny (broker ต่อสายแล้ว
         // แต่ว่าง — resource ไม่รู้จัก ไม่ใช่ unconfigured)
         let mut rt = Runtime::init(cfg.clone(), base.clone()).unwrap();
-        rt.gateway.caps.grant(aivm_capability::Capability::new(
-            "use",
-            "secret",
-            "test_tok:read",
-        ));
         let body = serde_json::json!({
             "tool": "process.exec",
             "resource": "test_tok",
@@ -1721,11 +1737,6 @@ secrets:
         )
         .unwrap();
         let mut rt = Runtime::init(cfg, base.clone()).unwrap();
-        rt.gateway.caps.grant(aivm_capability::Capability::new(
-            "use",
-            "secret",
-            "test_tok:read",
-        ));
         let body = serde_json::json!({
             "tool": "process.exec",
             "resource": "test_tok",

@@ -241,6 +241,7 @@ const DANGEROUS_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_kill,
     libc::SYS_tkill,
     libc::SYS_tgkill,
+    libc::SYS_rt_sigqueueinfo,
     libc::SYS_pidfd_open,
     libc::SYS_pidfd_send_signal,
     libc::SYS_setpgid,
@@ -419,7 +420,6 @@ const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_timer_delete,
     libc::SYS_gettimeofday,
     // Signal handling
-    libc::SYS_rt_sigqueueinfo,
     libc::SYS_rt_sigtimedwait,
     libc::SYS_rt_sigpending,
     libc::SYS_rt_sigsuspend,
@@ -1969,6 +1969,11 @@ mod tests {
         // Explicitly dangerous syscall -> KILL.
         assert_eq!(
             bpf_verdict(&f, 0xc000003e, libc::SYS_reboot as u32),
+            0x00000000
+        );
+        // ห้ามส่งสัญญาณพร้อมข้อมูลไปยัง process ของ host ที่ใช้ UID เดียวกัน
+        assert_eq!(
+            bpf_verdict(&f, 0xc000003e, libc::SYS_rt_sigqueueinfo as u32),
             0x00000000
         );
         // สถาปัตยกรรมผิด -> KILL ทันที
