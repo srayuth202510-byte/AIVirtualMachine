@@ -105,6 +105,10 @@ Snapshot บน host เดียวกันป้องกันความ�
 รุ่นนี้ยังไม่ทำ encryption, external replication, retention pruning, scheduling
 หรือเชื่อม automatic recovery supervisor ให้เลือก restore เอง
 
+สำหรับสำเนานอกเครื่อง มี [ชุดตั้งค่า S3 และคู่มือ offsite restore](offsite-backup.md)
+ให้ operator ใช้เตรียมปลายทางและส่งสำเนาด้วยตัวเอง ยังไม่ใช่ automatic replication
+และยังไม่ผ่านการ deploy/restore บน AWS จริง
+
 ## การทดสอบ
 
 ```bash

@@ -137,6 +137,7 @@ crates/
 ## เอกสาร
 
 - [`docs/workspace-recovery.md`](./docs/workspace-recovery.md) — snapshot workspace, integrity verification และ operator restore ลง VM ใหม่
+- [`docs/offsite-backup.md`](./docs/offsite-backup.md) — ชุดตั้งค่า S3 Object Lock, แยกสิทธิ์ upload/restore และขั้นตอนทดลองกู้จากนอกเครื่อง (ยังไม่ผ่าน AWS host validation)
 - [`docs/audit-rotation.md`](./docs/audit-rotation.md) — ลำดับ rotate, recovery หลัง process หยุด และพฤติกรรมเมื่อเกิด error
 - [`docs/audit-watcher.md`](./docs/audit-watcher.md) — เฝ้าดู audit ต่อเนื่อง พร้อมตรวจ partial writes/rotation และให้ Qwen ทบทวนเบื้องหลัง
 - [`docs/recovery-supervisor.md`](./docs/recovery-supervisor.md) — controller ภายนอกสำหรับงานบนเครื่องเดียว: dry-run, กักกัน, สร้างทดแทน, จำกัดการเกิดใหม่ และ drain

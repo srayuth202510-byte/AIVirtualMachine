@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AIVM operator backups; deploy in a separate backup account.
+Parameters:
+  RetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 3650
+    Description: Minimum protection period; expiration does not delete data.
+Resources:
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: GOVERNANCE
+            Days: !Ref RetentionDays
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  BackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Bucket: !Ref BackupBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RequireTLS
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt BackupBucket.Arn
+              - !Sub '${BackupBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Sid: RequireS3EncryptionHeader
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub '${BackupBucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: AES256
+  UploaderPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Attach only to a dedicated backup-account upload role.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: UploadSnapshots
+            Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub '${BackupBucket.Arn}/snapshots/*'
+          # ห้ามตัวส่งเปลี่ยนการเก็บรักษาหรือลบข้อมูล แม้มี Allow เพิ่มภายหลัง
+          - Sid: DenyBackupMutation
+            Effect: Deny
+            Action:
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+              - s3:PutObjectRetention
+              - s3:PutObjectLegalHold
+              - s3:BypassGovernanceRetention
+              - s3:DeleteBucket
+              - s3:PutBucketVersioning
+              - s3:PutBucketObjectLockConfiguration
+              - s3:PutLifecycleConfiguration
+              - s3:PutBucketPolicy
+              - s3:DeleteBucketPolicy
+              - s3:PutBucketAcl
+              - s3:PutBucketPublicAccessBlock
+              - s3:PutEncryptionConfiguration
+            Resource:
+              - !GetAtt BackupBucket.Arn
+              - !Sub '${BackupBucket.Arn}/*'
+  RestorePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Attach to an operator recovery role kept off the runtime host.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ListSnapshotVersions
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:ListBucketVersions
+            Resource: !GetAtt BackupBucket.Arn
+            Condition:
+              StringLike:
+                s3:prefix: 'snapshots/*'
+          - Sid: ReadSnapshotVersions
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:GetObjectRetention
+            Resource: !Sub '${BackupBucket.Arn}/snapshots/*'
+Outputs:
+  BucketName:
+    Value: !Ref BackupBucket
+  UploaderPolicyArn:
+    Value: !Ref UploaderPolicy
+  RestorePolicyArn:
+    Value: !Ref RestorePolicy
