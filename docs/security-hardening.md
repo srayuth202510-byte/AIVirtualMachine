@@ -32,6 +32,18 @@ secrets:
 
 หากไม่ตั้ง `low_risk_allow` ค่าเริ่มต้นของ resource เป็น High โปรแกรมที่ได้รับ secret จะได้รับผ่าน environment variable (inject ผ่าน `env_extra` ใน `ExecSpec`) และค่า secret จะถูก zeroize ทันทีหลัง spawn เสร็จ ผลลัพธ์ที่คืนให้ agent จะเป็น `[REDACTED]` แทน stdout/stderr จริง เพื่อป้องกันการส่งค่า secret กลับมา ต้องตรวจผลการทำงานผ่าน exit status/audit metadata แทน (ดู `crates/aivm-tools/src/lib.rs` ฟังก์ชัน `exec_inner`)
 
+Secret leases ที่คืนหลัง restart ต้องมี capability ที่ยังครอบคลุม resource/scope
+และค่า secret เดิมใน `secrets.yaml` ปัจจุบัน การลบหรือหมุนค่า secret ทำให้ lease เดิม
+ใช้ไม่ได้ การลด `max_ttl_seconds` หรือ `max_uses_allowed` ปฏิเสธ lease ที่ขัดกับ
+เพดานใหม่ และ `secrets.allow: []` ปฏิเสธทั้งหมด ต้องขอ lease ใหม่ตาม policy ปัจจุบัน
+การคืน lease ที่ยังผ่านเกณฑ์คงจำนวนครั้งที่ใช้และวันหมดอายุเดิมไว้
+
+Gateway ตรวจ capability ซ้ำก่อน inject โดยไม่หักโควต้าการออก lease อีกรอบ
+การเพิกถอน capability จึงหยุดการใช้ lease เดิม ขณะที่การออก lease จนโควต้าหมด
+ยังใช้ lease ที่ออกแล้วได้ตามจำนวนครั้งของ lease นั้น Broker ที่ใช้อยู่จะ revoke
+lease ของ resource ทันทีเมื่อเรียก `remove_secret` หรือเปลี่ยนค่าผ่าน `register_secret`
+การแก้ไฟล์ config/secret มีผลต่อ Runtime ที่โหลดใหม่
+
 Container backend บังคับ namespaces + Landlock/seccomp + cgroups v2 CPU/RAM/PIDs
 ไม่มี fallback เมื่อ setup ไม่ครบ ใช้ mounts จาก pinned descriptors และฆ่าทั้ง tree
 ผ่าน `cgroup.kill` ดูข้อกำหนดและข้อจำกัดใน [`container.md`](./container.md)

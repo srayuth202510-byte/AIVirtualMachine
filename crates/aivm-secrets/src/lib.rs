@@ -219,12 +219,27 @@ impl SecretBroker {
 
     /// Register a secret with the broker (operator-only operation)
     pub fn register_secret(&mut self, resource: String, value: String) {
+        if self.secrets.get(&resource).is_some_and(|old| old != &value) {
+            self.revoke_resource_leases(&resource);
+        }
         self.secrets.insert(resource, value);
     }
 
-    /// Remove a secret from broker
+    /// Remove a secret and invalidate every outstanding lease for it.
     pub fn remove_secret(&mut self, resource: &str) -> Option<String> {
+        self.revoke_resource_leases(resource);
         self.secrets.remove(resource)
+    }
+
+    fn revoke_resource_leases(&mut self, resource: &str) {
+        for lease in self
+            .leases
+            .values_mut()
+            .filter(|l| l.request.resource == resource)
+        {
+            lease.status = LeaseStatus::Revoked;
+            zeroize_secret(&mut lease.value);
+        }
     }
 
     /// Request a secret lease (AI-initiated, goes through capability/policy/HITL)
@@ -236,15 +251,7 @@ impl SecretBroker {
         hitl_approved: bool,
         approved_by: Option<String>,
     ) -> Result<SecretLease, SecretError> {
-        if request.max_uses == 0
-            || request.max_uses > 1000
-            || request.ttl_seconds == 0
-            || request.ttl_seconds > 86400
-        {
-            return Err(SecretError::InvalidRequest(
-                "invalid lease lifetime or usage limit".into(),
-            ));
-        }
+        self.check_request_limits(&request)?;
         // 1. Capability check
         let scope = format!("{}:{}", request.resource, request.scope);
         caps.authorize("use", "secret", &scope)
@@ -268,28 +275,14 @@ impl SecretBroker {
         let requires_hitl = self.policy.hitl_required_for.contains(&request.risk);
         let pre_approved = hitl_approved;
 
-        // 4. Validate TTL and max_uses against policy
-        if self.policy.max_ttl_seconds > 0 && request.ttl_seconds > self.policy.max_ttl_seconds {
-            return Err(SecretError::InvalidRequest(format!(
-                "TTL {} exceeds policy max {}",
-                request.ttl_seconds, self.policy.max_ttl_seconds
-            )));
-        }
-        if self.policy.max_uses_allowed > 0 && request.max_uses > self.policy.max_uses_allowed {
-            return Err(SecretError::InvalidRequest(format!(
-                "max_uses {} exceeds policy max {}",
-                request.max_uses, self.policy.max_uses_allowed
-            )));
-        }
-
-        // 5. Get secret value
+        // 4. Get secret value
         let value = self
             .secrets
             .get(&request.resource)
             .ok_or_else(|| SecretError::SecretNotFound(request.resource.clone()))?
             .clone();
 
-        // 6. Create lease (High-risk ที่ยังไม่ approve = PENDING ไว้ก่อน)
+        // 5. Create lease (High-risk ที่ยังไม่ approve = PENDING ไว้ก่อน)
         let resource_for_audit = request.resource.clone();
         let ttl_seconds = request.ttl_seconds;
         let now = Utc::now();
@@ -470,7 +463,12 @@ impl SecretBroker {
             if l.uses >= l.request.max_uses {
                 continue;
             }
-            if self.check_policy(&l.request).is_err() {
+            // A lease is bound to the operator's current value and limits.
+            // Persisted values cannot resurrect removed or rotated credentials.
+            if self.secrets.get(&l.request.resource) != Some(&l.value)
+                || self.check_request_limits(&l.request).is_err()
+                || self.check_policy(&l.request).is_err()
+            {
                 continue;
             }
             let scope = format!("{}:{}", l.request.resource, l.request.scope);
@@ -520,6 +518,32 @@ impl SecretBroker {
         });
     }
 
+    fn check_request_limits(&self, request: &SecretRequest) -> Result<(), SecretError> {
+        if request.max_uses == 0
+            || request.max_uses > 1000
+            || request.ttl_seconds == 0
+            || request.ttl_seconds > 86400
+        {
+            return Err(SecretError::InvalidRequest(
+                "invalid lease lifetime or usage limit".into(),
+            ));
+        }
+        if self.policy.max_ttl_seconds > 0 && request.ttl_seconds > self.policy.max_ttl_seconds {
+            return Err(SecretError::InvalidRequest(format!(
+                "TTL {} exceeds policy max {}",
+                request.ttl_seconds, self.policy.max_ttl_seconds
+            )));
+        }
+        if self.policy.max_uses_allowed > 0 && request.max_uses > self.policy.max_uses_allowed {
+            return Err(SecretError::InvalidRequest(format!(
+                "max_uses {} exceeds policy max {}",
+                request.max_uses, self.policy.max_uses_allowed
+            )));
+        }
+
+        Ok(())
+    }
+
     fn check_policy(&self, request: &SecretRequest) -> Result<(), SecretError> {
         let scope = format!("{}:{}", request.resource, request.scope);
 
@@ -533,18 +557,14 @@ impl SecretBroker {
             }
         }
 
-        // Check allow list
-        if !self.policy.allow.is_empty() {
-            let mut allowed = false;
-            for pattern in &self.policy.allow {
-                if Self::match_pattern(pattern, &scope) {
-                    allowed = true;
-                    break;
-                }
-            }
-            if !allowed {
-                return Err(SecretError::PolicyDenied("not in allow list".into()));
-            }
+        // Empty allow lists deny all secret access.
+        if !self
+            .policy
+            .allow
+            .iter()
+            .any(|pattern| Self::match_pattern(pattern, &scope))
+        {
+            return Err(SecretError::PolicyDenied("not in allow list".into()));
         }
 
         Ok(())
@@ -819,7 +839,7 @@ mod tests {
                 ttl_seconds: 300,
                 risk: RiskLevel::Low,
             },
-            value: "v".into(),
+            value: "ghp_test123".into(),
             status,
             created_at: now,
             expires_at: now + chrono::Duration::seconds(300),
@@ -1085,5 +1105,101 @@ mod tests {
         let mut empty = String::new();
         zeroize_secret(&mut empty);
         assert!(empty.is_empty());
+    }
+    fn restorable_lease() -> SecretLease {
+        let mut lease = test_lease("ghp_test123");
+        lease.expires_at = lease.created_at + chrono::Duration::seconds(300);
+        lease.request.max_uses = 3;
+        lease
+    }
+
+    #[test]
+    fn restore_rejects_removed_or_rotated_secret_values() {
+        let lease = restorable_lease();
+        let mut unchanged = test_broker();
+        assert_eq!(unchanged.restore(vec![lease.clone()]), 1);
+        for rotated in [false, true] {
+            let mut broker = test_broker();
+            if rotated {
+                broker.register_secret("github_token".into(), "rotated-value".into());
+            } else {
+                broker.remove_secret("github_token");
+            }
+            assert_eq!(broker.restore(vec![lease.clone()]), 0);
+            assert!(broker.use_lease(&lease.id).is_err());
+        }
+    }
+
+    #[test]
+    fn restore_enforces_current_limits_and_default_deny() {
+        let lease = restorable_lease();
+        for change in ["uses", "ttl", "allow"] {
+            let mut broker = test_broker();
+            match change {
+                "uses" => broker.policy.max_uses_allowed = 1,
+                "ttl" => broker.policy.max_ttl_seconds = 60,
+                "allow" => broker.policy.allow.clear(),
+                _ => unreachable!(),
+            }
+            assert_eq!(broker.restore(vec![lease.clone()]), 0, "{change}");
+        }
+    }
+
+    #[test]
+    fn removing_or_rotating_a_secret_revokes_existing_leases() {
+        for rotated in [false, true] {
+            let mut broker = test_broker();
+            let lease = restorable_lease();
+            assert_eq!(broker.restore(vec![lease.clone()]), 1);
+            if rotated {
+                broker.register_secret("github_token".into(), "rotated-value".into());
+            } else {
+                broker.remove_secret("github_token");
+            }
+            assert!(matches!(
+                broker.use_lease(&lease.id),
+                Err(SecretError::LeaseRevoked)
+            ));
+            assert!(broker.get_lease(&lease.id).unwrap().value.is_empty());
+        }
+    }
+    #[test]
+    fn restore_preserves_usage_and_original_expiry() {
+        let mut broker = test_broker();
+        let mut lease = restorable_lease();
+        lease.uses = 2;
+        lease.created_at -= chrono::Duration::seconds(30);
+        lease.expires_at -= chrono::Duration::seconds(30);
+        broker.restore(vec![lease.clone()]);
+        let restored = broker.get_lease(&lease.id).unwrap();
+        assert_eq!(restored.uses, 2);
+        assert_eq!(restored.expires_at, lease.expires_at);
+        assert_eq!(broker.use_lease(&lease.id).unwrap(), "ghp_test123");
+        assert!(matches!(
+            broker.use_lease(&lease.id),
+            Err(SecretError::LeaseExhausted)
+        ));
+    }
+
+    #[test]
+    fn empty_allow_list_denies_new_secret_requests() {
+        let mut broker = test_broker();
+        broker.policy.allow.clear();
+        let mut caps = CapabilitySet::new(vec![aivm_capability::Capability::new(
+            "use",
+            "secret",
+            "github_token:read",
+        )]);
+        assert!(matches!(
+            broker.request_lease(
+                restorable_lease().request,
+                &Cube::new("default-deny"),
+                &mut caps,
+                false,
+                None
+            ),
+            Err(SecretError::PolicyDenied(_))
+        ));
+        assert!(broker.live_leases().is_empty());
     }
 }

@@ -283,6 +283,18 @@ impl ToolGateway {
         self.secret_broker.as_mut()
     }
 
+    /// Restore only leases whose issuing authority still exists in the fresh
+    /// capability set. Exhausted issuance quotas do not invalidate issued leases.
+    pub fn restore_secret_leases(&mut self, cube: &Cube, leases: Vec<SecretLease>) {
+        let leases = leases
+            .into_iter()
+            .filter(|lease| secret_authority(&self.caps, cube, &lease.request))
+            .collect();
+        if let Some(broker) = self.secret_broker.as_mut() {
+            broker.restore(leases);
+        }
+    }
+
     /// leases ที่ยังมีชีวิตไว้ persist (G4b — runtime เท่านั้น)
     pub fn live_secret_leases(&self) -> Vec<aivm_secrets::SecretLease> {
         match &self.secret_broker {
@@ -932,6 +944,10 @@ impl ToolGateway {
                     Some(l) if l.request.tool != "process.exec" => Resolve::Deny {
                         rule: "secret-tool-mismatch",
                         msg: "lease bound to another tool".into(),
+                    },
+                    Some(l) if !secret_authority(&self.caps, cube, &l.request) => Resolve::Deny {
+                        rule: "secret-capability-revoked",
+                        msg: "secret issuing capability is no longer granted".into(),
                     },
                     Some(l) => {
                         let id = l.id.clone();
@@ -1962,8 +1978,20 @@ fn public_addresses(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, 
     Ok(addresses)
 }
 
-/// ล้างค่า secret ใน env pairs (best-effort zeroize — เรียกทุกทางออก
-/// หลัง secret เข้าสู่มือ gateway แล้ว)
+/// Recheck authority without consuming the quota already charged at issuance.
+fn secret_authority(caps: &CapabilitySet, cube: &Cube, request: &SecretRequest) -> bool {
+    let scope = format!("{}:{}", request.resource, request.scope);
+    caps.caps.iter().any(|cap| {
+        cap.covers("use", "secret", &scope)
+            && !cap.is_expired()
+            && !cap
+                .condition
+                .as_ref()
+                .is_some_and(|condition| condition.is_stale_in(cube.current_state().as_str()))
+    })
+}
+
+/// ล้างค่า secret ใน env pairs (best-effort zeroize)
 fn zeroize_env(env: &mut [(String, String)]) {
     for (_, v) in env.iter_mut() {
         zeroize_secret(v);
@@ -2752,6 +2780,68 @@ network: {{allow: [], deny: ['10.0.0.0/8']}}
         assert!(log.contains("lease-exhausted"));
         // audit ทั้งไฟล์ต้องไม่มีค่า secret เลย
         assert!(!log.contains("TOP-SECRET-XYZ"), "value ห้ามลง audit เด็ดขาด");
+    }
+
+    #[test]
+    fn issued_secret_lease_requires_retained_authority_without_recharging_issuance() {
+        for revoke in [false, true] {
+            let (mut gw, mut cube, dir) = secret_harness();
+            let cap = gw
+                .caps
+                .caps
+                .iter_mut()
+                .find(|c| c.resource == "secret" && c.scope == "test_token:read")
+                .unwrap();
+            cap.max_uses = Some(1);
+            let result = gw
+                .secret_request(
+                    &mut cube,
+                    Some(&secret_body("process.exec", "test_token", "read", "low")),
+                )
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            let id = value["lease_id"].as_str().unwrap();
+            assert_eq!(
+                gw.caps
+                    .caps
+                    .iter()
+                    .find(|c| c.resource == "secret" && c.scope == "test_token:read")
+                    .unwrap()
+                    .used_count,
+                1
+            );
+            if revoke {
+                gw.caps.revoke_where(|cap| cap.resource == "secret");
+            }
+            let result = gw.dispatch(
+                &mut cube,
+                &ToolRequest {
+                    tool: "process.exec".into(),
+                    path: "/usr/bin/printenv".into(),
+                    content: Some(
+                        serde_json::json!({"argv": ["AIVM_SECRET_TEST_TOKEN_READ"], "secret": id})
+                            .to_string(),
+                    ),
+                },
+            );
+            if revoke {
+                assert!(matches!(result, Err(ToolError::Denied(_))));
+                assert_eq!(
+                    gw.secret_broker_mut().unwrap().get_lease(id).unwrap().uses,
+                    0
+                );
+                assert!(std::fs::read_to_string(dir.join("audit.jsonl"))
+                    .unwrap()
+                    .contains("secret-capability-revoked"));
+            } else {
+                assert!(
+                    result.unwrap().ok,
+                    "issued lease must survive exhausted issuance quota"
+                );
+            }
+            aivm_audit::clear_flags(&dir);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     // G4: exec ไม่แนบ lease = ไม่มี secret ใน env (ไม่รั่วข้าม run)

@@ -471,9 +471,7 @@ impl Runtime {
                 }
                 restore_cap_usage(&mut gateway.caps, &saved.caps);
                 // G4b: ฟื้น leases ที่ยังใช้ได้ (หมดอายุ/หมดโควต้า/จบแล้วทิ้ง)
-                if let Some(broker) = gateway.secret_broker_mut() {
-                    broker.restore(saved.leases);
-                }
+                gateway.restore_secret_leases(&cube, saved.leases);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // A dangling symlink is not a fresh state file.
@@ -1814,6 +1812,8 @@ runtime:
   isolation: sandbox
 tools:
   allow: [/usr/bin/printenv]
+capabilities:
+  initial: [read:workspace, search:code, "secret:test_tok:write"]
 secrets:
   allow: ["test_tok:write"]
   hitl_required_for: ["high"]
@@ -2171,5 +2171,67 @@ secrets:
         assert_eq!(reduced.gateway.caps.caps[0].used_count, 4);
         aivm_audit::clear_flags(&base);
         std::fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn restart_invalidates_secret_leases_after_operator_revocation() {
+        use std::os::unix::fs::PermissionsExt;
+        for change in ["capability", "value", "file", "policy", "uses", "ttl"] {
+            let (rt, base) = test_runtime(&format!("secret-revoke-{change}"));
+            let mut cfg = rt.config.clone();
+            drop(rt);
+            cfg.capabilities.initial = vec!["secret:credential:read".into()];
+            cfg.secrets.allow = vec!["credential:read".into()];
+            cfg.secrets.low_risk_allow = vec!["credential:read".into()];
+            let path = base.join("secrets.yaml");
+            std::fs::write(&path, "credential: CURRENT-VALUE\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let mut rt = Runtime::init(cfg.clone(), base.clone()).unwrap();
+            let result = rt
+                .gateway
+                .secret_request(
+                    &mut rt.cube,
+                    Some(
+                        &serde_json::json!({
+                            "tool": "process.exec", "resource": "credential", "scope": "read",
+                            "purpose": "test", "risk": "low", "max_uses": 3, "ttl_seconds": 300
+                        })
+                        .to_string(),
+                    ),
+                )
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            let id = value["lease_id"].as_str().unwrap();
+            drop(rt); // issuance checkpoint is the only persisted state
+            let mut unchanged = Runtime::init(cfg.clone(), base.clone()).unwrap();
+            assert!(unchanged
+                .gateway
+                .secret_broker_mut()
+                .unwrap()
+                .get_lease(id)
+                .is_some());
+            drop(unchanged);
+            match change {
+                "capability" => cfg.capabilities.initial = vec!["read:workspace".into()],
+                "value" => std::fs::write(&path, "credential: ROTATED-VALUE\n").unwrap(),
+                "file" => std::fs::remove_file(&path).unwrap(),
+                "policy" => cfg.secrets.allow.clear(),
+                "uses" => cfg.secrets.max_uses_allowed = 1,
+                "ttl" => cfg.secrets.max_ttl_seconds = 60,
+                _ => unreachable!(),
+            }
+            let mut restored = Runtime::init(cfg, base.clone()).unwrap();
+            assert!(
+                restored
+                    .gateway
+                    .secret_broker_mut()
+                    .unwrap()
+                    .get_lease(id)
+                    .is_none(),
+                "{change}"
+            );
+            assert!(restored.approve_secret_lease(id, "operator").is_err());
+            aivm_audit::clear_flags(&base);
+            std::fs::remove_dir_all(base).unwrap();
+        }
     }
 }
