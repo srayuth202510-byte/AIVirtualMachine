@@ -9,7 +9,7 @@
 //! หลักซื่อสัตย์: กลไกไหนใช้ไม่ได้ในเครื่องนั้นจะถูกรายงานใน
 //! `ExecOutcome.degraded` + `SandboxProbe` อย่างเปิดเผย ไม่เงียบหาย
 
-use aivm_policy::{Decision, Policy};
+use aivm_policy::{Decision, EvalContext, Policy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
@@ -798,8 +798,10 @@ pub fn validate(spec: &ExecSpec, policy: &Policy) -> Result<PathBuf, SandboxErro
         }
     }
     // 3. allowlist ของ policy (deny ชนะเสมออยู่ใน evaluate อยู่แล้ว)
+    //    ชั้นนี้ไม่ถือ state ของ cube: conditional rules (มี `when`) ถูกตรวจ
+    //    ซ้ำที่ gateway ด้วย ctx จริง — ที่นี่ยังคุม unconditional + CEL พัง
     let scope = canon.to_string_lossy().to_string();
-    match policy.evaluate_process(&scope) {
+    match policy.evaluate_process(&scope, &EvalContext::default()) {
         (Decision::Allow, _) => {}
         (Decision::Deny, rule) => {
             return Err(bad(&format!(
@@ -946,7 +948,9 @@ pub fn revalidate_exe(canon: &Path, policy: &Policy) -> Result<(), SandboxError>
         return Err(bad("exe path changed after validate"));
     }
     let scope = canon.to_string_lossy().to_string();
-    match policy.evaluate_process(&scope) {
+    // ไม่มี ctx ที่ชั้น revalidate (เหมือน validate ด้านบน) — conditional
+    // rules ถูก gateway คุมไว้แล้วด้วย state จริง
+    match policy.evaluate_process(&scope, &EvalContext::default()) {
         (Decision::Allow, _) => Ok(()),
         (Decision::Deny, rule) => Err(bad(&format!(
             "exe not allowlisted on revalidate ({})",
@@ -1743,7 +1747,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(", ");
         Policy::from_yaml(&format!(
-            "name: t\nprocess:\n  allow: [{allow_list}]\n  deny: [/bin/sh, /bin/bash]\n"
+            "name: t\nfilesystem: {{deny: ['**/.env*']}}\nprocess:\n  allow: [{allow_list}]\n  deny: [/bin/sh, /bin/bash]\nnetwork: {{allow: [], deny: ['10.0.0.0/8']}}\n"
         ))
         .unwrap()
     }

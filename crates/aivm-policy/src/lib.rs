@@ -123,6 +123,9 @@ impl Policy {
         let policy: Self =
             serde_yaml::from_str(text).map_err(|e| PolicyError::Parse(e.to_string()))?;
         policy.validate_syntax()?;
+        // เชิงความหมายด้วย — โหลด YAML ตรง ๆ ต้องได้ policy ชุดเดียวกับ
+        // ที่ `PolicyManager` รับ (เดิมข้ามแล้วได้ policy อ่อน ๆ)
+        policy.validate_semantics()?;
         Ok(policy)
     }
 
@@ -158,6 +161,50 @@ impl Policy {
                     "process allow entries must be concrete paths".into(),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// validate เชิงความหมาย (fail-closed) — ใช้ร่วมกันทุกทางเข้า:
+    /// `Policy::from_yaml` และ `PolicyManager::add_policy` (เดิมมีแค่ฝั่ง
+    /// manager ทำให้คนโหลด YAML ตรง ๆ ได้ policy อ่อน ๆ)
+    pub fn validate_semantics(&self) -> Result<(), PolicyError> {
+        // ต้องมี name
+        if self.name.is_empty() {
+            return Err(PolicyError::Parse("policy name is required".into()));
+        }
+        // deny_overrides ต้องเป็น true (deny-override คือ fail-closed ของ §13)
+        if !self.deny_overrides {
+            return Err(PolicyError::Parse(
+                "deny_overrides must be true for security".into(),
+            ));
+        }
+        // ต้องมี deny list ขั้นต่ำสำหรับ filesystem (defense in depth)
+        if self.filesystem.deny.is_empty() {
+            return Err(PolicyError::Parse(
+                "filesystem deny list must not be empty".into(),
+            ));
+        }
+        // process deny ต้องมี shell ขั้นต่ำ
+        let has_shell_deny = self
+            .process
+            .deny
+            .iter()
+            .any(|d| d.contains("sh") || d.contains("bash"));
+        if !has_shell_deny {
+            return Err(PolicyError::Parse(
+                "process deny must include shell (/bin/sh or /bin/bash)".into(),
+            ));
+        }
+        // network deny ต้องมี private ranges
+        let has_private_deny =
+            self.network.deny.iter().any(|d| {
+                d.starts_with("10.") || d.starts_with("192.168.") || d.starts_with("172.")
+            });
+        if !has_private_deny {
+            return Err(PolicyError::Parse(
+                "network deny must include private IP ranges".into(),
+            ));
         }
         Ok(())
     }
@@ -236,21 +283,78 @@ impl Policy {
         (Decision::Deny, Some("default-deny".into()))
     }
 
-    pub fn evaluate_process(&self, executable: &str) -> (Decision, Option<String>) {
+    /// ประเมินสิทธิ์รัน executable — เดิมไม่ได้ดู conditional rules เลยทำให้
+    /// process deny rule เงียบหาย (fail-open); ตอนนี้ประเมิน rule ครบทั้ง
+    /// deny/allow + state gate แบบเดียวกับ filesystem
+    /// หมายเหตุ: process rule จับคู่ด้วย `resource: process` เท่านั้น (ไม่สน
+    /// action) เพราะการตัดสินใจ process มีมุมมองเดียว
+    pub fn evaluate_process(
+        &self,
+        executable: &str,
+        ctx: &EvalContext,
+    ) -> (Decision, Option<String>) {
         if self.validate_syntax().is_err() {
             return (Decision::Deny, Some("invalid-policy".into()));
         }
+        if !self.rules_are_evaluable(ctx) {
+            return (Decision::Deny, Some("policy-evaluation-error".into()));
+        }
+        // 1. deny list ชนะเสมอ (deny-overrides)
         for pat in &self.process.deny {
             if match_pattern(pat, executable) {
                 return (Decision::Deny, Some(format!("deny-list:{pat}")));
             }
         }
+        // 2. rule แบบมีเงื่อนไขที่ effect: deny
+        for rule in &self.rules {
+            if rule.effect.as_deref() == Some("deny")
+                && rule.resource == "process"
+                && match_pattern(&rule.scope, executable)
+                && rule_matches(rule, ctx)
+            {
+                return (Decision::Deny, Some(format!("rule:{}", rule.id)));
+            }
+        }
+        // 3. allow list — แต่ allow-rule แบบมีเงื่อนไขที่ครอบคำขอนี้จะเป็น
+        //    state gate: ไม่มี rule ตรงสักใบ = สิทธิ์ allow พื้นฐานถูกระงับ
         for pat in &self.process.allow {
             if match_pattern(pat, executable) {
-                return (Decision::Allow, Some(format!("allow-list:{pat}")));
+                if self.gated_process(executable, ctx) {
+                    return (Decision::Allow, Some(format!("allow-list:{pat}")));
+                }
+                return (Decision::Deny, Some("state-gate".into()));
+            }
+        }
+        // 4. allow-rule แบบมีเงื่อนไข
+        for rule in &self.rules {
+            let effect = rule.effect.as_deref().unwrap_or("allow");
+            if effect == "allow"
+                && rule.resource == "process"
+                && match_pattern(&rule.scope, executable)
+                && rule_matches(rule, ctx)
+            {
+                return (Decision::Allow, Some(format!("rule:{}", rule.id)));
             }
         }
         (Decision::Deny, Some("default-deny".into()))
+    }
+
+    /// state gate ของ process (เทียบ scope ด้วย `resource: process` เท่านั้น)
+    fn gated_process(&self, executable: &str, ctx: &EvalContext) -> bool {
+        let mut scoped = false;
+        for rule in &self.rules {
+            let effect = rule.effect.as_deref().unwrap_or("allow");
+            if effect == "allow"
+                && rule.resource == "process"
+                && match_pattern(&rule.scope, executable)
+            {
+                scoped = true;
+                if rule_matches(rule, ctx) {
+                    return true;
+                }
+            }
+        }
+        !scoped
     }
 
     pub fn evaluate_network(&self, target: &str, ctx: &EvalContext) -> (Decision, Option<String>) {
@@ -353,7 +457,7 @@ impl Policy {
         match resource {
             "filesystem" => self.evaluate_fs(action, scope, ctx),
             "network" => self.evaluate_network(scope, ctx),
-            "process" => self.evaluate_process(scope),
+            "process" => self.evaluate_process(scope, ctx),
             _ => (Decision::Deny, Some("unknown-resource".into())),
         }
     }
@@ -654,46 +758,10 @@ impl PolicyManager {
             .map(|vs| vs.iter().map(|v| v.version).collect())
     }
 
-    /// Validate policy structure (fail-closed)
+    /// Validate policy structure (fail-closed) — ตัวจริงอยู่ที่
+    /// `Policy::validate_semantics` (ทางเข้าเดียวกันทุกที่)
     fn validate_policy(&self, policy: &Policy) -> Result<(), PolicyError> {
-        // ต้องมี name
-        if policy.name.is_empty() {
-            return Err(PolicyError::Parse("policy name is required".into()));
-        }
-        // deny_overrides ควรเป็น true (security best practice)
-        if !policy.deny_overrides {
-            return Err(PolicyError::Parse(
-                "deny_overrides must be true for security".into(),
-            ));
-        }
-        // ต้องมี deny list ขั้นต่ำสำหรับ filesystem (defense in depth)
-        if policy.filesystem.deny.is_empty() {
-            return Err(PolicyError::Parse(
-                "filesystem deny list must not be empty".into(),
-            ));
-        }
-        // process deny ต้องมี shell ขั้นต่ำ
-        let has_shell_deny = policy
-            .process
-            .deny
-            .iter()
-            .any(|d| d.contains("sh") || d.contains("bash"));
-        if !has_shell_deny {
-            return Err(PolicyError::Parse(
-                "process deny must include shell (/bin/sh or /bin/bash)".into(),
-            ));
-        }
-        // network deny ต้องมี private ranges
-        let has_private_deny =
-            policy.network.deny.iter().any(|d| {
-                d.starts_with("10.") || d.starts_with("192.168.") || d.starts_with("172.")
-            });
-        if !has_private_deny {
-            return Err(PolicyError::Parse(
-                "network deny must include private IP ranges".into(),
-            ));
-        }
-        Ok(())
+        policy.validate_semantics()
     }
 
     /// โหลด policy จาก YAML string พร้อม validate
@@ -822,6 +890,24 @@ impl PolicyEvaluator {
             response_bytes: req.response_bytes,
             timeout_ms: None,
         };
+        // 4. ตรวจ policy ก่อน — ห้ามตัดงบ capability ก่อนรู้ผล policy:
+        //    request ที่ policy ห้ามต้องไม่กิน `used_count`/bytes (ไม่งั้น
+        //    denied burst เผาโควตา agent ได้ = self-DoS + บัญชีใช้งานเท็จ)
+        let (decision, reason_opt) = match req.resource {
+            "filesystem" => policy.evaluate_fs(req.action, req.scope, req.ctx),
+            "network" => policy.evaluate_network(req.scope, req.ctx),
+            "process" => policy.evaluate_process(req.scope, req.ctx),
+            _ => (Decision::Deny, Some("unknown-resource".into())),
+        };
+        if decision == Decision::Deny {
+            return (
+                Decision::Deny,
+                reason_opt.unwrap_or_else(|| "no-reason".into()),
+                policy_version,
+            );
+        }
+
+        // 5. ตัด capability (ตัดครั้งเดียว หลังผ่าน policy แล้วเท่านั้น)
         if caps
             .authorize_with_context(req.action, req.resource, req.scope, &context)
             .is_err()
@@ -833,16 +919,11 @@ impl PolicyEvaluator {
             );
         }
 
-        // 5. ตรวจสอบ Policy (fail-closed)
-        let (decision, reason_opt) = match req.resource {
-            "filesystem" => policy.evaluate_fs(req.action, req.scope, req.ctx),
-            "network" => policy.evaluate_network(req.scope, req.ctx),
-            "process" => policy.evaluate_process(req.scope),
-            _ => (Decision::Deny, Some("unknown-resource".into())),
-        };
-
-        let reason = reason_opt.unwrap_or_else(|| "no-reason".into());
-        (decision, reason, policy_version)
+        (
+            Decision::Allow,
+            reason_opt.unwrap_or_else(|| "no-reason".into()),
+            policy_version,
+        )
     }
 }
 
@@ -983,8 +1064,197 @@ system:
     #[test]
     fn shell_denied() {
         let p = policy();
-        assert_eq!(p.evaluate_process("/bin/sh").0, Decision::Deny);
-        assert_eq!(p.evaluate_process("/usr/bin/cargo").0, Decision::Allow);
+        let ctx = EvalContext::default();
+        assert_eq!(p.evaluate_process("/bin/sh", &ctx).0, Decision::Deny);
+        assert_eq!(
+            p.evaluate_process("/usr/bin/cargo", &ctx).0,
+            Decision::Allow
+        );
+    }
+
+    /// regression #11: process rule แบบมีเงื่อนไขถูกตรวจซ้ำ — deny ต้อง fire
+    /// ตาม state และไม่ fire เมื่อเงื่อนไขไม่ตรง
+    #[test]
+    fn process_conditional_deny_rule_is_enforced() {
+        let p = Policy::from_yaml(
+            r#"
+name: proc-conditional
+deny_overrides: true
+filesystem:
+  read: [/workspace]
+  write: [/workspace/src]
+  deny: ["**/.env*"]
+process:
+  allow: [/usr/bin/git]
+  deny: [/bin/sh]
+network:
+  allow: [github.com]
+  deny: ["10.0.0.0/8"]
+rules:
+  - id: no-git-in-analyze
+    action: execute
+    resource: process
+    scope: /usr/bin/git
+    when: "state == 'ANALYZE'"
+    effect: deny
+"#,
+        )
+        .unwrap();
+        let analyze = EvalContext {
+            state: "ANALYZE".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            p.evaluate_process("/usr/bin/git", &analyze).0,
+            Decision::Deny
+        );
+        let modify = EvalContext {
+            state: "MODIFY".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            p.evaluate_process("/usr/bin/git", &modify).0,
+            Decision::Allow
+        );
+        // path อื่นใน allow list ไม่โดน rule นี้
+        assert_eq!(p.evaluate_process("/bin/sh", &analyze).0, Decision::Deny);
+    }
+
+    /// regression #11: allow-rule ที่มี `when` ทำหน้าที่ state gate — ห้าม
+    /// allow list พื้นฐานข้าม state ที่ operator ระบุ
+    #[test]
+    fn process_state_gate_suspends_base_allow() {
+        let p = Policy::from_yaml(
+            r#"
+name: proc-gate
+deny_overrides: true
+filesystem:
+  read: [/workspace]
+  write: [/workspace/src]
+  deny: ["**/.env*"]
+process:
+  allow: [/usr/bin/cargo]
+  deny: [/bin/sh]
+network:
+  allow: [github.com]
+  deny: ["10.0.0.0/8"]
+rules:
+  - id: cargo-only-in-modify
+    action: execute
+    resource: process
+    scope: /usr/bin/cargo
+    when: "state == 'MODIFY'"
+    effect: allow
+"#,
+        )
+        .unwrap();
+        let analyze = EvalContext {
+            state: "ANALYZE".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            p.evaluate_process("/usr/bin/cargo", &analyze).0,
+            Decision::Deny
+        );
+        let modify = EvalContext {
+            state: "MODIFY".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            p.evaluate_process("/usr/bin/cargo", &modify).0,
+            Decision::Allow
+        );
+    }
+
+    /// regression #11: CEL พังใน process rule → DENY (fail-closed ไม่ใช่
+    /// ข้าม rule แล้วปล่อย allow list ผ่าน)
+    #[test]
+    fn process_rules_with_broken_cel_fail_closed() {
+        let mut p = policy();
+        p.rules.push(Rule {
+            id: "broken".into(),
+            action: "execute".into(),
+            resource: "process".into(),
+            scope: "/usr/bin/git".into(),
+            when: Some("state ==".into()),
+            effect: Some("deny".into()),
+        });
+        let ctx = EvalContext::default();
+        let (d, reason) = p.evaluate_process("/usr/bin/git", &ctx);
+        assert_eq!(d, Decision::Deny);
+        // fail-closed: เหตุผลต้องระบุได้ ไม่ใช่ allow list รอดผ่าน
+        assert!(reason.is_some());
+    }
+
+    /// regression #10: ตัดสิน policy ก่อน — คำขอที่ policy ห้ามต้องไม่กินงบ
+    /// capability (ไม่งั้น denied burst เผาโควตา = self-DoS + บัญชีเท็จ)
+    #[test]
+    fn policy_deny_does_not_consume_capability_budget() {
+        let mut mgr = PolicyManager::new();
+        // PolicyEvaluator ดึง policy id "default" เสมอ
+        mgr.load_from_yaml(
+            "default",
+            1,
+            r#"
+name: budget-test
+deny_overrides: true
+filesystem:
+  read: [/workspace]
+  write: [/workspace/src]
+  deny: ["**/.env*"]
+process:
+  allow: [/usr/bin/cargo]
+  deny: [/bin/sh]
+network:
+  allow: [github.com]
+  deny: ["10.0.0.0/8"]
+"#,
+        )
+        .unwrap();
+        let evaluator = PolicyEvaluator::new(mgr);
+        let mut caps = CapabilitySet::default();
+        caps.grant(
+            aivm_capability::Capability::new("read", "filesystem", "/workspace")
+                .with_constraints(aivm_capability::Constraints::new().with_max_calls(1)),
+        );
+        let ctx = EvalContext::default();
+        // คำขอที่ capability ครอบคลุม แต่ policy ห้าม (**/.env*)
+        let denied = EvalRequest {
+            agent_id: "agent-1",
+            action: "read",
+            resource: "filesystem",
+            scope: "/workspace/.env",
+            ctx: &ctx,
+            request_bytes: None,
+            protocol: None,
+            port: None,
+            response_bytes: None,
+        };
+        let (d, reason, _) = evaluator.evaluate(denied, &mut caps);
+        assert_eq!(d, Decision::Deny);
+        assert_eq!(
+            reason, "deny-list:**/.env*",
+            "policy deny reason must be surfaced"
+        );
+        assert_eq!(
+            caps.caps[0].used_count, 0,
+            "policy deny must not burn call budget"
+        );
+        // งบยังอยู่ครบ: คำขอที่ policy อนุญาตใช้โควตาใบนี้ได้พอดี
+        let allowed = EvalRequest {
+            agent_id: "agent-1",
+            action: "read",
+            resource: "filesystem",
+            scope: "/workspace/src/main.rs",
+            ctx: &ctx,
+            request_bytes: None,
+            protocol: None,
+            port: None,
+            response_bytes: None,
+        };
+        let (d, _, _) = evaluator.evaluate(allowed, &mut caps);
+        assert_eq!(d, Decision::Allow);
+        assert_eq!(caps.caps[0].used_count, 1);
     }
 
     #[test]
@@ -1013,10 +1283,13 @@ name: gated
 filesystem:
   read: [/workspace]
   write: [/workspace/src]
-  deny: []
+  deny: ["**/.env*"]
+process:
+  allow: []
+  deny: [/bin/sh]
 network:
   allow: [github.com]
-  deny: []
+  deny: ["10.0.0.0/8"]
 rules:
   - id: allow_write_src
     action: write
@@ -1098,9 +1371,16 @@ rules:
         let p = Policy::from_yaml(
             r#"
 name: cidr
+filesystem:
+  read: [/workspace]
+  write: [/workspace/src]
+  deny: ["**/.env*"]
+process:
+  allow: []
+  deny: [/bin/sh]
 network:
   allow: ["2606:4700::/32"]
-  deny: ["8.8.8.0/24", "2606:4700::/32"]
+  deny: ["8.8.8.0/24", "2606:4700::/32", "10.0.0.0/8"]
 "#,
         )
         .unwrap();
@@ -1127,9 +1407,16 @@ network:
         let p = Policy::from_yaml(
             r#"
 name: denyhost
+filesystem:
+  read: [/workspace]
+  write: [/workspace/src]
+  deny: ["**/.env*"]
+process:
+  allow: []
+  deny: [/bin/sh]
 network:
   allow: [evil.example]
-  deny: [evil.example]
+  deny: [evil.example, "10.0.0.0/8"]
 "#,
         )
         .unwrap();
@@ -1159,9 +1446,16 @@ network:
         let p = Policy::from_yaml(
             r#"
 name: netgate
+filesystem:
+  read: [/workspace]
+  write: [/workspace/src]
+  deny: ["**/.env*"]
+process:
+  allow: []
+  deny: [/bin/sh]
 network:
   allow: [github.com]
-  deny: []
+  deny: ["10.0.0.0/8"]
 rules:
   - id: allow_net_deploy
     action: network

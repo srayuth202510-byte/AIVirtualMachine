@@ -182,7 +182,9 @@ fn prepare_inner(
     add(&rules, exe, EXECUTE | READ_FILE)?;
     for binary in &policy.process.allow {
         let path = Path::new(binary);
-        if path.is_file() && policy.evaluate_process(binary).0 == Decision::Allow {
+        if path.is_file()
+            && policy.evaluate_process(binary, &EvalContext::default()).0 == Decision::Allow
+        {
             add(&rules, path, EXECUTE | READ_FILE)?;
         }
     }

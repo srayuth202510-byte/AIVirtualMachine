@@ -94,7 +94,7 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
     let ws_str = ws_abs.to_string_lossy().to_string();
 
     let policy = Policy::from_yaml(&format!(
-        "name: demo\nfilesystem:\n  read: [{ws_str}]\n  write: [{ws_str}/src]\n  deny: ['**/.env*', '**/secrets/**']\nprocess: {{allow: [], deny: [/bin/sh]}}\nnetwork: {{allow: [], deny: []}}\n"
+        "name: demo\nfilesystem:\n  read: [{ws_str}]\n  write: [{ws_str}/src]\n  deny: ['**/.env*', '**/secrets/**']\nprocess: {{allow: [], deny: [/bin/sh]}}\nnetwork: {{allow: [], deny: ['10.0.0.0/8']}}\n"
     ))
     .map_err(|e| RuntimeError::Policy(e.to_string()))?;
 

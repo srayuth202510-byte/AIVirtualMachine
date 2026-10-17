@@ -26,7 +26,7 @@ fn gateway() -> (Fixture, ToolGateway, Cube) {
     std::fs::write(root.0.join(".env"), "SYNTHETIC_SECRET=test").unwrap();
     let scope = root.0.to_string_lossy();
     let policy = Policy::from_yaml(&format!(
-        "name: detector\nfilesystem:\n  read: [{scope}]\n  deny: ['**/.env*']\n"
+        "name: detector\nfilesystem:\n  read: [{scope}]\n  deny: ['**/.env*']\nprocess: {{allow: [], deny: [/bin/sh]}}\nnetwork: {{allow: [], deny: ['10.0.0.0/8']}}\n"
     ))
     .unwrap();
     let caps = CapabilitySet::new(vec![Capability::new("read", "filesystem", &scope)]);

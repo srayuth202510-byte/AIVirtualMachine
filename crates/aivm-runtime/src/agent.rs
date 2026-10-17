@@ -767,7 +767,7 @@ mod tests {
 
         let ws_str = ws.to_string_lossy().to_string();
         let policy = Policy::from_yaml(&format!(
-            "name: agent-test\nfilesystem:\n  read: [{ws_str}]\n  write: [{ws_str}/src]\n  deny: ['**/.env*']\nprocess: {{allow: [], deny: [/bin/sh]}}\nnetwork: {{allow: [], deny: []}}\n"
+            "name: agent-test\nfilesystem:\n  read: [{ws_str}]\n  write: [{ws_str}/src]\n  deny: ['**/.env*']\nprocess: {{allow: [], deny: [/bin/sh]}}\nnetwork: {{allow: [], deny: ['10.0.0.0/8']}}\n"
         ))
         .unwrap();
         let caps = CapabilitySet::new(vec![

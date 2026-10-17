@@ -30,7 +30,7 @@ fn gateway(tag: &str) -> (ToolGateway, Cube, std::path::PathBuf) {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     let ws = dir.canonicalize().unwrap();
     let policy = Policy::from_yaml(&format!(
-        "name: inv\nfilesystem:\n  read: [{}]\n  write: [{}/src]\n  deny: ['**/.env*', '**/secrets/**']\nprocess: {{allow: [], deny: [/bin/sh]}}\nnetwork: {{allow: [github.com], deny: []}}\n",
+        "name: inv\nfilesystem:\n  read: [{}]\n  write: [{}/src]\n  deny: ['**/.env*', '**/secrets/**']\nprocess: {{allow: [], deny: [/bin/sh]}}\nnetwork: {{allow: [github.com], deny: ['10.0.0.0/8']}}\n",
         ws.display(),
         ws.display()
     ))
@@ -97,7 +97,7 @@ fn i2_every_action_needs_capability() {
 #[test]
 fn i3_policy_judges_every_capability() {
     let p = Policy::from_yaml(
-        "name: t\nfilesystem:\n  read: [/workspace]\n  write: []\n  deny: [/workspace]\n",
+        "name: t\nfilesystem:\n  read: [/workspace]\n  write: []\n  deny: [/workspace]\nprocess: {allow: [], deny: [/bin/sh]}\nnetwork: {allow: [], deny: ['10.0.0.0/8']}\n",
     )
     .unwrap();
     let ctx = EvalContext::default();
@@ -358,7 +358,7 @@ fn i10_structural_enforcement() {
     std::fs::create_dir_all(&ws).unwrap();
     let real = std::fs::canonicalize("/bin/true").unwrap();
     let policy = Policy::from_yaml(&format!(
-        "name: t\nprocess:\n  allow: [\"{}\"]\n  deny: []\n",
+        "name: t\nfilesystem: {{deny: ['**/.env*']}}\nprocess:\n  allow: [\"{}\"]\n  deny: [/bin/sh]\nnetwork: {{allow: [], deny: ['10.0.0.0/8']}}\n",
         real.display()
     ))
     .unwrap();

@@ -742,7 +742,7 @@ mod linux {
             std::fs::write(&denied, "hidden").unwrap();
             std::os::unix::fs::symlink(&denied, ws.join("link")).unwrap();
             let exe = std::fs::canonicalize("/usr/bin/true").unwrap();
-            let policy = Policy::from_yaml(&format!("name: test\nprocess:\n  allow: [{}]\nfilesystem:\n  read: ['{}/**']\n  deny: ['{}']\n", exe.display(), ws.display(), denied.display())).unwrap();
+            let policy = Policy::from_yaml(&format!("name: test\nprocess:\n  allow: [{}]\n  deny: [/bin/sh]\nfilesystem:\n  read: ['{}/**']\n  deny: ['{}']\nnetwork: {{allow: [], deny: ['10.0.0.0/8']}}\n", exe.display(), ws.display(), denied.display())).unwrap();
             let (grants, _) =
                 landlock::prepare_mounts(&ws, &exe, &policy, 1024 * 1024, None).unwrap();
             assert!(!grants

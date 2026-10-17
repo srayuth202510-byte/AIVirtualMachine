@@ -503,7 +503,7 @@ mod tests {
         std::fs::write(&rootfs, b"fake-rootfs").unwrap();
         let real = std::fs::canonicalize("/bin/true").unwrap();
         let policy = Policy::from_yaml(&format!(
-            "name: t\nprocess:\n  allow: [\"{}\"]\n  deny: []\n",
+            "name: t\nfilesystem: {{deny: ['**/.env*']}}\nprocess:\n  allow: [\"{}\"]\n  deny: [/bin/sh]\nnetwork: {{allow: [], deny: ['10.0.0.0/8']}}\n",
             real.display()
         ))
         .unwrap();
@@ -760,7 +760,7 @@ mod tests {
             let ws = test_ws("realboot");
             let real = std::fs::canonicalize(exe).unwrap();
             let policy = Policy::from_yaml(&format!(
-                "name: t\nprocess:\n  allow: [\"{}\"]\n  deny: []\n",
+                "name: t\nfilesystem: {{deny: ['**/.env*']}}\nprocess:\n  allow: [\"{}\"]\n  deny: [/bin/sh]\nnetwork: {{allow: [], deny: ['10.0.0.0/8']}}\n",
                 real.display()
             ))
             .unwrap();

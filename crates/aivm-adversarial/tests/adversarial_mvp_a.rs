@@ -51,7 +51,7 @@ fn harness(tag: &str) -> (ToolGateway, Cube, std::path::PathBuf) {
     std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
     let ws = dir.canonicalize().unwrap();
     let yaml = format!(
-        "name: t\nfilesystem:\n  read: [{}]\n  write: [{}/src]\n  deny: ['**/.env*', '**/secrets/**']\nprocess: {{allow: [], deny: []}}\nnetwork: {{allow: [], deny: []}}\n",
+        "name: t\nfilesystem:\n  read: [{}]\n  write: [{}/src]\n  deny: ['**/.env*', '**/secrets/**']\nprocess: {{allow: [], deny: [/bin/sh]}}\nnetwork: {{allow: [], deny: ['10.0.0.0/8']}}\n",
         ws.display(),
         ws.display()
     );
@@ -99,7 +99,7 @@ fn symlink_escape_must_deny() {
     std::os::unix::fs::symlink("/etc", dir.join("src").join("evil")).unwrap();
     let ws = dir.canonicalize().unwrap();
     let policy = Policy::from_yaml(&format!(
-        "name: t\nfilesystem:\n  read: [{}]\n  write: [{}/src]\n  deny: []\n",
+        "name: t\nfilesystem:\n  read: [{}]\n  write: [{}/src]\n  deny: ['**/.env*']\nprocess: {{allow: [], deny: [/bin/sh]}}\nnetwork: {{allow: [], deny: ['10.0.0.0/8']}}\n",
         ws.display(),
         ws.display()
     ))
@@ -120,7 +120,10 @@ fn symlink_escape_must_deny() {
 fn shell_and_unknown_tools_must_deny() {
     let (mut gw, mut cube, dir) = harness("proc");
     let p = test_policy();
-    assert_eq!(p.evaluate_process("/bin/sh").0, Decision::Deny);
+    assert_eq!(
+        p.evaluate_process("/bin/sh", &Default::default()).0,
+        Decision::Deny
+    );
     for tool in [
         "shell.exec",
         "process.spawn",
@@ -169,9 +172,16 @@ fn network_cidr_and_port_bypass_must_deny() {
     let p = Policy::from_yaml(
         r#"
 name: adv-net
+filesystem:
+  read: [/workspace]
+  write: [/workspace/src]
+  deny: ["**/.env*"]
+process:
+  allow: []
+  deny: [/bin/sh]
 network:
   allow: [github.com]
-  deny: ["8.8.8.0/24", "evil.example"]
+  deny: ["8.8.8.0/24", "evil.example", "10.0.0.0/8"]
 rules:
   - id: gate
     action: network
@@ -323,7 +333,7 @@ fn state_gate_holds_despite_capability() {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     let ws = dir.canonicalize().unwrap();
     let policy = Policy::from_yaml(&format!(
-        "name: gated\nfilesystem:\n  read: [{}]\n  write: [{}/src]\n  deny: []\nrules:\n  - id: allow_write_src\n    action: write\n    resource: filesystem\n    scope: {}/src/**\n    when: \"state in ['MODIFY', 'VALIDATE'] && confidence >= 0.8\"\n",
+        "name: gated\nfilesystem:\n  read: [{}]\n  write: [{}/src]\n  deny: ['**/.env*']\nprocess: {{allow: [], deny: [/bin/sh]}}\nnetwork: {{allow: [], deny: ['10.0.0.0/8']}}\nrules:\n  - id: allow_write_src\n    action: write\n    resource: filesystem\n    scope: {}/src/**\n    when: \"state in ['MODIFY', 'VALIDATE'] && confidence >= 0.8\"\n",
         ws.display(), ws.display(), ws.display()
     ))
     .unwrap();
@@ -363,10 +373,11 @@ fn exec_harness(
     let deny_list = deny
         .iter()
         .map(|s| format!("\"{s}\""))
+        .chain(std::iter::once("\"/bin/sh\"".to_string()))
         .collect::<Vec<_>>()
         .join(", ");
     let policy = Policy::from_yaml(&format!(
-        "name: t\nprocess:\n  allow: [{allow_list}]\n  deny: [{deny_list}]\n"
+        "name: t\nfilesystem:\n  read: [/workspace]\n  write: [/workspace/src]\n  deny: ['**/.env*']\nprocess:\n  allow: [{allow_list}]\n  deny: [{deny_list}]\nnetwork:\n  allow: []\n  deny: ['10.0.0.0/8']\n"
     ))
     .unwrap();
     let ws = dir.canonicalize().unwrap();
@@ -455,6 +466,30 @@ fn exec_policy_deny_wins() {
     let real2 = real.clone();
     let (mut gw, mut cube, dir) = exec_harness("deny", std::slice::from_ref(&real), &[real2], true);
     assert!(gw.dispatch(&mut cube, &exec_req("/bin/true", &[])).is_err());
+    adv_clean(&dir);
+}
+
+/// §38: conditional process deny (`when` + `resource: process`) ห้ามถูก
+/// allowlist + capability ข้าม — ต้อง DENY พร้อม audit record (I-7)
+#[test]
+fn conditional_process_deny_rule_must_not_bypass() {
+    let real = std::fs::canonicalize("/bin/true")
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let (mut gw, mut cube, dir) = exec_harness("cond", std::slice::from_ref(&real), &[], true);
+    gw.policy.rules.push(aivm_policy::Rule {
+        id: "no-exec-in-init".into(),
+        action: "execute".into(),
+        resource: "process".into(),
+        scope: real,
+        // cube เริ่มต้นที่ INIT — rule นี้ต้องยิงทันที
+        when: Some("state == 'INIT'".into()),
+        effect: Some("deny".into()),
+    });
+    assert!(gw.dispatch(&mut cube, &exec_req("/bin/true", &[])).is_err());
+    let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+    assert!(log.contains("no-exec-in-init"), "audit: {log}");
     adv_clean(&dir);
 }
 

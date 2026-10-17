@@ -887,6 +887,16 @@ impl ToolGateway {
             self.audit_decision(cube, "execute", &scope, "deny", "no-capability", "error")?;
             return Err(ToolError::Denied("no capability".into()));
         }
+        // process policy แบบมีเงื่อนไข (deny rule/state gate ที่มี `when`)
+        // ต้องเห็น state จริงของ cube — sandbox ชั้นในไม่มี ctx จึงเช็กซ้ำ
+        // ตรงนี้ด้วย ctx จริง (fail-closed ทั้งสองชั้น)
+        let (proc_decision, proc_reason) =
+            self.policy.evaluate_process(&scope, &Self::ctx_of(cube));
+        if proc_decision == Decision::Deny {
+            let rule = proc_reason.unwrap_or_else(|| "process-policy".into());
+            self.audit_decision(cube, "execute", &scope, "deny", &rule, "error")?;
+            return Err(ToolError::Denied(rule));
+        }
         // secret lease (G4): resolve หลัง validate+caps (deny ก่อนหน้าไม่เผา
         // one-time lease) — value เข้า env_extra ช่องเดียว ไม่มีทางอื่น
         // หมายเหตุ borrow: คุยกับ broker ให้จบใน block เดียว (owned ออกมา)
@@ -2091,8 +2101,8 @@ filesystem:
   read: [{}]
   write: [{}/src]
   deny: ["**/.env*", "**/secrets/**"]
-process: {{allow: [], deny: []}}
-network: {{allow: [], deny: []}}
+process: {{allow: [], deny: [/bin/sh]}}
+network: {{allow: [], deny: ['10.0.0.0/8']}}
 "#,
             ws_real.display(),
             ws_real.display()
@@ -2271,6 +2281,33 @@ network: {{allow: [], deny: []}}
             },
         );
         assert!(matches!(r, Err(ToolError::Denied(_))));
+    }
+
+    /// regression #11: process rule แบบมีเงื่อนไข (`when`) ต้องถูกคุมที่
+    /// gateway ด้วย state จริงของ cube — allow list พื้นฐานข้าม rule ไม่ได้
+    #[test]
+    fn exec_denied_by_state_conditional_process_rule() {
+        let (mut gw, mut cube, dir) = exec_harness();
+        // cube เริ่มต้นที่ INIT (as_str => "INIT")
+        let exe = std::fs::canonicalize("/bin/true")
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        gw.policy.rules.push(aivm_policy::Rule {
+            id: "no-exec-in-init".into(),
+            action: "execute".into(),
+            resource: "process".into(),
+            scope: exe.clone(),
+            when: Some("state == 'INIT'".into()),
+            effect: Some("deny".into()),
+        });
+        let r = gw.exec(&mut cube, &exe, &[]);
+        assert!(matches!(r, Err(ToolError::Denied(_))), "must deny: {r:?}");
+        // decision ใหม่ทุกอันมี audit record (I-7)
+        let log = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(log.contains("no-exec-in-init"), "audit: {log}");
+        aivm_audit::clear_flags(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
