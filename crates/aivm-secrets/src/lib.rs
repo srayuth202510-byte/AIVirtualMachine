@@ -51,7 +51,10 @@ fn default_ttl_seconds() -> u64 {
 }
 
 /// Secret Lease — ตั๋วอนุญาตใช้งาน secret ชั่วคราว
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// ไม่ derive `Debug` — `value` ต้องไม่มีทางหลุดเข้า log/panic message
+/// (ใช้ `impl Debug` ที่ redact ด้านล่างแทน)
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SecretLease {
     /// Unique lease ID
     pub id: String,
@@ -74,6 +77,24 @@ pub struct SecretLease {
     pub hitl_approved: bool,
     /// Approved by (operator identity)
     pub approved_by: Option<String>,
+}
+
+/// Debug ที่ redact `value` เสมอ — log/`{:?}`/panic ห้ามโชว์ secret จริง
+/// (regression #25: derive Debug เดิมพิมพ์ค่า plain text ออกมาด้วย)
+impl std::fmt::Debug for SecretLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretLease")
+            .field("id", &self.id)
+            .field("request", &self.request)
+            .field("value", &"<redacted>")
+            .field("status", &self.status)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("uses", &self.uses)
+            .field("hitl_approved", &self.hitl_approved)
+            .field("approved_by", &self.approved_by)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,14 +551,26 @@ impl SecretBroker {
     }
 
     fn match_pattern(pattern: &str, scope: &str) -> bool {
-        // Simple glob-style matching: * matches anything
-        if pattern == "*" {
+        // "globs" ล้วน (`*`, `**`) = ตรงทุกอย่าง (เดิม `**` ตกไปเทียบ prefix
+        // ผิด ๆ แล้ว deny หุบปาก)
+        if !pattern.is_empty() && pattern.chars().all(|c| c == '*') {
             return true;
         }
+        // รูป `prefix*` ยังคงนิยาม prefix-match เดิมไว้ (scope อาจมี `/` กลาง
+        // ซึ่ง glob `*` ข้ามไม่ได้ในบาง mode — ของเดิมทำแบบนี้และใช้งานได้)
         if let Some(prefix) = pattern.strip_suffix('*') {
-            return scope.starts_with(prefix);
+            if !prefix.contains(['*', '?', '[']) {
+                return scope.starts_with(prefix);
+            }
         }
-        pattern == scope
+        // wildcard กลาง/ต้น pattern (เช่น `*token*`, `?[ab]`) ต้องเทียบด้วย
+        // glob จริง — regression #27: เดิม `*token*` ถูกตัดเป็น prefix `"*token"`
+        // แล้วไม่เคยตรงกับ scope ไหนเลย = deny list ไม่มีผล (fail-open)
+        match glob::Pattern::new(pattern) {
+            Ok(p) => p.matches(scope),
+            // pattern ไม่ถูกต้อง: เทียบตรงตัว — allow = fail-closed เสมอ
+            Err(_) => pattern == scope,
+        }
     }
 }
 
@@ -569,35 +602,44 @@ impl SecretInjector {
     /// Inject secret via file descriptor (more secure, for high-risk)
     /// Returns path to temp file with secret (caller must clean up)
     pub fn inject_file(lease: &SecretLease) -> Result<PathBuf, SecretError> {
+        // ชื่อไฟล์สุ่ม — เดิมใช้ `lease.id` ซึ่งเดาได้และมี `/` (path traversal
+        // ออกจาก temp dir ได้)
         let mut path = std::env::temp_dir();
-        path.push(format!("aivm-secret-{}.tmp", lease.id));
+        path.push(format!("aivm-secret-{}.tmp", uuid::Uuid::new_v4()));
 
-        std::fs::write(&path, &lease.value)
-            .map_err(|e| SecretError::AuditError(format!("failed to write secret file: {}", e)))?;
-
-        // Make file readable only by owner
+        // เปิดด้วย mode 0600 ตั้งแต่สร้างไฟล์: ไม่มีช่วง write-then-chmod ที่
+        // ไฟล์ถูก umask เปิดกว้างชั่วคราว + `create_new` กัน symlink ทับ
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path)
-                .map_err(|e| SecretError::AuditError(e.to_string()))?
-                .permissions();
-            perms.set_mode(0o600);
-            std::fs::set_permissions(&path, perms)
-                .map_err(|e| SecretError::AuditError(e.to_string()))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
         }
+        let mut file = opts
+            .open(&path)
+            .map_err(|e| SecretError::AuditError(format!("failed to create secret file: {}", e)))?;
+        std::io::Write::write_all(&mut file, lease.value.as_bytes())
+            .map_err(|e| SecretError::AuditError(format!("failed to write secret file: {}", e)))?;
+        // ยืนยัน flush ก่อนคืน path (กัน caller อ่านได้ไฟล์เปล่า)
+        std::io::Write::flush(&mut file)
+            .map_err(|e| SecretError::AuditError(format!("failed to flush secret file: {}", e)))?;
 
         Ok(path)
     }
 }
 
-/// Zeroize secret from memory (best effort)
+/// Zeroize secret จากหน่วยความจำ (กัน compiler ตัด dead store ทิ้ง)
 pub fn zeroize_secret(secret: &mut String) {
-    // Overwrite with zeros
+    // volatile write: คำสั่งเขียนนี้เป็น side effect ที่ LLVM ห้ามลบ
+    // (regression #28: เดิมเป็น dead store ปกติแล้วถูก optimize ทิ้งได้)
+    // SAFETY: เขียนทับ byte ของ string ตัวนี้เท่านั้น ไม่อ่านค่าเก่า
     let bytes = unsafe { secret.as_bytes_mut() };
     for b in bytes.iter_mut() {
-        *b = 0;
+        unsafe { std::ptr::write_volatile(b, 0u8) };
     }
+    // กันการย้าย/ตัดคำสั่งข้ามขอบเขตนี้อีกชั้น
+    std::hint::black_box(&*secret);
     // Clear the string
     secret.clear();
 }
@@ -892,5 +934,156 @@ mod tests {
             ),
             Err(SecretError::HitlRequired(_))
         ));
+    }
+
+    fn test_lease(value: &str) -> SecretLease {
+        SecretLease {
+            id: "lease-1234".into(),
+            request: SecretRequest {
+                tool: "git.push".into(),
+                resource: "github_token".into(),
+                scope: "read".into(),
+                purpose: "read repo".into(),
+                max_uses: 1,
+                ttl_seconds: 300,
+                risk: RiskLevel::Low,
+            },
+            value: value.into(),
+            status: LeaseStatus::Active,
+            created_at: Utc::now(),
+            expires_at: Utc::now(),
+            uses: 0,
+            hitl_approved: false,
+            approved_by: None,
+        }
+    }
+
+    // regression #25: Debug ห้ามโชว์ secret จริง (derive เดิมหลุดทุก {:?})
+    #[test]
+    fn lease_debug_redacts_value() {
+        let lease = test_lease("ghp_super_secret_value");
+        let dbg = format!("{:?}", lease);
+        assert!(
+            !dbg.contains("ghp_super_secret_value"),
+            "Debug leaked secret: {}",
+            dbg
+        );
+        assert!(dbg.contains("<redacted>"));
+        // panic/Result ที่ถือ lease ผ่าน {:?} ก็ต้องไม่หลุดเหมือนกัน
+        let err = format!("{:?}", Ok::<SecretLease, ()>(lease));
+        assert!(!err.contains("ghp_super_secret_value"));
+    }
+
+    // regression #27: deny pattern ขึ้นต้น wildcard ต้องยิงจริง (fail-closed)
+    #[test]
+    fn deny_pattern_with_leading_wildcard_is_enforced() {
+        let mut broker = SecretBroker::new(
+            SecretPolicy {
+                deny: vec!["*admin*".into()],
+                ..Default::default()
+            },
+            None,
+        );
+        broker.register_secret("github_token".into(), "ghp_x".into());
+        let mut caps = CapabilitySet::new(vec![aivm_capability::Capability::new(
+            "use",
+            "secret",
+            "github_token:admin",
+        )]);
+        let request = SecretRequest {
+            tool: "git.push".into(),
+            resource: "github_token".into(),
+            scope: "admin".into(),
+            purpose: "admin".into(),
+            max_uses: 1,
+            ttl_seconds: 300,
+            risk: RiskLevel::High,
+        };
+        let Err(SecretError::PolicyDenied(msg)) = broker.request_lease(
+            request,
+            &Cube::new("test"),
+            &mut caps,
+            true,
+            Some("operator".into()),
+        ) else {
+            panic!("wildcard deny pattern must fire");
+        };
+        // ต้องมาจาก deny branch (ไม่ใช่ "not in allow list")
+        assert!(msg.contains("denied by pattern"), "wrong branch: {}", msg);
+        assert!(msg.contains("*admin*"), "wrong pattern: {}", msg);
+    }
+
+    // regression #27: `**` (glob ล้วน) = deny ทุกอย่าง ไม่ใช่เทียบ prefix ผิด ๆ
+    #[test]
+    fn deny_glob_only_pattern_blocks_everything() {
+        let mut broker = SecretBroker::new(
+            SecretPolicy {
+                deny: vec!["**".into()],
+                ..Default::default()
+            },
+            None,
+        );
+        broker.register_secret("github_token".into(), "ghp_x".into());
+        let mut caps = CapabilitySet::new(vec![aivm_capability::Capability::new(
+            "use",
+            "secret",
+            "github_token:read",
+        )]);
+        let request = SecretRequest {
+            tool: "git.push".into(),
+            resource: "github_token".into(),
+            scope: "read".into(),
+            purpose: "read".into(),
+            max_uses: 1,
+            ttl_seconds: 300,
+            risk: RiskLevel::High,
+        };
+        let Err(SecretError::PolicyDenied(msg)) = broker.request_lease(
+            request,
+            &Cube::new("test"),
+            &mut caps,
+            true,
+            Some("operator".into()),
+        ) else {
+            panic!("`**` deny must fire");
+        };
+        assert!(msg.contains("denied by pattern"), "wrong branch: {}", msg);
+    }
+
+    // regression #26: ไฟล์ inject ต้อง 0600 ตั้งแต่สร้าง + ชื่อเดาไม่ได้
+    #[cfg(unix)]
+    #[test]
+    fn inject_file_is_private_and_unguessable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let lease = test_lease("ghp_injected_value");
+        let p1 = SecretInjector::inject_file(&lease).unwrap();
+
+        let meta = std::fs::metadata(&p1).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        // ชื่อไฟล์ไม่ผูกกับ lease id (เดาได้/มี ../ แทรกแซงได้ในแบบเดิม)
+        let name = p1.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(!name.contains(&lease.id));
+        assert!(p1.starts_with(std::env::temp_dir()));
+        // เนื้อหาถูกเขียนครบ
+        assert_eq!(std::fs::read_to_string(&p1).unwrap(), "ghp_injected_value");
+        // เรียกซ้ำ = คนละ path (ไม่เขียนทับกัน)
+        let p2 = SecretInjector::inject_file(&lease).unwrap();
+        assert_ne!(p1, p2);
+
+        let _ = std::fs::remove_file(p1);
+        let _ = std::fs::remove_file(p2);
+    }
+
+    // regression #28: zeroize ต้องล้างค่าจริง (และไม่ panic กับ string ว่าง)
+    #[test]
+    fn zeroize_clears_secret() {
+        let mut secret = String::from("ghp_zer0ize_me");
+        zeroize_secret(&mut secret);
+        assert!(secret.is_empty());
+
+        let mut empty = String::new();
+        zeroize_secret(&mut empty);
+        assert!(empty.is_empty());
     }
 }

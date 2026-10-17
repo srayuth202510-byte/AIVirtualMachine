@@ -10,6 +10,7 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 uuid = { workspace = true }
+glob = { workspace = true }
 aivm-capability = { path = "../aivm-capability" }
 aivm-policy = { path = "../aivm-policy" }
 aivm-audit = { path = "../aivm-audit" }
