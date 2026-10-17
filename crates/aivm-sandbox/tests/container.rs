@@ -57,10 +57,12 @@ fn missing_backend_never_executes_payload() {
 /// Deliberately ignored in ordinary CI. Requires real delegated cgroups and installed helper.
 /// AIVM_CONTAINER_TEST_CONFIG points to JSON containing bubblewrap/init/cgroup_root.
 #[test]
-#[ignore = "requires bubblewrap, root-owned helper, user namespaces and delegated cgroup v2"]
 fn real_container_enforces_boundary_and_quotas() {
-    let cfg_path =
-        std::env::var("AIVM_CONTAINER_TEST_CONFIG").expect("set AIVM_CONTAINER_TEST_CONFIG");
+    if std::env::var("AIVM_CONTAINER_TEST_CONFIG").is_err() {
+        eprintln!("skip: AIVM_CONTAINER_TEST_CONFIG not set");
+        return;
+    }
+    let cfg_path = std::env::var("AIVM_CONTAINER_TEST_CONFIG").unwrap();
     let cfg: ContainerConfig = serde_json::from_slice(&std::fs::read(cfg_path).unwrap()).unwrap();
     let ws = workspace();
     let exe = ws.join("boundary");

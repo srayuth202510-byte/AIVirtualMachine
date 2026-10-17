@@ -682,6 +682,10 @@ fn launch_and_run_inner(
         eff_mem,
     )?;
 
+    // Remote Attestation — ต้องผ่านก่อน spawn (regression #19: เดิมเรียกหลัง
+    // qemu spawn = รัน instance บนแพลตฟอร์มที่ attest ไม่ผ่าน, fail-open)
+    verify_attestation(cfg)?;
+
     // Spawn QEMU (serial เขียนลงไฟล์ผ่าน `-serial file:` โดยตรง —
     // ไม่ต้องเปิด handle ค้างไว้ ไฟล์ไม่มีก็อ่านเป็นค่าว่างแล้วรอ marker)
     let serial_log = scratch.join("serial.log");
@@ -692,9 +696,6 @@ fn launch_and_run_inner(
         qemu_cmd.spawn().map_err(|e| spawn_err("qemu spawn", e))?,
     ));
     let child = guard.0.as_mut().expect("guard holds child");
-
-    // Remote Attestation (หลัง VM เริ่ม ก่อนจับผล workload)
-    verify_attestation(cfg)?;
 
     // รอ marker (เส้นตายรวมจาก config) ระหว่างนั้นถ้า VMM ตายก่อน = ล้มแบบดัง
     // verdict (G3): VMM ตายก่อน marker = หลักฐานละเมิด boundary → `Compromise`

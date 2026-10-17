@@ -632,6 +632,10 @@ unsafe fn install_dangerous_filter(filter: &[libc::sock_filter]) -> std::io::Res
 /// syscalls while leaving ordinary model runtime syscalls available. The
 /// filter is intentionally narrower than the process-exec profile so model
 /// backends can evolve their memory/thread syscall usage independently.
+///
+/// นอกเหนือจาก network: กัน cross-process/inspection ที่ worker ไม่มีทางใช้
+/// (regression #16: เดิม denylist ลืม ptrace/process_vm_*/bpf — model worker
+/// ที่ถูกบุกรุกอ่านหน่วยความจำ/จับคู่ process อื่น + load BPF ได้)
 #[cfg(target_os = "linux")]
 pub fn install_worker_network_seccomp() -> std::io::Result<()> {
     let denied: &[libc::c_long] = &[
@@ -654,6 +658,11 @@ pub fn install_worker_network_seccomp() -> std::io::Result<()> {
         libc::SYS_getsockopt,
         libc::SYS_setsockopt,
         libc::SYS_shutdown,
+        // cross-process ทั้งคู่ — worker ไม่ได้ spawn/inspect process อื่นเลย
+        libc::SYS_ptrace,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+        libc::SYS_bpf,
     ];
     let kill = libc::sock_filter {
         code: 0x06,

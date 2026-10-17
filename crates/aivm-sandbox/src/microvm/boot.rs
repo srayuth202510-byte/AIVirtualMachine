@@ -505,9 +505,10 @@ fn boot_and_run_inner(
     } else {
         MarkerScheme::V1
     };
-    // kernel เลือกแล้วใช้เลย (verify ครบทุกชุดที่ประตูแล้ว) ส่วน rootfs
-    // ถูก verify ซ้ำหลังก็อปอีกชั้น (กันไฟล์ถูกสลับกลางบูต)
-    let (kpath, _ksha, k_alt) = match (&cfg.alt_kernel, rng.below(2)) {
+    // kernel กับ rootfs ถูก verify ซ้ำทุกชุดหลังก็อปไป scratch (กันไฟล์ถูก
+    // สลับกลางบูต — regression #17: เดิม kernel ใช้ไฟล์ pin ตรง ๆ ไม่มี
+    // re-verify ก่อน InstanceStart ต่างจาก rootfs)
+    let (kpath, ksha, k_alt) = match (&cfg.alt_kernel, rng.below(2)) {
         (Some(a), 1) => (&a.path, &a.sha256, true),
         _ => (&cfg.kernel_path, &cfg.kernel_sha256, false),
     };
@@ -545,11 +546,14 @@ fn boot_and_run_inner(
     std::fs::copy(rpath, &guest_root).map_err(|e| spawn_err("rootfs copy", e))?;
     verify_artifact(&guest_root, rsha, cfg.max_artifact_bytes)
         .map_err(|e| (e, RunVerdict::Compromise("rootfs-copy-reverify-failed")))?;
-    let kernel_abs = kpath.canonicalize().map_err(|e| {
-        clean_err(SandboxError::Spawn(format!(
-            "microvm kernel path failed: {e}"
-        )))
-    })?;
+    // 1b. kernel ก็อปไป scratch แล้ว verify ซ้ำ เหมือน rootfs — ห้ามใช้ไฟล์
+    // pin ตรง ๆ (ชั่วโมงระหว่าง verify กับ InstanceStart สลับไฟล์ได้ = TOCTOU,
+    // regression #17) และทำให้ `scratch/vmlinux.bin` มีอยู่จริงสำหรับ
+    // jailer copy ด้านล่าง (regression #18 เดิม copy จากไฟล์ที่ไม่เคยมี)
+    let kernel_copy = scratch.join("vmlinux.bin");
+    std::fs::copy(kpath, &kernel_copy).map_err(|e| spawn_err("kernel copy", e))?;
+    verify_artifact(&kernel_copy, ksha, cfg.max_artifact_bytes)
+        .map_err(|e| (e, RunVerdict::Compromise("kernel-copy-reverify-failed")))?;
 
     // 2. staging: exe + loader + libs คงโครง absolute path
     let closure = ldd_closure(canon)?;
@@ -683,51 +687,75 @@ fn boot_and_run_inner(
     // 5. spawn firecracker (serial → ไฟล์, ไม่มีเน็ตเวิร์กเลย)
     // รองรับ Jailer (optional, requires root) — จะ wrap firecracker ด้วย isolation เพิ่มเติม
     let use_jailer = cfg.jailer.is_some();
-    let sock = scratch.join("api.sock");
+    let host_sock = scratch.join("api.sock");
     let serial_log = scratch.join("serial.log");
     let serial_file = std::fs::File::create(&serial_log).map_err(|e| spawn_err("serial log", e))?;
     let err_log = scratch.join("stderr.log");
     let err_file = std::fs::File::create(&err_log).map_err(|e| spawn_err("stderr log", e))?;
-    let mut guard = KillOnDrop(Some(if use_jailer {
-        spawn_jailer(cfg, fc_bin, &sock, serial_file, err_file, scratch)?
+    // jailer ทำ chroot ตัวเองเป็น `<base>/<id>/rootfs` — firecracker ที่อยู่ใน
+    // chroot เห็น image/socket เป็น `/...` แต่ host ต้อง connect คนละ path
+    // (regression #18: เดิมส่ง host path absolute เข้า API ทั้งที่อยู่นอก
+    // chroot ทั้งหมด = boot ไม่เคยขึ้น)
+    let (raw_child, api_sock) = if use_jailer {
+        spawn_jailer(cfg, fc_bin, serial_file, err_file, scratch, &kernel_copy)?
     } else {
-        spawn_firecracker_direct(fc_bin, &sock, serial_file, err_file)?
-    }));
+        (
+            spawn_firecracker_direct(fc_bin, &host_sock, serial_file, err_file)?,
+            host_sock,
+        )
+    };
+    let mut guard = KillOnDrop(Some(raw_child));
     let child = guard.0.as_mut().expect("guard holds child");
+
+    // path ที่ firecracker เปิดได้จริงตอน configure: jailer mode = อยู่ใน
+    // chroot (เห็นเป็น `/...`), spawn ตรง = host path เต็ม
+    let (k_cfg_path, root_cfg_path, data_cfg_path) = if use_jailer {
+        (
+            "/vmlinux.bin".to_string(),
+            "/root.img".to_string(),
+            "/data.img".to_string(),
+        )
+    } else {
+        (
+            kernel_copy.to_string_lossy().into_owned(),
+            guest_root.to_string_lossy().into_owned(),
+            data_img.to_string_lossy().into_owned(),
+        )
+    };
 
     // 6. configure ผ่าน API (ล้มขั้นไหนก็ fail-closed ไม่ boot)
     // ขนาด guest ถูก clamp (+ jitter ถ้าเปิด) ตั้งแต่ขั้น DNA แล้ว
-    wait_socket(&sock, Duration::from_secs(5))?;
+    wait_socket(&api_sock, Duration::from_secs(5))?;
     fc_put(
-        &sock,
+        &api_sock,
         "/machine-config",
         &format!("{{\"vcpu_count\":{eff_vcpu},\"mem_size_mib\":{eff_mem}}}"),
     )?;
     fc_put(
-        &sock,
+        &api_sock,
         "/boot-source",
         &format!(
             "{{\"kernel_image_path\":{},\"boot_args\":\"console=ttyS0 reboot=t panic=1 pci=off init=/sbin/aivm-init\"}}",
-            serde_json_string(&kernel_abs.to_string_lossy())
+            serde_json_string(&k_cfg_path)
         ),
     )?;
     fc_put(
-        &sock,
+        &api_sock,
         "/drives/rootfs",
         &format!(
             "{{\"drive_id\":\"rootfs\",\"path_on_host\":{},\"is_root_device\":true,\"is_read_only\":false}}",
-            serde_json_string(&guest_root.to_string_lossy())
+            serde_json_string(&root_cfg_path)
         ),
     )?;
     fc_put(
-        &sock,
+        &api_sock,
         "/drives/data",
         &format!(
             "{{\"drive_id\":\"data\",\"path_on_host\":{},\"is_root_device\":false,\"is_read_only\":true}}",
-            serde_json_string(&data_img.to_string_lossy())
+            serde_json_string(&data_cfg_path)
         ),
     )?;
-    fc_put(&sock, "/actions", "{\"action_type\":\"InstanceStart\"}")?;
+    fc_put(&api_sock, "/actions", "{\"action_type\":\"InstanceStart\"}")?;
 
     // 7. รอ marker (เส้นตายรวมจาก config) ระหว่างนั้นถ้า VMM ตายก่อน = ล้มแบบดัง
     // verdict (G3): VMM ตายก่อน marker = หลักฐานละเมิด boundary → `Compromise`

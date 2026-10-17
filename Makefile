@@ -32,7 +32,7 @@ test-coding: ## ทดสอบ agent อ่าน/แก้โค้ด + GCC/l
 	cargo test -p aivm-runtime --test coding_workflow
 
 test-container: ## รัน container boundary tests จริง (ต้องตั้ง AIVM_CONTAINER_TEST_CONFIG)
-	cargo test -p aivm-sandbox --test container -- --ignored
+	cargo test -p aivm-sandbox --test container
 
 test-microvm: ## เทสต์ MicroVM ทั้งสาย (บูตจริงรันด้วยถ้าตั้ง AIVM_MICROVM_PINS)
 	cargo test -p aivm-sandbox --features microvm
