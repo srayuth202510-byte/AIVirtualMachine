@@ -178,7 +178,7 @@ fn agent_reads_fixes_builds_and_tests_with_audited_limits() {
     );
     assert_eq!(fixture.runtime.cube.current_state(), AgentState::Modify);
     assert!(
-        !fixture.runtime.cube.tests_passed,
+        !fixture.runtime.cube.tests_passed(),
         "agent cannot supply operator guards"
     );
     let artifacts = fixture.runtime.workspace.join(".aivm-build");
@@ -343,7 +343,7 @@ fn compiler_errors_are_failures_with_diagnostics_and_no_state_escalation() {
     let run = fixture.execute(steps);
     assert!(run.steps[0].outcome.starts_with("FAIL"), "{:?}", run.steps);
     assert!(run.steps[0].outcome.contains("error:"));
-    assert!(!fixture.runtime.cube.tests_passed);
+    assert!(!fixture.runtime.cube.tests_passed());
 }
 
 #[test]

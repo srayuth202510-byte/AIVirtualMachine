@@ -190,6 +190,36 @@ fn i4_transitions_validated() {
         .is_err());
 }
 
+/// I-4 ต่อ: snapshot ที่ attacker แก้ payload เอง (ตั้ง state=DEPLOY) ถูก
+/// MAC กันไว้ — rollback ต้องปฏิเสธ ไม่ใช่รับ state ปลอมเข้ามา
+#[test]
+fn i4_forged_snapshot_cannot_reach_deploy() {
+    use aivm_cube::workflow;
+    let mut engine = workflow::WorkflowEngine::new();
+    let wf = workflow::build_default_workflow();
+    engine.register(wf.clone()).unwrap();
+    let mut exec = engine.start("default").unwrap();
+    let cube = Cube::new("i4-forge");
+    let snapshot = engine.snapshot(&exec, &cube).unwrap();
+
+    // ดัดแปลง payload ให้ state = DEPLOY โดยไม่แตะ MAC (ไม่รู้คีย์)
+    let mut forged = snapshot;
+    let mut payload: serde_json::Value = serde_json::from_slice(&forged.cube_state).unwrap();
+    payload["state"] = serde_json::Value::String("DEPLOY".into());
+    forged.cube_state = serde_json::to_vec(&payload).unwrap();
+    let err = engine.rollback(&mut exec, forged).unwrap_err();
+    assert!(
+        err.to_string().contains("mac mismatch"),
+        "I-4 violated: forged snapshot accepted ({err})"
+    );
+    assert_eq!(exec.current_node, "analyze");
+
+    // และเส้นตรง INIT->DEPLOY ยังถูกกันตามเดิม
+    assert!(Cube::new("i4-jump")
+        .transition(AgentState::Deploy, &TransitionGuards::default())
+        .is_err());
+}
+
 /// I-5: AI แก้เส้นขอบเขตตัวเองไม่ได้ (boundary path เขียนไม่เข้า)
 #[test]
 fn i5_boundary_immutable() {

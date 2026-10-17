@@ -126,7 +126,7 @@ fn restores_deleted_and_overwritten_data_without_rolling_back_security_state() {
         audit_before
     );
     let rt = Runtime::init(config(), dest.clone()).unwrap();
-    assert_eq!(rt.cube.state, AgentState::Init);
+    assert_eq!(rt.cube.current_state(), AgentState::Init);
     assert!(rt.gateway.live_secret_leases().is_empty());
     let saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dest.join("state.json")).unwrap()).unwrap();
@@ -466,7 +466,7 @@ fn restore_uses_the_current_operator_config_and_does_not_replay_modify_grants() 
     let saved = VmConfig::from_file(&dir.join("aivm.yaml")).unwrap();
     assert_eq!(saved.resources.cpu, 1);
     let rt = Runtime::init(saved, dir).unwrap();
-    assert_eq!(rt.cube.state, AgentState::Init);
+    assert_eq!(rt.cube.current_state(), AgentState::Init);
     assert!(!rt
         .gateway
         .caps

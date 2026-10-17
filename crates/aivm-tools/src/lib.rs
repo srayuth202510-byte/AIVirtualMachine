@@ -331,8 +331,8 @@ impl ToolGateway {
     fn ctx_of(cube: &Cube) -> EvalContext {
         EvalContext {
             state: cube.current_state().to_string(),
-            confidence: cube.confidence,
-            tests_passed: cube.tests_passed,
+            confidence: cube.confidence(),
+            tests_passed: cube.tests_passed(),
         }
     }
 

@@ -722,8 +722,8 @@ impl Runtime {
             self.config.resources.cpu,
             self.config.resources.memory,
             self.workspace.display(),
-            self.cube.cells.len(),
-            self.cube.denials,
+            self.cube.cells_len(),
+            self.cube.denials(),
         )
     }
 }

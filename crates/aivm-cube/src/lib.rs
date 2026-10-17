@@ -136,17 +136,20 @@ pub struct TransitionGuards {
 }
 
 /// Cube ขนาดเล็กแยกตาม task (สเปก §9.3.2: แยก instance ต่อ task เก็บเฉพาะ working set)
+///
+/// ฟิลด์เป็น private ทั้งหมด — เปลี่ยน state/guard ได้ทาง `transition()` ที่ผ่าน
+/// state machine เท่านั้น (ข้าม guard ด้วย field assign ตรง ๆ ไม่ได้อีก)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cube {
-    pub task_id: String,
-    pub state: AgentState,
-    pub confidence: f64,
-    pub tests_passed: bool,
-    pub policy_approved: bool,
-    pub cells: HashMap<(u32, u32), CubeCell>,
-    pub max_cells: usize,
-    pub denials: u64,
-    pub transitions: Vec<(String, String)>,
+    task_id: String,
+    state: AgentState,
+    confidence: f64,
+    tests_passed: bool,
+    policy_approved: bool,
+    cells: HashMap<(u32, u32), CubeCell>,
+    max_cells: usize,
+    denials: u64,
+    transitions: Vec<(String, String)>,
 }
 
 impl Cube {
@@ -166,6 +169,38 @@ impl Cube {
 
     pub fn current_state(&self) -> AgentState {
         self.state
+    }
+
+    // ---- getter แบบอ่านอย่างเดียว (ฟิลด์เป็น private) ------------------
+    // การเขียนทุกช่องทางต้องผ่าน method ที่ validate แล้ว (`transition`,
+    // `upsert_cell`, `record_denial`) เท่านั้น
+
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub fn confidence(&self) -> f64 {
+        self.confidence
+    }
+
+    pub fn tests_passed(&self) -> bool {
+        self.tests_passed
+    }
+
+    pub fn policy_approved(&self) -> bool {
+        self.policy_approved
+    }
+
+    pub fn cells_len(&self) -> usize {
+        self.cells.len()
+    }
+
+    pub fn denials(&self) -> u64 {
+        self.denials
+    }
+
+    pub fn transitions(&self) -> &[(String, String)] {
+        &self.transitions
     }
 
     /// transition ที่ผ่านการ validate ถ้าเส้นผิดหรือ guard ไม่ผ่านจะได้ Err (fail-closed)
@@ -265,6 +300,7 @@ fn state_id_of(s: AgentState) -> u32 {
 pub mod workflow {
     use super::{AgentState, CubeError, TransitionGuards};
     use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
     use std::collections::HashMap;
 
     /// Workflow Node: ขั้นตอนใน workflow
@@ -326,23 +362,36 @@ pub mod workflow {
         pub snapshots: Vec<WorkflowSnapshot>,
     }
 
-    /// Snapshot สำหรับ Rollback
+    /// Snapshot สำหรับ Rollback — ผูกกับ `mac` (HMAC-SHA256 ด้วยคีย์สุ่มของ
+    /// engine) กัน payload ถูกดัดแปลงให้ state=DEPLOY ข้าม state machine
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct WorkflowSnapshot {
         pub node_id: String,
         pub cube_state: Vec<u8>, // serialized cube state
         pub timestamp: u64,
+        /// HMAC ของ (node_id ‖ timestamp ‖ cube_state) — ไม่มี/ผิด = ของปลอม
+        /// (fail-closed: field ขาดจากการ deserialize จะได้ค่าศูนย์ ≠ ของจริง)
+        #[serde(default)]
+        pub mac: [u8; 32],
     }
 
     /// Workflow Engine
     pub struct WorkflowEngine {
         workflows: HashMap<String, Workflow>,
+        /// คีย์สุ่มต่อ instance สำหรับ MAC snapshot — คีย์ไม่เคยถูก persist
+        /// ดังนั้น snapshot ที่มาจากแหล่งภายนอกปลอม MAC ไม่ได้
+        mac_key: [u8; 32],
     }
 
     impl WorkflowEngine {
         pub fn new() -> Self {
+            // สุ่ม 32 ไบต์จาก OS (uuid v4 ×2) — ไม่ใช่ค่าคงที่ฝังใน source
+            let mut mac_key = [0u8; 32];
+            mac_key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+            mac_key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
             Self {
                 workflows: HashMap::new(),
+                mac_key,
             }
         }
 
@@ -481,7 +530,7 @@ pub mod workflow {
             }
         }
 
-        /// สร้าง snapshot สำหรับ rollback
+        /// สร้าง snapshot สำหรับ rollback (พร้อม MAC ผูกกับ engine ตัวนี้)
         pub fn snapshot(
             &self,
             execution: &WorkflowExecution,
@@ -489,19 +538,39 @@ pub mod workflow {
         ) -> Result<WorkflowSnapshot, CubeError> {
             let cube_bytes = serde_json::to_vec(cube)
                 .map_err(|e| CubeError::GuardFailed(format!("snapshot serialize failed: {e}")))?;
+            let timestamp = now_ms();
+            let mac = snapshot_mac(
+                &self.mac_key,
+                &execution.current_node,
+                timestamp,
+                &cube_bytes,
+            );
             Ok(WorkflowSnapshot {
                 node_id: execution.current_node.clone(),
                 cube_state: cube_bytes,
-                timestamp: now_ms(),
+                timestamp,
+                mac,
             })
         }
 
-        /// Rollback ไปยัง snapshot
+        /// Rollback ไปยัง snapshot — ตรวจ MAC ก่อนแตะ payload อะไรทั้งนั้น
+        /// (snapshot ปลอม/ถูกดัดแปลง = DENY ไม่ใช่ adopt state ใหม่)
         pub fn rollback(
             &self,
             execution: &mut WorkflowExecution,
             snapshot: WorkflowSnapshot,
         ) -> Result<super::Cube, CubeError> {
+            let expected = snapshot_mac(
+                &self.mac_key,
+                &snapshot.node_id,
+                snapshot.timestamp,
+                &snapshot.cube_state,
+            );
+            if !ct_eq(&expected, &snapshot.mac) {
+                return Err(CubeError::GuardFailed(
+                    "snapshot mac mismatch (forged or tampered snapshot rejected)".into(),
+                ));
+            }
             let cube: super::Cube = serde_json::from_slice(&snapshot.cube_state)
                 .map_err(|e| CubeError::GuardFailed(format!("rollback deserialize failed: {e}")))?;
             execution.current_node = snapshot.node_id;
@@ -578,6 +647,43 @@ pub mod workflow {
         let delay = (policy.base_delay_ms as f64
             * policy.backoff_multiplier.powi(attempt as i32 - 1)) as u64;
         delay.min(policy.max_delay_ms)
+    }
+
+    /// HMAC-SHA256 (RFC 2104) — คีย์ยาวพอดี 32 < blockSize(64) จึงใช้ตรง ๆ
+    fn hmac_sha256(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
+        let mut ipad = [0x36u8; 64];
+        let mut opad = [0x5cu8; 64];
+        for i in 0..32 {
+            ipad[i] ^= key[i];
+            opad[i] ^= key[i];
+        }
+        let mut inner = Sha256::new();
+        inner.update(ipad);
+        inner.update(msg);
+        let inner = inner.finalize();
+        let mut outer = Sha256::new();
+        outer.update(opad);
+        outer.update(inner);
+        outer.finalize().into()
+    }
+
+    /// MAC ของ snapshot: ผูก node_id + timestamp + payload ใน single MAC
+    /// (แก้ payload อย่างเดียวไม่ได้ — ต้องรู้คีย์ด้วย)
+    fn snapshot_mac(key: &[u8; 32], node_id: &str, timestamp: u64, cube_state: &[u8]) -> [u8; 32] {
+        let mut msg = Vec::with_capacity(node_id.len() + 8 + cube_state.len());
+        msg.extend_from_slice(node_id.as_bytes());
+        msg.extend_from_slice(&timestamp.to_be_bytes());
+        msg.extend_from_slice(cube_state);
+        hmac_sha256(key, &msg)
+    }
+
+    /// เทียบ MAC แบบไม่ shortcut ตามเวลา (กัน timing oracle ระดับ theory)
+    fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+        let mut diff = 0u8;
+        for i in 0..32 {
+            diff |= a[i] ^ b[i];
+        }
+        diff == 0
     }
 
     fn now_ms() -> u64 {
@@ -896,6 +1002,61 @@ mod tests {
         let rolled_back_cube = engine.rollback(&mut execution, snapshot).unwrap();
         assert_eq!(execution.current_node, "modify");
         assert_eq!(rolled_back_cube.current_state(), AgentState::Analyze);
+    }
+
+    /// regression #14: ดัดแปลง payload ของ snapshot (ปลอม state=DEPLOY)
+    /// โดยไม่รู้คีย์ → MAC ไม่ตรง → ถูกปฏิเสธก่อนแตะ payload (ข้าม state
+    /// machine ด้วย snapshot ปลอมไม่ได้)
+    #[test]
+    fn rollback_rejects_tampered_snapshot_payload() {
+        let mut engine = workflow::WorkflowEngine::new();
+        let workflow = workflow::build_default_workflow();
+        engine.register(workflow.clone()).unwrap();
+
+        let mut execution = engine.start("default").unwrap();
+        let mut cube = Cube::new("test-workflow");
+        let _ = engine.step(&workflow, &mut execution, &mut cube).unwrap();
+        assert_eq!(execution.current_node, "modify");
+
+        let mut snapshot = engine.snapshot(&execution, &cube).unwrap();
+        let mut payload: serde_json::Value = serde_json::from_slice(&snapshot.cube_state).unwrap();
+        payload["state"] = serde_json::Value::String("DEPLOY".into());
+        snapshot.cube_state = serde_json::to_vec(&payload).unwrap();
+
+        let err = engine.rollback(&mut execution, snapshot).unwrap_err();
+        assert!(err.to_string().contains("mac mismatch"), "{err}");
+        // execution ไม่ถูกขยับจากการ rollback ที่ถูกปฏิเสธ
+        assert_eq!(execution.current_node, "modify");
+    }
+
+    /// regression #14: snapshot ที่ประกอบเอง/มาจาก JSON ภายนอก (ไม่มี MAC
+    /// ของ engine ตัวนี้) = ของปลอม — fail-closed ทั้งกรณี mac ศูนย์และ
+    /// กรณี field mac หายไปจากการ deserialize
+    #[test]
+    fn rollback_rejects_snapshot_without_valid_mac() {
+        let mut engine = workflow::WorkflowEngine::new();
+        let workflow = workflow::build_default_workflow();
+        engine.register(workflow.clone()).unwrap();
+        let mut execution = engine.start("default").unwrap();
+
+        let forged = workflow::WorkflowSnapshot {
+            node_id: "modify".into(),
+            cube_state: b"{}".to_vec(),
+            timestamp: 1u64,
+            mac: [0u8; 32],
+        };
+        assert!(engine.rollback(&mut execution, forged).is_err());
+
+        let parsed: workflow::WorkflowSnapshot = serde_json::from_value(serde_json::json!({
+            "node_id": "modify",
+            "cube_state": [],
+            "timestamp": 1u64
+        }))
+        .unwrap();
+        assert_eq!(parsed.mac, [0u8; 32], "missing mac must decode as zeros");
+        assert!(engine.rollback(&mut execution, parsed).is_err());
+        // ทั้งสองครั้งถูกปฏิเสธ: current_node ยังเป็น entry เดิม
+        assert_eq!(execution.current_node, "analyze");
     }
 
     #[test]

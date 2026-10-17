@@ -261,6 +261,8 @@ pub fn search(index: &RagIndex, query: &str, top_k: usize, current_state: u32) -
 }
 
 /// รวม top-K chunks เป็น context string สำหรับ model prompt
+/// หมายเหตุ: `max_chars` ถูกนับและตัดเป็น "byte" เดียวกันทั้งสองฝั่ง
+/// ( header/query นอก budget ยังมี slack เล็กน้อยตามแบบเดิม )
 pub fn assemble_context(query: &str, hits: &[SearchHit], max_chars: usize) -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -273,20 +275,34 @@ pub fn assemble_context(query: &str, hits: &[SearchHit], max_chars: usize) -> St
             "\n=== Retrieved Context ( {} chunks ) ===",
             hits.len()
         ));
-        let mut total_chars = 0;
+        let mut used_bytes = 0;
         for hit in hits {
             let chunk_text = format!(
                 "\n--- {} :{}-{} (score: {:.2}) ---\n{}",
                 hit.file_path, hit.line_start, hit.line_end, hit.score, hit.content
             );
-            if total_chars + chunk_text.len() > max_chars {
-                // ตัดท้ายถ้ายาวเกิน
-                let remaining = max_chars.saturating_sub(total_chars);
-                let truncated: String = chunk_text.chars().take(remaining).collect();
-                parts.push(format!("{truncated}…"));
+            if used_bytes + chunk_text.len() > max_chars {
+                // ตัดด้วย "หน่วยเดียวกับที่ใช้เปรียบเทียบ" (byte) — เดิมเทียบ
+                // ด้วย byte แต่ตัดด้วย char ทำให้ multibyte ทะลุ budget
+                let budget = max_chars.saturating_sub(used_bytes);
+                const ELLIPSIS: char = '…';
+                let mut truncated = String::new();
+                for ch in chunk_text.chars() {
+                    if truncated.len() + ch.len_utf8() + ELLIPSIS.len_utf8() > budget {
+                        break;
+                    }
+                    truncated.push(ch);
+                }
+                if truncated.is_empty() {
+                    if budget >= ELLIPSIS.len_utf8() {
+                        parts.push(ELLIPSIS.to_string());
+                    }
+                } else {
+                    parts.push(format!("{truncated}{ELLIPSIS}"));
+                }
                 break;
             }
-            total_chars += chunk_text.len();
+            used_bytes += chunk_text.len();
             parts.push(chunk_text);
         }
     }
@@ -380,6 +396,29 @@ mod tests {
         let ctx = assemble_context("test", &hits, 500);
         assert!(ctx.len() <= 560); // หน่วยเกินเล็กน้อยสำหรับ header
         assert!(ctx.contains("a.rs"));
+    }
+
+    /// regression #15: budget ต้องเป็นหน่วยเดียวกับที่ตัด (byte) — ถ้าปน
+    /// char-truncate กับ byte-compare ข้อความ multibyte จะทะลุ budget
+    #[test]
+    fn assemble_context_respects_byte_budget_on_multibyte() {
+        let hits = vec![SearchHit {
+            chunk_id: 0,
+            score: 1.0,
+            file_path: "th.rs".to_string(),
+            content: "ก".repeat(1000),
+            line_start: 1,
+            line_end: 10,
+        }];
+        let ctx = assemble_context("test", &hits, 500);
+        assert!(
+            ctx.len() <= 560,
+            "{} bytes exceeds budget (header slack 60)",
+            ctx.len()
+        );
+        assert!(ctx.contains("th.rs"));
+        // ตัดที่ขอบ char ห้ามแตก UTF-8
+        assert!(std::str::from_utf8(ctx.as_bytes()).is_ok());
     }
 
     #[test]
