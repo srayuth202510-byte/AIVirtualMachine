@@ -19,6 +19,10 @@ pub enum CapabilityError {
     ScopeMismatch(String, String),
     #[error("action/resource mismatch")]
     Mismatch,
+    #[error("timeout constraint unsatisfiable (timeout_ms<={0})")]
+    TimeoutUnmet(u64),
+    #[error("capability constraint needs an AuthorizationContext that was not provided")]
+    MissingContext,
 }
 
 /// action พื้นฐานตามสเปก §10.1
@@ -387,6 +391,22 @@ impl Capability {
                 self.constraints.max_calls.unwrap() as u64,
             ));
         }
+        // fail-closed: ไม่มี AuthorizationContext → constraint ที่ต้องใช้ค่าคำขอ
+        // (max_bytes / timeout / response size) และ condition.protocol ตรวจไม่ได้
+        // → ห้ามอนุมัติ (เดิมข้ามไปเงียบ ๆ = fail-open ของ API สาธารณะนี้)
+        if self.constraints.max_bytes.is_some()
+            || self.constraints.timeout_ms.is_some()
+            || self.constraints.max_response_bytes.is_some()
+        {
+            return Err(CapabilityError::MissingContext);
+        }
+        if self
+            .condition
+            .as_ref()
+            .is_some_and(|c| c.protocol.is_some())
+        {
+            return Err(CapabilityError::MissingContext);
+        }
         self.check_constraints(None, None, None, None, None)?;
         self.used_count += 1;
         Ok(())
@@ -395,7 +415,12 @@ impl Capability {
 
 /// `/workspace` ครอบคลุม `/workspace/src/main.rs` แต่ไม่คลุม `/workspace2` หรือ `/etc`
 /// scope ที่ลงท้าย `/**` หรือ `/*` ถือเป็น prefix นอกนั้นต้องตรงกันพอดีหรือเป็น prefix แบบไดเรกทอรี
+/// fail-closed: ปิด path ที่มี component `.`/`..`ทั้งสองฝั่ง เพราะ capability
+/// layer ไม่ได้ canonicalize — `/workspace/../etc` ต้องไม่ถือว่าอยู่ใน `/workspace`
 pub fn scope_covers(cap_scope: &str, requested: &str) -> bool {
+    if has_relative_component(cap_scope) || has_relative_component(requested) {
+        return false;
+    }
     let base = cap_scope
         .trim_end_matches("/**")
         .trim_end_matches("/*")
@@ -408,6 +433,11 @@ pub fn scope_covers(cap_scope: &str, requested: &str) -> bool {
         return true;
     }
     req.starts_with(&format!("{base}/"))
+}
+
+/// จริงเมื่อ path มี component แบบ relative (`.`หรือ`..`) ที่ยังไม่ถูก normalize
+fn has_relative_component(path: &str) -> bool {
+    path.split('/').any(|c| c == "." || c == "..")
 }
 
 /// ตรวจ scope ที่กว้างเกินไปสำหรับ filesystem (root/empty/wildcard) —
@@ -491,12 +521,20 @@ impl CapabilitySet {
             if !cap.covers(action, resource, scope) {
                 continue;
             }
-            if cap
-                .constraints
-                .timeout_ms
-                .is_some_and(|max| ctx.timeout_ms.is_some_and(|value| value > max))
-            {
-                continue;
+            // fail-closed: คำขอไม่บอก timeout → บังคับ constraint timeout ไม่ได้
+            // (เดิม is_some_and ปล่อยผ่าน = fail-open)
+            if let Some(max) = cap.constraints.timeout_ms {
+                if ctx.timeout_ms.is_none_or(|value| value > max) {
+                    budget_err = Some(CapabilityError::TimeoutUnmet(max));
+                    continue;
+                }
+            }
+            // condition.protocol ต้องตรงกับ protocol ของคำขอ
+            // (ไม่ทราบทะเบียน = ไม่ผ่าน — fail-closed ของ field ที่เคยเป็น dead)
+            if let Some(want) = cap.condition.as_ref().and_then(|c| c.protocol.as_ref()) {
+                if !ctx.protocol.is_some_and(|p| p.eq_ignore_ascii_case(want)) {
+                    continue;
+                }
             }
             if let Err(e) = cap.check_constraints(
                 ctx.request_bytes,
@@ -786,5 +824,145 @@ mod tests {
                 },
             )
             .is_ok());
+    }
+
+    // #6: authorize() แบบไม่มี context ต้องปฏิเสธ cap ที่มี constraint ที่
+    // ต้องใช้ค่าคำขอ — เดิมข้าม max_bytes/timeout เงียบ ๆ (fail-open)
+    #[test]
+    fn plain_authorize_denies_context_dependent_constraints() {
+        let mut cap = Capability::new("read", "filesystem", "/workspace")
+            .with_constraints(Constraints::new().with_max_bytes(100));
+        assert!(matches!(
+            cap.authorize("read", "filesystem", "/workspace/a.rs"),
+            Err(CapabilityError::MissingContext)
+        ));
+        // ยังไม่ถูกนับการใช้ (deny ไม่กินงบ)
+        assert_eq!(cap.used_count, 0);
+
+        let mut with_timeout = Capability::new("execute", "process", "/usr/bin/true")
+            .with_constraints(Constraints::new().with_timeout_ms(5000));
+        assert!(matches!(
+            with_timeout.authorize("execute", "process", "/usr/bin/true"),
+            Err(CapabilityError::MissingContext)
+        ));
+
+        // condition.protocol ก็ต้องมี context เช่นกัน
+        let mut cond_cap = Capability::new("network:fetch", "network", "example.com:443");
+        cond_cap.condition = Some(crate::Condition {
+            protocol: Some("https".into()),
+            require_state: None,
+            valid_states: vec![],
+        });
+        assert!(matches!(
+            cond_cap.authorize("network:fetch", "network", "example.com:443"),
+            Err(CapabilityError::MissingContext)
+        ));
+        // ไม่มี constraint ที่ต้องใช้ context → ทำงานเหมือนเดิม
+        let mut plain = Capability::new("read", "filesystem", "/workspace");
+        assert!(plain
+            .authorize("read", "filesystem", "/workspace/a.rs")
+            .is_ok());
+    }
+
+    // #7: timeout constraint ที่คำขอไม่บอกค่า = DENY (เดิม fail-open)
+    #[test]
+    fn timeout_constraint_denies_when_request_omits_timeout() {
+        use crate::{AuthorizationContext, CapabilitySet};
+        let cap = Capability::new("execute", "process", "/usr/bin/true")
+            .with_constraints(Constraints::new().with_timeout_ms(5000));
+        let mut set = CapabilitySet::new(vec![cap]);
+        // ไม่บอก timeout → DENY
+        assert!(matches!(
+            set.authorize_with_context(
+                "execute",
+                "process",
+                "/usr/bin/true",
+                &AuthorizationContext::default()
+            ),
+            Err(CapabilityError::TimeoutUnmet(5000))
+        ));
+        // บอก timeout เกิน → DENY
+        assert!(matches!(
+            set.authorize_with_context(
+                "execute",
+                "process",
+                "/usr/bin/true",
+                &AuthorizationContext {
+                    timeout_ms: Some(6000),
+                    ..Default::default()
+                }
+            ),
+            Err(CapabilityError::TimeoutUnmet(5000))
+        ));
+        // บอก timeout อยู่ในเกณฑ์ → ALLOW
+        assert!(set
+            .authorize_with_context(
+                "execute",
+                "process",
+                "/usr/bin/true",
+                &AuthorizationContext {
+                    timeout_ms: Some(1000),
+                    ..Default::default()
+                }
+            )
+            .is_ok());
+    }
+
+    // #8: condition.protocol ไม่ใช่ dead field อีกต่อไป
+    #[test]
+    fn condition_protocol_is_enforced() {
+        use crate::{AuthorizationContext, CapabilitySet};
+        let mut cap = Capability::new("network:fetch", "network", "example.com:443");
+        cap.condition = Some(crate::Condition {
+            protocol: Some("https".into()),
+            require_state: None,
+            valid_states: vec![],
+        });
+        let mut set = CapabilitySet::new(vec![cap]);
+        // protocol ผิด / ไม่ระบุ → DENY
+        assert!(set
+            .authorize_with_context(
+                "network:fetch",
+                "network",
+                "example.com:443",
+                &AuthorizationContext {
+                    protocol: Some("http"),
+                    ..Default::default()
+                }
+            )
+            .is_err());
+        assert!(set
+            .authorize_with_context(
+                "network:fetch",
+                "network",
+                "example.com:443",
+                &AuthorizationContext::default()
+            )
+            .is_err());
+        // protocol ตรง → ALLOW
+        assert!(set
+            .authorize_with_context(
+                "network:fetch",
+                "network",
+                "example.com:443",
+                &AuthorizationContext {
+                    protocol: Some("https"),
+                    ..Default::default()
+                }
+            )
+            .is_ok());
+    }
+
+    // #9: capability layer ไม่ canonicalize → path ที่มี `..`/`.` ต้องไม่ผ่าน
+    #[test]
+    fn scope_covers_rejects_relative_components() {
+        assert!(!scope_covers("/workspace", "/workspace/../etc"));
+        assert!(!scope_covers("/workspace", "/workspace/./src"));
+        assert!(!scope_covers("/workspace/..", "/workspace"));
+        assert!(!scope_covers("/workspace/**", "/workspace/../etc/passwd"));
+        // canonical path ยังคงทำงานเหมือนเดิม
+        assert!(scope_covers("/workspace", "/workspace"));
+        assert!(scope_covers("/workspace", "/workspace/src/main.rs"));
+        assert!(!scope_covers("/workspace", "/workspace2"));
     }
 }
