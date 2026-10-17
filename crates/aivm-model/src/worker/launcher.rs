@@ -198,10 +198,7 @@ impl WorkerClient {
                                     break;
                                 }
                             }
-                        }
-                        if failure.is_some() {
-                            self.cancelled.store(true, Ordering::Relaxed);
-                        }
+}
                     }
                     let outcome = handle
                         .join()
