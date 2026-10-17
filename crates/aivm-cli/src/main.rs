@@ -23,11 +23,21 @@ fn collect_rag_files(
         }
         if meta.is_dir() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || matches!(name, "target" | "node_modules") {
+            if name.starts_with('.')
+                || looks_like_secret(name)
+                || matches!(name, "target" | "node_modules")
+            {
                 continue;
             }
             collect_rag_files(root, &path, out);
         } else if meta.is_file() {
+            // regression #24: ข้ามไฟล์ที่ดูเหมือน secret — index เดิมอ่านไฟล์
+            // arbitrary รวมถึง .env/คีย์/credentials โดยไม่ผ่าน mediation
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if looks_like_secret(name) {
+                    continue;
+                }
+            }
             if let Ok(content) = std::fs::read_to_string(&path) {
                 let rel = path
                     .strip_prefix(root)
@@ -38,6 +48,31 @@ fn collect_rag_files(
             }
         }
     }
+}
+
+/// ไฟล์ที่ดูเหมือน secret → ห้าม index (regression #24)
+fn looks_like_secret(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with(".env")
+        || lower.ends_with(".env")
+        || lower.contains(".env.")
+        || lower.ends_with(".pem")
+        || lower.ends_with(".key")
+        || lower.ends_with(".p12")
+        || lower.ends_with(".pfx")
+        || lower.ends_with(".keystore")
+        || lower.ends_with(".jks")
+        || lower.ends_with(".npmrc")
+        || lower.ends_with(".netrc")
+        || lower.ends_with(".pgpass")
+        || lower.ends_with(".htpasswd")
+        || lower.ends_with(".gpg")
+        || lower.starts_with("id_")
+        || lower == "credentials"
+        || lower == "credentials.json"
+        || lower.starts_with("secrets")
+        || lower.starts_with("secret")
+        || lower.contains("service-account")
 }
 
 #[derive(Parser)]
@@ -110,6 +145,9 @@ enum Cmd {
         json: bool,
     },
     /// สร้าง inverted index สำหรับ workspace
+    ///
+    /// เป็นคำสั่งของ operator (ไม่ใช่ agent) — อ่านต้นทางที่ระบุโดยตรง และ
+    /// ข้ามไฟล์ที่ดูเหมือน secret (`.env`, คีย์, credentials) อยู่แล้ว
     Index {
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -731,4 +769,51 @@ fn inspect_manifest(local: &aivm_model::LocalModelConfig, production: bool) -> M
 
 fn err<E: std::fmt::Display>(e: E) -> AnyErr {
     Box::<dyn std::error::Error>::from(format!("{e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_files_are_not_indexed() {
+        let dir = std::env::temp_dir().join(format!(
+            "aivm-index-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
+        std::fs::write(dir.join("id_rsa"), "PRIVATE").unwrap();
+        std::fs::write(dir.join("app.pem"), "CERT").unwrap();
+        std::fs::write(dir.join("production.env"), "SECRET=2").unwrap();
+        std::fs::write(dir.join("credentials.json"), "PRIVATE").unwrap();
+        std::fs::create_dir(dir.join("secrets")).unwrap();
+        std::fs::write(dir.join("secrets/token.txt"), "PRIVATE").unwrap();
+        std::fs::create_dir(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn safe() {}").unwrap();
+        std::os::unix::fs::symlink(dir.join("main.rs"), dir.join("linked.rs")).unwrap();
+        let mut files = Vec::new();
+        collect_rag_files(&dir, &dir, &mut files);
+        let names: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"main.rs"));
+        assert!(names.contains(&"src/lib.rs"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn looks_like_secret_matches_known_names() {
+        assert!(looks_like_secret(".env"));
+        assert!(looks_like_secret("id_rsa"));
+        assert!(looks_like_secret("server.pem"));
+        assert!(looks_like_secret("secrets.yaml"));
+        assert!(!looks_like_secret("main.rs"));
+        assert!(!looks_like_secret("src/lib.rs"));
+    }
 }

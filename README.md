@@ -101,6 +101,13 @@ cargo run -q -p aivm-cli -- audit coder
 | `demo` | self-test 14 เคส ไม่ต้องมี VM |
 | `pause` / `stop` / `kill` | จัดการ lifecycle |
 
+`aivm index <path>` เป็นคำสั่งสำหรับ operator เท่านั้น อ่าน directory ที่ระบุโดยตรง
+นอก VM gateway จึงต้องใช้กับต้นทางที่ operator ตรวจแล้วว่าเหมาะสำหรับ retrieval
+คำสั่งข้าม symlink, hidden directories, `target`, `node_modules` และชื่อไฟล์/ไดเรกทอรี
+ที่ดูเหมือน secret เช่น `.env*`, `*.env`, `*.pem`, `*.key`, `id_*`, `credentials`
+และ `secrets` การกรองชื่อนี้เป็น best effort; secret ที่อยู่ในไฟล์ชื่อทั่วไปยังต้องนำออกเอง
+Agent สร้าง retrieval context ผ่าน gateway ที่บังคับ capability/policy ของ VM
+
 config เขียนยังไงดู [`docs/configuration.md`](./docs/configuration.md) (มีตัวอย่าง `microvm:` สำหรับ isolation ระดับ MicroVM)
 
 ## ทดสอบ

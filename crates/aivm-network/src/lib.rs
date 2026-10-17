@@ -48,3 +48,58 @@ impl NetworkGateway {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy() -> Policy {
+        Policy::from_yaml(
+            r#"name: t
+filesystem:
+  deny: ['**/.env*']
+process:
+  deny: [/bin/sh]
+network:
+  allow: ['example.com']
+  deny: ['evil.com', '10.0.0.0/8']
+"#,
+        )
+        .unwrap()
+    }
+
+    fn req(host: &str, protocol: &str) -> NetworkRequest {
+        NetworkRequest {
+            host: host.into(),
+            protocol: protocol.into(),
+            port: 443,
+        }
+    }
+
+    #[test]
+    fn non_https_is_denied_before_policy() {
+        let gw = NetworkGateway::new(policy());
+        match gw.request(&req("example.com", "http"), &EvalContext::default()) {
+            Err(NetworkError::Denied(m)) => assert_eq!(m, "protocol-not-https"),
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_allow_still_denied_in_mvp_a() {
+        let gw = NetworkGateway::new(policy());
+        match gw.request(&req("example.com", "https"), &EvalContext::default()) {
+            Err(NetworkError::Denied(m)) => assert!(m.contains("mvp-a-no-egress"), "{m}"),
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_deny_reports_rule_label() {
+        let gw = NetworkGateway::new(policy());
+        match gw.request(&req("evil.com", "https"), &EvalContext::default()) {
+            Err(NetworkError::Denied(m)) => assert!(m.contains("deny-list"), "{m}"),
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+}

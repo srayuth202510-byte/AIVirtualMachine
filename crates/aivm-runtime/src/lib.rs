@@ -25,7 +25,7 @@ pub mod demo;
 pub const CONFIDENCE_THRESHOLD: f64 = 0.8;
 /// lease แบบจำกัดเวลาสำหรับสิทธิ์เน็ตเวิร์กที่ให้ตาม state (สเปก §14.3, แบบ JIT)
 pub const NETWORK_LEASE_SECS: u64 = 300;
-/// cube + ชุด capability ที่ persist ไว้ เพื่อให้สิทธิ์แบบ dynamic รอดข้าม restart
+/// Persisted cube and capability usage counters; grants come from current config.
 const STATE_FILE: &str = "state.json";
 /// ไฟล์ค่า secrets ของ operator (G4 §26) — values อยู่ที่นี่ที่เดียว
 /// ห้ามอยู่ใน `aivm.yaml` เด็ดขาด (ดู `load_secrets_file`)
@@ -282,7 +282,7 @@ pub struct Runtime {
 
 /// state แบบ dynamic ที่ persist ไว้: cube ที่ผ่าน validate แล้ว + lease ที่ยังใช้ได้
 /// policy/config อยู่ใน `aivm.yaml` (ต้นฉบับความจริง) มีแค่ส่วนที่เปลี่ยน
-/// แปลงตามเวลาที่อยู่ไฟล์นี้ เพื่อให้ grant กับตัวนับการใช้รอดข้าม restart
+/// แปลงตามเวลาที่อยู่ไฟล์นี้ ตัวนับรอด restart แต่ grant มาจาก config ปัจจุบัน
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedState {
     cube: Cube,
@@ -291,6 +291,27 @@ struct PersistedState {
     /// secrets.yaml) ฟื้นเฉพาะที่ยังใช้ได้ ที่เหลือทิ้ง (fail-closed ข้าม restart)
     #[serde(default)]
     leases: Vec<aivm_secrets::SecretLease>,
+}
+
+/// Restore usage only for identical action/resource/scope identities. Saved
+/// grants, conditions, limits and expiry never replace current configuration.
+fn restore_cap_usage(current: &mut CapabilitySet, saved: &CapabilitySet) {
+    for cap in &mut current.caps {
+        for old in &saved.caps {
+            if (
+                cap.action.as_str(),
+                cap.resource.as_str(),
+                cap.scope.as_str(),
+            ) == (
+                old.action.as_str(),
+                old.resource.as_str(),
+                old.scope.as_str(),
+            ) {
+                cap.used_count = cap.used_count.max(old.used_count);
+                cap.used_bytes = cap.used_bytes.max(old.used_bytes);
+            }
+        }
+    }
 }
 
 impl Runtime {
@@ -437,7 +458,18 @@ impl Runtime {
                 let saved: PersistedState = serde_json::from_str(&text)
                     .map_err(|e| RuntimeError::Config(format!("invalid persisted state: {e}")))?;
                 cube = saved.cube;
-                gateway.caps = saved.caps;
+                // Rebuild state-specific grants from fresh config, then merge
+                // counters only (including legacy state without a fingerprint).
+                gateway.caps.revoke_stale(&cube.current_state().to_string());
+                for cap in state_grants(
+                    cube.current_state(),
+                    &workspace,
+                    &config.network,
+                    &policy.process.allow,
+                ) {
+                    gateway.caps.grant(cap);
+                }
+                restore_cap_usage(&mut gateway.caps, &saved.caps);
                 // G4b: ฟื้น leases ที่ยังใช้ได้ (หมดอายุ/หมดโควต้า/จบแล้วทิ้ง)
                 if let Some(broker) = gateway.secret_broker_mut() {
                     broker.restore(saved.leases);
@@ -1381,10 +1413,13 @@ capabilities:
         rt.persist().unwrap();
         drop(rt);
         let mut restored = Runtime::init(test_config(), base.clone()).unwrap();
+        let cap = &restored.gateway.caps.caps[0];
+        assert_eq!(cap.used_count, 1);
+        assert_eq!(cap.max_uses, None);
         assert!(restored
             .gateway
             .read(&mut restored.cube, "data.txt")
-            .is_err());
+            .is_ok());
         drop(restored);
         std::fs::write(base.join(STATE_FILE), "{not json").unwrap();
         assert!(matches!(
@@ -1926,10 +1961,12 @@ secrets:
         let cfg = rt.config.clone();
         drop(rt);
         let mut restored = Runtime::init(cfg, base.clone()).unwrap();
+        assert_eq!(restored.gateway.caps.caps[0].used_count, 1);
+        assert_eq!(restored.gateway.caps.caps[0].max_uses, None);
         assert!(restored
             .gateway
             .read(&mut restored.cube, "src/seed.txt")
-            .is_err());
+            .is_ok());
         aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(base);
     }
@@ -1940,6 +1977,27 @@ secrets:
     fn consumed_byte_budget_survives_restart() {
         use aivm_capability::AuthorizationContext;
         let (mut rt, base) = test_runtime("budget-restart");
+        rt.config.network.allow = vec!["example.com".into()];
+        rt.config.network.max_total_bytes = Some(100);
+        rt.transition_to(AgentState::Analyze, &TransitionGuards::default())
+            .unwrap();
+        rt.transition_to(
+            AgentState::Modify,
+            &TransitionGuards {
+                confidence: 0.9,
+                confidence_threshold: CONFIDENCE_THRESHOLD,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        rt.transition_to(
+            AgentState::Validate,
+            &TransitionGuards {
+                tests_passed: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         std::fs::create_dir_all(rt.workspace.join("src")).unwrap();
         std::fs::write(rt.workspace.join("src/seed.txt"), "seed").unwrap();
         let mut cap = Capability::new("network:fetch", "network", "example.com:443")
@@ -1954,6 +2012,8 @@ secrets:
         let mut restored = Runtime::init(cfg, base.clone()).unwrap();
         let ctx = AuthorizationContext {
             request_bytes: Some(50),
+            protocol: Some("https"),
+            port: Some(443),
             ..Default::default()
         };
         // เหลือ 40 ขอ 50 = DENY (งบไม่กลับมาเพราะ restart)
@@ -1976,6 +2036,8 @@ secrets:
                 "example.com:443",
                 &AuthorizationContext {
                     request_bytes: Some(40),
+                    protocol: Some("https"),
+                    port: Some(443),
                     ..Default::default()
                 },
             )
@@ -2003,5 +2065,111 @@ secrets:
             assert_eq!(cap.constraints.max_calls, Some(5));
             assert_eq!(cap.constraints.max_total_bytes, Some(1024));
         }
+    }
+
+    #[test]
+    fn restart_uses_fresh_grants_and_limits_with_legacy_usage() {
+        let (mut rt, base) = test_runtime("fresh-caps");
+        rt.config.tools.allow = vec!["/bin/true".into()];
+        rt.policy.process.allow = vec![std::fs::canonicalize("/bin/true")
+            .unwrap()
+            .display()
+            .to_string()];
+        rt.config.network.allow = vec!["example.com".into(), "removed.example".into()];
+        rt.config.network.max_calls = Some(10);
+        rt.config.network.max_total_bytes = Some(1000);
+        rt.transition_to(AgentState::Analyze, &TransitionGuards::default())
+            .unwrap();
+        rt.transition_to(
+            AgentState::Modify,
+            &TransitionGuards {
+                confidence: 0.9,
+                confidence_threshold: CONFIDENCE_THRESHOLD,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        rt.transition_to(
+            AgentState::Validate,
+            &TransitionGuards {
+                tests_passed: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(rt.gateway.caps.caps.iter().any(|c| c.action == "execute"));
+        for cap in &mut rt.gateway.caps.caps {
+            cap.used_count = 4;
+            cap.used_bytes = 60;
+            cap.constraints = Default::default();
+            cap.condition = None;
+            cap.expiration = None;
+        }
+        rt.gateway
+            .caps
+            .caps
+            .push(Capability::new("deploy", "host", "*"));
+        // Duplicate identities cannot reset counters with a later zero entry.
+        rt.gateway.caps.caps.push(Capability::new(
+            "network:fetch",
+            "network",
+            "example.com:443",
+        ));
+        rt.persist().unwrap();
+        let mut cfg = rt.config.clone();
+        cfg.tools.allow.clear();
+        cfg.network.allow = vec!["example.com".into()];
+        cfg.network.max_calls = Some(3);
+        cfg.network.max_total_bytes = Some(50);
+        drop(rt);
+        // The initial-capability list is unchanged: changing only network/tool
+        // config must still replace persisted authority.
+        let restored = Runtime::init(cfg.clone(), base.clone()).unwrap();
+        assert_eq!(restored.cube.current_state(), AgentState::Validate);
+        assert!(!restored
+            .gateway
+            .caps
+            .caps
+            .iter()
+            .any(|c| c.action == "execute"
+                || c.action == "deploy"
+                || c.scope == "removed.example:443"));
+        assert_eq!(
+            restored
+                .gateway
+                .caps
+                .caps
+                .iter()
+                .filter(|c| c.resource == "network")
+                .count(),
+            2
+        );
+        for cap in restored
+            .gateway
+            .caps
+            .caps
+            .iter()
+            .filter(|c| c.resource == "network")
+        {
+            assert_eq!(cap.used_count, 4);
+            assert_eq!(cap.used_bytes, 60);
+            assert_eq!(cap.constraints.max_calls, Some(3));
+            assert_eq!(cap.constraints.max_total_bytes, Some(50));
+            assert!(cap.constraints.require_tls);
+            assert!(cap.condition.is_some());
+            assert!(cap.expiration.is_some());
+            assert!(cap.check_usable().is_err());
+        }
+        cfg.capabilities.initial = vec!["read:workspace".into()];
+        let reduced = Runtime::init(cfg, base.clone()).unwrap();
+        assert!(!reduced
+            .gateway
+            .caps
+            .caps
+            .iter()
+            .any(|c| c.action == "search"));
+        assert_eq!(reduced.gateway.caps.caps[0].used_count, 4);
+        aivm_audit::clear_flags(&base);
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

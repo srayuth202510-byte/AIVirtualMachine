@@ -44,24 +44,49 @@ pub fn save_status(dir: &Path, status: &VmStatus) -> Result<(), SupervisorError>
     )
     .map_err(error)
 }
+// This inode lives outside the replaceable VM directory. Keep the lock file
+// after release: unlinking it would let contenders lock different inodes.
+pub fn create_lock(root: &Path, name: &str) -> Result<Lock, SupervisorError> {
+    lock_file(&root.join(format!(".create-{name}.lock")))
+}
+
+fn lock_file(path: &Path) -> Result<Lock, SupervisorError> {
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(error)?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(error("VM already has an active operation"));
+    }
+    Ok(Lock { file: lock })
+}
+
+pub struct Lock {
+    file: File,
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // A concurrent fork may inherit this open file description. Explicitly
+        // unlock rather than waiting for every inherited descriptor to close.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 pub struct Lease {
-    _lock: File,
+    _lock: Lock,
     dir: PathBuf,
     active: bool,
 }
 impl Lease {
     pub fn acquire(dir: &Path, active: bool) -> Result<Self, SupervisorError> {
-        let lock = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(dir.join("runtime.lock"))
-            .map_err(error)?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(error("VM already has an active operation"));
-        }
+        let lock = lock_file(&dir.join("runtime.lock"))?;
         if active {
             let pid = std::process::id();
             let record = Process {
@@ -90,10 +115,6 @@ impl Drop for Lease {
             if previous == VmStatus::Running {
                 let _ = save_status(&self.dir, &VmStatus::Stopped);
             }
-        }
-        // unlock อย่างชัดเจน เพราะ thread อื่นอาจ fork และสืบทอด open description
-        unsafe {
-            libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN);
         }
     }
 }
@@ -189,6 +210,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
+    #[test]
+    fn create_lock_releases_even_with_an_inherited_descriptor() {
+        let dir = directory();
+        let lock = create_lock(&dir, "vm").unwrap();
+        let inherited = lock.file.try_clone().unwrap();
+        assert!(create_lock(&dir, "vm").is_err());
+        drop(lock);
+        assert!(create_lock(&dir, "vm").is_ok());
+        drop(inherited);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn operations_are_exclusive_and_status_survives_restart() {
         let dir = directory();

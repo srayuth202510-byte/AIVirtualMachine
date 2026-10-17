@@ -1903,12 +1903,9 @@ fn parse_url(url: &str) -> Result<(String, u16, String), ToolError> {
     let parsed =
         url::Url::parse(url).map_err(|e| ToolError::Denied(format!("invalid URL: {e}")))?;
     let protocol = parsed.scheme().to_string();
-    if !matches!(protocol.as_str(), "http" | "https")
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
+    if protocol != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(ToolError::Denied(
-            "HTTP(S) URL without credentials required".into(),
+            "HTTPS URL without credentials required".into(),
         ));
     }
     let host = parsed
@@ -2904,6 +2901,13 @@ network: {{allow: [], deny: ['10.0.0.0/8']}}
         for host in ["127.0.0.2", "10.1.2.3", "::ffff:127.0.0.1", "::1"] {
             assert!(public_addresses(host, 443).is_err());
         }
+        assert!(parse_url("http://example.com/").is_err());
+        assert!(parse_url("HTTP://example.com:443/").is_err());
+        assert_eq!(
+            parse_url("https://Example.com/path").unwrap(),
+            ("example.com".into(), 443, "https".into())
+        );
+        assert_eq!(parse_url("https://example.com:8443/path").unwrap().1, 8443);
         assert!(parse_url("file:///etc/passwd").is_err());
         assert!(parse_url("https://user:pass@example.com/").is_err());
         assert!(serde_json::from_str::<NetworkFetchRequest>(r#"{"redirects":true}"#).is_err());

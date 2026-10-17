@@ -108,11 +108,33 @@ impl Supervisor {
         prepare: impl FnOnce(&std::path::Path) -> Result<(), SupervisorError>,
     ) -> Result<(), SupervisorError> {
         Self::validate_name(name)?;
-        if self.vms.contains_key(name) || self.vm_dir(name).exists() {
+        if self.vms.contains_key(name) {
             return Err(SupervisorError::Exists(name.into()));
         }
-        let dir = self.vm_dir(name);
         std::fs::create_dir_all(&self.root).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        let _create_lock = lifecycle::create_lock(&self.root, name)
+            .map_err(|_| SupervisorError::Exists(name.into()))?;
+        let dir = self.vm_dir(name);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) => {
+                // Never follow a symlink or reclaim a published VM. Hold both
+                // locks through cleanup; creators also lock before mkdir, so
+                // an unpublished directory cannot belong to a live creator.
+                if !meta.is_dir() || std::fs::symlink_metadata(dir.join("aivm.yaml")).is_ok() {
+                    return Err(SupervisorError::Exists(name.into()));
+                }
+                let _lease = lifecycle::Lease::acquire(&dir, false)
+                    .map_err(|_| SupervisorError::Exists(name.into()))?;
+                if std::fs::symlink_metadata(dir.join("aivm.yaml")).is_ok() {
+                    return Err(SupervisorError::Exists(name.into()));
+                }
+                std::fs::remove_dir_all(&dir)
+                    .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+                aivm_audit::clear_flags(&dir);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(SupervisorError::Runtime(e.to_string())),
+        }
         // Reserve the name atomically. Only this operation owns the new
         // directory, so a failed create cannot delete another creator's VM.
         std::fs::create_dir(&dir).map_err(|e| {
@@ -374,6 +396,79 @@ mod tests {
         assert_eq!(config.resources.cpu, winner);
         assert!(Runtime::init(config, root.join("vm")).is_ok());
         aivm_audit::clear_flags(&root);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_create_residue_is_reclaimed_and_name_reusable() {
+        let root = root("stale");
+        let dir = root.join("ghost");
+        std::fs::create_dir_all(&dir).unwrap();
+        // จำลอง create ค้าง (crash) — มี dir แต่ไม่มี discovery marker
+        std::fs::write(dir.join("partial"), "x").unwrap();
+        let mut supervisor = Supervisor::new(root.clone());
+        let config = VmConfig::from_yaml("name: test").unwrap();
+        supervisor.create("ghost", config).unwrap();
+        assert!(dir.join("aivm.yaml").exists());
+        assert!(Supervisor::new(root.clone()).status("ghost").is_some());
+        aivm_audit::clear_flags(&root);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn active_unpublished_create_is_not_reclaimed() {
+        let root = root("active");
+        let dir = root.join("vm");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("partial"), "keep").unwrap();
+        let lease = lifecycle::Lease::acquire(&dir, false).unwrap();
+        let config = VmConfig::from_yaml("name: test").unwrap();
+        let mut supervisor = Supervisor::new(root.clone());
+        assert!(matches!(
+            supervisor.create("vm", config.clone()),
+            Err(SupervisorError::Exists(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("partial")).unwrap(),
+            "keep"
+        );
+        drop(lease);
+        let lock = lifecycle::create_lock(&root, "vm").unwrap();
+        assert!(matches!(
+            supervisor.create("vm", config.clone()),
+            Err(SupervisorError::Exists(_))
+        ));
+        drop(lock);
+        supervisor.create("vm", config).unwrap();
+        assert!(!dir.join("partial").exists());
+        aivm_audit::clear_flags(&root);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn create_does_not_reclaim_symlink_or_published_directory() {
+        let root = root("preserve");
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("partial"), "keep").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
+        let mut supervisor = Supervisor::new(root.clone());
+        let config = VmConfig::from_yaml("name: test").unwrap();
+        assert!(matches!(
+            supervisor.create("link", config.clone()),
+            Err(SupervisorError::Exists(_))
+        ));
+        assert!(target.join("partial").exists());
+        let published = root.join("published");
+        std::fs::create_dir(&published).unwrap();
+        std::fs::write(published.join("aivm.yaml"), "invalid config").unwrap();
+        assert!(matches!(
+            supervisor.create("published", config),
+            Err(SupervisorError::Exists(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(published.join("aivm.yaml")).unwrap(),
+            "invalid config"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }
