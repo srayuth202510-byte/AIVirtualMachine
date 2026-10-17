@@ -198,7 +198,7 @@ impl WorkerClient {
                                     break;
                                 }
                             }
-}
+                        }
                     }
                     let outcome = handle
                         .join()
