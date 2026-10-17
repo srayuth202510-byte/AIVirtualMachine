@@ -382,8 +382,13 @@ const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_getdents,
     libc::SYS_access,
     libc::SYS_faccessat,
+    libc::SYS_faccessat2,
     libc::SYS_chdir,
     libc::SYS_fchdir,
+    libc::SYS_umask,
+    libc::SYS_chmod,
+    libc::SYS_fchmod,
+    libc::SYS_fchmodat,
     libc::SYS_getcwd,
     libc::SYS_getdents64,
     libc::SYS_dup,
@@ -394,7 +399,10 @@ const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_writev,
     libc::SYS_pread64,
     libc::SYS_pwrite64,
+    libc::SYS_lseek,
     libc::SYS_sendfile,
+    libc::SYS_splice,
+    libc::SYS_tee,
     libc::SYS_copy_file_range,
     libc::SYS_fsync,
     libc::SYS_fdatasync,
@@ -406,6 +414,7 @@ const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_flock,
     libc::SYS_fcntl,
     libc::SYS_ioctl,
+    libc::SYS_poll,
     libc::SYS_pselect6,
     libc::SYS_ppoll,
     // Time
@@ -455,10 +464,18 @@ const ALLOWED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_rseq,
 ];
 
+// BPF jump offset (jt/jf) เป็น 8-bit (0..=255): allowlist+denylist ยาวเกินแล้ว
+// offset จะล้นแบบเงียบ ๆ ทำให้ syscall อันตรายหลุด — บังคับ fail ตอน compile
+const _: () = assert!(
+    ALLOWED_SYSCALLS.len() + DANGEROUS_SYSCALLS.len() <= u8::MAX as usize,
+    "seccomp allow+deny list too long for 8-bit BPF jump offset"
+);
+
 /// โหมดการทำงานของ seccomp filter
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SeccompMode {
     /// Hybrid: allowlist -> denylist -> KILL (fail-closed production)
+    /// syscall ที่ไม่อยู่ใน allowlist = KILL (ไม่ใช่ default ALLOW)
     #[default]
     Hybrid,
     /// Audit: allowlist -> denylist -> TRACE (log unknown, then KILL)
@@ -499,10 +516,11 @@ unsafe fn build_hybrid_filter(mode: SeccompMode) -> Vec<libc::sock_filter> {
         k,
     };
 
-    // Default action ตามโหมด
+    // Default action สำหรับ syscall ที่ไม่อยู่ใน allowlist (ตรวจ allowlist/denylist ไม่โดน)
     let default_action = match mode {
-        SeccompMode::Hybrid => 0x7fff0000, // ALLOW after explicit allow/deny checks
-        SeccompMode::Audit => 0x7ff00000,  // TRACE (ENOSYS + notify tracer)
+        // allowlist จริง: syscall นอกลิสต์ = KILL (fail-closed)
+        SeccompMode::Hybrid => 0x80000000,       // KILL_PROCESS
+        SeccompMode::Audit => 0x7ff00000,        // TRACE (ENOSYS + notify tracer)
         SeccompMode::DenylistOnly => 0x7fff0000, // legacy denylist defaults to ALLOW
     };
 
@@ -567,39 +585,32 @@ unsafe fn build_hybrid_filter(mode: SeccompMode) -> Vec<libc::sock_filter> {
     filter.push(ret(0x00000000));
 
     // ============ ALLOWLIST: linear scan ============
-    // pc ที่ allowlist[i] = base_allow + i
-    // target = base_allow + n_allow + n_deny (default_action ret)
-    // jt = target - (pc + 1) = n_allow + n_deny - i - 1
+    // allowlist[i] อยู่ที่ pc = base + i
+    // target = ALLOW ret (base + n_allow + n_deny + 1)
+    // jt = target - (pc + 1) = n_allow + n_deny - i
     if n_allow > 0 {
         for (i, &nr) in ALLOWED_SYSCALLS.iter().enumerate() {
-            let skip = n_allow + n_deny - i - 1;
+            let skip = n_allow + n_deny - i;
             filter.push(jeq(nr as u32, skip as u8));
         }
     }
 
     // ============ DENYLIST: linear scan ============
-    // DEBUG: print counts
-    // target KILL ret = base_allow + n_allow + n_deny + 1
-    // base_deny = base_allow + n_allow
-    // pc ที่ denylist[i] = base_allow + n_allow + i
-    // target = base_allow + n_allow + n_deny + 1 (KILL ret)
-    // jt = target - (pc + 1) = n_deny - i - 1
-    if mode != SeccompMode::DenylistOnly {
-        for (i, &nr) in DANGEROUS_SYSCALLS.iter().enumerate() {
-            let skip = n_deny - i;
-            filter.push(jeq(nr as u32, skip as u8));
-        }
-    } else {
-        // denylist-only: default_action = KILL
-        for (i, &nr) in DANGEROUS_SYSCALLS.iter().enumerate() {
-            let skip = n_deny - i;
-            filter.push(jeq(nr as u32, skip as u8));
-        }
+    // denylist[i] อยู่ที่ pc = base + n_allow + i
+    // target = KILL ret (base + n_allow + n_deny + 2)
+    // jt = target - (pc + 1) = n_deny - i + 1
+    for (i, &nr) in DANGEROUS_SYSCALLS.iter().enumerate() {
+        let skip = n_deny - i + 1;
+        filter.push(jeq(nr as u32, skip as u8));
     }
 
-    // ============ DEFAULT ACTION ============
-    filter.push(ret(default_action)); // TRACE หรือ KILL
-    filter.push(ret(0x00000000)); // KILL (fallback)
+    // ============ VERDICTS ============
+    // syscall ที่ไม่โดน allowlist/denylist ตกมาที่นี่ (Hybrid=KILL, Audit=TRACE, DenylistOnly=ALLOW)
+    filter.push(ret(default_action));
+    // syscall ที่ผ่าน allowlist -> ALLOW ชัดเจน (ไม่ผูกกับ default_action)
+    filter.push(ret(0x7fff0000));
+    // syscall ที่อยู่ใน denylist + fallback -> KILL
+    filter.push(ret(0x00000000));
 
     filter
 }
@@ -1980,6 +1991,32 @@ mod tests {
         assert_eq!(
             bpf_verdict(&f, 0x40000003, libc::SYS_read as u32),
             0x00000000
+        );
+    }
+
+    #[test]
+    fn seccomp_hybrid_kills_unlisted_syscall() {
+        // allowlist จริง: syscall ที่ไม่อยู่ทั้ง allowlist และ denylist ต้อง KILL
+        // (regression: เดิม default เป็น ALLOW ทำให้ syscall นอกลิสต์หลุด)
+        let f = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
+        assert!(!ALLOWED_SYSCALLS.contains(&libc::SYS_getpgid));
+        assert!(!DANGEROUS_SYSCALLS.contains(&libc::SYS_getpgid));
+        assert_eq!(
+            bpf_verdict(&f, 0xc000003e, libc::SYS_getpgid as u32),
+            0x80000000,
+            "unlisted syscall must be KILLed under Hybrid (fail-closed allowlist)"
+        );
+        // อีกหนึ่ง syscall นอกลิสต์ (benign เช่นกัน) ต้อง KILL
+        assert_eq!(
+            bpf_verdict(&f, 0xc000003e, libc::SYS_sethostname as u32),
+            0x80000000,
+            "unlisted syscall must be KILLed under Hybrid (fail-closed allowlist)"
+        );
+        // DenylistOnly ยังคง default ALLOW สำหรับ syscall นอกลิสต์ (legacy)
+        let legacy = unsafe { build_hybrid_filter(SeccompMode::DenylistOnly) };
+        assert_eq!(
+            bpf_verdict(&legacy, 0xc000003e, libc::SYS_getpgid as u32),
+            0x7fff0000
         );
     }
 

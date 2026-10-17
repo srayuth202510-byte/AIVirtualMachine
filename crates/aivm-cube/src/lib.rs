@@ -406,6 +406,9 @@ pub mod workflow {
             if execution.iteration_count >= workflow.max_iterations {
                 return Err(CubeError::GuardFailed("max iterations exceeded".into()));
             }
+            // นับทุกครั้งที่ step เดินหน้า (success/failure/retry/timeout)
+            // ไม่ใช่แค่ success — กัน on_failure self-loop วนไม่จำกัด
+            execution.iteration_count += 1;
 
             let node = workflow.nodes.get(&execution.current_node).ok_or_else(|| {
                 CubeError::InvalidTransition {
@@ -435,7 +438,6 @@ pub mod workflow {
                 Ok(_) => {
                     // Success - record attempt and transition
                     *execution.node_attempts.entry(node.id.clone()).or_insert(0) += 1;
-                    execution.iteration_count += 1;
                     execution.last_transition_at = now_ms();
 
                     // Determine next node
@@ -921,6 +923,51 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("max iterations exceeded"));
+    }
+
+    #[test]
+    fn workflow_failure_self_loop_respects_max_iterations() {
+        use workflow::{Workflow, WorkflowNode, WorkflowStepResult};
+        let mut nodes = std::collections::HashMap::new();
+        // node เดียวที่ guard ไม่ผ่านตลอด และ on_failure ชี้กลับหาตัวเอง
+        nodes.insert(
+            "loop".into(),
+            WorkflowNode {
+                id: "loop".into(),
+                state: AgentState::Modify,
+                guards: TransitionGuards {
+                    confidence: 0.0,
+                    confidence_threshold: 0.9,
+                    ..Default::default()
+                },
+                timeout_ms: None,
+                retry_policy: None,
+                on_success: vec![],
+                on_failure: vec!["loop".into()],
+                on_timeout: vec![],
+            },
+        );
+        let wf = Workflow {
+            id: "loop".into(),
+            name: "loop".into(),
+            nodes,
+            entry_node: "loop".into(),
+            max_iterations: 3,
+            global_timeout_ms: None,
+        };
+        let mut engine = workflow::WorkflowEngine::new();
+        engine.register(wf.clone()).unwrap();
+        let mut execution = engine.start("loop").unwrap();
+        let mut cube = Cube::new("loop");
+
+        // failure ก็ต้องนับ iteration — เดิมนับแค่ success ทำให้วนไม่จำกัด
+        for _ in 0..3 {
+            let r = engine.step(&wf, &mut execution, &mut cube).unwrap();
+            assert_eq!(r, WorkflowStepResult::Transitioned);
+        }
+        assert_eq!(execution.iteration_count, 3);
+        let err = engine.step(&wf, &mut execution, &mut cube).unwrap_err();
+        assert!(err.to_string().contains("max iterations exceeded"));
     }
 
     #[test]

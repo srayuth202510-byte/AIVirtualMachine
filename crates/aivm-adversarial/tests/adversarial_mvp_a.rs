@@ -165,6 +165,53 @@ fn network_must_deny() {
 }
 
 #[test]
+fn network_cidr_and_port_bypass_must_deny() {
+    let p = Policy::from_yaml(
+        r#"
+name: adv-net
+network:
+  allow: [github.com]
+  deny: ["8.8.8.0/24", "evil.example"]
+rules:
+  - id: gate
+    action: network
+    resource: network
+    scope: github.com
+    when: "state == 'DEPLOY'"
+"#,
+    )
+    .unwrap();
+    let analyze = EvalContext {
+        state: "ANALYZE".into(),
+        tests_passed: true,
+        ..Default::default()
+    };
+    for target in [
+        "8.8.8.8",      // CIDR deny ต้องถูกตีความเป็นช่วง
+        "8.8.8.8:443",  // ...แม้ใส่พอร์ต
+        "evil.example", // host-only deny ต้องครอบทุกพอร์ต
+        "evil.example:80",
+        "evil.example:8443",
+        "github.com:443", // เติม :443 ต้องไม่บายพาส state gate
+    ] {
+        assert_eq!(
+            p.evaluate_network(target, &analyze).0,
+            Decision::Deny,
+            "must deny {target}"
+        );
+    }
+    let deploy = EvalContext {
+        state: "DEPLOY".into(),
+        tests_passed: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        p.evaluate_network("github.com:443", &deploy).0,
+        Decision::Allow
+    );
+}
+
+#[test]
 fn expired_and_exhausted_capability_must_deny() {
     let mut cap = Capability::new("read", "filesystem", "/workspace").with_max_uses(1);
     assert!(cap.authorize("read", "filesystem", "/workspace").is_ok());

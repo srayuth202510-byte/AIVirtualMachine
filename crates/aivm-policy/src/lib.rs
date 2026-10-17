@@ -253,7 +253,7 @@ impl Policy {
         (Decision::Deny, Some("default-deny".into()))
     }
 
-    pub fn evaluate_network(&self, host: &str, ctx: &EvalContext) -> (Decision, Option<String>) {
+    pub fn evaluate_network(&self, target: &str, ctx: &EvalContext) -> (Decision, Option<String>) {
         if self.validate_syntax().is_err() {
             return (Decision::Deny, Some("invalid-policy".into()));
         }
@@ -261,11 +261,13 @@ impl Policy {
             return (Decision::Deny, Some("policy-evaluation-error".into()));
         }
         // เครือข่ายส่วนตัว/loopback/metadata ปฏิเสธเสมอ (defense in depth §18)
-        if is_blocked_network(host) {
+        if is_blocked_network(target) {
             return (Decision::Deny, Some("blocked-range".into()));
         }
+        // deny list: pattern แบบ host-only ครอบทุกพอร์ต และรองรับ CIDR
+        // (deny=true) — ผู้ใช้ต้องปฏิเสธได้จริงแม้ปลายทางจะไม่ใช่ 443
         for pat in &self.network.deny {
-            if network_pattern(pat, host) {
+            if network_pattern(pat, target, true) {
                 return (Decision::Deny, Some(format!("deny-list:{pat}")));
             }
         }
@@ -274,7 +276,7 @@ impl Policy {
             if rule.effect.as_deref() == Some("deny")
                 && rule.action == "network"
                 && rule.resource == "network"
-                && network_pattern(&rule.scope, host)
+                && network_pattern(&rule.scope, target, true)
                 && rule_matches(rule, ctx)
             {
                 return (Decision::Deny, Some(format!("rule:{}", rule.id)));
@@ -284,8 +286,8 @@ impl Policy {
             return (Decision::Deny, Some("require-test-before-network".into()));
         }
         for pat in &self.network.allow {
-            if network_pattern(pat, host) {
-                if self.gated("network", "network", host, ctx) {
+            if network_pattern(pat, target, false) {
+                if self.gated_network(target, ctx) {
                     return (Decision::Allow, Some(format!("allow-list:{pat}")));
                 }
                 return (Decision::Deny, Some("state-gate".into()));
@@ -305,6 +307,27 @@ impl Policy {
                 && rule.action == action
                 && rule.resource == resource
                 && match_pattern(&rule.scope, scope)
+            {
+                scoped = true;
+                if rule_matches(rule, ctx) {
+                    return true;
+                }
+            }
+        }
+        !scoped
+    }
+
+    /// state gate สำหรับ network โดยเฉพาะ: เทียบ rule scope กับ "target" ดิบ
+    /// ด้วย semantics แบบ deny (host-only ครอบทุกพอร์ต + รองรับ CIDR)
+    /// จึงปิดช่องบายพาส gate ด้วยการเติม/ตัดพอร์ต เช่น `host` เทียบ `host:443`
+    fn gated_network(&self, target: &str, ctx: &EvalContext) -> bool {
+        let mut scoped = false;
+        for rule in &self.rules {
+            let effect = rule.effect.as_deref().unwrap_or("allow");
+            if effect == "allow"
+                && rule.action == "network"
+                && rule.resource == "network"
+                && network_pattern(&rule.scope, target, true)
             {
                 scoped = true;
                 if rule_matches(rule, ctx) {
@@ -404,16 +427,82 @@ fn is_blocked_network(target: &str) -> bool {
             .map(|ip| !is_public_address(ip))
             .unwrap_or(false)
 }
-fn network_pattern(pattern: &str, target: &str) -> bool {
+/// เทียบ network pattern กับ target (`host`, `host:port`, `[v6]:port`, `ip`)
+/// - CIDR (`10.0.0.0/8`, `2001:db8::/32`) เทียบกับ target ที่เป็น IP
+/// - pattern ที่ไม่ระบุพอร์ต: ถ้า `deny` = true จะครอบทุกพอร์ต (ใช้กับ deny
+///   list / deny rule / state gate); ถ้าเป็น allow-list ของ hostname จะหมายถึง
+///   HTTPS default port (443) เท่านั้น
+fn network_pattern(pattern: &str, target: &str, deny: bool) -> bool {
+    // CIDR มาก่อน เพราะ IPv6 CIDR มี ':' ปนอยู่ด้วย
+    if let Some((net, prefix)) = parse_cidr(pattern) {
+        return match network_host(target).parse::<std::net::IpAddr>() {
+            Ok(ip) => ip_in_cidr(ip, net, prefix),
+            Err(_) => false,
+        };
+    }
     if pattern.contains(':') {
         return match_pattern(pattern, target);
     }
     let host = network_host(target);
-    // scope แบบ hostname ไม่ระบุ port หมายถึง HTTPS default port เท่านั้น
-    if host != target && !target.ends_with(":443") {
+    // allow-list ของ hostname ไม่ระบุ port = HTTPS default port เท่านั้น
+    if !deny && host != target && !target.ends_with(":443") {
         return false;
     }
     match_pattern(pattern, host)
+}
+
+/// แยก CIDR (`net/prefix`) เป็น (IP, prefix len) หรือ None ถ้าไม่ใช่ CIDR ที่ถูกต้อง
+fn parse_cidr(pattern: &str) -> Option<(std::net::IpAddr, u8)> {
+    let (net, prefix) = pattern.split_once('/')?;
+    let ip: std::net::IpAddr = net
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()?;
+    let prefix: u8 = prefix.trim().parse().ok()?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    if prefix > max {
+        return None;
+    }
+    Some((ip, prefix))
+}
+
+/// จริงเมื่อ `ip` อยู่ในช่วง CIDR (`net`, `prefix`) รวมกรณี v4-mapped IPv6
+fn ip_in_cidr(ip: std::net::IpAddr, net: std::net::IpAddr, prefix: u8) -> bool {
+    use std::net::IpAddr;
+    match (ip, net) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => {
+            if prefix > 32 {
+                return false;
+            }
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            (u32::from(a) & mask) == (u32::from(b) & mask)
+        }
+        (IpAddr::V6(a), IpAddr::V6(b)) => {
+            if prefix > 128 {
+                return false;
+            }
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (u128::from(a) & mask) == (u128::from(b) & mask)
+        }
+        (IpAddr::V6(a), net @ IpAddr::V4(_)) => a
+            .to_ipv4_mapped()
+            .map(|v4| ip_in_cidr(IpAddr::V4(v4), net, prefix))
+            .unwrap_or(false),
+        (ip @ IpAddr::V4(_), IpAddr::V6(b)) => b
+            .to_ipv4_mapped()
+            .map(|v4| ip_in_cidr(ip, IpAddr::V4(v4), prefix))
+            .unwrap_or(false),
+    }
 }
 
 fn rule_matches(rule: &Rule, ctx: &EvalContext) -> bool {
@@ -1002,6 +1091,109 @@ rules:
             p.evaluate_network("github.com", &validate).0,
             Decision::Allow
         );
+    }
+
+    #[test]
+    fn network_deny_cidr_is_interpreted() {
+        let p = Policy::from_yaml(
+            r#"
+name: cidr
+network:
+  allow: ["2606:4700::/32"]
+  deny: ["8.8.8.0/24", "2606:4700::/32"]
+"#,
+        )
+        .unwrap();
+        let ctx = EvalContext {
+            tests_passed: true,
+            ..Default::default()
+        };
+        // CIDR ต้องถูกตีความเป็นช่วงจริง ไม่ใช่ glob ตรงตัว
+        let (d, r) = p.evaluate_network("8.8.8.8", &ctx);
+        assert_eq!(d, Decision::Deny);
+        assert_eq!(r.as_deref(), Some("deny-list:8.8.8.0/24"));
+        // นอกช่วง CIDR → ตกไป default-deny (ไม่ถูกจับแบบผิด ๆ)
+        let (d, r) = p.evaluate_network("8.8.9.9", &ctx);
+        assert_eq!(d, Decision::Deny);
+        assert_eq!(r.as_deref(), Some("default-deny"));
+        // IPv6 CIDR
+        let (d, r) = p.evaluate_network("2606:4700::1111", &ctx);
+        assert_eq!(d, Decision::Deny);
+        assert_eq!(r.as_deref(), Some("deny-list:2606:4700::/32"));
+    }
+
+    #[test]
+    fn network_deny_host_only_covers_all_ports() {
+        let p = Policy::from_yaml(
+            r#"
+name: denyhost
+network:
+  allow: [evil.example]
+  deny: [evil.example]
+"#,
+        )
+        .unwrap();
+        let ctx = EvalContext {
+            tests_passed: true,
+            ..Default::default()
+        };
+        // deny แบบ host-only ต้องกันทุกพอร์ต ไม่ใช่แค่ 443
+        for target in [
+            "evil.example",
+            "evil.example:80",
+            "evil.example:443",
+            "evil.example:8443",
+        ] {
+            let (d, r) = p.evaluate_network(target, &ctx);
+            assert_eq!(d, Decision::Deny, "target {target}");
+            assert_eq!(
+                r.as_deref(),
+                Some("deny-list:evil.example"),
+                "target {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_state_gate_not_bypassable_by_port() {
+        let p = Policy::from_yaml(
+            r#"
+name: netgate
+network:
+  allow: [github.com]
+  deny: []
+rules:
+  - id: allow_net_deploy
+    action: network
+    resource: network
+    scope: github.com
+    when: "state == 'DEPLOY'"
+"#,
+        )
+        .unwrap();
+        let analyze = EvalContext {
+            state: "ANALYZE".into(),
+            tests_passed: true,
+            ..Default::default()
+        };
+        // เติม :443 ต้องไม่ทำให้ gate หลุด
+        for target in ["github.com", "github.com:443"] {
+            let (d, r) = p.evaluate_network(target, &analyze);
+            assert_eq!(d, Decision::Deny, "target {target}");
+            assert_eq!(r.as_deref(), Some("state-gate"), "target {target}");
+        }
+        let deploy = EvalContext {
+            state: "DEPLOY".into(),
+            tests_passed: true,
+            ..Default::default()
+        };
+        for target in ["github.com", "github.com:443"] {
+            assert_eq!(
+                p.evaluate_network(target, &deploy).0,
+                Decision::Allow,
+                "target {target}"
+            );
+        }
     }
 
     #[test]
