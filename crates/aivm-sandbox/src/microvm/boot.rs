@@ -13,7 +13,6 @@
 use super::{ExecOutcome, ExecSpec, MicroVmConfig};
 use crate::{verify_artifact, RunVerdict, SandboxError};
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -696,13 +695,15 @@ fn boot_and_run_inner(
     // chroot เห็น image/socket เป็น `/...` แต่ host ต้อง connect คนละ path
     // (regression #18: เดิมส่ง host path absolute เข้า API ทั้งที่อยู่นอก
     // chroot ทั้งหมด = boot ไม่เคยขึ้น)
+    // spawn firecracker through jailer or directly
     let (raw_child, api_sock) = if use_jailer {
-        spawn_jailer(cfg, fc_bin, serial_file, err_file, scratch, &kernel_copy)?
+        // jailer mode: returns (Child, PathBuf) with api_sock inside chroot
+        let jail_result = spawn_jailer(cfg, fc_bin, serial_file, err_file, scratch, &kernel_copy)?;
+        (jail_result.0, jail_result.1)
     } else {
-        (
-            spawn_firecracker_direct(fc_bin, &host_sock, serial_file, err_file)?,
-            host_sock,
-        )
+        // direct mode: returns Child, api_sock is host path
+        let direct_child = spawn_firecracker_direct(fc_bin, &host_sock, serial_file, err_file)?;
+        (direct_child, host_sock)
     };
     let mut guard = KillOnDrop(Some(raw_child));
     let child = guard.0.as_mut().expect("guard holds child");
@@ -942,11 +943,11 @@ fn spawn_firecracker_direct(
 fn spawn_jailer(
     cfg: &MicroVmConfig,
     fc_bin: &Path,
-    sock: &Path,
     serial_file: std::fs::File,
     err_file: std::fs::File,
     scratch: &Path,
-) -> BootResult<Child> {
+    kernel: &Path,
+) -> BootResult<(Child, PathBuf)> {
     let jailer_cfg = cfg.jailer.as_ref().expect("use_jailer guard");
 
     // Find jailer binary
@@ -966,38 +967,51 @@ fn spawn_jailer(
         jailer_cfg.jailer_id.clone()
     };
 
-    // Create chroot directory for jailer
+    // chroot ของ jailer อยู่ที่ `<base>/<id>/rootfs` (layout ตาม jailer ของ
+    // Firecracker) — firecracker ที่อยู่ใน chroot เห็นไฟล์เป็น `/...`
     let chroot_base = std::env::temp_dir().join(format!("aivm-jailer-{}-chroot", jailer_id));
     std::fs::create_dir_all(&chroot_base).map_err(|e| {
         clean_err(SandboxError::Spawn(format!(
             "jailer chroot dir create failed: {e}"
         )))
     })?;
+    let chroot_dir = chroot_base.join(&jailer_id).join("rootfs");
+    std::fs::create_dir_all(&chroot_dir).map_err(|e| {
+        clean_err(SandboxError::Spawn(format!(
+            "jailer rootfs dir create failed: {e}"
+        )))
+    })?;
 
-    // Copy firecracker binary into chroot
-    let fc_in_chroot = chroot_base.join("firecracker");
-    std::fs::copy(fc_bin, &fc_in_chroot)
-        .map_err(|e| clean_err(SandboxError::Spawn(format!("jailer fc copy failed: {e}"))))?;
+    // copy image เข้า chroot — firecracker ใน chroot เปิดได้เฉพาะที่นี่
+    // (regression #18: เดิม copy kernel จาก `scratch/vmlinux.bin` ที่ไม่เคยมี)
+    let kernel_in_chroot = chroot_dir.join("vmlinux.bin");
+    std::fs::copy(kernel, &kernel_in_chroot).map_err(|e| {
+        clean_err(SandboxError::Spawn(format!(
+            "jailer kernel copy failed: {e}"
+        )))
+    })?;
+    let rootfs_in_chroot = chroot_dir.join("root.img");
+    std::fs::copy(scratch.join("root.img"), &rootfs_in_chroot).map_err(|e| {
+        clean_err(SandboxError::Spawn(format!(
+            "jailer rootfs copy failed: {e}"
+        )))
+    })?;
+    let data_in_chroot = chroot_dir.join("data.img");
+    std::fs::copy(scratch.join("data.img"), &data_in_chroot)
+        .map_err(|e| clean_err(SandboxError::Spawn(format!("jailer data copy failed: {e}"))))?;
 
-    // Make it executable
-    let mut perms = std::fs::metadata(&fc_in_chroot)
-        .map_err(|e| clean_err(SandboxError::Spawn(format!("jailer fc stat failed: {e}"))))?
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&fc_in_chroot, perms)
-        .map_err(|e| clean_err(SandboxError::Spawn(format!("jailer fc chmod failed: {e}"))))?;
-
-    // Build jailer command
+    // Build jailer command — `--firecracker-binary` เป็น host path (jailer
+    // คัดลอกเข้า chroot เอง) และ args ของ firecracker อยู่หลัง `--` โดยที่
+    // `--api-sock` เป็น path ภายใน chroot
     let mut cmd = Command::new(&jailer_bin);
     cmd.arg("--id")
         .arg(&jailer_id)
         .arg("--firecracker-binary")
-        .arg("/firecracker")
+        .arg(fc_bin)
         .arg("--chroot-base-dir")
-        .arg(&chroot_base)
-        .arg("--api-sock")
-        .arg(sock);
+        .arg(&chroot_base);
 
+    // isolation flags ตาม config (jailer ที่ไม่รู้จัก flag = spawn ล้มแบบดัง)
     if jailer_cfg.chroot {
         cmd.arg("--chroot");
     }
@@ -1014,33 +1028,20 @@ fn spawn_jailer(
         cmd.arg("--no-new-privs");
     }
 
-    // Copy images to chroot for jailer
-    let rootfs_in_chroot = chroot_base.join("root.img");
-    std::fs::copy(scratch.join("root.img"), &rootfs_in_chroot).map_err(|e| {
-        clean_err(SandboxError::Spawn(format!(
-            "jailer rootfs copy failed: {e}"
-        )))
-    })?;
-
-    let data_in_chroot = chroot_base.join("data.img");
-    std::fs::copy(scratch.join("data.img"), &data_in_chroot)
-        .map_err(|e| clean_err(SandboxError::Spawn(format!("jailer data copy failed: {e}"))))?;
-
-    // Copy kernel to chroot
-    let kernel_in_chroot = chroot_base.join("vmlinux.bin");
-    std::fs::copy(scratch.join("vmlinux.bin"), &kernel_in_chroot).map_err(|e| {
-        clean_err(SandboxError::Spawn(format!(
-            "jailer kernel copy failed: {e}"
-        )))
-    })?;
+    cmd.arg("--").arg("--api-sock").arg("/api.sock");
 
     cmd.stdin(Stdio::null())
         .stdout(serial_file)
         .stderr(err_file)
         .env_clear();
 
-    cmd.spawn()
-        .map_err(|e| clean_err(SandboxError::Spawn(format!("jailer spawn failed: {e}"))))
+    let child = cmd
+        .spawn()
+        .map_err(|e| clean_err(SandboxError::Spawn(format!("jailer spawn failed: {e}"))))?;
+
+    // socket ที่ host connect ได้ = ภายใน chroot (jailer bind ที่ `/api.sock`)
+    let api_sock = chroot_dir.join("api.sock");
+    Ok((child, api_sock))
 }
 
 #[cfg(test)]
