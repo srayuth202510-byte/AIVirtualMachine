@@ -8,9 +8,11 @@
 //! (เปิดด้วย `--features llama`)
 
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod artifact;
 pub mod worker;
 
 pub mod providers;
@@ -218,6 +220,7 @@ pub const MAX_MODEL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// ตรวจ supply chain ของไฟล์โมเดลก่อนโหลด (mirror `aivm_sandbox::verify_artifact`)
 /// `expected` ว่าง = ไม่ pin (โหลดได้ แต่ caller ควรรายงานใน degraded)
 /// ไม่ตรง/รูปแบบผิด/อ่านไม่ได้ = Err เสมอ ไม่มีการโหลดไฟล์นั้น
+/// เป็นการตรวจ ณ เวลานั้นเท่านั้น; loader ต้องใช้ PreparedModelFile เพื่อผูก bytes กับการโหลด
 pub fn verify_model_file(path: &str, expected_sha256_hex: &str) -> Result<(), ModelError> {
     let bad = |m: &str| ModelError::LoadFailed(m.to_string());
     if expected_sha256_hex.is_empty() {
@@ -229,16 +232,6 @@ pub fn verify_model_file(path: &str, expected_sha256_hex: &str) -> Result<(), Mo
     {
         return Err(bad("bad model hash (must be 64 hex chars)"));
     }
-    let mut expected = [0u8; 32];
-    for (i, chunk) in expected_sha256_hex.as_bytes().chunks(2).enumerate() {
-        let hi = (chunk[0] as char)
-            .to_digit(16)
-            .ok_or_else(|| bad("bad hex"))?;
-        let lo = (chunk[1] as char)
-            .to_digit(16)
-            .ok_or_else(|| bad("bad hex"))?;
-        expected[i] = ((hi << 4) | lo) as u8;
-    }
     let expected = expected_sha256_hex.to_ascii_lowercase();
     let actual = model_file_sha256(path)?;
     if actual != expected {
@@ -249,20 +242,7 @@ pub fn verify_model_file(path: &str, expected_sha256_hex: &str) -> Result<(), Mo
 
 /// Compute the SHA-256 of a model artifact without loading it into memory.
 pub fn model_file_sha256(path: &str) -> Result<String, ModelError> {
-    let bad = |m: &str| ModelError::LoadFailed(m.to_string());
-    let mut file = std::fs::File::open(path).map_err(|_| bad("model not readable"))?;
-    let meta = file.metadata().map_err(|_| bad("model not statable"))?;
-    if !meta.is_file() {
-        return Err(bad("model is not a regular file"));
-    }
-    if meta.len() > MAX_MODEL_BYTES {
-        return Err(bad("model too large"));
-    }
-    // อ่านแบบ stream กันไฟล์ใหญ่กินหน่วยความจำ
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).map_err(|_| bad("model not readable"))?;
-    let digest = hasher.finalize();
-    Ok(format!("{digest:x}"))
+    artifact::file_sha256(&mut artifact::open_regular(path)?)
 }
 
 pub trait Model: Send + Sync {
@@ -415,6 +395,8 @@ impl Model for EchoModel {
 pub struct LocalLlamaModel {
     backend: LlamaBackend,
     model: LlamaModel,
+    // เก็บ fd จน model/mmap ถูกทำลาย ไม่เปิด source pathname ซ้ำหลัง verify
+    _artifact: artifact::PreparedModelFile,
     chat_template: Option<llama_cpp_2::model::LlamaChatTemplate>,
     config: LocalModelConfig,
     name: String,
@@ -426,8 +408,7 @@ impl LocalLlamaModel {
         if config.model_path.is_empty() {
             return Err(ModelError::LoadFailed("model_path is required".into()));
         }
-        // supply chain มาก่อนโหลด: hash ไม่ตรง = ไม่แตะไฟล์นั้นเลย
-        verify_model_file(&config.model_path, &config.model_sha256)?;
+        let artifact = artifact::PreparedModelFile::new(&config.model_path, &config.model_sha256)?;
 
         let backend = LlamaBackend::init().map_err(|e| ModelError::Backend(e.to_string()))?;
 
@@ -438,7 +419,7 @@ impl LocalLlamaModel {
             .with_use_mlock(config.use_mlock)
             .with_vocab_only(config.embedding);
 
-        let model = LlamaModel::load_from_file(&backend, &config.model_path, &model_params)
+        let model = LlamaModel::load_from_file(&backend, artifact.load_path(), &model_params)
             .map_err(|e| ModelError::LoadFailed(e.to_string()))?;
         // Instruct GGUF-үүдийн template model metadata-д бий. Байхгүй
         // base model-д хуучин raw-prompt үйлдлийг хэвээр үлдээнэ.
@@ -451,6 +432,7 @@ impl LocalLlamaModel {
         Ok(Self {
             backend,
             model,
+            _artifact: artifact,
             chat_template,
             name: config.model_path.clone(),
             config,

@@ -67,17 +67,13 @@ impl WorkerClient {
                 if size > limits.storage_mb.saturating_mul(1024 * 1024) {
                     return Err(WorkerError::LimitExceeded("staging storage".into()));
                 }
-                let staged = if microvm {
-                    path.clone()
-                } else {
-                    // A distinct inode avoids exposing source files through hard links.
-                    let staged = config_path
-                        .parent()
-                        .unwrap()
-                        .join(format!("artifact-{index}"));
-                    std::fs::copy(&path, &staged).map_err(|e| fail(&e))?;
-                    staged
-                };
+                // สำเนา private/read-only ทั้งสอง tier: mode ของ source (เช่น 0664)
+                // ต้องไม่ทำให้ loader มองว่า staged input ยังเปิดให้ UID อื่นเขียนได้
+                let staged = config_path
+                    .parent()
+                    .unwrap()
+                    .join(format!("artifact-{index}"));
+                stage_readonly_artifact(&path, &staged).map_err(|e| fail(&e))?;
                 policy
                     .filesystem
                     .read
@@ -85,13 +81,11 @@ impl WorkerClient {
                 mounted.insert(path, staged);
             }
             let map = |path: &Path| {
+                let staged = mounted.get(path).map_or(path, PathBuf::as_path);
                 if microvm {
-                    format!("/mnt/data{}", path.display())
+                    format!("/mnt/data{}", staged.display())
                 } else {
-                    mounted.get(path).map_or_else(
-                        || path.to_string_lossy().into_owned(),
-                        |p| p.to_string_lossy().into_owned(),
-                    )
+                    staged.to_string_lossy().into_owned()
                 }
             };
             let guest_local = guest_config.local.as_mut().unwrap();
@@ -267,5 +261,37 @@ impl WorkerClient {
         let _ = std::fs::remove_file(request_path);
         let _ = std::fs::remove_file(config_path_guest);
         result
+    }
+}
+
+fn stage_readonly_artifact(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::copy(source, destination)?;
+    let mut permissions = std::fs::metadata(destination)?.permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(destination, permissions)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn staged_artifact_has_distinct_inode_and_no_write_permissions() {
+        let directory = std::env::temp_dir().join(format!("aivm-stage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.gguf");
+        let staged = directory.join("staged.gguf");
+        std::fs::write(&source, b"approved weights").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o666)).unwrap();
+        stage_readonly_artifact(&source, &staged).unwrap();
+        assert_eq!(std::fs::metadata(&staged).unwrap().mode() & 0o222, 0);
+        assert_ne!(
+            std::fs::metadata(&staged).unwrap().ino(),
+            std::fs::metadata(&source).unwrap().ino()
+        );
+        std::fs::write(&source, b"changed weights").unwrap();
+        assert_eq!(std::fs::read(&staged).unwrap(), b"approved weights");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

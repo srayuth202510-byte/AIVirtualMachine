@@ -103,6 +103,7 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "ureq",
+ "uuid",
 ]
 
 [[package]]

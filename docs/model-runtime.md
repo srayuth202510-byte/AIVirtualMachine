@@ -106,6 +106,30 @@ Container copy model/dependencies เข้า private staging directory ก่�
 MicroVM stage เฉพาะ file grants ไม่ copy directory จาก host ทั้งก้อน และตรวจ storage quota
 ข้อมูล config/request อยู่ใน directory `0700` และไฟล์ `0600`; ล้างเมื่อ request จบ
 
+## ผูก model pin กับไฟล์ที่โหลดจริง
+
+GGUF loader บน Linux เปิด source ด้วย `O_NOFOLLOW | O_NONBLOCK` และรับเฉพาะ regular file
+ไม่เกิน 64 GiB สำหรับ source บน writable mount จะสร้างไฟล์ใน private directory `0700`
+แล้ว unlink ก่อน copy แบบจำกัดขนาด เพื่อไม่ทิ้งสำเนาขนาดใหญ่เมื่อ process ถูก kill ระหว่าง copy
+จากนั้นเปลี่ยนสำเนาเป็น `0400` และเปิด descriptor แบบ read-only ก่อนตรวจ hash
+loader เปิด `/proc/self/fd/<fd>` ของสำเนาที่ตรวจแล้วและเก็บ descriptor จน model ถูกทำลาย
+การแทน source pathname, สลับ symlink หรือเขียน source inode เดิมหลังตรวจจึงไม่เปลี่ยน bytes
+ที่ loader/mmap ใช้ หาก source เปลี่ยนระหว่าง copy จะยอมรับเฉพาะสำเนาที่ hash ตรง pin เท่านั้น
+
+Container/MicroVM ใช้สำเนาที่ launcher stage ไว้บน read-only mount โดยไม่ copy เพิ่ม
+เส้นนี้ต้องเป็นไฟล์ link เดียว, owner เป็น root หรือ UID ปัจจุบัน และไม่มี group/world write
+ระบบตรวจ mount และ metadata ผ่าน descriptor จริง ไม่ใช้ชื่อ tier ใน config เป็นหลักฐาน
+จากนั้น hash และ load ผ่าน descriptor เดียวกัน ตาม threat model ยังเชื่อถือ host/kernel/operator
+รวมถึง host ที่เป็นเจ้าของ backing storage ของ read-only mount
+
+Writable source ต้องมี temporary storage เพิ่มเท่าขนาด GGUF และมีค่า copy/hash ก่อนโหลด
+ตำแหน่งมาจาก temporary directory ของ process (`TMPDIR` สำหรับ inline); ถ้าเป็น tmpfs
+พื้นที่นี้ใช้ RAM/swap และนับตามข้อจำกัดของ host/worker ด้วย ต้องเตรียม quota ให้พอ
+หาก copy, cleanup, hash หรือ `/proc/self/fd` ใช้ไม่ได้จะคืน error โดยไม่มี fallback ไป source
+Process worker อาจมีทั้งสำเนาจาก launcher และสำเนาของ loader พร้อมกันระหว่างโหลด
+เส้นนี้รองรับ single-file GGUF; ไม่อนุญาตให้ค้น split/shard เพิ่มจาก source directory
+โดยไม่ผ่าน verification
+
 ## Streaming, cancellation และ verification
 
 `aivm reason --config model.yaml --prompt 'Hello' --stream` ส่ง delta จาก worker
