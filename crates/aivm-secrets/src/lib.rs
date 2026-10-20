@@ -120,6 +120,7 @@ pub struct SecretCapability {
 
 /// Secret Policy — policy สำหรับ secrets
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecretPolicy {
     /// Allow list: resource:scope patterns ที่อนุญาต
     #[serde(default)]

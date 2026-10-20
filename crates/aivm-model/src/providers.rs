@@ -23,7 +23,7 @@ fn sanitize(api_key: &str, msg: String) -> String {
 // ---------- OpenAI ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct OpenAIConfig {
     pub api_key_env: String, // ชื่อ env var ที่เก็บ API key
     pub model: String,       // เช่น "gpt-4o-mini"
@@ -131,7 +131,7 @@ impl Model for OpenAIProvider {
 // ---------- Anthropic ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AnthropicConfig {
     pub api_key_env: String,
     pub model: String, // เช่น "claude-sonnet-4-20250514"

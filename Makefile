@@ -1,7 +1,7 @@
 # ทางลัดนักพัฒนา AIVM ดูรายการด้วย `make help`
 # ทุก target คือ cargo ธรรมดา ใช้ `rtk make <target>` ได้เหมือนกัน
 
-.PHONY: help build check test test-adv test-coding test-microvm test-hardware test-container check-microvm check-hardware check-ci demo e2e llama-smoke clippy fmt fmt-check verify ci clean bench setup-host pins audit-pack query path explain graph-update debug-test
+.PHONY: help build check test test-adv test-coding test-llama test-microvm test-hardware test-container check-llama check-microvm check-hardware check-ci demo e2e llama-smoke clippy fmt fmt-check verify ci clean bench setup-host pins audit-pack query path explain graph-update debug-test
 
 help: ## แสดงวิธีใช้นี้
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS=":.*?## "} {printf "  %-10s %s\n", $$1, $$2}'
@@ -30,6 +30,12 @@ test-adv: ## ชุด must-deny อย่างเดียว (สเปก §
 
 test-coding: ## ทดสอบ agent อ่าน/แก้โค้ด + GCC/ld + test binary จริง พร้อม adversarial quotas
 	cargo test -p aivm-runtime --test coding_workflow
+
+test-llama: ## คอมไพล์และทดสอบ local GGUF backend ที่อยู่หลังฟีเจอร์ llama
+	cargo test -p aivm-model -p aivm-model-worker --features llama
+
+check-llama: ## lint local GGUF backend และ worker ทุก target
+	cargo clippy -p aivm-model -p aivm-model-worker --all-targets --features llama -- -D warnings
 
 test-container: ## รัน container boundary tests จริง (ต้องตั้ง AIVM_CONTAINER_TEST_CONFIG)
 	cargo test -p aivm-sandbox --test container
@@ -74,7 +80,7 @@ fmt-check: ## ตกถ้าฟอร์แมตเพี้ยน
 verify: fmt-check clippy test demo ## ด่านรวม: format + lint + test + self-test
 	@echo "verify: all green"
 
-ci: verify e2e check-microvm test-microvm check-hardware test-hardware ## เหมือน CI บน GitHub: verify + วงจร CLI ครบ + microvm + hardware
+ci: verify e2e check-llama test-llama check-microvm test-microvm check-hardware test-hardware ## เหมือน CI บน GitHub: verify + วงจร CLI ครบ + llama + microvm + hardware
 
 clean: ## ลบ build artifact กับบ้าน VM เดโม
 	cargo clean

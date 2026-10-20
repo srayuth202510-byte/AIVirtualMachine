@@ -61,6 +61,7 @@ pub enum AttestationMode {
 
 /// การตั้งค่า GPU/NPU isolation
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct GpuConfig {
     /// เปิด MIG (Multi-Instance GPU) — ต้องการ NVIDIA A100/H100 + driver
     #[serde(default)]
@@ -84,6 +85,7 @@ pub struct GpuConfig {
 
 /// การตั้งค่า Disk Encryption
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DiskEncryptionConfig {
     /// เปิด disk encryption (LUKS2 + vTPM-sealed key)
     #[serde(default)]
@@ -117,6 +119,7 @@ fn default_key_size() -> u32 {
 
 /// การตั้งค่า Secure/Measured Boot
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MeasuredBootConfig {
     /// เปิด measured boot (PCR measurements)
     #[serde(default)]
@@ -141,6 +144,7 @@ fn default_firmware() -> String {
 
 /// การตั้งค่า vTPM
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct VtpmConfig {
     /// เปิด vTPM (ผ่าน swtpm + QEMU)
     #[serde(default)]
@@ -162,6 +166,7 @@ fn default_true() -> bool {
 
 /// Image artifact ที่ pin ด้วย sha256
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactPin {
     /// path ไฟล์ image (kernel/initrd/rootfs)
     pub path: PathBuf,
@@ -171,6 +176,7 @@ pub struct ArtifactPin {
 
 /// Hardware Isolation configuration (Level 3)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HardwareConfig {
     /// ประเภท TEE: sevsnp | tdx | generic
     #[serde(default)]

@@ -332,7 +332,8 @@ fn i7_every_decision_audited() {
         .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
         .unwrap_or(0);
     assert_eq!(granted, 1);
-    assert_eq!(after_rt - before_rt, granted + 2); // grant + สอง validated transitions
+    // แต่ละ transition มี prepare+commit และ MODIFY มี grant ที่ commit แล้ว
+    assert_eq!(after_rt - before_rt, granted + 4);
     assert!(AuditWriter::verify(&audit_p).is_ok());
     inv_clean(&dir);
     inv_clean(&rt_dir);

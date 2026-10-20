@@ -46,6 +46,7 @@ pub enum RuntimeError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VmConfig {
     pub name: String,
     #[serde(default)]
@@ -89,6 +90,7 @@ pub struct VmConfig {
 /// Deployment posture. Development remains the backward-compatible default;
 /// production requires verified hashes for local open-weight model files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityBlock {
     #[serde(default = "default_security_profile")]
     pub profile: String,
@@ -107,6 +109,7 @@ fn default_security_profile() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeBlock {
     #[serde(default = "default_isolation")]
     pub isolation: String,
@@ -129,6 +132,7 @@ fn default_isolation() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelBlock {
     #[serde(default = "default_provider")]
     pub provider: String,
@@ -164,6 +168,7 @@ fn default_model() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceBlock {
     #[serde(default = "default_cpu")]
     pub cpu: u32,
@@ -192,6 +197,7 @@ fn default_storage() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct FilesystemBlock {
     #[serde(default)]
     pub read: Vec<String>,
@@ -200,6 +206,7 @@ pub struct FilesystemBlock {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkBlock {
     #[serde(default)]
     pub allow: Vec<String>,
@@ -212,18 +219,21 @@ pub struct NetworkBlock {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ToolsBlock {
     #[serde(default)]
     pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilitiesBlock {
     #[serde(default)]
     pub initial: Vec<String>, // "read:workspace", "search:code"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyExtra {
     #[serde(default)]
     pub require_test_before_network: bool,
@@ -293,8 +303,9 @@ struct PersistedState {
     leases: Vec<aivm_secrets::SecretLease>,
 }
 
-/// Restore usage only for identical action/resource/scope identities. Saved
-/// grants, conditions, limits and expiry never replace current configuration.
+/// Restore usage and the original deadline for identical grant identities.
+/// Current conditions and limits remain authoritative, while an old expiry can
+/// only shorten the freshly rebuilt grant. Restart must never renew a JIT lease.
 fn restore_cap_usage(current: &mut CapabilitySet, saved: &CapabilitySet) {
     for cap in &mut current.caps {
         for old in &saved.caps {
@@ -309,6 +320,11 @@ fn restore_cap_usage(current: &mut CapabilitySet, saved: &CapabilitySet) {
             ) {
                 cap.used_count = cap.used_count.max(old.used_count);
                 cap.used_bytes = cap.used_bytes.max(old.used_bytes);
+                cap.expiration = match (cap.expiration, old.expiration) {
+                    (Some(fresh), Some(saved)) => Some(fresh.min(saved)),
+                    (None, Some(saved)) => Some(saved),
+                    (fresh, None) => fresh,
+                };
             }
         }
     }
@@ -556,15 +572,8 @@ impl Runtime {
         let state = next.to_string();
         let mut next_caps = self.gateway.caps.clone();
         let revoked = next_caps.revoke_stale(&state);
-        if revoked > 0 {
-            self.audit_op(
-                "revoke",
-                "capability",
-                &format!("{revoked} stale lease(s)"),
-                &state,
-            )?;
-        }
         let mut granted = 0;
+        let mut granted_labels = Vec::new();
         for cap in state_grants(
             next,
             &self.workspace,
@@ -573,17 +582,59 @@ impl Runtime {
         ) {
             let label = format!("{}:{}", cap.action, cap.scope);
             if next_caps.grant(cap) {
-                self.audit_op("grant", &label, "lease issued", &state)?;
+                granted_labels.push(label);
                 granted += 1;
             }
         }
-        // ติดตั้งสิทธิ์หลัง audit ครบเท่านั้น; error ไม่เปลี่ยน state ในหน่วยความจำ
-        self.audit_op("transition", &state, "validated", &state)?;
-        let previous_cube = std::mem::replace(&mut self.cube, next_cube);
-        let previous_caps = std::mem::replace(&mut self.gateway.caps, next_caps);
+        // Prepare is not a success claim. A transition is authoritative only
+        // after the durable state and the transition-commit record both exist.
+        self.audit_op(
+            "transition-prepare",
+            &state,
+            &format!("pending granted={granted} revoked={revoked}"),
+            &state,
+        )?;
+        let previous_cube = self.cube.clone();
+        let previous_caps = self.gateway.caps.clone();
+        self.cube = next_cube;
+        self.gateway.caps = next_caps;
         if let Err(error) = self.persist() {
             self.cube = previous_cube;
             self.gateway.caps = previous_caps;
+            let _ = self.audit_op_decision(
+                "transition-rollback",
+                &state,
+                &format!("state persist failed: {error}"),
+                &state,
+                "deny",
+            );
+            return Err(error);
+        }
+        let audit_result = (|| {
+            if revoked > 0 {
+                self.audit_op(
+                    "revoke",
+                    "capability",
+                    &format!("{revoked} stale lease(s) committed"),
+                    &state,
+                )?;
+            }
+            for label in &granted_labels {
+                self.audit_op("grant", label, "lease issued and committed", &state)?;
+            }
+            self.audit_op("transition-commit", &state, "committed", &state)
+        })();
+        if let Err(error) = audit_result {
+            self.cube = previous_cube;
+            self.gateway.caps = previous_caps;
+            let rollback = self.persist();
+            let _ = self.audit_op_decision(
+                "transition-rollback",
+                &state,
+                &format!("audit commit failed: {error}; state rollback: {rollback:?}"),
+                &state,
+                "deny",
+            );
             return Err(error);
         }
         self.gateway.clear_quarantine();
@@ -605,21 +656,7 @@ impl Runtime {
         let lease = broker
             .approve_lease(lease_id, approved_by)
             .map_err(|e| RuntimeError::Secret(e.to_string()))?;
-        let state = self.cube.current_state().to_string();
-        if let Err(error) = self.audit_op("secret-approve", &lease.id, approved_by, &state) {
-            // audit ล้มต้องเพิกถอนสิทธิ์ที่เพิ่งอนุมัติในหน่วยความจำ
-            if let Some(broker) = self.gateway.secret_broker_mut() {
-                let _ = broker.revoke_lease(&lease.id);
-            }
-            return Err(error);
-        }
-        if let Err(error) = self.persist() {
-            if let Some(broker) = self.gateway.secret_broker_mut() {
-                let _ = broker.revoke_lease(&lease.id);
-            }
-            return Err(error);
-        }
-        Ok(aivm_secrets::LeaseSummary {
+        let summary = aivm_secrets::LeaseSummary {
             id: lease.id.clone(),
             tool: lease.request.tool.clone(),
             resource: lease.request.resource.clone(),
@@ -630,7 +667,46 @@ impl Runtime {
             max_uses: lease.request.max_uses,
             hitl_approved: lease.hitl_approved,
             approved_by: lease.approved_by.clone(),
-        })
+        };
+        let state = self.cube.current_state().to_string();
+        if let Err(error) =
+            self.audit_op("secret-approve-prepare", &summary.id, approved_by, &state)
+        {
+            // audit ล้มต้องเพิกถอนสิทธิ์ที่เพิ่งอนุมัติในหน่วยความจำ
+            if let Some(broker) = self.gateway.secret_broker_mut() {
+                let _ = broker.revoke_lease(&summary.id);
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.persist() {
+            if let Some(broker) = self.gateway.secret_broker_mut() {
+                let _ = broker.revoke_lease(&summary.id);
+            }
+            let _ = self.audit_op_decision(
+                "secret-approve-rollback",
+                &summary.id,
+                &format!("state persist failed: {error}"),
+                &state,
+                "deny",
+            );
+            return Err(error);
+        }
+        if let Err(error) = self.audit_op("secret-approve-commit", &summary.id, approved_by, &state)
+        {
+            if let Some(broker) = self.gateway.secret_broker_mut() {
+                let _ = broker.revoke_lease(&summary.id);
+            }
+            let rollback = self.persist();
+            let _ = self.audit_op_decision(
+                "secret-approve-rollback",
+                &summary.id,
+                &format!("audit commit failed: {error}; state rollback: {rollback:?}"),
+                &state,
+                "deny",
+            );
+            return Err(error);
+        }
+        Ok(summary)
     }
 
     /// persist cube ที่ validate แล้ว + lease ที่ยังใช้ได้ เพื่อให้
@@ -656,6 +732,17 @@ impl Runtime {
         result: &str,
         state: &str,
     ) -> Result<(), RuntimeError> {
+        self.audit_op_decision(action, resource, result, state, "allow")
+    }
+
+    fn audit_op_decision(
+        &mut self,
+        action: &str,
+        resource: &str,
+        result: &str,
+        state: &str,
+        decision: &str,
+    ) -> Result<(), RuntimeError> {
         self.op_seq += 1;
         let mut rec = AuditRecord::new(
             0,
@@ -665,7 +752,7 @@ impl Runtime {
             state,
             action,
             resource,
-            "allow",
+            decision,
             &self.policy.name,
         );
         rec.capability = resource.to_string();
@@ -1137,6 +1224,11 @@ fn validate_model_security(config: &VmConfig) -> Result<(), RuntimeError> {
             "security.profile=production requires model.local.model_sha256 for local models".into(),
         ));
     }
+    if config.security.profile == "production" && local.worker_path.is_none() {
+        return Err(RuntimeError::Config(
+            "security.profile=production requires an isolated model.local.worker_path".into(),
+        ));
+    }
     verify_artifact_pin("model", &local.model_path, &local.model_sha256)?;
     match (&local.worker_path, &local.worker_sha256) {
         (Some(path), Some(hash)) if !hash.is_empty() => {
@@ -1238,19 +1330,52 @@ capabilities:
     }
 
     #[test]
+    fn operator_config_rejects_unknown_security_and_isolation_fields() {
+        for yaml in [
+            "name: typo\nruntime:\n  isolaton: container\n",
+            "name: typo\nsecurity:\n  profle: production\n",
+            "name: typo\nnetwork:\n  max_call: 1\n",
+        ] {
+            assert!(VmConfig::from_yaml(yaml).is_err(), "accepted typo: {yaml}");
+        }
+    }
+
+    #[test]
+    fn restore_keeps_original_network_lease_expiry() {
+        let mut fresh = Capability::new("network:fetch", "network", "example.com:443");
+        fresh.expiration = Some(aivm_capability::now_secs() + 300);
+        let mut old = fresh.clone();
+        old.expiration = Some(aivm_capability::now_secs() + 10);
+        old.used_count = 3;
+        let mut current = CapabilitySet::new(vec![fresh]);
+        let saved = CapabilitySet::new(vec![old.clone()]);
+        restore_cap_usage(&mut current, &saved);
+        assert_eq!(current.caps[0].expiration, old.expiration);
+        assert_eq!(current.caps[0].used_count, 3);
+    }
+
+    #[test]
     fn production_local_model_requires_matching_manifest() {
         let dir = std::env::temp_dir().join(format!("aivm-manifest-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let model = dir.join("model.gguf");
         let manifest = dir.join("model.manifest.json");
+        let worker = dir.join("model-worker");
         std::fs::write(&model, b"model-bytes").unwrap();
+        std::fs::write(&worker, b"worker-bytes").unwrap();
         let model_hash = aivm_model::model_file_sha256(model.to_str().unwrap()).unwrap();
+        let worker_hash = aivm_model::model_file_sha256(worker.to_str().unwrap()).unwrap();
         std::fs::write(&manifest, format!("{{\"model_sha256\":\"{model_hash}\"}}")).unwrap();
         let manifest_hash = aivm_model::model_file_sha256(manifest.to_str().unwrap()).unwrap();
         let yaml = format!(
-            "name: production\nsecurity:\n  profile: production\nmodel:\n  provider: local\n  local:\n    model_path: {}\n    model_sha256: {}\n    manifest_path: {}\n    manifest_sha256: {}\n",
-            model.display(), model_hash, manifest.display(), manifest_hash
+            "name: production\nsecurity:\n  profile: production\nmodel:\n  provider: local\n  local:\n    model_path: {}\n    model_sha256: {}\n    worker_path: {}\n    worker_sha256: {}\n    manifest_path: {}\n    manifest_sha256: {}\n",
+            model.display(),
+            model_hash,
+            worker.display(),
+            worker_hash,
+            manifest.display(),
+            manifest_hash
         );
         let cfg = VmConfig::from_yaml(&yaml).unwrap();
         assert!(validate_model_security(&cfg).is_ok());
@@ -1393,6 +1518,23 @@ capabilities:
         assert!(r.is_err());
         assert_eq!(rt.cube.current_state(), AgentState::Init);
         assert!(rt.gateway.caps.caps.iter().all(|c| c.action != "write"));
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn failed_transition_persist_is_audited_as_rollback_without_commit() {
+        let (mut rt, base) = test_runtime("transition-rollback");
+        std::fs::create_dir(base.join(STATE_FILE)).unwrap();
+        assert!(rt
+            .transition_to(AgentState::Analyze, &TransitionGuards::default())
+            .is_err());
+        assert_eq!(rt.cube.current_state(), AgentState::Init);
+        let log = std::fs::read_to_string(base.join("audit.jsonl")).unwrap();
+        assert!(log.contains("transition-prepare"));
+        assert!(log.contains("transition-rollback"));
+        assert!(!log.contains("transition-commit"));
+        assert!(aivm_audit::AuditWriter::verify(base.join("audit.jsonl")).is_ok());
         aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);
     }

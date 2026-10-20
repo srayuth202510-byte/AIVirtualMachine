@@ -18,10 +18,10 @@ def main():
     mk = (PROJECT / "Makefile").read_text()
     ci = (PROJECT / ".github/workflows/ci.yml").read_text()
 
-    # 1. make ci ต้องมี gate ครบ (verify + e2e + microvm + hardware)
+    # 1. make ci ต้องมี gateครบ (verify + e2e + llama + microvm + hardware)
     m = re.search(r"^ci:(.*)$", mk, re.M)
     deps = m.group(1) if m else ""
-    for need in ["verify", "e2e", "check-microvm", "test-microvm", "check-hardware", "test-hardware"]:
+    for need in ["verify", "e2e", "check-llama", "test-llama", "check-microvm", "test-microvm", "check-hardware", "test-hardware"]:
         if need not in deps:
             ok = fail(f"Makefile ci ขาด {need}") and False
 
@@ -40,6 +40,8 @@ def main():
         "test_llama_replay.py",
         "eval-qwen-audit.py",
         "smoke-qwen-watch.py",
+        "make check-llama",
+        "make test-llama",
         "make test-microvm",
         "make check-hardware",
         "make test-hardware",

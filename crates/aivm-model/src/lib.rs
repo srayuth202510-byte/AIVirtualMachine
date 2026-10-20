@@ -43,6 +43,7 @@ pub enum ModelError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     pub provider: String, // "local" | "remote" | "echo" | "openai" | "anthropic"
     pub name: String,
@@ -96,6 +97,7 @@ impl ModelConfig {
 
 /// การตั้งค่าซิงสำหรับแบ็กเอนด์ local (GGUF)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalModelConfig {
     /// พาธไฟล์โมเดล (.gguf)
     pub model_path: String,

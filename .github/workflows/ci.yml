@@ -1,5 +1,5 @@
 # CI ของ AIVM: ล็อกเกตคุณภาพทุก push/PR ห้าม main พังเงียบ
-# งานตรงกับ `make ci` ในเครื่อง (verify + e2e + microvm + hardware) ใช้
+# งานตรงกับ `make ci` ในเครื่อง (verify + e2e + llama + microvm + hardware) ใช้
 # Ubuntu 24.04 แบบระบุรุ่น เพื่อให้การเปลี่ยน ubuntu-latest ไม่เปลี่ยนฐาน CI เอง
 # หมายเหตุ: runner ไม่มี KVM เทสต์บูตจริงจึง skip อย่างซื่อสัตย์ เหลือ
 # unit/adversarial/plumbing ที่ deterministic ไว้จับโค้ดหลังฟีเจอร์พัง
@@ -44,6 +44,12 @@ jobs:
           python3 -m unittest discover -s scripts -p 'test_llama_replay.py'
           python3 scripts/eval-qwen-audit.py
           python3 scripts/smoke-qwen-watch.py
+
+      - name: lint local GGUF backend และ worker
+        run: make check-llama
+
+      - name: ทดสอบโค้ดหลังฟีเจอร์ llama
+        run: make test-llama
 
       - name: lint โค้ดหลังฟีเจอร์ microvm (กันแก้พังเงียบ)
         run: cargo clippy -p aivm-sandbox -p aivm-tools -p aivm-runtime -p aivm-cli --all-targets --features microvm -- -D warnings

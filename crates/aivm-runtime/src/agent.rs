@@ -331,7 +331,11 @@ fn is_successful_test(task: &str, request: &ToolRequest, output: &str) -> bool {
     if request.tool != "process.exec" || !output.contains("exit status: 0") {
         return false;
     }
-    if request.path.starts_with("build:") && request.path.to_ascii_lowercase().contains("test") {
+    if request
+        .path
+        .strip_prefix("build:")
+        .is_some_and(|name| name == "test" || name == "tests" || name.starts_with("test-"))
+    {
         return true;
     }
     let task_requests_tests = task.to_ascii_lowercase().contains("test") || task.contains("ทดสอบ");
@@ -344,13 +348,29 @@ fn is_successful_test(task: &str, request: &ToolRequest, output: &str) -> bool {
     let Ok(body) = serde_json::from_str::<serde_json::Value>(content) else {
         return false;
     };
-    body.get("argv")
+    let argv = body
+        .get("argv")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|argv| {
+        .map(|argv| {
             argv.iter()
                 .filter_map(serde_json::Value::as_str)
-                .any(|arg| arg == "test" || arg == "tests" || arg.ends_with("_test"))
+                .collect::<Vec<_>>()
         })
+        .unwrap_or_default();
+    let executable = std::path::Path::new(&request.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    match executable {
+        "cargo" | "go" => argv.first() == Some(&"test"),
+        "pytest" | "py.test" => true,
+        "python" | "python3" => argv.windows(2).any(|pair| pair == ["-m", "pytest"]),
+        "make" | "gmake" => argv
+            .iter()
+            .any(|arg| matches!(*arg, "test" | "tests" | "verify" | "check" | "ci")),
+        "npm" | "pnpm" | "yarn" => argv.first() == Some(&"test"),
+        _ => false,
+    }
 }
 
 fn task_requires_test_completion(task: &str) -> bool {
@@ -934,6 +954,30 @@ mod tests {
         assert!(!phase_task(task, Some(CodingSubtask::Verify)).contains("Read it and edit"));
         assert!(is_build_instruction_path("Makefile"));
         assert!(task_requires_test_completion("Fix the code and run tests"));
+    }
+
+    #[test]
+    fn arbitrary_zero_exit_command_is_not_test_evidence() {
+        let request = ToolRequest {
+            tool: "process.exec".into(),
+            path: "/usr/bin/true".into(),
+            content: Some(serde_json::json!({"argv": ["test"]}).to_string()),
+        };
+        assert!(!is_successful_test(
+            "Fix the code and run tests",
+            &request,
+            "exit status: 0\n"
+        ));
+        let cargo = ToolRequest {
+            path: "/usr/bin/cargo".into(),
+            content: Some(serde_json::json!({"argv": ["test", "--workspace"]}).to_string()),
+            ..request
+        };
+        assert!(is_successful_test(
+            "Fix the code and run tests",
+            &cargo,
+            "exit status: 0\n"
+        ));
     }
 
     #[test]

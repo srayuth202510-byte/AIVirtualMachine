@@ -369,8 +369,12 @@ impl WorkerClient {
         let mut effective_config = config.clone();
         effective_config.worker_limits = Some(limits.clone());
         let config = &effective_config;
-        let config_path = write_ephemeral_config(config)?;
         let launcher = config.local.as_ref().map(|local| &local.worker_launcher);
+        let stage_process_artifacts = matches!(
+            launcher,
+            Some(WorkerLauncher::Process | WorkerLauncher::ProcessNamespace)
+        );
+        let config_path = write_ephemeral_config(config, limits, stage_process_artifacts)?;
         let result = match launcher {
             Some(WorkerLauncher::Container { .. }) => {
                 self.infer_sandboxed(config, &config_path, &request, limits, on_delta)
@@ -700,7 +704,11 @@ fn set_limit(resource: libc::__rlimit_resource_t, soft: u64, hard: u64) -> std::
     }
 }
 
-fn write_ephemeral_config(config: &ModelConfig) -> Result<PathBuf, WorkerError> {
+fn write_ephemeral_config(
+    config: &ModelConfig,
+    limits: &InferenceLimits,
+    stage_process_artifacts: bool,
+) -> Result<PathBuf, WorkerError> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| WorkerError::Failed(format!("clock: {e}")))?
@@ -714,11 +722,80 @@ fn write_ephemeral_config(config: &ModelConfig) -> Result<PathBuf, WorkerError> 
             .create(&dir)
             .map_err(|e| WorkerError::Failed(format!("private directory: {e}")))?;
     }
+    let mut staged_config = config.clone();
+    if stage_process_artifacts {
+        stage_local_artifacts(&mut staged_config, &dir, limits)?;
+    }
     let path = dir.join("config.json");
-    let bytes = serde_json::to_vec(config)
+    let bytes = serde_json::to_vec(&staged_config)
         .map_err(|e| WorkerError::Failed(format!("encode model config: {e}")))?;
     write_private(&path, &bytes)?;
     Ok(path)
+}
+
+/// Process workers receive private copies of model inputs. The worker verifies
+/// the copies against the configured pins and loads those same private paths,
+/// removing the hash-then-reopen race on operator-controlled source paths.
+fn stage_local_artifacts(
+    config: &mut ModelConfig,
+    directory: &Path,
+    limits: &InferenceLimits,
+) -> Result<(), WorkerError> {
+    let Some(local) = config.local.as_mut() else {
+        return Ok(());
+    };
+    if local.model_path.is_empty() {
+        return Ok(());
+    }
+    let mut paths = vec![&mut local.model_path];
+    paths.extend(
+        [
+            &mut local.manifest_path,
+            &mut local.tokenizer_path,
+            &mut local.config_path,
+        ]
+        .into_iter()
+        .filter_map(Option::as_mut),
+    );
+    let maximum = limits.storage_mb.saturating_mul(1024 * 1024);
+    let mut total = 0u64;
+    for (index, path) in paths.into_iter().enumerate() {
+        let source = Path::new(path)
+            .canonicalize()
+            .map_err(|e| WorkerError::Failed(format!("artifact path: {e}")))?;
+        let metadata = source
+            .metadata()
+            .map_err(|e| WorkerError::Failed(format!("artifact metadata: {e}")))?;
+        if !metadata.is_file() {
+            return Err(WorkerError::InvalidRequest(
+                "model artifact must be a regular file".into(),
+            ));
+        }
+        total = total.saturating_add(metadata.len());
+        if total > maximum {
+            return Err(WorkerError::LimitExceeded("staging storage".into()));
+        }
+        let destination = directory.join(format!("process-artifact-{index}"));
+        let mut input = std::fs::File::open(&source)
+            .map_err(|e| WorkerError::Failed(format!("open artifact: {e}")))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut output = options
+            .open(&destination)
+            .map_err(|e| WorkerError::Failed(format!("stage artifact: {e}")))?;
+        std::io::copy(&mut input, &mut output)
+            .map_err(|e| WorkerError::Failed(format!("copy artifact: {e}")))?;
+        output
+            .sync_all()
+            .map_err(|e| WorkerError::Failed(format!("sync artifact: {e}")))?;
+        *path = destination.to_string_lossy().into_owned();
+    }
+    Ok(())
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), WorkerError> {

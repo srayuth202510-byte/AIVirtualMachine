@@ -38,6 +38,7 @@ const BOOT_TIMEOUT_MAX_SECS: u64 = 600;
 
 /// ภาพที่ต้องใช้บูต MicroVM หนึ่งครั้ง (pin ทุกไฟล์ด้วย sha256)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MicroVmConfig {
     /// path ไฟล์ kernel (vmlinux bzImage)
     #[serde(default)]
@@ -88,6 +89,7 @@ pub struct MicroVmConfig {
 
 /// image หนึ่งชุดที่ pin ด้วย sha256 (primary ใช้ฟิลด์เดิม, alt ใช้ struct นี้)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactPin {
     /// path ไฟล์ image
     pub path: PathBuf,
@@ -110,6 +112,7 @@ fn default_boot_timeout() -> u64 {
 
 /// Jailer configuration for additional isolation (requires root)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct JailerConfig {
     /// Path to jailer binary (default: "jailer" in PATH)
     #[serde(default)]

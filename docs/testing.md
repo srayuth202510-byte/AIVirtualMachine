@@ -6,12 +6,13 @@
 |---|---|---|
 | `make demo` | self-test 14 เคส ALLOW/DENY ใน temp dir (~1 วินาที) | ดีบักเส้น enforcement — เร็วสุด พิมพ์ decision/reason ต่อเคส |
 | `make verify` | `fmt-check` + `clippy(-D warnings)` + `cargo test --workspace` + `demo` | gate ก่อน commit ทุกครั้ง |
-| `make ci` | `verify` + `e2e` + `check-microvm` + `test-microvm` + `check-hardware` + `test-hardware` | เท่า CI บน GitHub ทุกอย่าง |
+| `make ci` | `verify` + `e2e` + `check/test-llama` + `check/test-microvm` + `check/test-hardware` | เท่า CI บน GitHub ทุกอย่าง |
 | `make e2e` | `scripts/smoke.sh` (create/inspect/run/agent/transition/logs/audit/kill + demo + adversarial) | ตรวจวงจร CLI ครบ |
 | `make test-coding` | agent loop + GCC/ld + test binary จริง และ quota/adversarial checks | แก้ build/output/agent observations |
 | `make test-adv` | `cargo test -p aivm-adversarial` (must-deny สเปก §38) | แตะ surface ด้าน security |
 | `make test-microvm` | sandbox/tools/runtime แบบเปิดฟีเจอร์ `microvm` | แตะโค้ดหลังฟีเจอร์ microvm |
 | `make test-hardware` | sandbox/tools/runtime แบบเปิดฟีเจอร์ `hardware` | แตะโค้ดหลังฟีเจอร์ hardware |
+| `make test-llama` | model/model-worker แบบเปิดฟีเจอร์ `llama` | compile และทดสอบ local GGUF backend |
 | `make debug-test F=<ชื่อ> [P=<crate>]` | เทสต์เดียว + backtrace + `--nocapture` | ไล่บั๊ก (repro ก่อนแก้เสมอ) |
 
 กฎ: แก้บั๊กโดยไม่มี regression test / demo case = ยังไม่เสร็จ
