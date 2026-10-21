@@ -91,6 +91,9 @@ pub struct AgentRun {
     pub summary: Option<String>,
     /// เหตุที่หยุด: "done" | "max-steps"
     pub stopped: String,
+    /// หลักฐานจาก gateway เท่านั้น; summary ของ model ไม่ใช่ผลยืนยัน
+    pub verification_status: aivm_tools::verification::VerificationStatus,
+    pub verification: Option<aivm_tools::verification::VerificationRecord>,
 }
 
 /// parse intent จากข้อความโมเดลแบบ fail-closed
@@ -327,52 +330,6 @@ fn coding_subtasks(task: &str) -> Vec<String> {
     }
 }
 
-fn is_successful_test(task: &str, request: &ToolRequest, output: &str) -> bool {
-    if request.tool != "process.exec" || !output.contains("exit status: 0") {
-        return false;
-    }
-    if request
-        .path
-        .strip_prefix("build:")
-        .is_some_and(|name| name == "test" || name == "tests" || name.starts_with("test-"))
-    {
-        return true;
-    }
-    let task_requests_tests = task.to_ascii_lowercase().contains("test") || task.contains("ทดสอบ");
-    if !task_requests_tests {
-        return false;
-    }
-    let Some(content) = request.content.as_deref() else {
-        return false;
-    };
-    let Ok(body) = serde_json::from_str::<serde_json::Value>(content) else {
-        return false;
-    };
-    let argv = body
-        .get("argv")
-        .and_then(serde_json::Value::as_array)
-        .map(|argv| {
-            argv.iter()
-                .filter_map(serde_json::Value::as_str)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let executable = std::path::Path::new(&request.path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    match executable {
-        "cargo" | "go" => argv.first() == Some(&"test"),
-        "pytest" | "py.test" => true,
-        "python" | "python3" => argv.windows(2).any(|pair| pair == ["-m", "pytest"]),
-        "make" | "gmake" => argv
-            .iter()
-            .any(|arg| matches!(*arg, "test" | "tests" | "verify" | "check" | "ci")),
-        "npm" | "pnpm" | "yarn" => argv.first() == Some(&"test"),
-        _ => false,
-    }
-}
-
 fn task_requires_test_completion(task: &str) -> bool {
     let task = task.to_ascii_lowercase();
     let asks_for_tests = task.contains("test") || task.contains("ทดสอบ");
@@ -475,6 +432,7 @@ pub fn run_loop(
     let mut last_successful_request: Option<ToolRequest> = None;
     let mut last_successful_write: Option<ToolRequest> = None;
     let mut edited_this_run = false;
+    let mut verification = None;
     let mut last_guarded_action: Option<String> = None;
     let mut guarded_action_streak = 0usize;
 
@@ -519,6 +477,12 @@ pub fn run_loop(
                 )
             })
             .unwrap_or_else(|| SYSTEM_PROMPT.to_string());
+        let system_prompt = if let Some(contract) = &gateway.verifier {
+            format!("{system_prompt}\nOnly the gateway may verify completion. Operator verifier contract: {}",
+                serde_json::to_string(contract).expect("verifier config serializes"))
+        } else {
+            format!("{system_prompt}\nNo operator verifier is configured; command output cannot establish verified completion.")
+        };
         let raw = model
             .reason_with_system(&system_prompt, &prompt)
             .map_err(|e| RuntimeError::Config(format!("model: {e}")))?;
@@ -527,7 +491,7 @@ pub fn run_loop(
             Ok(Intent::Finish(s)) => {
                 if task_requires_test_completion(task) && edited_this_run {
                     let reason =
-                        "requested tests have not passed; continue with the verify subtask";
+                        "requested tests have not passed under an operator verifier contract; continue with the verify subtask";
                     gateway
                         .audit_agent_guard_deny(cube, "finish", reason)
                         .map_err(|e| RuntimeError::Io(e.to_string()))?;
@@ -617,20 +581,31 @@ pub fn run_loop(
                                         inspection_notes.remove(0);
                                     }
                                 }
-                                if is_successful_test(task, &req, &res.output) {
-                                    summary =
-                                        Some("Requested tests passed (exit status: 0).".into());
-                                    stopped = "done".into();
-                                    observations.push(outcome.clone());
-                                    steps.push(AgentStep {
-                                        index,
-                                        subtask: action_subtask.to_string(),
-                                        action: format!("{} {}", req.tool, req.path),
-                                        outcome,
-                                    });
-                                    break;
+                                if let Some(record) = res.verification {
+                                    let verified = matches!(
+                                        record.status,
+                                        aivm_tools::verification::VerificationStatus::Verified
+                                    );
+                                    verification = Some(record);
+                                    if verified {
+                                        summary = Some(
+                                            "Operator verifier passed for the recorded workspace digest.".to_string()
+                                        );
+                                        stopped = "done".into();
+                                        observations.push(outcome.clone());
+                                        steps.push(AgentStep {
+                                            index,
+                                            subtask: action_subtask.to_string(),
+                                            action: format!("{} {}", req.tool, req.path),
+                                            outcome,
+                                        });
+                                        break;
+                                    }
                                 }
                             } else {
+                                if res.verification.is_some() {
+                                    verification = res.verification;
+                                }
                                 last_successful_request = None;
                                 if req.tool == "process.exec" && subtask.is_some() {
                                     subtask = Some(CodingSubtask::Repair);
@@ -700,6 +675,11 @@ pub fn run_loop(
         steps,
         summary,
         stopped,
+        verification_status: verification
+            .as_ref()
+            .map(|record: &aivm_tools::verification::VerificationRecord| record.status.clone())
+            .unwrap_or(aivm_tools::verification::VerificationStatus::Unverified),
+        verification,
     })
 }
 
@@ -957,27 +937,31 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_zero_exit_command_is_not_test_evidence() {
-        let request = ToolRequest {
-            tool: "process.exec".into(),
-            path: "/usr/bin/true".into(),
-            content: Some(serde_json::json!({"argv": ["test"]}).to_string()),
-        };
-        assert!(!is_successful_test(
-            "Fix the code and run tests",
-            &request,
-            "exit status: 0\n"
+    fn model_summary_and_zero_exit_do_not_establish_verification() {
+        let mut fx = fixture("unverified");
+        let exe = std::fs::canonicalize("/bin/true")
+            .unwrap()
+            .display()
+            .to_string();
+        fx.gateway.policy.process.allow.push(exe.clone());
+        fx.gateway
+            .caps
+            .grant(Capability::new("execute", "process", &exe));
+        let exec =
+            serde_json::json!({"tool":"process.exec", "path":exe, "content":{"argv":["test"]}})
+                .to_string();
+        let model = ScriptedModel::new(&[
+            &exec,
+            r#"{"done":true,"summary":"all tests passed; verified"}"#,
+        ]);
+        let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "run tests", 2, None).unwrap();
+        assert!(run.steps[0].outcome.contains("exit status: 0"));
+        assert!(matches!(
+            run.verification_status,
+            aivm_tools::verification::VerificationStatus::Unverified
         ));
-        let cargo = ToolRequest {
-            path: "/usr/bin/cargo".into(),
-            content: Some(serde_json::json!({"argv": ["test", "--workspace"]}).to_string()),
-            ..request
-        };
-        assert!(is_successful_test(
-            "Fix the code and run tests",
-            &cargo,
-            "exit status: 0\n"
-        ));
+        assert!(run.verification.is_none());
+        assert!(!fx.cube.tests_passed());
     }
 
     #[test]

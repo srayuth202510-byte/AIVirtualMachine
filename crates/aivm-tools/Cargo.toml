@@ -10,6 +10,7 @@ uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+sha2 = { workspace = true }
 walkdir = { workspace = true }
 ureq = { version = "2.9", features = ["json", "charset", "cookies", "tls"] }
 url = "2.5"
@@ -29,6 +30,3 @@ microvm = ["aivm-sandbox/microvm"]
 # ส่งต่อฟีเจอร์ Hardware Isolation (TEE skeleton) ไปยัง aivm-sandbox
 # ปิดไว้โดยปริยายเพื่อให้ `make verify` เบาและไม่พึ่ง KVM/QEMU ใน CI
 hardware = ["aivm-sandbox/hardware"]
-
-[dev-dependencies]
-sha2 = { workspace = true }

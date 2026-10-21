@@ -259,7 +259,16 @@ impl AuditWriter {
         &self.prev_hash
     }
 
-    pub fn append(&mut self, mut rec: AuditRecord) -> Result<AuditRecord, AuditError> {
+    pub fn append(&mut self, rec: AuditRecord) -> Result<AuditRecord, AuditError> {
+        self.append_with_hook(rec, &mut |_| Ok(()))
+    }
+
+    /// hook ใช้ทดสอบ crash boundaries; caller ต้องถือ exclusive writer lease
+    pub fn append_with_hook(
+        &mut self,
+        mut rec: AuditRecord,
+        hook: &mut impl FnMut(&str) -> std::io::Result<()>,
+    ) -> Result<AuditRecord, AuditError> {
         self.recover_rotation()?;
         rec.seq = self.seq;
         rec.seal(&self.prev_hash);
@@ -271,8 +280,21 @@ impl AuditWriter {
             .append(true)
             .open(&self.path)
             .map_err(|e| AuditError::Io(e.to_string()))?;
+        hook("opened").map_err(|e| AuditError::Io(e.to_string()))?;
         writeln!(f, "{line}").map_err(|e| AuditError::Io(e.to_string()))?;
+        hook("written").map_err(|e| AuditError::Io(e.to_string()))?;
         f.sync_data().map_err(|e| AuditError::Io(e.to_string()))?;
+        hook("synced").map_err(|e| AuditError::Io(e.to_string()))?;
+        // fsync directory ด้วยเพื่อให้ชื่อ log ใหม่ durable ก่อนลบ transaction journal
+        let parent = self
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(parent)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| AuditError::Io(e.to_string()))?;
+        hook("directory-synced").map_err(|e| AuditError::Io(e.to_string()))?;
         drop(f);
         harden_file(&self.path);
         self.prev_hash = rec.hash_entry.clone();

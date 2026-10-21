@@ -20,6 +20,7 @@ use thiserror::Error;
 
 pub mod agent;
 pub mod demo;
+mod transaction;
 
 /// เกณฑ์ confidence สำหรับ ANALYZE -> MODIFY (ตัวอย่างในสเปก §15)
 pub const CONFIDENCE_THRESHOLD: f64 = 0.8;
@@ -59,6 +60,9 @@ pub struct VmConfig {
     pub resources: ResourceBlock,
     #[serde(default)]
     pub build: aivm_tools::build::BuildConfig,
+    /// สัญญาตรวจผลที่ operator เลือก; ไม่เพิ่มสิทธิ์ execute
+    #[serde(default)]
+    pub verification: Option<aivm_tools::verification::VerifierConfig>,
     #[serde(default)]
     pub filesystem: FilesystemBlock,
     #[serde(default)]
@@ -288,12 +292,16 @@ pub struct Runtime {
     pub model: Box<dyn Model>,
     pub model_cfg: ModelConfig,
     op_seq: u64,
+    transaction_failed: bool,
+    #[cfg(test)]
+    transaction_hook: fn(&str) -> std::io::Result<()>,
 }
 
 /// state แบบ dynamic ที่ persist ไว้: cube ที่ผ่าน validate แล้ว + lease ที่ยังใช้ได้
 /// policy/config อยู่ใน `aivm.yaml` (ต้นฉบับความจริง) มีแค่ส่วนที่เปลี่ยน
 /// แปลงตามเวลาที่อยู่ไฟล์นี้ ตัวนับรอด restart แต่ grant มาจาก config ปัจจุบัน
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedState {
     cube: Cube,
     caps: CapabilitySet,
@@ -449,8 +457,9 @@ impl Runtime {
         }
         let caps = CapabilitySet::new(caps);
 
-        let audit = AuditWriter::open(base_dir.join("audit.jsonl"))
+        let mut audit = AuditWriter::open(base_dir.join("audit.jsonl"))
             .map_err(|e| RuntimeError::Io(e.to_string()))?;
+        transaction::recover(&base_dir, &mut audit)?;
         let mut gateway = ToolGateway::new(
             workspace.clone(),
             policy.clone(),
@@ -512,6 +521,17 @@ impl Runtime {
             .build
             .validate()
             .map_err(|e| RuntimeError::Config(e.to_string()))?;
+        if let Some(verifier) = &config.verification {
+            verifier
+                .validate()
+                .map_err(|e| RuntimeError::Config(e.to_string()))?;
+            if verifier.executable.starts_with("build:") && !config.build.enabled {
+                return Err(RuntimeError::Config(
+                    "build verifier requires build.enabled".into(),
+                ));
+            }
+        }
+        gateway.verifier = config.verification.clone();
         gateway.build = config.build.clone();
         gateway.level = level;
         gateway.container_cfg = config.runtime.container.clone();
@@ -549,6 +569,9 @@ impl Runtime {
             model,
             model_cfg,
             op_seq: 0,
+            transaction_failed: false,
+            #[cfg(test)]
+            transaction_hook: |_| Ok(()),
         })
     }
 
@@ -565,6 +588,7 @@ impl Runtime {
         next: AgentState,
         guards: &TransitionGuards,
     ) -> Result<(usize, usize), RuntimeError> {
+        self.ensure_ready()?;
         let mut next_cube = self.cube.clone();
         next_cube
             .transition(next, guards)
@@ -586,55 +610,15 @@ impl Runtime {
                 granted += 1;
             }
         }
-        // Prepare is not a success claim. A transition is authoritative only
-        // after the durable state and the transition-commit record both exist.
-        self.audit_op(
-            "transition-prepare",
-            &state,
-            &format!("pending granted={granted} revoked={revoked}"),
-            &state,
-        )?;
+        let before = self.saved_state();
         let previous_cube = self.cube.clone();
         let previous_caps = self.gateway.caps.clone();
         self.cube = next_cube;
         self.gateway.caps = next_caps;
-        if let Err(error) = self.persist() {
+        let details = format!("granted={granted} revoked={revoked} grants={granted_labels:?}");
+        if let Err(error) = self.commit_state_change("transition", &state, &details, before) {
             self.cube = previous_cube;
             self.gateway.caps = previous_caps;
-            let _ = self.audit_op_decision(
-                "transition-rollback",
-                &state,
-                &format!("state persist failed: {error}"),
-                &state,
-                "deny",
-            );
-            return Err(error);
-        }
-        let audit_result = (|| {
-            if revoked > 0 {
-                self.audit_op(
-                    "revoke",
-                    "capability",
-                    &format!("{revoked} stale lease(s) committed"),
-                    &state,
-                )?;
-            }
-            for label in &granted_labels {
-                self.audit_op("grant", label, "lease issued and committed", &state)?;
-            }
-            self.audit_op("transition-commit", &state, "committed", &state)
-        })();
-        if let Err(error) = audit_result {
-            self.cube = previous_cube;
-            self.gateway.caps = previous_caps;
-            let rollback = self.persist();
-            let _ = self.audit_op_decision(
-                "transition-rollback",
-                &state,
-                &format!("audit commit failed: {error}; state rollback: {rollback:?}"),
-                &state,
-                "deny",
-            );
             return Err(error);
         }
         self.gateway.clear_quarantine();
@@ -649,6 +633,8 @@ impl Runtime {
         lease_id: &str,
         approved_by: &str,
     ) -> Result<aivm_secrets::LeaseSummary, RuntimeError> {
+        self.ensure_ready()?;
+        let before = self.saved_state();
         let broker = self
             .gateway
             .secret_broker_mut()
@@ -668,42 +654,12 @@ impl Runtime {
             hitl_approved: lease.hitl_approved,
             approved_by: lease.approved_by.clone(),
         };
-        let state = self.cube.current_state().to_string();
         if let Err(error) =
-            self.audit_op("secret-approve-prepare", &summary.id, approved_by, &state)
-        {
-            // audit ล้มต้องเพิกถอนสิทธิ์ที่เพิ่งอนุมัติในหน่วยความจำ
-            if let Some(broker) = self.gateway.secret_broker_mut() {
-                let _ = broker.revoke_lease(&summary.id);
-            }
-            return Err(error);
-        }
-        if let Err(error) = self.persist() {
-            if let Some(broker) = self.gateway.secret_broker_mut() {
-                let _ = broker.revoke_lease(&summary.id);
-            }
-            let _ = self.audit_op_decision(
-                "secret-approve-rollback",
-                &summary.id,
-                &format!("state persist failed: {error}"),
-                &state,
-                "deny",
-            );
-            return Err(error);
-        }
-        if let Err(error) = self.audit_op("secret-approve-commit", &summary.id, approved_by, &state)
+            self.commit_state_change("secret-approve", &summary.id, approved_by, before)
         {
             if let Some(broker) = self.gateway.secret_broker_mut() {
                 let _ = broker.revoke_lease(&summary.id);
             }
-            let rollback = self.persist();
-            let _ = self.audit_op_decision(
-                "secret-approve-rollback",
-                &summary.id,
-                &format!("audit commit failed: {error}; state rollback: {rollback:?}"),
-                &state,
-                "deny",
-            );
             return Err(error);
         }
         Ok(summary)
@@ -712,16 +668,65 @@ impl Runtime {
     /// persist cube ที่ validate แล้ว + lease ที่ยังใช้ได้ เพื่อให้
     /// `transition_to` รอดข้าม restart supervisor เรียกหลัง run/transition/create
     pub fn persist(&self) -> Result<(), RuntimeError> {
-        let saved = PersistedState {
-            cube: self.cube.clone(),
-            caps: self.gateway.caps.clone(),
-            leases: self.gateway.live_secret_leases(),
-        };
+        self.ensure_ready()?;
+        let saved = self.saved_state();
         let text =
             serde_json::to_string_pretty(&saved).map_err(|e| RuntimeError::Io(e.to_string()))?;
         let path = self.base_dir.join(STATE_FILE);
         aivm_tools::state_store::write_private(&path, &text)
             .map_err(|e| RuntimeError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    fn ensure_ready(&self) -> Result<(), RuntimeError> {
+        if self.transaction_failed {
+            return Err(RuntimeError::Io(
+                "runtime transaction requires restart/recovery".into(),
+            ));
+        }
+        transaction::ensure_clear(&self.base_dir)
+    }
+
+    fn saved_state(&self) -> PersistedState {
+        PersistedState {
+            cube: self.cube.clone(),
+            caps: self.gateway.caps.clone(),
+            leases: self.gateway.live_secret_leases(),
+        }
+    }
+
+    /// ล้มเหลวหลัง publish journal ต้อง fence จน restart; ห้ามใช้ state ที่ยังไม่รู้ผล
+    fn commit_state_change(
+        &mut self,
+        action: &str,
+        resource: &str,
+        details: &str,
+        before: PersistedState,
+    ) -> Result<(), RuntimeError> {
+        let after = self.saved_state();
+        #[cfg(test)]
+        let mut hook = self.transaction_hook;
+        #[cfg(not(test))]
+        let mut hook = |_: &str| Ok(());
+        let result = transaction::commit(
+            &self.base_dir,
+            &mut self.gateway.audit,
+            &self.config.name,
+            &self.policy.name,
+            action,
+            resource,
+            details,
+            before,
+            after,
+            &mut hook,
+        );
+        if let Err(error) = result {
+            self.transaction_failed = true;
+            self.gateway.block_operations();
+            return Err(RuntimeError::Io(format!(
+                "state transaction outcome requires restart/recovery: {error}"
+            )));
+        }
         Ok(())
     }
 
@@ -767,6 +772,7 @@ impl Runtime {
     /// หนึ่งก้าวของ main loop แบบผ่านตัวกลาง (§23): ให้โมเดลคิดจาก context
     /// แล้วรัน filesystem read ผ่าน gateway คืนข้อความของโมเดล
     pub fn step(&mut self, context: &str) -> Result<String, RuntimeError> {
+        self.ensure_ready()?;
         let _mem = self.memory.retrieve(&self.cube);
         let model_name = self.model_cfg.name.clone();
         self.audit_op("inference", &model_name, "started", "step")?;
@@ -804,6 +810,7 @@ impl Runtime {
         max_steps: usize,
         workspace: Option<&std::path::Path>,
     ) -> Result<agent::AgentRun, RuntimeError> {
+        self.ensure_ready()?;
         let model_name = self.model_cfg.name.clone();
         self.audit_op("inference", &model_name, "started", "agent")?;
         // RAG อ่านจาก gateway workspace ที่ runtime เป็นเจ้าของเท่านั้น
@@ -1523,7 +1530,7 @@ capabilities:
     }
 
     #[test]
-    fn failed_transition_persist_is_audited_as_rollback_without_commit() {
+    fn failed_transition_persist_fences_runtime_until_recovery() {
         let (mut rt, base) = test_runtime("transition-rollback");
         std::fs::create_dir(base.join(STATE_FILE)).unwrap();
         assert!(rt
@@ -1532,7 +1539,9 @@ capabilities:
         assert_eq!(rt.cube.current_state(), AgentState::Init);
         let log = std::fs::read_to_string(base.join("audit.jsonl")).unwrap();
         assert!(log.contains("transition-prepare"));
-        assert!(log.contains("transition-rollback"));
+        assert!(base.join(transaction::JOURNAL).exists());
+        assert!(rt.persist().is_err());
+        assert!(rt.gateway.read(&mut rt.cube, "src/seed.txt").is_err());
         assert!(!log.contains("transition-commit"));
         assert!(aivm_audit::AuditWriter::verify(base.join("audit.jsonl")).is_ok());
         aivm_audit::clear_flags(&base);
@@ -2032,7 +2041,15 @@ secrets:
         // 4. audit มีรอย approve ระบุคน + ไม่มี value หลุด
         let log = std::fs::read_to_string(base.join("audit.jsonl")).unwrap();
         assert!(log.contains("secret-approve"));
-        assert!(log.contains("\"op\""), "audit ต้องระบุผู้ approve");
+        assert!(
+            log.lines().any(|line| {
+                let record: AuditRecord = serde_json::from_str(line).unwrap();
+                record.action == "secret-approve-commit"
+                    && serde_json::from_str::<serde_json::Value>(&record.result).unwrap()["details"]
+                        == "op"
+            }),
+            "audit ต้องระบุผู้ approve"
+        );
         assert!(!log.contains("ROUNDTRIP-VALUE"));
         aivm_audit::clear_flags(&base);
         let _ = std::fs::remove_dir_all(&base);

@@ -19,6 +19,9 @@ build:
   max_bytes: 1048576
 tools:
   allow: [cc, as, ld, "build:tests"]
+verification:
+  executable: "build:tests"
+  argv: []
 ```
 
 - Gateway เตรียม output slots ไว้ใต้ `<workspace>/.aivm-build` ไฟล์มี permission 0700 และ directory เป็น 0700
@@ -48,6 +51,9 @@ Gateway สร้าง `main.o` แล้วจึงรัน compiler Output 
 ```
 
 Tool result แสดง exit status, stdout และ stderr Agent observation ใช้ `FAIL` เมื่อคำสั่งออกด้วย nonzero status หรือ signal จึงเห็น diagnostics ของ compiler แทนข้อความ `OK` ที่ทำให้เข้าใจผิด
+
+การยืนยัน completion ต้องผ่าน `verification` contract ด้วย ไม่อนุมานจากชื่อ
+`build:tests` ดู [รูปแบบ receipt และข้อจำกัด](verification-and-transactions.md)
 
 ## ขอบเขตของ profile นี้
 

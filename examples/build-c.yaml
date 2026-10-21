@@ -10,6 +10,9 @@ build:
   enabled: true
   max_files: 4
   max_bytes: 1048576
+verification:
+  executable: "build:tests"
+  argv: []
 filesystem:
   read: [./workspace]
   write: [./workspace/src]

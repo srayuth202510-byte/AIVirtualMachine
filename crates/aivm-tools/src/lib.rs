@@ -53,6 +53,8 @@ pub struct ToolRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<verification::VerificationRecord>,
     pub ok: bool,
     pub decision: String,
     pub output: String,
@@ -102,6 +104,7 @@ const MAX_FILE_BYTES: u64 = 1024 * 1024;
 pub mod build;
 mod secure_fs;
 pub mod state_store;
+pub mod verification;
 
 pub struct ToolGateway {
     pub workspace: PathBuf,
@@ -128,6 +131,8 @@ pub struct ToolGateway {
     pub limits: ResourceLimits,
     pub state_path: Option<PathBuf>,
     pub build: build::BuildConfig,
+    pub verifier: Option<verification::VerifierConfig>,
+    blocked: bool,
     req_counter: u64,
     deny_tracker: DenyTracker,
     /// File contents read during the current agent run. Authorization and audit
@@ -247,11 +252,18 @@ impl ToolGateway {
             limits: ResourceLimits::default(),
             state_path: None,
             build: build::BuildConfig::default(),
+            verifier: None,
+            blocked: false,
             req_counter: 0,
             deny_tracker: DenyTracker::default(),
             read_cache: HashMap::new(),
             secret_broker: None,
         }
+    }
+
+    /// ธุรกรรมที่ผลยังไม่แน่นอนต้องหยุดทุก tool จนกว่าจะเปิด runtime ใหม่
+    pub fn block_operations(&mut self) {
+        self.blocked = true;
     }
 
     /// Start a fresh agent run with no assumptions about workspace contents.
@@ -324,6 +336,11 @@ impl ToolGateway {
         action: &str,
         resource: &str,
     ) -> Result<(), ToolError> {
+        if self.blocked {
+            return Err(ToolError::Denied(
+                "runtime transaction requires recovery".into(),
+            ));
+        }
         if self.deny_tracker.quarantined(Instant::now()) {
             self.audit_decision(
                 cube,
@@ -587,6 +604,7 @@ impl ToolGateway {
             self.charge_bytes(cube, cap_index, content.len() as u64)?;
             self.audit_decision(cube, "read", path, "allow", "cache-hit", "success")?;
             return Ok(ToolResult {
+                verification: None,
                 ok: true,
                 decision: "allow".into(),
                 output: content,
@@ -621,6 +639,7 @@ impl ToolGateway {
         self.audit_decision(cube, "read", path, "allow", "outcome", "success")?;
         self.read_cache.insert(canon, content.clone());
         Ok(ToolResult {
+            verification: None,
             ok: true,
             decision: "allow".into(),
             output: content,
@@ -659,6 +678,7 @@ impl ToolGateway {
             self.read_cache.insert(canon, content.to_string());
             self.audit_decision(cube, "write", path, "allow", "unchanged", "success")?;
             return Ok(ToolResult {
+                verification: None,
                 ok: true,
                 decision: "allow".into(),
                 output: "unchanged".into(),
@@ -705,6 +725,7 @@ impl ToolGateway {
         result?;
         self.read_cache.insert(canon, content.to_string());
         Ok(ToolResult {
+            verification: None,
             ok: true,
             decision: "allow".into(),
             output: "written".into(),
@@ -781,6 +802,7 @@ impl ToolGateway {
         }
         self.audit_decision(cube, "search", query, "allow", "mediated-search", "success")?;
         Ok(ToolResult {
+            verification: None,
             ok: true,
             decision: "allow".into(),
             output: hits.join("\n"),
@@ -818,6 +840,12 @@ impl ToolGateway {
         outputs: &[String],
     ) -> Result<ToolResult, ToolError> {
         self.check_quarantine(cube, "execute", exe)?;
+        let verifier = self.verifier.clone().filter(|contract| {
+            contract.executable == exe
+                && contract.argv == args
+                && lease_id.is_none()
+                && outputs.is_empty()
+        });
         let artifact = if let Some(name) = exe.strip_prefix("build:") {
             match self.build.artifact_path(&self.workspace, name) {
                 Ok(path) => Some(path.to_string_lossy().into_owned()),
@@ -1014,6 +1042,25 @@ impl ToolGateway {
                 }
             };
         }
+        let verification = match verifier {
+            Some(config) => {
+                match verification::PreparedVerification::new(config, &self.workspace, &canon) {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        self.audit_decision(
+                            cube,
+                            "verification",
+                            &scope,
+                            "deny",
+                            "verifier-inputs",
+                            &error.to_string(),
+                        )?;
+                        return Err(error);
+                    }
+                }
+            }
+            None => None,
+        };
         spec.env_extra = secret_env;
         let mut run_result = if self.level == SandboxLevel::Container {
             aivm_sandbox::container::run(&spec, &self.policy, &self.container_cfg)
@@ -1114,7 +1161,37 @@ impl ToolGateway {
             ),
             "success",
         )?;
+        let verification = if let Some(prepared) = verification {
+            let mut record = prepared.finish(&self.workspace, outcome.code, &outcome.stdout);
+            self.req_counter += 1;
+            let mut audit = AuditRecord::new(
+                0,
+                &self.agent,
+                &self.session_id,
+                &format!("verification_{:06}", self.req_counter),
+                &cube.current_state().to_string(),
+                "verification",
+                &scope,
+                if matches!(record.status, verification::VerificationStatus::Verified) {
+                    "allow"
+                } else {
+                    "deny"
+                },
+                &self.policy.name,
+            );
+            audit.result =
+                serde_json::to_string(&record).map_err(|e| ToolError::Io(e.to_string()))?;
+            let audit = self
+                .audit
+                .append(audit)
+                .map_err(|e| ToolError::Audit(e.to_string()))?;
+            record.audit_id = audit.hash_entry;
+            Some(record)
+        } else {
+            None
+        };
         Ok(ToolResult {
+            verification,
             ok: outcome.success(),
             decision: "allow".into(),
             output: if lease_id.is_some() {
@@ -1287,6 +1364,7 @@ impl ToolGateway {
             "success",
         )?;
         Ok(ToolResult {
+            verification: None,
             ok: (200..300).contains(&status),
             decision: "allow".into(),
             output,
@@ -1407,6 +1485,7 @@ impl ToolGateway {
             "success",
         )?;
         Ok(ToolResult {
+            verification: None,
             ok: true,
             decision: "allow".into(),
             output: format!("connected to {scope}"),
@@ -1650,6 +1729,7 @@ impl ToolGateway {
                 )?;
                 self.checkpoint(cube)?;
                 Ok(ToolResult {
+                    verification: None,
                     ok: true,
                     decision: "allow".into(),
                     output: out,
@@ -2289,6 +2369,65 @@ network: {{allow: [], deny: ['10.0.0.0/8']}}
         let r = gw.dispatch(&mut cube, &exe("/bin/false")).unwrap();
         assert!(!r.ok);
         assert_eq!(r.decision, "allow");
+    }
+
+    #[test]
+    fn verification_requires_exact_operator_contract_and_trusted_execution_result() {
+        let (mut gateway, mut cube, dir) = exec_harness();
+        // เหมือน Runtime จริง: audit อยู่นอก workspace ที่กำลังตรวจ digest
+        gateway.workspace = dir.join("workspace");
+        std::fs::create_dir(&gateway.workspace).unwrap();
+        let exe = std::fs::canonicalize("/bin/true")
+            .unwrap()
+            .display()
+            .to_string();
+        let args = vec!["test".to_string()];
+        // ชื่อ argv และ exit 0 ไม่มีสิทธิ์สร้างหลักฐานเอง
+        assert!(gateway
+            .exec(&mut cube, &exe, &args)
+            .unwrap()
+            .verification
+            .is_none());
+        gateway.verifier = Some(verification::VerifierConfig {
+            executable: exe.clone(),
+            argv: args.clone(),
+            executable_sha256: Some(verification::digest(&std::fs::read(&exe).unwrap())),
+            stdout_contains: None,
+        });
+        let result = gateway.exec(&mut cube, &exe, &args).unwrap();
+        let record = result.verification.unwrap();
+        assert!(matches!(
+            record.status,
+            verification::VerificationStatus::Verified
+        ));
+        assert_eq!(record.exit_code, Some(0));
+        assert_eq!(record.audit_id.len(), 64);
+        assert!(std::fs::read_to_string(dir.join("audit.jsonl"))
+            .unwrap()
+            .contains(&record.audit_id));
+        // argv ต้องตรงทุกตัว แม้คำสั่งที่เหลือ exit 0 เหมือนกัน
+        assert!(gateway
+            .exec(&mut cube, &exe, &[])
+            .unwrap()
+            .verification
+            .is_none());
+        gateway.verifier.as_mut().unwrap().stdout_contains = Some("test result: 2 passed".into());
+        let result = gateway.exec(&mut cube, &exe, &args).unwrap();
+        assert!(result.ok);
+        assert!(matches!(
+            result.verification.unwrap().status,
+            verification::VerificationStatus::Failed
+        ));
+        gateway.verifier.as_mut().unwrap().executable_sha256 = Some("0".repeat(64));
+        assert!(gateway.exec(&mut cube, &exe, &args).is_err());
+        let req = ToolRequest {
+            tool: "process.exec".into(),
+            path: exe,
+            content: Some(r#"{"argv":["test"],"verification":{"status":"verified"}}"#.into()),
+        };
+        assert!(gateway.dispatch(&mut cube, &req).is_err());
+        aivm_audit::clear_flags(&dir);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

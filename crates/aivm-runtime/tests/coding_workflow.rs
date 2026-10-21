@@ -74,8 +74,14 @@ impl Fixture {
 name: coding
 resources: {{cpu: 1, memory: 1GB, storage: 64MB}}
 build: {{enabled: {enabled}, max_files: 4, max_bytes: 1048576}}
+{verification}
 tools: {{allow: [cc, as, ld, "build:tests"]}}
-"#
+"#,
+            verification = if enabled {
+                "verification: {executable: 'build:tests', argv: []}"
+            } else {
+                ""
+            }
         ))
         .unwrap();
         let runtime = Runtime::init(config, root.clone()).unwrap();
@@ -165,6 +171,14 @@ fn agent_reads_fixes_builds_and_tests_with_audited_limits() {
     steps.push(done());
     let run = fixture.execute(steps);
     assert_eq!(run.stopped, "done");
+    assert!(matches!(
+        run.verification_status,
+        aivm_tools::verification::VerificationStatus::Verified
+    ));
+    let record = run.verification.as_ref().unwrap();
+    assert_eq!(record.workspace_sha256.len(), 64);
+    assert_eq!(record.executable_sha256.len(), 64);
+    assert_eq!(record.audit_id.len(), 64);
     assert_eq!(run.steps.len(), 5);
     assert!(
         run.steps.iter().all(|step| step.outcome.starts_with("OK")),

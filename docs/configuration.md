@@ -3,6 +3,10 @@
 `create` จะ validate config ก่อนบูตเสมอ config ผิด = บูตไม่ขึ้น (fail-closed)
 ฟิลด์ที่ไม่ระบุใช้ค่า default ตามตาราง ทุกบล็อก `#[serde(default)]` หมด
 
+`verification` ระบุ executable/argv และ pin ของ operator สำหรับยืนยันผล
+ไม่ตั้งค่า = ผล agent เป็น `unverified` แม้คำสั่ง exit 0 ดู
+[Verifier contracts และ state/audit transactions](verification-and-transactions.md)
+
 ```yaml
 name: coder
 

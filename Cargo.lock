@@ -151,10 +151,13 @@ dependencies = [
  "aivm-sandbox",
  "aivm-secrets",
  "aivm-tools",
+ "libc",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]

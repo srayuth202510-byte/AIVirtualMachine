@@ -334,6 +334,16 @@ fn main() -> Result<(), AnyErr> {
             for s in &run.steps {
                 println!("#{} [{}] {} -> {}", s.index, s.subtask, s.action, s.outcome);
             }
+            println!(
+                "verification: {}",
+                serde_json::to_value(&run.verification_status)?
+            );
+            if let Some(record) = &run.verification {
+                println!(
+                    "verification evidence: {} (workspace {})",
+                    record.audit_id, record.workspace_sha256
+                );
+            }
             match &run.summary {
                 Some(s) => println!("summary: {s}"),
                 None => println!("(stopped: {})", run.stopped),

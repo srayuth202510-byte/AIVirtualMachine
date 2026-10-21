@@ -332,8 +332,25 @@ fn i7_every_decision_audited() {
         .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
         .unwrap_or(0);
     assert_eq!(granted, 1);
-    // แต่ละ transition มี prepare+commit และ MODIFY มี grant ที่ commit แล้ว
-    assert_eq!(after_rt - before_rt, granted + 4);
+    // grant อยู่ใน transaction commit เดียวกัน ไม่อ้างสำเร็จก่อน commit
+    assert_eq!(after_rt - before_rt, 4);
+    let records: Vec<aivm_audit::AuditRecord> = std::fs::read_to_string(&audit_p)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let commit = records
+        .iter()
+        .find(|record| record.action == "transition-commit" && record.state == "MODIFY")
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_str(&commit.result).unwrap();
+    assert!(result["details"].as_str().unwrap().contains("granted=1"));
+    assert!(result["details"].as_str().unwrap().contains("write:"));
+    assert_eq!(result["state_sha256"].as_str().unwrap().len(), 64);
+    assert!(records
+        .iter()
+        .any(|record| record.action == "transition-prepare"
+            && record.request_id == commit.request_id));
     assert!(AuditWriter::verify(&audit_p).is_ok());
     inv_clean(&dir);
     inv_clean(&rt_dir);

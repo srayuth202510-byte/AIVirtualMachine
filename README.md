@@ -143,6 +143,8 @@ crates/
 
 ## เอกสาร
 
+- [`docs/verification-and-transactions.md`](./docs/verification-and-transactions.md) — operator verifier contracts, completion receipts และ crash recovery ของ state/audit
+
 - [`docs/workspace-recovery.md`](./docs/workspace-recovery.md) — snapshot workspace, integrity verification และ operator restore ลง VM ใหม่
 - [`docs/offsite-backup.md`](./docs/offsite-backup.md) — ชุดตั้งค่า S3 Object Lock, แยกสิทธิ์ upload/restore และขั้นตอนทดลองกู้จากนอกเครื่อง (ยังไม่ผ่าน AWS host validation)
 - [`docs/audit-rotation.md`](./docs/audit-rotation.md) — ลำดับ rotate, recovery หลัง process หยุด และพฤติกรรมเมื่อเกิด error

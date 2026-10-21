@@ -1,5 +1,11 @@
 # Testing — เมทริกซ์คำสั่งทดสอบ
 
+## Verifier และ state/audit crash recovery
+
+`cargo test -p aivm-runtime transaction::tests` ทดสอบ SIGKILL ระหว่าง mutation
+และ recovery; `make test-coding` ตรวจ verifier receipt ของ compiler/test binary จริง
+รายละเอียดอยู่ใน [Verifier contracts และ transactions](verification-and-transactions.md)
+
 ## คำสั่งหลัก
 
 | คำสั่ง | วิ่งอะไร | เมื่อไหร่ที่ใช้ |
