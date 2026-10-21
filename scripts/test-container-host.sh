@@ -39,7 +39,8 @@ printf '%s\n' "$$" > "$CGROUP_ROOT/runner/cgroup.procs"
 printf '+cpu +memory +pids\n' > "$CGROUP_ROOT/cgroup.subtree_control"
 
 CONFIG=$(mktemp /tmp/aivm-container-config-XXXXXX.json)
-trap 'rm -f "$CONFIG"' EXIT HUP INT TERM
+LOG=$(mktemp /tmp/aivm-container-test-XXXXXX.log)
+trap 'rm -f "$CONFIG" "$LOG"' EXIT HUP INT TERM
 python3 - "$CONFIG" "$CGROUP_ROOT" "$HELPER" <<'PY'
 import json
 import sys
@@ -48,6 +49,19 @@ with open(sys.argv[1], "w") as file:
                "cgroup_root": sys.argv[2]}, file)
 PY
 
-AIVM_CONTAINER_TEST_CONFIG="$CONFIG" cargo test -p aivm-sandbox \
+if AIVM_CONTAINER_TEST_CONFIG="$CONFIG" cargo test -p aivm-sandbox \
     --test container real_container_enforces_boundary_and_quotas \
-    -- --exact --ignored --nocapture
+    -- --exact --nocapture >"$LOG" 2>&1; then
+    cat "$LOG"
+else
+    CODE=$?
+    cat "$LOG"
+    exit "$CODE"
+fi
+# exit 0 ที่เลือก 0 test หรือ skip ไม่ใช่หลักฐานว่า boundary ผ่าน
+python3 - "$SCRIPT_DIR/validate-model-host.py" "$LOG" <<'PY'
+import pathlib,runpy,sys
+validator=runpy.run_path(sys.argv[1])
+if not validator['exact_test_passed'](pathlib.Path(sys.argv[2]).read_text()):
+    raise SystemExit('container boundary test did not execute exactly once without skips')
+PY

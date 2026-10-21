@@ -1,5 +1,23 @@
 # รายงานวิเคราะห์และทบทวนระบบ AIVM — 20 ตุลาคม 2026
 
+## สถานะติดตาม — 21 ตุลาคม 2026
+
+รายงานด้านล่างเป็นผลประวัติศาสตร์ที่ commit `f6aa57a` ไม่ใช่รายการช่องโหว่ปัจจุบันทั้งหมด
+ตรวจติดตาม source ถึง `44aba9e` และชุด validation ที่เพิ่มภายหลัง:
+
+| Finding | สถานะติดตาม |
+|---|---|
+| H-1 | `696a15e` เพิ่ม strict config parsing และ regression สำหรับ security/isolation typo |
+| M-1 | `696a15e` รักษา deadline เดิมเมื่อ restore พร้อม regression test |
+| M-2 | ปฏิเสธกรณี `/usr/bin/true test` แล้ว แต่ยังใช้ runner-name/argv heuristic; typed verifier contract ที่ผูก revision/digest ยังเป็นงานต่อ |
+| M-3 | เพิ่ม prepare/commit/rollback และ test persist failure แล้ว; ยังไม่ได้พิสูจน์ crash consistency ทุกจุดระหว่าง state กับ audit |
+| M-4 | `44aba9e` เพิ่ม protected snapshot/fd loading; ผล loader และ worker บน host จริงอยู่ใน [รายงานติดตาม](host-validation-2026-10-21.md) |
+| M-5 | เพิ่ม `llama` clippy/tests ใน CI หลักแล้ว; recurring real-model workflow เพิ่มใน source แต่ต้องเปิด runner/variables ก่อน |
+| L-1 / L-2 | ยังไม่ได้แก้ครบในการติดตามรอบนี้ |
+
+จึงต้องอ่านข้อสรุป production readiness เดิมประกอบสถานะข้างบนและขอบเขตหลักฐานใหม่
+ไม่ถือว่าประเด็นที่ลดความเสี่ยงแล้วได้รับการพิสูจน์ครบทุก failure mode
+
 ## บทสรุปผู้บริหาร
 
 ตรวจ commit `f6aa57a9299ec532890e91526eed7fe578b1e3ea` ครอบคลุม Rust workspace 15 crates,

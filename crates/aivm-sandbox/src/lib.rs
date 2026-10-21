@@ -494,6 +494,19 @@ pub enum SeccompMode {
 ///   default_action (KILL/TRACE)
 #[cfg(target_os = "linux")]
 unsafe fn build_hybrid_filter(mode: SeccompMode) -> Vec<libc::sock_filter> {
+    build_hybrid_filter_with_init(mode, false)
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn build_container_filter() -> Vec<libc::sock_filter> {
+    build_hybrid_filter_with_init(SeccompMode::Hybrid, true)
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn build_hybrid_filter_with_init(
+    mode: SeccompMode,
+    container_init: bool,
+) -> Vec<libc::sock_filter> {
     let n_allow = ALLOWED_SYSCALLS.len();
     let n_deny = DANGEROUS_SYSCALLS.len();
 
@@ -556,6 +569,25 @@ unsafe fn build_hybrid_filter(mode: SeccompMode) -> Vec<libc::sock_filter> {
         k: 0x40000000,
     });
     filter.push(ret(0x00000000));
+
+    // helper ต้องติดตั้ง Landlock หลัง bubblewrap ติดตั้ง seccomp แล้ว
+    // worker ต้อง stack seccomp ของตัวเองด้วย; ทั้งสองเพิ่มข้อจำกัดได้เท่านั้น
+    if container_init {
+        for nr in [
+            libc::SYS_landlock_create_ruleset,
+            libc::SYS_landlock_add_rule,
+            libc::SYS_landlock_restrict_self,
+            libc::SYS_seccomp,
+        ] {
+            filter.push(libc::sock_filter {
+                code: 0x15,
+                jt: 0,
+                jf: 1,
+                k: nr as u32,
+            });
+            filter.push(ret(0x7fff0000));
+        }
+    }
 
     // ioctl ที่ clone/เปลี่ยน filesystem metadata อาจหลบขอบเขต output/byte quota
     // ยังคงให้ ioctl ปกติ (เช่น isatty) ผ่านเพื่อให้ compiler ทำงานได้
@@ -2031,6 +2063,39 @@ mod tests {
             bpf_verdict(&legacy, 0xc000003e, libc::SYS_getpgid as u32),
             0x7fff0000
         );
+    }
+
+    #[test]
+    fn container_filter_allows_security_setup_without_weakening_other_verdicts() {
+        let container = unsafe { build_container_filter() };
+        let process = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
+        let setup = [
+            libc::SYS_landlock_create_ruleset,
+            libc::SYS_landlock_add_rule,
+            libc::SYS_landlock_restrict_self,
+            libc::SYS_seccomp,
+        ];
+        // เปรียบเทียบทุก syscall ในช่วงนี้: เปลี่ยนผลเฉพาะ setup สี่ตัว
+        for nr in 0..=1024 {
+            let expected = if setup.contains(&(nr as libc::c_long)) {
+                0x7fff0000
+            } else {
+                bpf_verdict(&process, 0xc000003e, nr)
+            };
+            assert_eq!(
+                bpf_verdict(&container, 0xc000003e, nr),
+                expected,
+                "syscall {nr}"
+            );
+            assert_eq!(bpf_verdict(&container, 0xc000003e, nr | 0x40000000), 0);
+            assert_eq!(bpf_verdict(&container, 0x40000003, nr), 0);
+        }
+        for command in [0x40049409, 0x4020940d, 0xc0189436, 0x40086602, 0x401c5820] {
+            assert_eq!(
+                bpf_verdict_with_ioctl(&container, 0xc000003e, libc::SYS_ioctl as u32, command),
+                0
+            );
+        }
     }
 
     #[test]

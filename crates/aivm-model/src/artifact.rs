@@ -90,8 +90,19 @@ impl PreparedModelFile {
         let mut file = if read_only_staged {
             source
         } else {
-            let directory =
-                std::env::temp_dir().join(format!("aivm-gguf-{}", uuid::Uuid::new_v4()));
+            // ชื่อใช้แยกการจอง directory เท่านั้น ไม่ใช่ secret: create + 0700
+            // เป็น boundary จริง และไม่ต้องรอ entropy ใน MicroVM ที่เพิ่งบูต
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| failed("model staging clock before epoch"))?
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "aivm-gguf-{}-{timestamp}-{}",
+                std::process::id(),
+                NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed)
+            ));
             std::fs::DirBuilder::new()
                 .mode(0o700)
                 .create(&directory)
@@ -197,6 +208,40 @@ mod tests {
         std::fs::write(&replacement, b"malicious replacement").unwrap();
         symlink(&replacement, &path).unwrap();
         assert_eq!(std::fs::read(prepared.load_path()).unwrap(), bytes);
+    }
+
+    // ใช้ GGUF จริงแต่แก้เฉพาะสำเนาของ fixture; ไม่แตะไฟล์โมเดลของ operator
+    #[cfg(feature = "llama")]
+    #[test]
+    #[ignore = "requires AIVM_GGUF and operator-approved AIVM_GGUF_SHA256"]
+    fn real_loader_uses_verified_snapshot_after_source_tampering() {
+        use crate::{LlamaBackend, LlamaModel, LlamaModelParams};
+
+        let original = std::env::var("AIVM_GGUF").expect("set AIVM_GGUF");
+        let expected = std::env::var("AIVM_GGUF_SHA256").expect("pin AIVM_GGUF_SHA256");
+        assert!(!expected.is_empty(), "a trusted model pin is required");
+        let fixture = Fixture::new();
+        let path = fixture.model();
+        std::fs::copy(original, &path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let prepared = PreparedModelFile::new(&path, &expected).unwrap();
+
+        // ทำลาย inode เดิมแล้วแทนชื่อด้วย symlink ก่อน llama.cpp เปิดไฟล์
+        std::fs::write(&path, b"invalid GGUF written after verification").unwrap();
+        let replaced = fixture.0.join("replaced.gguf");
+        std::fs::rename(&path, &replaced).unwrap();
+        symlink(&replaced, &path).unwrap();
+        assert!(open_regular(&path).is_err());
+        let mut verified = File::open(prepared.load_path()).unwrap();
+        assert!(file_sha256(&mut verified)
+            .unwrap()
+            .eq_ignore_ascii_case(&expected));
+
+        let backend = LlamaBackend::init().unwrap();
+        let params = LlamaModelParams::default().with_n_gpu_layers(0);
+        let model = LlamaModel::load_from_file(&backend, prepared.load_path(), &params)
+            .expect("llama.cpp must load the verified snapshot despite source tampering");
+        assert!(model.n_vocab() > 0);
     }
 
     #[test]

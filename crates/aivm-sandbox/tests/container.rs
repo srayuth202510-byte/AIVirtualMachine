@@ -54,7 +54,7 @@ fn missing_backend_never_executes_payload() {
     std::fs::remove_dir_all(ws).unwrap();
 }
 
-/// Deliberately ignored in ordinary CI. Requires real delegated cgroups and installed helper.
+/// Skips without configuration in ordinary CI; the host wrapper requires an actual run.
 /// AIVM_CONTAINER_TEST_CONFIG points to JSON containing bubblewrap/init/cgroup_root.
 #[test]
 fn real_container_enforces_boundary_and_quotas() {

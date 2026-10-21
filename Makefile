@@ -22,6 +22,7 @@ test: ## เทสต์ unit + integration ทั้งหมด
 	python3 -m unittest discover -s scripts -p 'test_security_court.py'
 	python3 -m unittest discover -s scripts -p 'test_fuzz_seeded.py'
 	python3 -m unittest discover -s scripts -p 'test_llama_replay.py'
+	python3 -m unittest discover -s scripts -p 'test_model_host_validation.py'
 	python3 scripts/eval-qwen-audit.py
 	python3 scripts/smoke-qwen-watch.py
 

@@ -112,12 +112,15 @@ GGUF loader บน Linux เปิด source ด้วย `O_NOFOLLOW | O_NONBLO
 ไม่เกิน 64 GiB สำหรับ source บน writable mount จะสร้างไฟล์ใน private directory `0700`
 แล้ว unlink ก่อน copy แบบจำกัดขนาด เพื่อไม่ทิ้งสำเนาขนาดใหญ่เมื่อ process ถูก kill ระหว่าง copy
 จากนั้นเปลี่ยนสำเนาเป็น `0400` และเปิด descriptor แบบ read-only ก่อนตรวจ hash
+ชื่อ staging ใช้ PID/เวลา/counter โดยจอง directory แบบ atomic และไม่ใช้ชื่อเป็น secret
+จึงไม่ต้องรอ entropy เพื่อสร้าง UUID ใน MicroVM ที่เพิ่งบูต
 loader เปิด `/proc/self/fd/<fd>` ของสำเนาที่ตรวจแล้วและเก็บ descriptor จน model ถูกทำลาย
 การแทน source pathname, สลับ symlink หรือเขียน source inode เดิมหลังตรวจจึงไม่เปลี่ยน bytes
 ที่ loader/mmap ใช้ หาก source เปลี่ยนระหว่าง copy จะยอมรับเฉพาะสำเนาที่ hash ตรง pin เท่านั้น
 
-Container/MicroVM ใช้สำเนาที่ launcher stage ไว้บน read-only mount โดยไม่ copy เพิ่ม
-เส้นนี้ต้องเป็นไฟล์ link เดียว, owner เป็น root หรือ UID ปัจจุบัน และไม่มี group/world write
+Container/MicroVM ใช้สำเนาที่ launcher stage ไว้บน read-only mount โดยไม่ copy เพิ่มได้
+เมื่อเป็นไฟล์ link เดียว, owner เป็น root หรือ UID ปัจจุบัน และไม่มี group/world write
+หาก metadata ไม่เข้าเงื่อนไข เช่น UID ของไฟล์จาก host ไม่ตรง UID ใน guest จะสร้าง snapshot เพิ่ม
 ระบบตรวจ mount และ metadata ผ่าน descriptor จริง ไม่ใช้ชื่อ tier ใน config เป็นหลักฐาน
 จากนั้น hash และ load ผ่าน descriptor เดียวกัน ตาม threat model ยังเชื่อถือ host/kernel/operator
 รวมถึง host ที่เป็นเจ้าของ backing storage ของ read-only mount

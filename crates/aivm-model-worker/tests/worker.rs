@@ -186,6 +186,20 @@ fn real_isolated_worker_host_validation() {
         ..request()
     };
     let client = WorkerClient::new(local.worker_path.as_ref().unwrap());
+    // pin ผิดต้องปฏิเสธทุก tier และห้ามปล่อย token ออกมาก่อนตรวจผ่าน
+    let mut wrong_pin = config.clone();
+    let hash = &mut wrong_pin.local.as_mut().unwrap().model_sha256;
+    hash.replace_range(..1, if hash.starts_with('0') { "1" } else { "0" });
+    let mut deltas = 0;
+    let error = client
+        .infer_stream(&wrong_pin, req.clone(), &limits, &mut |_| {
+            deltas += 1;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("sha256 mismatch"), "{error}");
+    assert_eq!(deltas, 0, "unpinned bytes must never produce output");
+
     let mut streamed = String::new();
     let response = client
         .infer_stream(&config, req, &limits, &mut |delta| {

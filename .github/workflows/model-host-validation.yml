@@ -1,0 +1,44 @@
+name: real-model-validation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '19 20 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: model-host-validation
+  cancel-in-progress: false
+
+jobs:
+  pinned-gguf:
+    if: vars.AIVM_ENABLE_MODEL_VALIDATION == '1'
+    runs-on: [self-hosted, linux, kvm]
+    timeout-minutes: 45
+    env:
+      AIVM_GGUF: ${{ vars.AIVM_GGUF }}
+      AIVM_GGUF_SHA256: ${{ vars.AIVM_GGUF_SHA256 }}
+      AIVM_MICROVM_PINS: ${{ vars.AIVM_MICROVM_PINS }}
+      EVIDENCE_DIR: target/model-host-validation/${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # fixture/helper/KVM/delegation เตรียมโดย operator; ไม่ download หรือ repin เอง
+      - name: Validate pinned model on process, container, and MicroVM
+        run: |
+          python3 scripts/validate-model-host.py \
+            --model "$AIVM_GGUF" --model-sha256 "$AIVM_GGUF_SHA256" \
+            --pins "$AIVM_MICROVM_PINS" --out "$EVIDENCE_DIR"
+
+      - name: Retain host validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-host-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: warn
+          retention-days: 30

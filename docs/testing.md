@@ -48,7 +48,37 @@
 
 ## CI (`.github/workflows/ci.yml` = `make ci`)
 
-fmt → clippy strict → `cargo test --workspace` → clippy หลังฟีเจอร์ microvm →
+fmt → clippy strict → `cargo test --workspace` → Python tests → clippy/test หลังฟีเจอร์ llama → clippy หลังฟีเจอร์ microvm →
 `make test-microvm` → clippy/test หลังฟีเจอร์ hardware → demo → smoke.sh
 runner ระบุรุ่นเป็น `ubuntu-24.04` (เทสต์บูตจริงข้ามเมื่อไม่มี KVM/pins — unit/plumbing
 ที่เหลือยังจับของพังได้)
+
+## Pinned GGUF บน host จริง
+
+รันนอก restricted sandbox บน Linux host ที่มี user/network namespaces, KVM,
+Firecracker, bubblewrap, root-owned container helper และ systemd user delegation
+สำหรับ `cpu memory pids` เตรียม GGUF และ MicroVM pins ที่ operator อนุมัติไว้ก่อน
+สคริปต์ไม่ download โมเดลหรือเปลี่ยน pins เอง:
+
+```bash
+python3 scripts/validate-model-host.py \
+  --model /path/model.gguf --model-sha256 '<approved-64-hex-sha256>' \
+  --pins /path/microvm-pins.json --out target/model-host-validation/manual
+```
+
+ตรวจ model/kernel/rootfs/Firecracker กับ pins ก่อนรัน จากนั้นทดสอบ loader จริงหลัง
+เขียนทับ inode และแทน source pathname ด้วย symlink ในสำเนาส่วนตัว ไม่แตะ GGUF ต้นฉบับ
+ทั้ง `process_namespace`, `container` และ `microvm` ต้องปฏิเสธ hash ผิดโดยไม่ปล่อย token,
+โหลด hash ถูก, ตรวจ streaming เทียบ final output และยกเลิกได้หลัง delta แรก
+exit 0 ที่ไม่พบเทสต์หรือข้าม prerequisite ไม่นับว่าผ่าน เก็บ command, elapsed time,
+raw logs, commit/source identifiers และ hashes ก่อน/หลังใน output directory
+ต้องมี temporary storage สำหรับสำเนา GGUF ตาม [model runtime](model-runtime.md)
+
+Workflow [real-model-validation](../.github/workflows/model-host-validation.yml) เตรียมไว้
+สำหรับ manual dispatch และรันทุกวัน 20:19 UTC (03:19 Asia/Bangkok วันถัดไป)
+ใช้ self-hosted runner labels `self-hosted, linux, kvm` และไม่รับ pull-request trigger
+เปิดด้วย repository variable `AIVM_ENABLE_MODEL_VALIDATION=1` พร้อมตั้ง absolute paths
+`AIVM_GGUF`, `AIVM_MICROVM_PINS` และ trusted digest `AIVM_GGUF_SHA256`
+เก็บ evidence เป็น workflow artifact 30 วัน แม้ test ล้มเหลวเมื่อมีไฟล์ให้เก็บ
+การเพิ่ม workflow ใน source ยังไม่เปิดใช้งาน runner หรือตั้ง repository variables ให้เอง
+ผลบน host หนึ่งไม่ใช่การรับรอง production hosts อื่นหรือ TEE/attestation

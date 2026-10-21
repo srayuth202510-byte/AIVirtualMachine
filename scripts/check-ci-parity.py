@@ -38,6 +38,7 @@ def main():
         "test_security_court.py",
         "test_fuzz_seeded.py",
         "test_llama_replay.py",
+        "test_model_host_validation.py",
         "eval-qwen-audit.py",
         "smoke-qwen-watch.py",
         "make check-llama",
@@ -57,7 +58,7 @@ def main():
 
     # 4. Makefile test ต้องมี pins + court + fuzz + llama test (ห้ามหลุดเงียบ)
     for need in ("test_pins.py", "test_security_court.py", "test_fuzz_seeded.py",
-                 "test_llama_replay.py"):
+                 "test_llama_replay.py", "test_model_host_validation.py"):
         if need not in mk:
             ok = fail(f"Makefile test ขาด {need}") and False
 
