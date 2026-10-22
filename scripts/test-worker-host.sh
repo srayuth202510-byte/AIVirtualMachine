@@ -6,18 +6,21 @@ PROJECT_DIR=$(dirname -- "$SCRIPT_DIR")
 TIER=${1:-}
 MODEL=${2:-}
 PINS=${3:-"$HOME/.local/share/aivm/microvm/pins.json"}
-case "$TIER" in container|microvm|process_namespace) ;; *) echo 'usage: sh scripts/test-worker-host.sh container|microvm|process_namespace /path/model.gguf [pins.json]' >&2; exit 2 ;; esac
+SCENARIO=${4:-baseline}
+case "$SCENARIO" in baseline|failure-recovery) ;; *) echo 'scenario must be baseline or failure-recovery' >&2; exit 2 ;; esac
+case "$TIER" in container|microvm|process_namespace) ;; *) echo 'usage: sh scripts/test-worker-host.sh container|microvm|process_namespace /path/model.gguf [pins.json] [baseline|failure-recovery]' >&2; exit 2 ;; esac
 [ -f "$MODEL" ] || { echo "model missing: $MODEL" >&2; exit 2; }
 cd "$PROJECT_DIR"
-if [ "${4:-}" != --inside ]; then
-    cargo build -q -p aivm-model-worker --features llama,microvm
+if [ "${5:-}" != --inside ]; then
+    cargo build --locked -q -p aivm-model-worker --features llama,microvm
     if [ "$TIER" = container ]; then
         exec systemd-run --user --wait --pipe --collect \
             --property='Delegate=cpu memory pids' --setenv="PATH=$PATH" --setenv="AIVM_WORKER_STRACE=${AIVM_WORKER_STRACE:-}" \
             --setenv="AIVM_GGUF_SHA256=${AIVM_GGUF_SHA256:-}" \
             --setenv="CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-1}" \
+            --setenv="AIVM_WORKER_HOST_EVIDENCE=${AIVM_WORKER_HOST_EVIDENCE:-}" \
             --unit="aivm-worker-host-$(id -u)-$$" \
-            /bin/sh "$SCRIPT_DIR/test-worker-host.sh" "$TIER" "$MODEL" "$PINS" --inside
+            /bin/sh "$SCRIPT_DIR/test-worker-host.sh" "$TIER" "$MODEL" "$PINS" "$SCENARIO" --inside
     fi
 fi
 CGROUP_ROOT=''
@@ -28,8 +31,9 @@ if [ "$TIER" = container ]; then
     printf '%s\n' "$$" > "$CGROUP_ROOT/runner/cgroup.procs"
     printf '+cpu +memory +pids\n' > "$CGROUP_ROOT/cgroup.subtree_control"
 fi
-CONFIG=$(mktemp /tmp/aivm-worker-host-XXXXXX.json)
-trap 'rm -f "$CONFIG"' EXIT HUP INT TERM
+RUN_DIR=$(mktemp -d /tmp/aivm-worker-host-XXXXXX)
+CONFIG="$RUN_DIR/config.json"
+trap 'rm -rf "$RUN_DIR"' EXIT HUP INT TERM
 python3 - "$CONFIG" "$TIER" "$MODEL" "$PROJECT_DIR/target/debug/aivm-model-worker" "$PINS" "$CGROUP_ROOT" <<'PY'
 import hashlib,json,os,pathlib,re,sys
 output,tier,model,worker,pins,cgroup=sys.argv[1:]
@@ -55,5 +59,14 @@ pathlib.Path(output).write_text(json.dumps(config))
 PY
 set --
 if [ -n "${AIVM_WORKER_STRACE:-}" ]; then set -- strace -f -o "$AIVM_WORKER_STRACE"; fi
-AIVM_WORKER_HOST_CONFIG="$CONFIG" "$@" cargo test -p aivm-model-worker --features llama,microvm \
+if [ "$SCENARIO" = failure-recovery ]; then
+    [ -n "${AIVM_WORKER_HOST_EVIDENCE:-}" ] || { echo 'failure-recovery requires AIVM_WORKER_HOST_EVIDENCE' >&2; exit 2; }
+    # scratch อยู่ใต้ directory เฉพาะเทสต์; เก็บ serial ชั่วคราวเพื่อแยก OOM จาก error อื่น
+    FAIL_TMP=$(mktemp -d "$RUN_DIR/aivm-worker-failures-XXXXXX")
+    TMPDIR="$FAIL_TMP" AIVM_WORKER_HOST_TMPDIR="$FAIL_TMP" AIVM_MICROVM_KEEP_SCRATCH=1 \
+        AIVM_WORKER_HOST_CONFIG="$CONFIG" "$@" cargo test --locked -p aivm-model-worker --features llama,microvm \
+        --test failure_recovery real_isolated_worker_failure_recovery -- --exact --ignored --nocapture
+    exit $?
+fi
+AIVM_WORKER_HOST_CONFIG="$CONFIG" "$@" cargo test --locked -p aivm-model-worker --features llama,microvm \
     --test worker real_isolated_worker_host_validation -- --exact --ignored --nocapture

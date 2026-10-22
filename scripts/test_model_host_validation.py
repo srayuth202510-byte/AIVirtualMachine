@@ -18,6 +18,30 @@ SPEC.loader.exec_module(HOST)
 
 
 class HostEvidenceTests(unittest.TestCase):
+    def test_failure_evidence_requires_both_failures_recovery_and_cleanup(self):
+        # ห้ามนับเพียง process exit หรือรายงานบางส่วนว่า failure/recovery ผ่าน
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = Path(temporary) / "failure.json"
+            self.assertFalse(HOST.failure_evidence_passed(evidence))
+            rows = []
+            for case in ("timeout", "recovery-after-timeout", "memory", "recovery-after-memory"):
+                rows.append({"case": case, "passed": True, "descendants_reaped": True,
+                    "staging_clean": True, "observed_processes": {"123": 456}, "verification": "verified",
+                    "stream_deltas": 0, "error": "specific resource failure", "elapsed_ms": 10,
+                    "timeout_ms": 100, "memory_mb": 128, "memory_failure_kind": "allocation-failure"})
+            evidence.write_text(json.dumps(rows))
+            self.assertTrue(HOST.failure_evidence_passed(evidence))
+            for invalid in ([], rows[:3], rows[::-1], [{**rows[0], "passed": False}] + rows[1:],
+                            [{**rows[0], "observed_processes": {}}] + rows[1:],
+                            [{**rows[0], "observed_processes": {"123": True}}] + rows[1:],
+                            [{**rows[0], "elapsed_ms": True}] + rows[1:],
+                            [{**rows[0], "staging_clean": False}] + rows[1:],
+                            rows[:2] + [{**rows[2], "memory_mb": 4096}] + rows[3:],
+                            rows[:2] + [{**rows[2], "memory_failure_kind": "unknown"}] + rows[3:],
+                            rows[:3] + [{**rows[3], "verification": "unverified"}]):
+                evidence.write_text(json.dumps(invalid))
+                self.assertFalse(HOST.failure_evidence_passed(evidence), invalid)
+
     def test_container_service_preserves_incremental_build_setting_before_worker_pinning(self):
         # systemd ต้องไม่เปลี่ยน build identity แล้วทำให้ worker pin เก่าหลัง cargo test
         with tempfile.TemporaryDirectory() as temporary:
@@ -45,6 +69,14 @@ class HostEvidenceTests(unittest.TestCase):
                 subprocess.run(["sh", str(script), "container", str(model)], env=env,
                                capture_output=True, text=True, check=True)
                 self.assertIn("--setenv=CARGO_INCREMENTAL=" + (setting or "1"), json.loads(capture.read_text()))
+            # evidence path และ scenario ต้องข้าม delegated service โดยไม่แตก argv เมื่อมีช่องว่าง
+            evidence = root / "evidence with spaces.json"
+            env["AIVM_WORKER_HOST_EVIDENCE"] = str(evidence)
+            subprocess.run(["sh", str(script), "container", str(model), "/pins.json", "failure-recovery"],
+                           env=env, capture_output=True, text=True, check=True)
+            arguments = json.loads(capture.read_text())
+            self.assertIn("--setenv=AIVM_WORKER_HOST_EVIDENCE=" + str(evidence), arguments)
+            self.assertEqual(arguments[-2:], ["failure-recovery", "--inside"])
 
     def test_zero_exit_without_exact_test_or_with_skip_is_not_success(self):
         passed = "test result: ok. 1 passed; 0 failed; 0 ignored; 9 filtered out; finished in 1s"

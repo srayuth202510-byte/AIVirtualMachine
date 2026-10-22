@@ -50,6 +50,43 @@ def exact_test_passed(log):
     )
 
 
+def failure_evidence_passed(path):
+    # log ผ่านแต่หลักฐานขาด/ไม่ครบต้องไม่กลายเป็นผลผ่านของ failure suite
+    try:
+        rows = json.loads(Path(path).read_text())
+        cases = ["timeout", "recovery-after-timeout", "memory", "recovery-after-memory"]
+        if not isinstance(rows, list) or len(rows) != len(cases):
+            return False
+        for case, row in zip(cases, rows):
+            if not isinstance(row, dict) or row.get("case") != case:
+                return False
+            if any(row.get(field) is not True for field in ("passed", "descendants_reaped", "staging_clean")):
+                return False
+            if not isinstance(row.get("observed_processes"), dict) or not row["observed_processes"]:
+                return False
+            if not all(isinstance(pid, str) and pid.isdecimal() and int(pid) > 0
+                       and type(start) is int and start > 0
+                       for pid, start in row["observed_processes"].items()):
+                return False
+            if case.startswith("recovery-"):
+                if row.get("verification") != "verified":
+                    return False
+            elif (row.get("stream_deltas") != 0 or not isinstance(row.get("error"), str)
+                  or not row["error"] or type(row.get("elapsed_ms")) is not int
+                  or not 0 <= row["elapsed_ms"] < 180_000):
+                return False
+            elif case == "timeout" and row.get("timeout_ms") != 100:
+                return False
+            elif case == "memory" and row.get("memory_mb") != 128:
+                return False
+            elif case == "memory" and row.get("memory_failure_kind") not in (
+                    "allocation-failure", "guest-oom-diagnostic", "ram-backed-staging-capacity"):
+                return False
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
@@ -78,6 +115,7 @@ def main():
     sources = [
         "scripts/validate-model-host.py", "scripts/test-worker-host.sh",
         "crates/aivm-model/src/artifact.rs", "crates/aivm-model-worker/tests/worker.rs",
+        "crates/aivm-model-worker/tests/failure_recovery.rs",
         "crates/aivm-sandbox/src/lib.rs", "crates/aivm-sandbox/src/container.rs",
     ]
     save("validation-sources.json", {name: digest(PROJECT / name) for name in sources})
@@ -85,21 +123,27 @@ def main():
     env = dict(os.environ, AIVM_GGUF=str(model), AIVM_GGUF_SHA256=args.model_sha256,
                CARGO_TARGET_DIR=str(PROJECT / "target"))
 
-    def run(name, command, exact=False):
+    def run(name, command, exact=False, extra_env=None, evidence=None):
         print(f"START {name}", flush=True)
+        if evidence is not None:
+            Path(evidence).unlink(missing_ok=True)
         start = time.monotonic()
         with (out / f"{name}.log").open("w") as log:
             try:
-                code = subprocess.run(command, cwd=PROJECT, env=env, stdout=log,
+                code = subprocess.run(command, cwd=PROJECT, env=dict(env, **(extra_env or {})), stdout=log,
                                       stderr=subprocess.STDOUT, timeout=900).returncode
             except subprocess.TimeoutExpired:
                 code = 124
         content = (out / f"{name}.log").read_text(errors="replace")
         passed = code == 0 and (not exact or exact_test_passed(content))
+        if evidence is not None:
+            passed = passed and failure_evidence_passed(evidence)
         row = {"name": name, "command": command, "returncode": code,
                "passed": passed, "elapsed_seconds": round(time.monotonic() - start, 2),
                "summaries": re.findall(r"^test result:.*$", content, re.M),
                "log": f"{name}.log"}
+        if evidence is not None:
+            row["evidence"] = Path(evidence).name
         results.append(row)
         save("results.json", results)
         print(f"END {name}: passed={passed}, seconds={row['elapsed_seconds']}", flush=True)
@@ -124,6 +168,10 @@ def main():
         for tier in ("process_namespace", "container", "microvm"):
             run(f"worker-{tier}", ["sh", "scripts/test-worker-host.sh", tier,
                                    str(model), str(pins)], exact=True)
+            evidence = out / f"failure-recovery-{tier}.json"
+            run(f"failure-recovery-{tier}", ["sh", "scripts/test-worker-host.sh", tier,
+                str(model), str(pins), "failure-recovery"], exact=True,
+                extra_env={"AIVM_WORKER_HOST_EVIDENCE": str(evidence)}, evidence=evidence)
     finally:
         # ทดสอบเสร็จแล้วต้องยืนยันว่า fixture/pins/worker ต้นฉบับไม่ถูกเปลี่ยน
         after = snapshot(model, args.model_sha256, pins)

@@ -76,9 +76,35 @@ python3 scripts/validate-model-host.py \
 เขียนทับ inode และแทน source pathname ด้วย symlink ในสำเนาส่วนตัว ไม่แตะ GGUF ต้นฉบับ
 ทั้ง `process_namespace`, `container` และ `microvm` ต้องปฏิเสธ hash ผิดโดยไม่ปล่อย token,
 โหลด hash ถูก, ตรวจ streaming เทียบ final output และยกเลิกได้หลัง delta แรก
+จากนั้นรัน `failure-recovery` แยกแต่ละ tier: request deadline 100 ms และ
+memory budget 128 MiB ต้องล้มโดยไม่ส่ง token พร้อมหลักฐานสาเหตุที่ตรงกัน
+ตรวจ PID/starttime ของ descendants, process ที่อ้าง private test directory,
+staging และ private container cgroups แล้วต้องรัน inference ที่ verified ได้
+ด้วย client/pins เดิมหลัง failure แต่ละครั้ง การตรวจ cleanup รอได้สูงสุด 5 วินาที
+deadline ของ worker ไม่รวม staging/boot preparation; test จำกัดเวลารวมของ
+แต่ละ failure พร้อม setup/cleanup ไว้ 180 วินาที ไม่อ้างว่า latency รวมคือ 100 ms
+OOM diagnostic ใน serial ของ pinned guest ใช้เป็นหลักฐานประกอบ host test เท่านั้น
+ไม่เปลี่ยน trust ของ guest output ให้เป็น security verdict ของ production
+แยก `allocation-failure`, `guest-oom-diagnostic` และ `ram-backed-staging-capacity`
+ใน evidence: MicroVM ที่มี RAM น้อยอาจเต็มที่ tmpfs snapshot ก่อนถึง inference
+กรณีหลังต้องยืนยันชนิด filesystem ผ่าน descriptor ก่อนระบุว่า RAM-backed staging เต็ม
+disk-full ทั่วไปหรือ exit code อย่างเดียวไม่นับเป็น memory-pressure evidence
 exit 0 ที่ไม่พบเทสต์หรือข้าม prerequisite ไม่นับว่าผ่าน เก็บ command, elapsed time,
 raw logs, commit/source identifiers และ hashes ก่อน/หลังใน output directory
 ต้องมี temporary storage สำหรับสำเนา GGUF ตาม [model runtime](model-runtime.md)
+
+รัน failure suite เฉพาะ tier โดยระบุ evidence path แบบ absolute:
+
+```bash
+AIVM_GGUF_SHA256='<approved-64-hex-sha256>' \
+AIVM_WORKER_HOST_EVIDENCE=/absolute/path/failure-recovery.json \
+  sh scripts/test-worker-host.sh container /path/model.gguf /path/pins.json failure-recovery
+```
+
+รายงาน `failure-recovery-<tier>.json` ต้องมี timeout, memory failure และ
+verified recovery หลังแต่ละกรณีครบทั้ง 4 records พร้อม cleanup evidence
+สคริปต์สร้าง private TMPDIR; เก็บ MicroVM scratch ชั่วคราวเพื่ออ่าน diagnostics
+แล้วล้างก่อนจบ test ไม่ส่ง rootfs/model copies เข้า workflow artifacts
 
 Workflow [real-model-validation](../.github/workflows/model-host-validation.yml) เตรียมไว้
 สำหรับ manual dispatch และรันทุกวัน 20:19 UTC (03:19 Asia/Bangkok วันถัดไป)
