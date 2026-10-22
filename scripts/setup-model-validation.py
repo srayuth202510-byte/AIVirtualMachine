@@ -129,7 +129,8 @@ def systemd_quote(value):
 
 
 def service_text(directory, home):
-    path = f"{home}/.cargo/bin:{home}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    # เครื่องมือสร้าง guest filesystem อยู่ใน sbin บน host หลายรุ่น
+    path = f"{home}/.cargo/bin:{home}/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
     systemd_quote(str(directory))  # ตรวจ control characters; WorkingDirectory ไม่ใช้ shell quoting
     working_directory = str(directory).replace("%", "%%")
     return ("# AIVM model validation runner\n[Unit]\nDescription=AIVM model validation GitHub runner\n"
@@ -137,6 +138,8 @@ def service_text(directory, home):
             f"WorkingDirectory={working_directory}\n"
             f"ExecStart={systemd_quote(str(directory / 'run.sh'))}\n"
             f"Environment={systemd_quote('PATH=' + path)}\n"
+            # run.sh ต้องส่งสัญญาณหยุดต่อให้ listener ก่อน systemd ยุติ process tree
+            "Environment=RUNNER_MANUALLY_TRAP_SIG=1\n"
             "UMask=0077\nDelegate=cpu memory pids\nKillSignal=SIGINT\nKillMode=mixed\n"
             "TimeoutStopSec=120\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n")
 

@@ -81,6 +81,12 @@ class RunnerSetupTests(unittest.TestCase):
         service = SETUP.service_text(Path('/home/operator/runner with "quotes"%'), Path("/home/operator"))
         self.assertIn("Delegate=cpu memory pids", service)
         self.assertIn("UMask=0077", service)
+        self.assertIn("Environment=RUNNER_MANUALLY_TRAP_SIG=1", service)
+        # runner ต้องค้นพบ mkfs.ext4/debugfs ได้เหมือน operator shell
+        environment = next(line for line in service.splitlines() if line.startswith('Environment="PATH='))
+        executable_paths = environment.removeprefix('Environment="PATH=').removesuffix('"').split(":")
+        for directory in ("/usr/local/sbin", "/usr/sbin", "/sbin"):
+            self.assertIn(directory, executable_paths)
         self.assertIn('runner with \\"quotes\\"%%/run.sh"', service)
         with self.assertRaises(ValueError):
             SETUP.systemd_quote("path\nExecStart=bad")

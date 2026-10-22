@@ -43,7 +43,8 @@ archive traversal filter และติดตั้งใน `~/.local/share/ai
 1. ตรวจ host และ artifact pins ซ้ำ และตรวจสิทธิ์ repository/workflow
 2. ลงทะเบียน runner เฉพาะ repository ด้วย registration token ชั่วคราว
 3. สร้าง user unit `aivm-model-validation-runner.service` ด้วย `UMask=0077`,
-   `Delegate=cpu memory pids` และ PATH ของ Rust/Firecracker
+   `Delegate=cpu memory pids` และ PATH ของ Rust/Firecracker รวมถึง sbin
+   สำหรับ `mkfs.ext4`/`debugfs`; เปิด signal forwarding ของ runner เพื่อหยุด listener ได้
 4. เปิด linger ของ account นี้ให้รับ job หลัง logout แล้วเปิด service
 5. ตรวจว่า GitHub รายงาน runner online พร้อม labels ครบ
 6. ปิด gate ชั่วคราว ตั้ง `AIVM_GGUF`, `AIVM_GGUF_SHA256`, `AIVM_MICROVM_PINS`,
