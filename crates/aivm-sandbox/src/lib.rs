@@ -23,14 +23,14 @@ pub mod container;
 mod landlock;
 
 /// MicroVM backend (Phase 7) — เปิดด้วยฟีเจอร์ `microvm` เท่านั้น
-/// ตอนนี้เป็น skeleton (ประตู fail-closed ยังไม่มีการ boot จริง) เพื่อให้
-/// `make verify` เบาและไม่พึ่ง KVM/Firecracker ใน CI (แบบเดียวกับ `llama`)
+/// บูตและรัน guest จริงผ่าน Firecracker/KVM พร้อม pinned artifacts
+/// ฟีเจอร์ปิดโดยปริยาย; เทสต์บูตจริงต้องมี host prerequisites และ pins
 #[cfg(feature = "microvm")]
 pub mod microvm;
 
 /// Hardware Isolation backend (Level 3) — เปิดด้วยฟีเจอร์ `hardware` เท่านั้น
-/// TEE (SEV-SNP/TDX), Remote Attestation, Secure/Measured Boot, GPU/NPU isolation,
-/// Disk Encryption + Secure Key Storage
+/// Generic QEMU/KVM รัน workload จริงได้; TEE/attestation ยัง experimental
+/// measured boot, disk encryption และ GPU ยังไม่ใช่ guarantees ที่ยืนยันแล้ว
 #[cfg(feature = "hardware")]
 pub mod hardware;
 
@@ -1035,11 +1035,11 @@ impl RunVerdict {
 /// จุดแยก backend ตาม `SandboxLevel` (seam ของ Phase 7)
 /// คืน verdict คู่กับ error เสมอ (G3): gateway เอาไปลง audit โดยไม่ต้องเดาเอง
 /// - `Process` = พฤติกรรม MVP-B เดิม (`run_checked`) ไม่เปลี่ยน
-/// - `MicroVm` = เปิดฟีเจอร์ `microvm` แล้วเดินประตู skeleton
-///   (spec → shape → supply chain → host readiness → `Disabled` จนกว่า
-///   milestone boot/exec จะส่งมอบ) ไม่เปิดฟีเจอร์คือ `Disabled` ทันที
+/// - `MicroVm` = pinned artifacts → host readiness → Firecracker boot/exec
+///   config ว่างหรือ prerequisites ไม่พร้อม = ปฏิเสธ; ไม่มีฟีเจอร์ = `Disabled`
 /// - `Container` = bubblewrap + mandatory delegated cgroup v2
-/// - `Hardware` = ยังไม่มี backend คืน `Disabled` เสมอ
+/// - `Hardware` = Generic QEMU/KVM เมื่อเปิดฟีเจอร์และ config พร้อม;
+///   TEE/attestation ยังไม่ยืนยัน และไม่มีฟีเจอร์ = `Disabled`
 ///
 /// gateway ชั้นบนจึงไม่ต้องแยกเคสเอง
 pub fn run_checked_with_level(
@@ -2289,9 +2289,9 @@ mod tests {
 
     #[test]
     fn non_process_levels_fail_closed() {
-        // Level ที่ยังไม่มี backend ต้อง fail-closed เสมอ (fail-closed)
+        // Level ที่ config/prerequisites ไม่พร้อมต้อง fail-closed เสมอ
         // gateway จึงไม่ต้องแยกเคสเอง และ CI ที่ไม่มี KVM ยังเขียว
-        // หมายเหตุ: เปิดฟีเจอร์ `microvm` แล้ว MicroVm จะเดินประตู skeleton
+        // หมายเหตุ: เปิดฟีเจอร์ `microvm` แล้ว MicroVm จะตรวจ artifact pins
         // ด้วย config ว่าง (artifact หาย) จึงเป็น Invalid แทน Disabled —
         // deny เหมือนกันทั้งคู่ ไม่มีทางรัน
         let ws = test_ws("levels");
@@ -2309,7 +2309,7 @@ mod tests {
             #[cfg(feature = "hardware")]
             assert!(
                 r.is_err(),
-                "Hardware skeleton ต้อง deny (Invalid/Disabled ก็ได้ ห้ามรัน)"
+                "Hardware ที่ไม่มี config ต้อง deny (Invalid/Disabled ก็ได้ ห้ามรัน)"
             );
         }
         #[cfg(not(feature = "microvm"))]
@@ -2320,7 +2320,7 @@ mod tests {
         #[cfg(feature = "microvm")]
         assert!(
             run_checked_with_level(&s, &pol, SandboxLevel::MicroVm).is_err(),
-            "MicroVm skeleton ต้อง deny (Invalid/Disabled ก็ได้ ห้ามรัน)"
+            "MicroVm ที่ไม่มี config ต้อง deny (Invalid/Disabled ก็ได้ ห้ามรัน)"
         );
         // Process ยังรันได้ปกติ (ไม่ถดถอย)
         assert!(run_checked_with_level(&s, &pol, SandboxLevel::Process).is_ok());

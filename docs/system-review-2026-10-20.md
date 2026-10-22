@@ -11,9 +11,10 @@
 | M-1 | `696a15e` รักษา deadline เดิมเมื่อ restore พร้อม regression test |
 | M-2 | แทน runner-name/argv heuristic ด้วย operator verifier contract และ gateway receipt ที่ผูก contract/executable/workspace digest แล้ว ดู [รายละเอียดและข้อจำกัด](verification-and-transactions.md) |
 | M-3 | เพิ่ม durable transaction journal, startup recovery, runtime fencing และ SIGKILL/fault-injection coverage แล้ว; ยังไม่ได้ทดลองตัดไฟ storage จริง ดู [ขอบเขตหลักฐาน](verification-and-transactions.md) |
-| M-4 | `44aba9e` เพิ่ม protected snapshot/fd loading; ผล loader และ worker บน host จริงอยู่ใน [รายงานติดตาม](host-validation-2026-10-21.md) |
-| M-5 | เพิ่ม `llama` clippy/tests ใน CI หลักแล้ว; recurring real-model workflow เพิ่มใน source แต่ต้องเปิด runner/variables ก่อน |
-| L-1 / L-2 | ยังไม่ได้แก้ครบในการติดตามรอบนี้ |
+| M-4 | `44aba9e` เพิ่ม protected snapshot/fd loading; ผล loader และ worker บน host จริงอยู่ใน [รายงาน 21 ตุลาคม](host-validation-2026-10-21.md) และ [ผลตรวจล่าสุด](host-validation-2026-10-22.md) |
+| M-5 | เพิ่ม `llama` clippy/tests ใน CI หลักแล้ว; recurring workflow และ setup tooling พร้อม; เตรียม pinned runner บน host เดิมแล้ว แต่ยังไม่ register/เปิด service/ตั้ง variables เพราะ GitHub ยังไม่เชื่อมต่อ ดู [ขั้นตอน](model-validation-runner.md) |
+| L-1 | แก้ dashboard paths/config, HTML escaping/runtime error, retention และ Prometheus exposition พร้อม HTTP/regression tests แล้ว ดู [คู่มือ](dashboard.md) |
+| L-2 | ปรับ sandbox/runtime/network comments และเอกสาร hardware/workflow ให้ตรงกับ backend ปัจจุบันแล้ว |
 
 จึงต้องอ่านข้อสรุป production readiness เดิมประกอบสถานะข้างบนและขอบเขตหลักฐานใหม่
 ไม่ถือว่าประเด็นที่ลดความเสี่ยงแล้วได้รับการพิสูจน์ครบทุก failure mode

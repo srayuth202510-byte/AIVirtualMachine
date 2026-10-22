@@ -44,8 +44,9 @@ AIVM คือ runtime สำหรับรัน open-weight models โดย�
 สถานะ Tier หมายถึงระดับการรองรับในโค้ด ไม่ใช่การรับรองความปลอดภัยของ host ทุกเครื่อง:
 Tier1 process เป็นค่าเริ่มต้น; Container และ MicroVM ต้องเตรียม host ตามคู่มือและ
 ตรวจผล probe/host validation สำหรับเครื่องเป้าหมาย; Hardware ยังเป็น experimental
-และ Generic QEMU ไม่ได้ยืนยัน TEE หรือ attestation. ดู [ผล host validation](./docs/host-validation-2026-10-16.md)
-ซึ่งเป็น snapshot ณ 16 ตุลาคม 2026 ของ commit `4ac447d` ไม่ใช่ผลตรวจ host ปัจจุบันโดยอัตโนมัติ.
+และ Generic QEMU ไม่ได้ยืนยัน TEE หรือ attestation. ดู [ผล host validation](./docs/host-validation-2026-10-22.md)
+ซึ่งเป็น snapshot ณ 22 ตุลาคม 2026 ที่ baseline `4a21a8c` พร้อม working-tree changes
+ทดสอบ pinned GGUF loader และ worker ทั้งสาม tier ไม่ใช่ผล probe แบบ live ของทุก host.
 
 รายละเอียดการบังคับใช้และพฤติกรรมที่เปลี่ยนหลัง security review: [`docs/security-hardening.md`](./docs/security-hardening.md)
 
@@ -142,6 +143,9 @@ crates/
 ลำดับ dependency: `capability` → `policy` → `cube`, `audit` → `tools` → `memory/network/sandbox/model` → `runtime` → `supervisor` → `cli` (ห้ามวน)
 
 ## เอกสาร
+
+- [`docs/dashboard.md`](./docs/dashboard.md) — audit dashboard, private SQLite storage และ Prometheus/JSON endpoints
+- [`docs/model-validation-runner.md`](./docs/model-validation-runner.md) — เตรียม KVM runner และเปิด recurring real-model CI
 
 - [`docs/verification-and-transactions.md`](./docs/verification-and-transactions.md) — operator verifier contracts, completion receipts และ crash recovery ของ state/audit
 

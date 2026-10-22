@@ -82,9 +82,12 @@ raw logs, commit/source identifiers และ hashes ก่อน/หลัง�
 
 Workflow [real-model-validation](../.github/workflows/model-host-validation.yml) เตรียมไว้
 สำหรับ manual dispatch และรันทุกวัน 20:19 UTC (03:19 Asia/Bangkok วันถัดไป)
-ใช้ self-hosted runner labels `self-hosted, linux, kvm` และไม่รับ pull-request trigger
+ใช้ self-hosted runner labels `self-hosted, linux, aivm-model-kvm` และไม่รับ pull-request trigger
 เปิดด้วย repository variable `AIVM_ENABLE_MODEL_VALIDATION=1` พร้อมตั้ง absolute paths
 `AIVM_GGUF`, `AIVM_MICROVM_PINS` และ trusted digest `AIVM_GGUF_SHA256`
 เก็บ evidence เป็น workflow artifact 30 วัน แม้ test ล้มเหลวเมื่อมีไฟล์ให้เก็บ
 การเพิ่ม workflow ใน source ยังไม่เปิดใช้งาน runner หรือตั้ง repository variables ให้เอง
 ผลบน host หนึ่งไม่ใช่การรับรอง production hosts อื่นหรือ TEE/attestation
+
+ขั้นตอนเตรียม runner, register, เปิด service และตั้ง variables อัตโนมัติอยู่ใน
+[Recurring real-model validation](model-validation-runner.md)

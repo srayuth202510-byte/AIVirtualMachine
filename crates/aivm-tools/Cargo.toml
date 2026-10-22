@@ -24,9 +24,9 @@ aivm-secrets = { path = "../aivm-secrets" }
 
 [features]
 default = []
-# ส่งต่อฟีเจอร์ MicroVM backend ไปยัง aivm-sandbox (config + skeleton)
+# ส่งต่อฟีเจอร์ MicroVM backend ไปยัง aivm-sandbox (config + backend)
 # ปิดไว้โดยปริยายเพื่อให้ `make verify` เบาและไม่พึ่ง KVM ใน CI
 microvm = ["aivm-sandbox/microvm"]
-# ส่งต่อฟีเจอร์ Hardware Isolation (TEE skeleton) ไปยัง aivm-sandbox
+# ส่งต่อฟีเจอร์ Hardware Isolation (Generic QEMU/KVM; TEE experimental) ไปยัง aivm-sandbox
 # ปิดไว้โดยปริยายเพื่อให้ `make verify` เบาและไม่พึ่ง KVM/QEMU ใน CI
 hardware = ["aivm-sandbox/hardware"]

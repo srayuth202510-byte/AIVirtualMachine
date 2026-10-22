@@ -2,12 +2,13 @@
 //!
 //! เครื่องมือที่ผ่านตัวกลาง: `filesystem.read / write / search` และ
 //! `process.exec` (เฉพาะ exe ที่ allowlist + มี execute capability +
-//! ได้ grant ตาม state) ไม่มี shell ไม่มีรันตามใจ ไม่มีเน็ตเวิร์ก
+//! ได้ grant ตาม state) และ network.fetch/network.connect ภายใต้ policy/quotas
+//! ไม่มี shell หรือการรันที่ข้าม gateway
 //! ทุกคำขอเดินตามสาย: canonicalize -> capability -> policy ->
 //! execute -> audit fail-closed ทุกขั้น กัน TOCTOU ด้วย realpath + ตรวจซ้ำ
 //!
 //! หมายเหตุเรื่อง subprocess tree: hardening ใน pre_exec (no-new-privs,
-//! rlimit, env ที่ล้างแล้ว, seccomp denylist) ตกทอดไป child ที่ fork/exec ต่อ
+//! rlimit, env ที่ล้างแล้ว, hybrid seccomp แบบ default-kill) ตกทอดไป child ที่ fork/exec ต่อ
 //! โดยอัตโนมัติ; pdeathsig ตั้งที่ child ตรงแล้วตั้งซ้ำในหลานที่เป็น PID 1
 //! (ค่าถูกล้างตอน fork) การกัก tree ด้วย PID/mount/net namespace ทำแบบ
 //! best-effort พร้อมรายงาน applied/degraded อย่างซื่อสัตย์ — เปิด

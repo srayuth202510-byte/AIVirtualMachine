@@ -78,14 +78,12 @@ pub struct VmConfig {
     #[serde(default)]
     pub secrets: aivm_secrets::SecretPolicy,
     /// บล็อก `microvm:` (kernel/rootfs pin + quota) ใช้เมื่อเปิดฟีเจอร์
-    /// `microvm` เท่านั้น — บิลด์ปกติไม่รู้จักฟิลด์นี้และเมินบล็อกทิ้ง
-    /// (serde เมิน unknown fields) พฤติกรรมจึงคงเดิมทุกประการ
+    /// `microvm` เท่านั้น — บิลด์ที่ไม่มีฟีเจอร์ปฏิเสธบล็อกนี้ด้วย strict schema
     #[cfg(feature = "microvm")]
     #[serde(default)]
     pub microvm: Option<aivm_sandbox::microvm::MicroVmConfig>,
     /// บล็อก `hardware:` (TEE pins + quota) ใช้เมื่อเปิดฟีเจอร์
-    /// `hardware` เท่านั้น — บิลด์ปกติไม่รู้จักฟิลด์นี้และเมินบล็อกทิ้ง
-    /// (serde เมิน unknown fields) พฤติกรรมจึงคงเดิมทุกประการ
+    /// `hardware` เท่านั้น — บิลด์ที่ไม่มีฟีเจอร์ปฏิเสธบล็อกนี้ด้วย strict schema
     #[cfg(feature = "hardware")]
     #[serde(default)]
     pub hardware: Option<aivm_sandbox::hardware::HardwareConfig>,

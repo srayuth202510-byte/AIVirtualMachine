@@ -140,17 +140,18 @@ Overall average: **60-90% token reduction** on common development operations.
 <!-- aivm-agent-workflow -->
 # AIVM Agent Workflow
 
-Rust workspace implementing the spec in `AI Virtual Machine.md` (MVP-A: mediated
-`filesystem.read/write` + `code.search` only; no shell/process/network).
+Rust workspace implementing `AI Virtual Machine.md`: model workers plus mediated
+filesystem/search/process/network tools, capabilities, policy and sandbox boundaries.
+No shell or direct execution from model output.
 
 ## Fast loops (prefer these)
 
 ```bash
 make verify        # full gate: fmt-check + clippy(-D warnings) + tests + demo
-make ci            # เหมือน CI บน GitHub ทุกอย่าง (= verify + e2e + microvm)
+make ci            # เหมือน CI บน GitHub ทุกอย่าง (= verify + e2e + llama + microvm + hardware)
 make test-adv      # adversarial must-deny suite only (spec §38)
 make test-microvm  # MicroVM ทั้งสาย (sandbox/tools/runtime + บูตจริงถ้ามี AIVM_MICROVM_PINS)
-make demo          # 13-case ALLOW/DENY self-test, throwaway temp dir (~1s)
+make demo          # 14-case ALLOW/DENY self-test, throwaway temp dir (~1s)
 cargo adv          # alias for the adversarial suite
 cargo lint         # alias for strict clippy
 ```

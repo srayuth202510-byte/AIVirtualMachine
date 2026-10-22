@@ -15,17 +15,27 @@ concurrency:
 jobs:
   pinned-gguf:
     if: vars.AIVM_ENABLE_MODEL_VALIDATION == '1'
-    runs-on: [self-hosted, linux, kvm]
+    runs-on: [self-hosted, linux, aivm-model-kvm]
     timeout-minutes: 45
     env:
       AIVM_GGUF: ${{ vars.AIVM_GGUF }}
       AIVM_GGUF_SHA256: ${{ vars.AIVM_GGUF_SHA256 }}
       AIVM_MICROVM_PINS: ${{ vars.AIVM_MICROVM_PINS }}
+      AIVM_REPOSITORY: ${{ github.repository }}
       EVIDENCE_DIR: target/model-host-validation/${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check pinned artifacts and KVM host prerequisites
+        run: |
+          python3 scripts/setup-model-validation.py \
+            --repo "$AIVM_REPOSITORY" \
+            --model "$AIVM_GGUF" --model-sha256 "$AIVM_GGUF_SHA256" \
+            --pins "$AIVM_MICROVM_PINS" --out "$EVIDENCE_DIR/setup-host.json"
 
       # fixture/helper/KVM/delegation เตรียมโดย operator; ไม่ download หรือ repin เอง
       - name: Validate pinned model on process, container, and MicroVM

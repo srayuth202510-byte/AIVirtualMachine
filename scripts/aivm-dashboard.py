@@ -1,236 +1,296 @@
 #!/usr/bin/env python3
-"""AIVM monitoring dashboard — realtime watch of audit log DENY/budget events.
+"""Read-only local audit dashboard with SQLite retention and Prometheus metrics."""
 
-Serves on http://localhost:8000 with:
-- HTML page showing recent DENY/budget events + counts
-- /metrics JSON endpoint (Prometheus‑scrapeable)
-- /graph PNG endpoint (simple bar chart of per‑category counts)
-- Stores events in SQLite (local, no external server needed)
-- Retains last N entries via TTL; purges old on each refresh
-
-Use: python3 scripts/aivm-dashboard.py
-Then open http://localhost:8000 in your browser.
-"""
-
-import http.server
-import socketserver
-import os
-import time
-import sqlite3
-from collections import defaultdict
-import json as _json
-import html
+import argparse
+from collections import deque
 import hashlib
-
-LOG_PATH = os.environ.get("AIVM_AUDIT_LOG", "/var/log/aivm/audit.log")
-PORT = 8000
-DB_PATH = "/home/lokis/Documents/AIVirtualMachine/scripts/events.db"
-MAX_ENTRIES = 500
-
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-
-init_sql = "CREATE TABLE IF NOT EXISTS events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL NOT NULL, type TEXT NOT NULL, path TEXT, reason TEXT, fingerprint TEXT UNIQUE); CREATE INDEX IF NOT EXISTS idx_ts ON events(timestamp);"
-conn = sqlite3.connect(DB_PATH)
-conn.executescript(init_sql)
-try:
-    conn.execute("ALTER TABLE events ADD COLUMN fingerprint TEXT")
-except sqlite3.OperationalError:
-    pass
-conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_fingerprint ON events(fingerprint)")
-conn.commit()
+import html
+import http.server
+import io
+import json
+import math
+import os
+from pathlib import Path
+import sqlite3
+import stat
+import threading
+import time
+from urllib.parse import urlsplit
 
 
-def purge_old() -> None:
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM events")
-    count = cur.fetchone()[0]
-    if count > MAX_ENTRIES:
-        cur.execute("DELETE FROM events WHERE event_id < (SELECT MIN(event_id) FROM events ORDER BY event_id DESC LIMIT %d - 1)" % MAX_ENTRIES)
-        conn.commit()
-    cur.close()
+MAX_AUDIT_BYTES = 4 * 1024 * 1024
+MAX_LINE_BYTES = 1024 * 1024
 
 
-def add_event(ev_type: str, path: str, reason: str) -> None:
-    conn.execute(
-        "INSERT OR IGNORE INTO events (timestamp, type, path, reason, fingerprint) VALUES (?, ?, ?, ?, ?)",
-        (time.time(), ev_type, path, reason, hashlib.sha256(f"{time.time_ns()}:{ev_type}:{path}:{reason}".encode()).hexdigest()),
-    )
-    conn.commit()
-    purge_old()
-
-
-def sync_audit_log() -> None:
-    """Import real AIVM JSONL audit decisions without rewriting the source log."""
-    try:
-        with open(LOG_PATH, encoding="utf-8") as source:
-            lines = source.readlines()[-MAX_ENTRIES:]
-    except OSError:
-        return
-    for line in lines:
+class EventStore:
+    def __init__(self, database, audit_log, max_entries=500):
+        if not 1 <= max_entries <= 10000:
+            raise ValueError("max_entries must be between 1 and 10000")
+        self.audit_log = Path(audit_log)
+        self.database = Path(database)
+        self.max_entries = max_entries
+        self.started = time.monotonic()
+        self.last_refresh = 0.0
+        self.audit_read_success = False
+        self.last_error = ""
+        self.lock = threading.Lock()
+        self.database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # DB อาจมีข้อมูลจาก audit จึงสร้าง private ตั้งแต่เปิด ไม่ทำ I/O ตอน import
+        fd = os.open(self.database, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
-            record = _json.loads(line)
-        except _json.JSONDecodeError:
-            continue
-        decision = str(record.get("decision", "")).lower()
-        result = str(record.get("result", ""))
-        if "deny" not in decision and not any(word in result.lower() for word in ("budget", "quarantine")):
-            continue
-        fingerprint = hashlib.sha256(line.rstrip("\n").encode()).hexdigest()
-        conn.execute(
-            "INSERT OR IGNORE INTO events (timestamp, type, path, reason, fingerprint) VALUES (?, ?, ?, ?, ?)",
-            (float(record.get("timestamp", time.time())), record.get("action", "unknown"),
-             record.get("resource", ""), result or record.get("rule_matched", ""), fingerprint),
-        )
-    conn.commit()
-    purge_old()
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_uid != os.geteuid():
+                raise ValueError("dashboard database must be an owned regular file with one link")
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+        self.conn = sqlite3.connect(self.database, check_same_thread=False)
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL, type TEXT NOT NULL, path TEXT,
+                reason TEXT, fingerprint TEXT UNIQUE);
+            CREATE INDEX IF NOT EXISTS idx_ts ON events(timestamp);
+        """)
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(events)")}
+        if "fingerprint" not in columns:
+            self.conn.execute("ALTER TABLE events ADD COLUMN fingerprint TEXT")
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_fingerprint ON events(fingerprint)")
+        self._purge()
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+    def _purge(self):
+        # subquery ต้องเลือก IDs ก่อน aggregate; คำสั่งเดิมไม่เคยลบแถวเกินเพดาน
+        self.conn.execute("DELETE FROM events WHERE event_id NOT IN "
+                          "(SELECT event_id FROM events ORDER BY event_id DESC LIMIT ?)",
+                          (self.max_entries,))
+
+    def sync(self):
+        with self.lock:
+            try:
+                with self.audit_log.open("rb") as source:
+                    size = source.seek(0, os.SEEK_END)
+                    offset = max(0, size - MAX_AUDIT_BYTES)
+                    source.seek(offset)
+                    discarding = bool(offset)
+                    lines = deque(maxlen=self.max_entries)
+                    # จำกัดทั้ง bytes และ line size; ไม่โหลด audit ทั้งไฟล์เข้าหน่วยความจำ
+                    remaining = MAX_AUDIT_BYTES
+                    while remaining > 0:
+                        line = source.readline(min(MAX_LINE_BYTES + 1, remaining))
+                        if not line:
+                            break
+                        remaining -= len(line)
+                        complete = line.endswith(b"\n")
+                        if discarding:
+                            discarding = not complete
+                            continue
+                        if not complete:
+                            discarding = True
+                            continue
+                        if len(line) <= MAX_LINE_BYTES:
+                            lines.append(line)
+                self.audit_read_success = True
+                self.last_error = ""
+            except OSError as error:
+                self.audit_read_success = False
+                self.last_error = f"Audit log could not be read: {error.strerror or type(error).__name__}"
+                return
+            with self.conn:
+                for line in lines:
+                    try:
+                        record = json.loads(line)
+                    except (ValueError, UnicodeError):
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    timestamp = record.get("timestamp")
+                    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+                        continue
+                    try:
+                        timestamp = float(timestamp)
+                        if not math.isfinite(timestamp):
+                            continue
+                    except OverflowError:
+                        continue
+                    decision = record.get("decision", "")
+                    result = record.get("result", "")
+                    if not isinstance(decision, str) or not isinstance(result, str):
+                        continue
+                    if decision.lower() != "deny" and not any(word in result.lower() for word in ("budget", "quarantine")):
+                        continue
+                    action, resource = record.get("action", "unknown"), record.get("resource", "")
+                    reason = result or record.get("rule_matched", "")
+                    if not all(isinstance(value, str) for value in (action, resource, reason)):
+                        continue
+                    fingerprint = hashlib.sha256(line.rstrip(b"\r\n")).hexdigest()
+                    self.conn.execute("INSERT OR IGNORE INTO events "
+                                      "(timestamp, type, path, reason, fingerprint) VALUES (?, ?, ?, ?, ?)",
+                                      (timestamp, action[:256], resource[:4096], reason[:4096], fingerprint))
+                self._purge()
+            self.last_refresh = time.time()
+
+    def snapshot(self):
+        with self.lock:
+            rows = self.conn.execute("SELECT type, path, reason, timestamp FROM events "
+                                     "ORDER BY event_id DESC LIMIT ?", (self.max_entries,)).fetchall()
+            categories = dict(self.conn.execute("SELECT type, COUNT(*) FROM events GROUP BY type"))
+            return {
+                "total": sum(categories.values()), "categories": categories,
+                "last_refresh": self.last_refresh, "uptime_seconds": time.monotonic() - self.started,
+                "audit_read_success": self.audit_read_success, "error": self.last_error,
+                "entries": [{"type": kind, "path": path or "", "reason": reason or "", "time": timestamp}
+                            for kind, path, reason, timestamp in rows],
+            }
 
 
-def parse_log(path: str) -> list:
-    cur = conn.cursor()
-    cur.execute("SELECT type, path, reason, timestamp FROM events ORDER BY event_id DESC LIMIT %d" % MAX_ENTRIES)
-    rows = cur.fetchall()
-    cur.close()
-    return [{"type": r, "path": p or "", "reason": r2 or "", "time": ts} for r, p, r2, ts in rows]
+def prometheus_metrics(snapshot):
+    # ตัวนับหน้าต่าง retention ลดลงได้ จึงเป็น gauge ไม่ใช่ cumulative counter
+    lines = [
+        "# HELP aivm_dashboard_events Retained audit DENY or budget events.",
+        "# TYPE aivm_dashboard_events gauge",
+        f"aivm_dashboard_events {snapshot['total']}",
+        "# HELP aivm_dashboard_events_by_category Retained events per audit action.",
+        "# TYPE aivm_dashboard_events_by_category gauge",
+    ]
+    for category, count in sorted(snapshot["categories"].items()):
+        escaped = category.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        lines.append(f'aivm_dashboard_events_by_category{{category="{escaped}"}} {count}')
+    lines += [
+        "# HELP aivm_dashboard_audit_read_success Whether the last audit read succeeded.",
+        "# TYPE aivm_dashboard_audit_read_success gauge",
+        f"aivm_dashboard_audit_read_success {int(snapshot['audit_read_success'])}",
+        "# HELP aivm_dashboard_last_refresh_timestamp_seconds Last successful import time.",
+        "# TYPE aivm_dashboard_last_refresh_timestamp_seconds gauge",
+        f"aivm_dashboard_last_refresh_timestamp_seconds {snapshot['last_refresh']:.6f}",
+        "# HELP aivm_dashboard_uptime_seconds Dashboard process uptime.",
+        "# TYPE aivm_dashboard_uptime_seconds gauge",
+        f"aivm_dashboard_uptime_seconds {snapshot['uptime_seconds']:.6f}",
+    ]
+    return "\n".join(lines) + "\n"
 
 
-def get_stats() -> dict:
-    cur = conn.cursor()
-    cur.execute("SELECT type, COUNT(*) AS cnt FROM events GROUP BY type")
-    rows = cur.fetchall()
-    cur.close()
-    cats = defaultdict(int)
-    total = 0
-    for rtype, c in rows:
-        cats[rtype] = c
-        total += c
-    return {"total": total, "categories": dict(cats)}
+def render_page(snapshot):
+    category_rows = "".join(f"<tr><td>{html.escape(category)}</td><td>{count}</td></tr>"
+                            for category, count in sorted(snapshot["categories"].items(), key=lambda pair: -pair[1]))
+    event_rows = "".join("<tr>" + "".join(f"<td>{html.escape(str(event[key]))}</td>"
+                                         for key in ("type", "path", "reason")) + "</tr>"
+                         for event in snapshot["entries"][:20])
+    warning = f'<p role="alert">{html.escape(snapshot["error"])}</p>' if snapshot["error"] else ""
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AIVM Monitoring Dashboard</title>
+<style>
+body{{font-family:sans-serif;margin:2rem;background:#f5f5f5;color:#333}}
+.container{{background:white;padding:1.5rem;border-radius:8px;margin-bottom:1.5rem;overflow:auto}}
+table{{width:100%;border-collapse:collapse}}th,td{{padding:.5rem;border:1px solid #ddd;text-align:left}}
+th{{background:#f0f0f0}}td{{overflow-wrap:anywhere}}[role=alert]{{color:#a11}}
+</style></head><body><h1>AIVM Monitoring Dashboard</h1>{warning}
+<div class="container"><h2>Statistics</h2><table>
+<tr><th>Retained DENY/Budget events</th><td>{snapshot['total']}</td></tr>{category_rows}
+<tr><th>Uptime (seconds)</th><td>{int(snapshot['uptime_seconds'])}</td></tr></table></div>
+<div class="container"><h2>Recent Events (last 20)</h2><table>
+<tr><th>Type</th><th>Path</th><th>Reason</th></tr>{event_rows}</table></div>
+<div class="container"><h2>Graph</h2><p><a href="/graph">PNG chart of retained events</a></p></div>
+<div class="container"><p><a href="/metrics">Prometheus metrics</a> · <a href="/metrics.json">JSON metrics</a></p></div>
+</body></html>"""
+
+
+def render_graph(snapshot):
+    # backend แบบ headless; matplotlib เป็น optional และไม่คืน PNG ปลอมเมื่อไม่มี
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    figure = Figure(figsize=(6, 4))
+    axes = figure.subplots()
+    categories = sorted(snapshot["categories"].items(), key=lambda pair: -pair[1])[:20]
+    axes.barh([pair[0] for pair in categories], [pair[1] for pair in categories], color="#4c72b0")
+    axes.set_xlabel("retained events")
+    axes.set_title("AIVM Audit — Events per Category")
+    output = io.BytesIO()
+    FigureCanvasAgg(figure).print_png(output)
+    return output.getvalue()
 
 
 class DashboardHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        path = self.path.rstrip("/")
-        sync_audit_log()
-        entries = parse_log(LOG_PATH)
-        stats = get_stats()
-
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+        if path not in {"/", "/metrics", "/metrics.json", "/graph"}:
+            self.send_error(404)
+            return
+        store = self.server.store
+        store.sync()
+        snapshot = store.snapshot()
         if path == "/metrics":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            out = {"total": stats["total"], "categories": stats["categories"], "last_refresh": time.time()}
-            self.wfile.write(_json.dumps(out).encode("utf-8"))
-            return
-
-        if path == "/graph":
-            self.send_response(200)
-            self.send_header("Content-Type", "image/png")
-            self.end_headers()
+            self.respond(200, "text/plain; version=0.0.4; charset=utf-8", prometheus_metrics(snapshot).encode())
+        elif path == "/metrics.json":
+            data = {key: value for key, value in snapshot.items() if key != "entries"}
+            self.respond(200, "application/json; charset=utf-8", json.dumps(data, allow_nan=False).encode())
+        elif path == "/graph":
             try:
-                import matplotlib.pyplot as plt
-            except Exception:
-                png_bytes = (b"\\x89PNG\\r\\x1a\\n\\x00\\x00\\x00\\rIHDR\\x00\\x00\\x00\\x01" b"\\x00\\x00\\x00\\x01\\x08\\x02\\x00\\x00\\x00\\x90wS\\xdf\\n" b"\\x00\\x00\\x00\\tEXtSoftware\\xff\\xff\\xff\\xff\\x00\\x00\\x00" b"\\x0I\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00" b"\\xff\\xc0\\xc0\\xc0\\x07\\x0a\\x80\\x80\\x80\\xff\\x00\\x00\\x00" b"\\xff\\x00\\x00\\x00\\x00\\x00\\x00\\x80\\x80\\x80\\x80\\x80\\x80" b"\\x80\\x00\\x00\\x00\\x00\\x00\\x00\\x80\\x80\\x80\\x80\\x80\\x80" b"\\x80\\x80\\x80\\x80\\x80\\x80\\x80\\x80\\x80\\x00\\x80\\x80\\x80" b"\\x80\\x80\\x80\\x80\\x00")
-                self.wfile.write(png_bytes)
+                image = render_graph(snapshot)
+            except ImportError:
+                self.respond(503, "text/plain; charset=utf-8", b"Chart unavailable. Metrics and recent events are available.\n")
                 return
-            cats = sorted(stats["categories"].items(), key=lambda x: -x[1])
-            labels = [c[0] for c in cats]
-            vals = [c[1] for c in cats]
-            fig, ax = plt.subplots(figsize=(6, 4))
-            bars = ax.barh(labels, vals, color="#4c72b0")
-            ax.set_xlabel("count")
-            ax.set_title("AIVM Audit — Events per Category")
-            buf = __import__("io").BytesIO()
-            fig.savefig(buf, format="png", bbox_inches="tight")
-            buf.seek(0)
-            png_bytes = buf.read()
-            plt.close(fig)
-            self.wfile.write(png_bytes)
-            return
+            self.respond(200, "image/png", image)
+        else:
+            self.respond(200, "text/html; charset=utf-8", render_page(snapshot).encode())
 
-        # HTML dashboard
-        cat_rows = []
-        for cat, count in sorted(stats["categories"].items(), key=lambda x: -x[1]):
-            cat_rows.append("<tr><td>%s</td><td>%d</td></tr>" % (cat, count))
-
-        entry_rows = []
-        for e in entries[:20]:
-            etype = html.escape(str(e.get("type", "unknown")))
-            path_s = html.escape(str(e.get("path", ""))[:60])
-            reason_s = html.escape(str(e.get("reason", ""))[:50])
-            entry_rows.append("<tr><td>%s</td><td>%s</td><td>%s</td></tr>" % (etype, path_s, reason_s))
-
-        html = (
-            "<!DOCTYPE html>"
-            "<html lang=\"th\">"
-            "<head>"
-            "<meta charset=\"UTF-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
-            "<title>AIVM Monitoring Dashboard</title>"
-            "<style>"
-            "body{font-family:sans-serif;margin:2rem;background:#f5f5f5;}"
-            "h1{color:#333;}"
-            ".container{background:white;padding:1.5rem;border-radius:8px;margin-bottom:1.5rem;}"
-            "table{width:100%;border-collapse:border-spacing:0.5rem;}"
-            "th,td{padding:0.5rem;border:1pxsolid #ddd;text-align:left;}"
-            "th{background:#f0f0f0;}"
-            ".stats{margin-top:1rem;font-size:0.9rem;}"
-            ".stats td{width:30%;}"
-            "</style>"
-            "</head>"
-            "<body>"
-            "<h1>AIVM Monitoring Dashboard</h1>"
-            "<divclass=\"container\">"
-            "<h2>Statistics</h2>"
-            "<table>"
-            "<tr><th>Total DENY/Budget events</th><td>%d</td></tr>" % stats["total"]
-            + "".join(cat_rows)
-            + "<tr><th>Uptime (seconds)</th><td>%d</td></tr>" % int(time.time() - stats.get("last_refresh", time.time()))
-            + "</table>"
-            + "</div>"
-            "<divclass=\"container\">"
-            "<h2>Recent Events (last 20)</h2>"
-            "<table>"
-            "<tr><th>Type</th><th>Path</th><th>Reason</th></tr>"
-            + "".join(entry_rows)
-            + "</table>"
-            + "</div>"
-            "<divclass=\"container\">"
-            "<h2>Graph</h2>"
-            '<p>View <a class=\"graph-link\" href=\"/graph\">PNG bar chart</a> of events per category.</p>'
-            + "</div>"
-            "<divclass=\"container\">"
-            '<p>View <a class=\"graph-link\" href=\"/metrics\">JSON metrics</a> compatible with Prometheus node_exporter.</p>'
-            + "</div>"
-            "</body>"
-            "</html>"
-        )
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+    def respond(self, status, content_type, body):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(html.encode("utf-8"))
+        self.wfile.write(body)
 
 
-class HTTPServer(socketserver.TCPServer):
+class DashboardServer(http.server.HTTPServer):
     allow_reuse_address = True
 
+    def __init__(self, address, store):
+        self.store = store
+        super().__init__(address, DashboardHandler)
 
-def main():
-    print("Starting AIVM dashboard server on http://localhost:%d" % PORT)
-    print("Watching log: %s" % LOG_PATH)
-    print("DB: %s" % DB_PATH)
-    print("Open your browser to http://localhost:%d" % PORT)
-    print("-" * 50)
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--log", type=Path, default=os.environ.get("AIVM_AUDIT_LOG", "./audit.jsonl"))
+    parser.add_argument("--db", type=Path, default=os.environ.get("AIVM_DASHBOARD_DB", "./.aivm-dashboard/events.db"))
+    parser.add_argument("--host", default=os.environ.get("AIVM_DASHBOARD_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=os.environ.get("AIVM_DASHBOARD_PORT", "8000"))
+    parser.add_argument("--max-entries", type=int, default=os.environ.get("AIVM_DASHBOARD_MAX_ENTRIES", "500"))
+    args = parser.parse_args(argv)
+    if not 0 <= args.port <= 65535:
+        parser.error("port must be between 0 and 65535")
+    if not 1 <= args.max_entries <= 10000:
+        parser.error("max-entries must be between 1 and 10000")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    store = None
     try:
-        # Keep the local dashboard off the network unless an operator changes
-        # this deliberately in source/configuration.
-        with HTTPServer(("127.0.0.1", PORT), DashboardHandler) as httpd:
-            print("Server running on port %d" % PORT)
-            httpd.serve_forever()
-    except OSError as e:
-        print("Error starting server on port %d: %s" % (PORT, e))
-        print("Check if port 8000 is already in use.")
-        exit(1)
+        store = EventStore(args.db.expanduser(), args.log.expanduser(), args.max_entries)
+        with DashboardServer((args.host, args.port), store) as server:
+            print(f"Dashboard: http://{args.host}:{server.server_port}", flush=True)
+            print(f"Audit log: {store.audit_log}; DB: {store.database}", flush=True)
+            server.serve_forever()
+    except KeyboardInterrupt:
+        return 0
+    except (OSError, ValueError, sqlite3.Error) as error:
+        print(f"Dashboard failed: {error}")
+        return 1
+    finally:
+        if store is not None:
+            store.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

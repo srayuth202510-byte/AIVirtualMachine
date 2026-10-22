@@ -1,6 +1,6 @@
-# Hardware Isolation — Level 3 (skeleton, fail-closed)
+# Hardware Isolation — Level 3 (experimental, fail-closed)
 
-สถานะ: 🚧 **skeleton** — ประตู fail-closed ครบทุกลำดับ (spec/shape/supply-chain/host)
+สถานะ: 🚧 **experimental** — ประตู fail-closed ครบทุกลำดับ (spec/shape/supply-chain/host)
 โค้ดรัน workload (drive-stuffing แบบเดียวกับ MicroVM) และ **บูต QEMU/KVM
 โหมด Generic จริงผ่านแล้ว** (ดู [รายงาน host validation](host-validation-2026-10-16.md)) แต่ยังไม่ได้ยืนยัน TEE จริง และ
 attestation/measured-boot/disk-encryption/GPU ยังเป็น stub ที่รายงานซื่อสัตย์
