@@ -35,7 +35,7 @@ pub(super) fn file_sha256(file: &mut File) -> Result<String, ModelError> {
         .map_err(|_| failed("model not seekable"))?;
     let mut hasher = Sha256::new();
     // จำกัดตอนอ่านด้วย เพราะต้นทางอาจโตหลัง fstat
-    copy_bounded(file, &mut hasher, MAX_MODEL_BYTES)?;
+    copy_bounded(file, &mut hasher, MAX_MODEL_BYTES, false)?;
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -43,9 +43,16 @@ fn copy_bounded(
     input: impl Read,
     output: &mut impl std::io::Write,
     maximum: u64,
+    ram_backed_snapshot: bool,
 ) -> Result<(), ModelError> {
-    let copied = std::io::copy(&mut input.take(maximum + 1), output)
-        .map_err(|e| failed(format!("model artifact read/copy failed: {e}")))?;
+    let copied = std::io::copy(&mut input.take(maximum + 1), output).map_err(|e| {
+        // ENOSPC ของ tmpfs คือ RAM-backed staging เต็ม; ไม่เรียก disk-full ทั่วไปว่า OOM
+        if ram_backed_snapshot && e.raw_os_error() == Some(libc::ENOSPC) {
+            failed("model snapshot tmpfs capacity exhausted (RAM-backed staging)")
+        } else {
+            failed(format!("model artifact read/copy failed: {e}"))
+        }
+    })?;
     if copied > maximum {
         return Err(failed("model too large"));
     }
@@ -125,7 +132,13 @@ impl PreparedModelFile {
             let mut output = output?;
             unlink.map_err(|e| failed(format!("unlink model snapshot: {e}")))?;
             cleanup.map_err(|e| failed(format!("remove model staging directory: {e}")))?;
-            copy_bounded(&mut source, &mut output, MAX_MODEL_BYTES)?;
+            let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            // SAFETY: output fd ยังมีเจ้าของ; อ่าน statfs เฉพาะเมื่อ syscall สำเร็จ
+            if unsafe { libc::fstatfs(output.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+                return Err(failed("cannot inspect snapshot filesystem"));
+            }
+            let ram_backed = unsafe { filesystem.assume_init() }.f_type == libc::TMPFS_MAGIC;
+            copy_bounded(&mut source, &mut output, MAX_MODEL_BYTES, ram_backed)?;
             output
                 .set_permissions(std::fs::Permissions::from_mode(0o400))
                 .map_err(|e| failed(format!("protect model snapshot: {e}")))?;
@@ -161,6 +174,31 @@ impl PreparedModelFile {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+    #[test]
+    fn snapshot_capacity_failure_distinguishes_tmpfs_from_disk_and_other_io_errors() {
+        struct Failure(i32);
+        impl std::io::Write for Failure {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(self.0))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for (ram_backed, errno, expected) in [
+            (true, libc::ENOSPC, true),
+            (false, libc::ENOSPC, false),
+            (true, libc::EACCES, false),
+        ] {
+            let error =
+                copy_bounded(&b"weights"[..], &mut Failure(errno), 100, ram_backed).unwrap_err();
+            assert_eq!(
+                error.to_string().contains("tmpfs capacity exhausted"),
+                expected
+            );
+        }
+    }
 
     struct Fixture(std::path::PathBuf);
 
@@ -294,10 +332,10 @@ mod tests {
     #[test]
     fn copy_limit_applies_to_bytes_read_even_if_source_grows() {
         let mut output = Vec::new();
-        assert!(copy_bounded(std::io::repeat(b'x'), &mut output, 4).is_err());
+        assert!(copy_bounded(std::io::repeat(b'x'), &mut output, 4, false).is_err());
         assert_eq!(output.len(), 5, "must stop after quota plus one byte");
         output.clear();
-        copy_bounded(&b"four"[..], &mut output, 4).unwrap();
+        copy_bounded(&b"four"[..], &mut output, 4, false).unwrap();
         assert_eq!(output, b"four");
     }
 }

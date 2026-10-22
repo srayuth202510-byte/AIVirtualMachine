@@ -58,6 +58,8 @@ Runner เก็บ credentials ใน directory ของตนเอง ไม
 การ dispatch สำเร็จยังไม่ใช่ผล validation ผ่าน ต้องตรวจผล job และ artifacts
 
 Workflow ตรวจ prerequisites ก่อนทดสอบ loader และ workers ทั้งสาม tier
+รวม timeout/memory-pressure failure และ verified recovery หลังแต่ละ failure
+โดยต้องมี structured evidence ครบและไม่เหลือ descendants/staging/cgroups ของเทสต์
 เก็บ evidence 30 วันแม้ test ล้มเมื่อมีไฟล์ให้เก็บ ไม่มีการ download/re-pin GGUF
 ห้าม build/test อื่นที่เปลี่ยน worker binary ระหว่าง host validation
 
