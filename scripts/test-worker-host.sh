@@ -15,6 +15,7 @@ if [ "${4:-}" != --inside ]; then
         exec systemd-run --user --wait --pipe --collect \
             --property='Delegate=cpu memory pids' --setenv="PATH=$PATH" --setenv="AIVM_WORKER_STRACE=${AIVM_WORKER_STRACE:-}" \
             --setenv="AIVM_GGUF_SHA256=${AIVM_GGUF_SHA256:-}" \
+            --setenv="CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-1}" \
             --unit="aivm-worker-host-$(id -u)-$$" \
             /bin/sh "$SCRIPT_DIR/test-worker-host.sh" "$TIER" "$MODEL" "$PINS" --inside
     fi
