@@ -5,6 +5,11 @@
 ใหม่ก่อนมี action ถัดไปได้โดยไม่ลืมรอยต่อ ใช้ `verify_sequence` หรือ `aivm audit`
 ตรวจ chain ข้ามไฟล์; จำนวน records รวม `seal` และ `resume` ด้วย
 
+`verify_sequence` และ `aivm audit` ต้องมี genesis (record แรกของไฟล์แรกมี
+`hash_prev` ว่าง) ถ้า archive ต้นสายหายจะคืน error ว่าประวัติไม่ครบ
+ใช้ `AuditWriter::verify` / `aivm verify-audit` เมื่อต้องการตรวจเพียง snapshot
+หรือ continuation ไฟล์เดียว ผลของคำสั่งนั้นไม่ยืนยันความครบถ้วนของประวัติก่อนหน้า
+
 ## ลำดับการเขียน
 
 1. ตรวจ suffix และชื่อ archive ก่อนเขียน seal; ชื่อซ้ำรวม dangling symlink

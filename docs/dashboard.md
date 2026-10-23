@@ -38,12 +38,28 @@ CLI มีลำดับเหนือ environment; `--port 0` ให้ระ
 จำนวน events เป็น **gauge** เพราะ retention ทำให้ลดลงได้ ไม่ใช่ cumulative counter
 มี metrics สำหรับ audit read success, last refresh timestamp และ uptime จริง
 
-อ่านเฉพาะท้าย audit ไม่เกิน 4 MiB และไม่เกินจำนวน lines ตาม `max-entries`
-ข้าม malformed records, partial writes และ lines เกิน 1 MiB
-DB เก็บสูงสุด `max-entries` events และ deduplicate ด้วย fingerprint ของ record
+อ่านจากต้นไฟล์แล้วเดิน cursor ต่อครั้งละไม่เกิน 4 MiB ต่อ request โดยไม่จำกัด
+จำนวน ALLOW lines ก่อนกรอง DENY/budget/quarantine จึงไม่ทำเหตุการณ์ที่ต้องเก็บ
+หลุดเพราะมี ALLOW จำนวนมากระหว่าง polls `max-entries` จำกัดเฉพาะ events ใน DB
+และ deduplicate ด้วย fingerprint ของ record ไม่ใช่จำนวนบรรทัดที่อ่าน
+
+partial line รอจนเขียนจบ ส่วน malformed/oversized records (เกิน 1 MiB) ถูกข้าม
+พร้อม coverage warning เมื่อ rotate จะอ่าน inode เก่าที่เปิดไว้ให้จบก่อนเปลี่ยน
+ไปไฟล์ปัจจุบัน และเทียบ seal hash กับ `hash_prev` ของไฟล์ใหม่เพื่อตรวจช่วงที่อาจหาย
+การ truncate/rewrite ที่พบจากขนาดไฟล์หรือ bytes ก่อน cursor ทำให้แจ้ง gap และ replay
+ไฟล์ที่ยังมีอยู่ การตรวจนี้ไม่ใช่การตรวจ hash chain หรือ authentication
+
+JSON/Prometheus มี `backlog_bytes`, `pending_bytes`, `coverage_gaps` และ
+`coverage_complete` แยกจาก `audit_read_success` ข้อมูลที่ยังอ่านไม่ทันหรืออ่านไม่ครบ
+จะแสดงคำเตือนบนหน้าเว็บ DB failure จะ rollback cursor เพื่อ retry โดยไม่ข้าม events
+coverage หมายถึงสิ่งที่สังเกตได้ใน process นี้ ไม่รับรองประวัติก่อนเริ่ม dashboard
+เมื่อ restart จะ backfill active file ใหม่ตั้งแต่ต้น ไม่ตาม archive ย้อนหลัง
+ถ้า active file เริ่มด้วย continuation จะแจ้งว่าไม่ได้ import ประวัติก่อนหน้า
+
 ถ้า log หาย/อ่านไม่ได้ ยังแสดงข้อมูลเดิมพร้อมข้อความแจ้งและ read-success = 0
-ตัวเลขนี้จึงเป็นหน้าต่างข้อมูลที่เก็บไว้ ไม่ใช่จำนวน events ตลอดอายุ VM
+จำนวน events เป็นหน้าต่างข้อมูลตาม retention ไม่ใช่จำนวนตลอดอายุ VM
 
 ทดสอบ regression ด้วย `python3 -m unittest discover -s scripts -p 'test_dashboard.py'`
 ครอบคลุม HTTP responses, HTML escaping, metrics labels, retention/dedup,
-partial/oversized input, private storage และ schema migration
+partial/oversized input, private storage, schema migration, traffic ระหว่าง polls,
+cursor/backlog, DB retry, truncation และ rotation ระหว่างมี backlog

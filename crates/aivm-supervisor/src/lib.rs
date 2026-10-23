@@ -313,6 +313,8 @@ impl Supervisor {
         if !dir.join("aivm.yaml").is_file() {
             return Err(SupervisorError::NotFound(name.into()));
         }
+        // init อาจกู้ transaction และเขียน audit จึงต้องถือ lease แม้เป็น inspect
+        let _lease = lifecycle::Lease::acquire(&dir, false)?;
         let st = lifecycle::status(&dir);
         let cfg = VmConfig::from_file(&dir.join("aivm.yaml"))
             .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
@@ -338,6 +340,33 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn inspect_cannot_recover_a_transaction_owned_by_an_active_operation() {
+        let root = root("inspect-lock");
+        let mut supervisor = Supervisor::new(root.clone());
+        supervisor
+            .create("vm", VmConfig::from_yaml("name: test").unwrap())
+            .unwrap();
+        let dir = root.join("vm");
+        let lease = lifecycle::Lease::acquire(&dir, false).unwrap();
+        // journal ที่ยังเขียนไม่จบต้องไม่ถูกอ่านหรือกู้โดย inspect อีกตัว
+        let journal = dir.join(".state-transaction.json");
+        std::fs::write(&journal, "in-flight journal").unwrap();
+        let state = std::fs::read(dir.join("state.json")).unwrap();
+        let error = supervisor.inspect("vm").unwrap_err().to_string();
+        assert!(error.contains("active operation"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&journal).unwrap(),
+            "in-flight journal"
+        );
+        assert_eq!(std::fs::read(dir.join("state.json")).unwrap(), state);
+        std::fs::remove_file(journal).unwrap();
+        drop(lease);
+        assert!(supervisor.inspect("vm").unwrap().contains("INIT"));
+        aivm_audit::clear_flags(&root);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

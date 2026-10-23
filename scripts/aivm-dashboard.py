@@ -2,7 +2,6 @@
 """Read-only local audit dashboard with SQLite retention and Prometheus metrics."""
 
 import argparse
-from collections import deque
 import hashlib
 import html
 import http.server
@@ -34,6 +33,17 @@ class EventStore:
         self.audit_read_success = False
         self.last_error = ""
         self.lock = threading.Lock()
+        self.source = None
+        self.cursor_tail = b""
+        self.discarding = False
+        self.backlog_bytes = 0
+        self.pending_bytes = 0
+        self.coverage_gaps = 0
+        self.coverage_warning = ""
+        self.last_hash = None
+        self.last_action = None
+        self.check_anchor = False
+        self.expected_anchor = None
         self.database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         # DB อาจมีข้อมูลจาก audit จึงสร้าง private ตั้งแต่เปิด ไม่ทำ I/O ตอน import
         fd = os.open(self.database, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -60,6 +70,8 @@ class EventStore:
         self.conn.commit()
 
     def close(self):
+        if self.source is not None:
+            self.source.close()
         self.conn.close()
 
     def _purge(self):
@@ -68,70 +80,144 @@ class EventStore:
                           "(SELECT event_id FROM events ORDER BY event_id DESC LIMIT ?)",
                           (self.max_entries,))
 
+    def _open_source(self):
+        fd = os.open(self.audit_log, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise ValueError("audit source must be a regular file")
+        self.source = os.fdopen(fd, "rb")
+        self.cursor_tail = b""
+        self.discarding = False
+        self.check_anchor = True
+
+    def _gap(self, warning):
+        # แจ้ง coverage แยกจากการเปิดอ่านสำเร็จ ไม่อ้างว่าเก็บครบเมื่อมีช่วงที่ไม่ทราบ
+        self.coverage_gaps += 1
+        self.coverage_warning = warning
+
+    def _ingest(self, line):
+        try:
+            record = json.loads(line)
+        except (ValueError, UnicodeError):
+            self._gap("Malformed audit records were skipped.")
+            return
+        if not isinstance(record, dict):
+            self._gap("Non-object audit records were skipped.")
+            return
+        if self.check_anchor:
+            previous = record.get("hash_prev", "")
+            if self.expected_anchor is not None:
+                if previous != self.expected_anchor:
+                    self._gap("Audit rotation continuity could not be established.")
+            elif previous:
+                self._gap("Audit source starts after genesis; earlier history was not imported.")
+            self.check_anchor = False
+            self.expected_anchor = None
+        self.last_hash = record.get("hash_entry")
+        self.last_action = record.get("action")
+        timestamp = record.get("timestamp")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+            return
+        try:
+            timestamp = float(timestamp)
+            if not math.isfinite(timestamp):
+                return
+        except OverflowError:
+            return
+        decision = record.get("decision", "")
+        result = record.get("result", "")
+        if not isinstance(decision, str) or not isinstance(result, str):
+            return
+        if decision.lower() != "deny" and not any(word in result.lower() for word in ("budget", "quarantine")):
+            return
+        action, resource = record.get("action", "unknown"), record.get("resource", "")
+        reason = result or record.get("rule_matched", "")
+        if not all(isinstance(value, str) for value in (action, resource, reason)):
+            return
+        fingerprint = hashlib.sha256(line.rstrip(b"\r\n")).hexdigest()
+        self.conn.execute("INSERT OR IGNORE INTO events "
+                          "(timestamp, type, path, reason, fingerprint) VALUES (?, ?, ?, ?, ?)",
+                          (timestamp, action[:256], resource[:4096], reason[:4096], fingerprint))
+
     def sync(self):
         with self.lock:
             try:
-                with self.audit_log.open("rb") as source:
-                    size = source.seek(0, os.SEEK_END)
-                    offset = max(0, size - MAX_AUDIT_BYTES)
-                    source.seek(offset)
-                    discarding = bool(offset)
-                    lines = deque(maxlen=self.max_entries)
-                    # จำกัดทั้ง bytes และ line size; ไม่โหลด audit ทั้งไฟล์เข้าหน่วยความจำ
-                    remaining = MAX_AUDIT_BYTES
-                    while remaining > 0:
-                        line = source.readline(min(MAX_LINE_BYTES + 1, remaining))
-                        if not line:
-                            break
-                        remaining -= len(line)
-                        complete = line.endswith(b"\n")
-                        if discarding:
-                            discarding = not complete
-                            continue
-                        if not complete:
-                            discarding = True
-                            continue
-                        if len(line) <= MAX_LINE_BYTES:
-                            lines.append(line)
+                if self.source is None:
+                    self._open_source()
+                position = self.source.tell()
+                metadata = os.fstat(self.source.fileno())
+                witness = os.pread(self.source.fileno(), len(self.cursor_tail), position - len(self.cursor_tail))
+                if metadata.st_size < position or witness != self.cursor_tail:
+                    self._gap("Audit source was truncated or rewritten; replaying the available file.")
+                    self.source.seek(0)
+                    self.cursor_tail = b""
+                    self.discarding = False
+                    self.check_anchor = True
+                    self.expected_anchor = None
+                remaining = MAX_AUDIT_BYTES
+                self.pending_bytes = 0
+                checkpoint = (self.source.tell(), self.discarding, self.check_anchor,
+                              self.expected_anchor, self.last_hash, self.last_action)
+                try:
+                    self._consume(remaining)
+                except (OSError, ValueError, sqlite3.Error):
+                    # DB rollback ต้อง rollback cursor ด้วย มิฉะนั้น poll ถัดไปจะข้าม events
+                    (position, self.discarding, self.check_anchor, self.expected_anchor,
+                     self.last_hash, self.last_action) = checkpoint
+                    self.source.seek(position)
+                    raise
+                position = self.source.tell()
+                held = os.fstat(self.source.fileno())
+                self.backlog_bytes = max(0, held.st_size - position)
+                self.cursor_tail = os.pread(self.source.fileno(), min(position, 128), max(0, position - 128))
+                current = self.audit_log.stat()
+                if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+                    if position >= held.st_size or self.pending_bytes:
+                        if self.pending_bytes or self.discarding:
+                            self._gap("Audit rotation left an incomplete record.")
+                        anchor = self.last_hash if self.last_action == "seal" else None
+                        if not anchor:
+                            self._gap("Audit source was replaced without an observed rotation seal.")
+                        self.source.close()
+                        self.source = None
+                        self.expected_anchor = anchor
+                        self._open_source()
+                        self.pending_bytes = 0
+                    # อ่านไฟล์ใหม่ครั้งถัดไปหลัง drain inode เก่าแล้ว
+                    self.backlog_bytes += current.st_size
                 self.audit_read_success = True
                 self.last_error = ""
-            except OSError as error:
+                self.last_refresh = time.time()
+            except (OSError, ValueError, sqlite3.Error) as error:
                 self.audit_read_success = False
-                self.last_error = f"Audit log could not be read: {error.strerror or type(error).__name__}"
-                return
-            with self.conn:
-                for line in lines:
-                    try:
-                        record = json.loads(line)
-                    except (ValueError, UnicodeError):
-                        continue
-                    if not isinstance(record, dict):
-                        continue
-                    timestamp = record.get("timestamp")
-                    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
-                        continue
-                    try:
-                        timestamp = float(timestamp)
-                        if not math.isfinite(timestamp):
-                            continue
-                    except OverflowError:
-                        continue
-                    decision = record.get("decision", "")
-                    result = record.get("result", "")
-                    if not isinstance(decision, str) or not isinstance(result, str):
-                        continue
-                    if decision.lower() != "deny" and not any(word in result.lower() for word in ("budget", "quarantine")):
-                        continue
-                    action, resource = record.get("action", "unknown"), record.get("resource", "")
-                    reason = result or record.get("rule_matched", "")
-                    if not all(isinstance(value, str) for value in (action, resource, reason)):
-                        continue
-                    fingerprint = hashlib.sha256(line.rstrip(b"\r\n")).hexdigest()
-                    self.conn.execute("INSERT OR IGNORE INTO events "
-                                      "(timestamp, type, path, reason, fingerprint) VALUES (?, ?, ?, ?, ?)",
-                                      (timestamp, action[:256], resource[:4096], reason[:4096], fingerprint))
-                self._purge()
-            self.last_refresh = time.time()
+                detail = getattr(error, "strerror", None) or str(error)
+                self.last_error = f"Audit log could not be imported: {detail}"
+
+    def _consume(self, remaining):
+        with self.conn:
+            # เดิน cursor ต่อทุก poll; retention จำกัดเฉพาะ events ที่ผ่าน filter แล้ว
+            while remaining > 0:
+                position = self.source.tell()
+                line = self.source.readline(min(MAX_LINE_BYTES + 1, remaining))
+                if not line:
+                    break
+                remaining -= len(line)
+                complete = line.endswith(b"\n")
+                if self.discarding:
+                    self.discarding = not complete
+                    continue
+                if len(line) > MAX_LINE_BYTES:
+                    self._gap("Oversized audit records were skipped.")
+                    self.discarding = not complete
+                    continue
+                if not complete:
+                    # เก็บ partial line ไว้อ่านใหม่เมื่อ writer เขียนจบ
+                    self.source.seek(position)
+                    if os.fstat(self.source.fileno()).st_size <= position + len(line):
+                        self.pending_bytes = len(line)
+                    break
+                self._ingest(line)
+            self._purge()
 
     def snapshot(self):
         with self.lock:
@@ -142,6 +228,11 @@ class EventStore:
                 "total": sum(categories.values()), "categories": categories,
                 "last_refresh": self.last_refresh, "uptime_seconds": time.monotonic() - self.started,
                 "audit_read_success": self.audit_read_success, "error": self.last_error,
+                "backlog_bytes": self.backlog_bytes, "pending_bytes": self.pending_bytes,
+                "coverage_gaps": self.coverage_gaps, "coverage_warning": self.coverage_warning,
+                "coverage_complete": self.audit_read_success and self.coverage_gaps == 0
+                                     and self.backlog_bytes == 0 and not self.discarding
+                                     and not (self.check_anchor and self.expected_anchor is not None),
                 "entries": [{"type": kind, "path": path or "", "reason": reason or "", "time": timestamp}
                             for kind, path, reason, timestamp in rows],
             }
@@ -170,6 +261,9 @@ def prometheus_metrics(snapshot):
         "# TYPE aivm_dashboard_uptime_seconds gauge",
         f"aivm_dashboard_uptime_seconds {snapshot['uptime_seconds']:.6f}",
     ]
+    for key in ("backlog_bytes", "pending_bytes", "coverage_gaps", "coverage_complete"):
+        lines += [f"# TYPE aivm_dashboard_{key} gauge",
+                  f"aivm_dashboard_{key} {int(snapshot[key])}"]
     return "\n".join(lines) + "\n"
 
 
@@ -179,7 +273,10 @@ def render_page(snapshot):
     event_rows = "".join("<tr>" + "".join(f"<td>{html.escape(str(event[key]))}</td>"
                                          for key in ("type", "path", "reason")) + "</tr>"
                          for event in snapshot["entries"][:20])
-    warning = f'<p role="alert">{html.escape(snapshot["error"])}</p>' if snapshot["error"] else ""
+    warnings = [snapshot["error"], snapshot["coverage_warning"]]
+    if snapshot["backlog_bytes"]:
+        warnings.append(f"Audit import pending: {snapshot['backlog_bytes']} bytes.")
+    warning = "".join(f'<p role="alert">{html.escape(message)}</p>' for message in warnings if message)
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">

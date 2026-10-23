@@ -68,6 +68,113 @@ class DashboardTests(unittest.TestCase):
         self.assertFalse(self.store.snapshot()["audit_read_success"])
         self.assertEqual(self.store.snapshot()["total"], 3)
 
+    def test_deny_is_not_lost_between_polls_when_allow_traffic_exceeds_retention(self):
+        self.write([])
+        self.store.sync()
+        records = [self.record(1)]
+        for index in range(2, 12):
+            record = self.record(index)
+            record.update(decision="allow", result="success")
+            records.append(record)
+        self.write(records)
+        self.store.sync()
+        snapshot = self.store.snapshot()
+        self.assertEqual([entry["path"] for entry in snapshot["entries"]], ["file-1"])
+        self.assertTrue(snapshot["coverage_complete"])
+
+    def test_byte_budget_resumes_at_cursor_and_reports_backlog_and_partial_writes(self):
+        self.write([self.record(index) for index in range(8)])
+        with patch.object(DASHBOARD, "MAX_AUDIT_BYTES", 300):
+            self.store.sync()
+            self.assertGreater(self.store.snapshot()["backlog_bytes"], 0)
+            self.assertFalse(self.store.snapshot()["coverage_complete"])
+            for _ in range(12):
+                self.store.sync()
+        self.assertEqual([entry["path"] for entry in self.store.snapshot()["entries"]],
+                         ["file-7", "file-6", "file-5"])
+        self.assertTrue(self.store.snapshot()["coverage_complete"])
+        line = json.dumps(self.record(8)).encode()
+        with self.log.open("ab") as output:
+            output.write(line[:30])
+        self.store.sync()
+        self.assertGreater(self.store.snapshot()["pending_bytes"], 0)
+        with self.log.open("ab") as output:
+            output.write(line[30:] + b"\n")
+        self.store.sync()
+        self.assertEqual(self.store.snapshot()["entries"][0]["path"], "file-8")
+        self.assertTrue(self.store.snapshot()["coverage_complete"])
+
+    def test_rotation_drains_held_inode_and_checks_continuity(self):
+        first = self.record(1, hash_prev="", hash_entry="first")
+        self.write([first])
+        self.store.sync()
+        seal = self.record(2, hash_prev="first", hash_entry="seal")
+        seal.update(action="seal", decision="allow", result="tip:first")
+        with self.log.open("a") as output:
+            output.write(json.dumps(self.record(3)) + "\n" + json.dumps(seal) + "\n")
+        archive = self.log.with_suffix(".old")
+        self.log.rename(archive)
+        self.write([self.record(4, hash_prev="seal", hash_entry="next")])
+        self.store.sync()
+        self.assertIn("file-3", [entry["path"] for entry in self.store.snapshot()["entries"]])
+        self.assertFalse(self.store.snapshot()["coverage_complete"])
+        self.store.sync()
+        self.assertEqual(self.store.snapshot()["entries"][0]["path"], "file-4")
+        self.assertTrue(self.store.snapshot()["coverage_complete"])
+        # ข้าม archive หนึ่งช่วงต้องไม่รายงาน coverage ว่าครบ
+        self.log.rename(self.log.with_suffix(".next"))
+        self.write([self.record(5, hash_prev="unseen-seal", hash_entry="last")])
+        self.store.sync()
+        self.store.sync()
+        self.assertGreater(self.store.snapshot()["coverage_gaps"], 0)
+        self.assertFalse(self.store.snapshot()["coverage_complete"])
+
+    def test_same_inode_rewrite_reports_gap_and_imports_available_records(self):
+        self.write([self.record(1), self.record(2)])
+        self.store.sync()
+        self.write([self.record(3)])
+        self.store.sync()
+        snapshot = self.store.snapshot()
+        self.assertEqual(snapshot["entries"][0]["path"], "file-3")
+        self.assertGreater(snapshot["coverage_gaps"], 0)
+        self.assertFalse(snapshot["coverage_complete"])
+
+    def test_import_failure_rolls_back_cursor_before_retry(self):
+        self.write([self.record(1), self.record(2)])
+        ingest = self.store._ingest
+        calls = 0
+        def fail_second(line):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise sqlite3.OperationalError("database is locked")
+            ingest(line)
+        with patch.object(self.store, "_ingest", side_effect=fail_second):
+            self.store.sync()
+        self.assertFalse(self.store.snapshot()["audit_read_success"])
+        self.assertEqual(self.store.snapshot()["total"], 0)
+        self.store.sync()
+        self.assertEqual(self.store.snapshot()["total"], 2)
+        self.assertTrue(self.store.snapshot()["coverage_complete"])
+
+    def test_rotation_with_backlog_does_not_skip_budget_split_records(self):
+        self.write([])
+        self.store.sync()  # เปิด inode เก่าก่อน rotate
+        records = [self.record(index) for index in range(1, 9)]
+        seal = self.record(9, hash_entry="seal", hash_prev="previous")
+        seal.update(action="seal", decision="allow", result="tip:previous")
+        with self.log.open("a") as output:
+            output.writelines(json.dumps(record) + "\n" for record in records + [seal])
+        self.log.rename(self.log.with_suffix(".old"))
+        self.write([self.record(10, hash_prev="seal", hash_entry="current")])
+        with patch.object(DASHBOARD, "MAX_AUDIT_BYTES", 300):
+            for _ in range(16):
+                self.store.sync()
+        snapshot = self.store.snapshot()
+        self.assertEqual([entry["path"] for entry in snapshot["entries"]],
+                         ["file-10", "file-8", "file-7"])
+        self.assertTrue(snapshot["coverage_complete"])
+
     def test_malformed_partial_and_oversized_lines_cannot_crash_or_inject_fragments(self):
         self.log.write_text('[]\nnull\n{"timestamp":"bad"}\n{"timestamp":NaN}\n')
         self.store.sync()

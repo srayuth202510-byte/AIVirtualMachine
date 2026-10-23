@@ -79,6 +79,13 @@ pub struct SecretLease {
     pub approved_by: Option<String>,
 }
 
+impl Drop for SecretLease {
+    fn drop(&mut self) {
+        // ล้าง value ของ lease instance นี้ แม้จบด้วย error/unwind
+        zeroize_secret(&mut self.value);
+    }
+}
+
 /// Debug ที่ redact `value` เสมอ — log/`{:?}`/panic ห้ามโชว์ secret จริง
 /// (regression #25: derive Debug เดิมพิมพ์ค่า plain text ออกมาด้วย)
 impl std::fmt::Debug for SecretLease {
@@ -208,6 +215,15 @@ pub struct SecretBroker {
     audit: Option<aivm_audit::AuditWriter>,
 }
 
+impl Drop for SecretBroker {
+    fn drop(&mut self) {
+        for value in self.secrets.values_mut() {
+            zeroize_secret(value);
+        }
+        // leases มี Drop ของตัวเอง รวมสำเนาที่ cleanup/restore ทิ้ง
+    }
+}
+
 impl SecretBroker {
     pub fn new(policy: SecretPolicy, audit: Option<aivm_audit::AuditWriter>) -> Self {
         Self {
@@ -223,7 +239,9 @@ impl SecretBroker {
         if self.secrets.get(&resource).is_some_and(|old| old != &value) {
             self.revoke_resource_leases(&resource);
         }
-        self.secrets.insert(resource, value);
+        if let Some(mut old) = self.secrets.insert(resource, value) {
+            zeroize_secret(&mut old);
+        }
     }
 
     /// Remove a secret and invalidate every outstanding lease for it.
@@ -252,6 +270,7 @@ impl SecretBroker {
         hitl_approved: bool,
         approved_by: Option<String>,
     ) -> Result<SecretLease, SecretError> {
+        self.cleanup();
         self.check_request_limits(&request)?;
         // 1. Capability check
         let scope = format!("{}:{}", request.resource, request.scope);
@@ -362,23 +381,27 @@ impl SecretBroker {
         // Check expiration
         if Utc::now() > lease.expires_at {
             lease.status = LeaseStatus::Expired;
+            zeroize_secret(&mut lease.value);
             return Err(SecretError::LeaseExpired);
         }
 
         // Check max uses
         if lease.uses >= lease.request.max_uses {
             lease.status = LeaseStatus::Exhausted;
+            zeroize_secret(&mut lease.value);
             return Err(SecretError::LeaseExhausted);
         }
 
         // Increment use count
+        let value = lease.value.clone();
         lease.uses += 1;
         if lease.uses >= lease.request.max_uses {
             lease.status = LeaseStatus::Exhausted;
+            zeroize_secret(&mut lease.value);
         }
 
         // Return secret value (caller must zeroize after use)
-        Ok(lease.value.clone())
+        Ok(value)
     }
 
     /// Revoke a lease early
@@ -388,6 +411,7 @@ impl SecretBroker {
             .get_mut(lease_id)
             .ok_or(SecretError::LeaseNotFound(lease_id.to_string()))?;
         lease.status = LeaseStatus::Revoked;
+        zeroize_secret(&mut lease.value);
         Ok(())
     }
 
@@ -417,6 +441,7 @@ impl SecretBroker {
         }
         if Utc::now() > lease.expires_at {
             lease.status = LeaseStatus::Expired;
+            zeroize_secret(&mut lease.value);
             return Err(SecretError::LeaseExpired);
         }
         lease.status = LeaseStatus::Active;
@@ -507,7 +532,9 @@ impl SecretBroker {
     pub fn cleanup(&mut self) {
         let now = Utc::now();
         self.leases.retain(|_, lease| {
-            if lease.status == LeaseStatus::Active && now > lease.expires_at {
+            if matches!(lease.status, LeaseStatus::Active | LeaseStatus::Pending)
+                && now > lease.expires_at
+            {
                 lease.status = LeaseStatus::Expired;
                 false
             } else {
@@ -1193,7 +1220,7 @@ mod tests {
         )]);
         assert!(matches!(
             broker.request_lease(
-                restorable_lease().request,
+                restorable_lease().request.clone(),
                 &Cube::new("default-deny"),
                 &mut caps,
                 false,
@@ -1202,5 +1229,48 @@ mod tests {
             Err(SecretError::PolicyDenied(_))
         ));
         assert!(broker.live_leases().is_empty());
+    }
+
+    #[test]
+    fn terminal_leases_clear_values_and_cleanup_removes_expired_pending_leases() {
+        let mut broker = test_broker();
+        let lease = restorable_lease();
+        broker.restore(vec![lease.clone()]);
+        for _ in 0..lease.request.max_uses {
+            assert_eq!(broker.use_lease(&lease.id).unwrap(), "ghp_test123");
+        }
+        assert!(broker.get_lease(&lease.id).unwrap().value.is_empty());
+        assert!(matches!(
+            broker.use_lease(&lease.id),
+            Err(SecretError::LeaseExhausted)
+        ));
+        let mut revoked = restorable_lease();
+        revoked.id = "lease-revoked".into();
+        broker.restore(vec![revoked.clone()]);
+        broker.revoke_lease(&revoked.id).unwrap();
+        assert!(broker.get_lease(&revoked.id).unwrap().value.is_empty());
+        let mut expired = restorable_lease();
+        expired.id = "lease-expired-pending".into();
+        broker.restore(vec![expired.clone()]);
+        let saved = broker.leases.get_mut(&expired.id).unwrap();
+        saved.status = LeaseStatus::Pending;
+        saved.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        broker.cleanup();
+        assert!(broker.leases.is_empty());
+        // canonical value ยังออก lease ใหม่ได้หลังล้างสำเนาที่หมดหน้าที่
+        let mut caps = CapabilitySet::new(vec![aivm_capability::Capability::new(
+            "use",
+            "secret",
+            "github_token:read",
+        )]);
+        assert!(broker
+            .request_lease(
+                lease.request.clone(),
+                &Cube::new("fresh"),
+                &mut caps,
+                true,
+                Some("operator".into())
+            )
+            .is_ok());
     }
 }

@@ -70,7 +70,7 @@ capabilities:
   # เช่น initial: ["secret:github_token:repo:read"]
 
 policy:
-  require_test_before_network: true        # false = เตือนตอน create (network ไม่ต้องมีเทสต์ก่อน)
+  require_test_before_network: true        # runtime บังคับ tests ก่อน network แม้ระบุ false
 
 # นโยบาย secrets (G4 §26): มีแค่ patterns — values อยู่ใน secrets.yaml
 # ของ operator (ข้างบ้าน VM, 0600 เท่านั้น) ไม่มีไฟล์ = deny หมด
@@ -245,6 +245,14 @@ model:
   (`capabilities.initial` ว่าง / `require_test_before_network: false` ก็เตือนเหมือนกัน)
 - `runtime.isolation: microvm` แต่ไม่มีบล็อก `microvm:` = gateway ใช้ค่า default
   ที่ deny ตั้งแต่ artifact หาย — ไม่มีทางรันโดยไม่ตั้งใจ
+
+Config API และ runtime สร้าง policy ด้วยตัวสร้างเดียวกัน `config::load_and_validate`
+ใช้ directory ของไฟล์ config เป็น VM home หาก config ต้นฉบับอยู่ที่อื่น ให้ใช้
+`config::load_and_validate_at(config_path, vm_home, policy_manager)` เพื่อ resolve
+filesystem scopes ให้ตรงกับ runtime ถ้า manager มี active default policy
+ที่ต่างจาก config/home นี้แล้ว API จะคืน error แทนการคง policy เก่าโดยเงียบ
+ค่า `require_test_before_network: false` ไม่ลด guard ของ runtime; config API
+จะเตือนว่า runtime ยังคงบังคับ tests ก่อน network
 
 ## Guards ของ transition (operator ให้ ไม่ใช่ agent อ้าง)
 

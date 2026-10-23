@@ -119,27 +119,32 @@ pub fn mediated_demo() -> Result<DemoReport, RuntimeError> {
             .map_err(|e| e.to_string()),
     );
 
-    // 2. อ่านสิ่งที่เขียนกลับมา (เนื้อหาต้องตรงกัน)
+    // 2. อ่านกลับและค้นด้วย search-only โดยไม่อาศัย read grant
+    let roundtrip = (|| {
+        let read = gw
+            .read(&mut cube, "src/new.rs")
+            .map_err(|e| e.to_string())?;
+        if !read.output.contains("fn new") {
+            return Err("round-trip mismatch".to_string());
+        }
+        let original_caps = gw.caps.clone();
+        gw.caps.caps.retain(|cap| cap.action == "search");
+        let searched = gw.search(&mut cube, "fn new");
+        gw.caps = original_caps;
+        if !searched
+            .map_err(|e| e.to_string())?
+            .output
+            .contains("src/new.rs")
+        {
+            return Err("search-only grant found no content".into());
+        }
+        Ok("content-and-search-ok".to_string())
+    })();
     case(
         &mut cases,
-        "read src/new.rs",
+        "read + search-only src/new.rs",
         Expect::Allow,
-        gw.read(&mut cube, "src/new.rs")
-            .map(|r| {
-                if r.output.contains("fn new") {
-                    "content-ok".to_string()
-                } else {
-                    "content-mismatch".to_string()
-                }
-            })
-            .map_err(|e| e.to_string())
-            .and_then(|s| {
-                if s == "content-ok" {
-                    Ok(s)
-                } else {
-                    Err("round-trip mismatch".to_string())
-                }
-            }),
+        roundtrip,
     );
 
     // 3. path traversal ต้องถูกปฏิเสธ

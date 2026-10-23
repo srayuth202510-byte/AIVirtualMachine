@@ -67,6 +67,30 @@ fn harness(tag: &str) -> (ToolGateway, Cube, std::path::PathBuf) {
 }
 
 #[test]
+fn search_only_grant_cannot_read_secrets_or_follow_an_escaping_symlink() {
+    let (mut gw, mut cube, dir) = harness("search-only");
+    gw.caps.caps.retain(|cap| cap.action == "search");
+    let outside = dir.with_extension("outside");
+    std::fs::write(&outside, "OUTSIDE-MARKER").unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join("src/escape.txt")).unwrap();
+    assert!(gw.read(&mut cube, "src/ok.rs").is_err());
+    assert!(gw.search(&mut cube, "SECRET=1").unwrap().output.is_empty());
+    assert!(gw
+        .search(&mut cube, "OUTSIDE-MARKER")
+        .unwrap()
+        .output
+        .is_empty());
+    assert!(gw
+        .search(&mut cube, "fn ok()")
+        .unwrap()
+        .output
+        .contains("ok.rs"));
+    assert!(gw.context_files(&mut cube).unwrap().is_empty());
+    std::fs::remove_file(outside).unwrap();
+    adv_clean(&dir);
+}
+
+#[test]
 fn fs_escape_must_deny() {
     let (mut gw, mut cube, dir) = harness("fs");
     for p in [

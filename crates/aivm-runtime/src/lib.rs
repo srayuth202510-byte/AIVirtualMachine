@@ -348,69 +348,8 @@ impl Runtime {
         let workspace = absolutize(&workspace);
         let base_dir = absolutize(&base_dir);
 
-        // แปลง scope ที่อิง workspace ให้เป็นสตริง absolute แบบ canonical
         let ws_str = workspace.to_string_lossy().to_string();
-        let read_scopes: Vec<String> = if config.filesystem.read.is_empty() {
-            vec![ws_str.clone()]
-        } else {
-            config
-                .filesystem
-                .read
-                .iter()
-                .map(|s| resolve_scope(&base_dir, &workspace, s))
-                .collect()
-        };
-        let write_scopes: Vec<String> = if config.filesystem.write.is_empty() {
-            vec![format!("{ws_str}/src")]
-        } else {
-            config
-                .filesystem
-                .write
-                .iter()
-                .map(|s| resolve_scope(&base_dir, &workspace, s))
-                .collect()
-        };
-
-        let policy = Policy {
-            name: format!("{}-default", config.name),
-            deny_overrides: true,
-            filesystem: aivm_policy::FsPolicy {
-                read: read_scopes,
-                write: write_scopes,
-                deny: vec![
-                    format!("{ws_str}/.git/config"),
-                    "**/.env*".into(),
-                    "**/secrets/**".into(),
-                    format!("{ws_str}/policies"),
-                    format!("{ws_str}/audit"),
-                ],
-            },
-            process: aivm_policy::ProcessPolicy {
-                // allowlist มาจาก tools.allow ใน config เท่านั้น (ชื่อล้วน
-                // ค้นใน /usr/bin:/bin แล้ว canonicalize ซ้ำ กัน PATH hijack)
-                allow: config
-                    .tools
-                    .allow
-                    .iter()
-                    .filter_map(|s| resolve_runtime_tool(s, &workspace, &config.build))
-                    .collect(),
-                deny: vec!["/bin/sh".into(), "/bin/bash".into()],
-            },
-            network: aivm_policy::NetworkPolicy {
-                allow: config.network.allow.clone(),
-                deny: vec![
-                    "10.0.0.0/8".into(),
-                    "192.168.0.0/16".into(),
-                    "172.16.0.0/12".into(),
-                    "127.0.0.1".into(),
-                    "::1".into(),
-                    "169.254.169.254".into(),
-                ],
-            },
-            system: Default::default(),
-            rules: vec![],
-            require_test_before_network: true,
-        };
+        let policy = build_policy(&config, &base_dir, &workspace);
 
         // สิทธิ์เริ่มต้น (state INIT ตาม §14.2)
         let mut caps = vec![];
@@ -836,16 +775,22 @@ impl Runtime {
     }
 
     pub fn inspect(&self) -> String {
+        // แสดง grants จริงโดยไม่อ้างว่า grant เพียงอย่างเดียวผ่าน policy แล้ว
+        let state = self.cube.current_state().to_string();
+        let grants: Vec<_> = self.gateway.caps.caps.iter().map(|cap| {
+            serde_json::json!({
+                "grant": cap,
+                "usable_in_state": cap.check_usable().is_ok()
+                    && cap.condition.as_ref().is_none_or(|condition| !condition.is_stale_in(&state)),
+            })
+        }).collect();
         format!(
-            "AI VM: {}\nState:\n  {}\nModel:\n  {}\nResources:\n  CPU      {}\n  Memory   {}\nCapabilities:\n  READ     {}\nDenied:\n  WRITE(outside src)\n  NETWORK\n  DEPLOY\nProcesses:\n  0\nMemory:\n  {} cells\nDenials:\n  {}\n",
-            self.config.name,
-            self.cube.current_state(),
-            self.model_cfg.name,
-            self.config.resources.cpu,
-            self.config.resources.memory,
-            self.workspace.display(),
-            self.cube.cells_len(),
-            self.cube.denials(),
+            "AI VM: {}\nState:\n  {}\nModel:\n  {}\nResources:\n  CPU      {}\n  Memory   {}\nCapabilities (grants; policy and constraints also apply):\n{}\nPolicy:\n{}\nProcesses:\n  not measured\nMemory:\n  {} cells\nDenials:\n  {}\n",
+            self.config.name, state, self.model_cfg.name,
+            self.config.resources.cpu, self.config.resources.memory,
+            serde_json::to_string_pretty(&grants).expect("capabilities serialize"),
+            serde_json::to_string_pretty(&self.gateway.policy).expect("policy serializes"),
+            self.cube.cells_len(), self.cube.denials(),
         )
     }
 }
@@ -1067,10 +1012,76 @@ fn resolve_scope(base_dir: &Path, workspace: &Path, scope: &str) -> String {
     workspace.join(scope).to_string_lossy().to_string()
 }
 
+/// สร้าง policy จาก context จริงร่วมกันทั้ง runtime และ config API
+fn build_policy(config: &VmConfig, base_dir: &Path, workspace: &Path) -> Policy {
+    let ws_str = workspace.to_string_lossy().to_string();
+    let read_scopes: Vec<String> = if config.filesystem.read.is_empty() {
+        vec![ws_str.clone()]
+    } else {
+        config
+            .filesystem
+            .read
+            .iter()
+            .map(|s| resolve_scope(base_dir, workspace, s))
+            .collect()
+    };
+    let write_scopes: Vec<String> = if config.filesystem.write.is_empty() {
+        vec![format!("{ws_str}/src")]
+    } else {
+        config
+            .filesystem
+            .write
+            .iter()
+            .map(|s| resolve_scope(base_dir, workspace, s))
+            .collect()
+    };
+
+    Policy {
+        name: format!("{}-default", config.name),
+        deny_overrides: true,
+        filesystem: aivm_policy::FsPolicy {
+            read: read_scopes,
+            write: write_scopes,
+            deny: vec![
+                format!("{ws_str}/.git/config"),
+                "**/.env*".into(),
+                "**/secrets/**".into(),
+                format!("{ws_str}/policies"),
+                format!("{ws_str}/audit"),
+            ],
+        },
+        process: aivm_policy::ProcessPolicy {
+            // allowlist มาจาก tools.allow ใน config เท่านั้น (ชื่อล้วน
+            // ค้นใน /usr/bin:/bin แล้ว canonicalize ซ้ำ กัน PATH hijack)
+            allow: config
+                .tools
+                .allow
+                .iter()
+                .filter_map(|s| resolve_runtime_tool(s, workspace, &config.build))
+                .collect(),
+            deny: vec!["/bin/sh".into(), "/bin/bash".into()],
+        },
+        network: aivm_policy::NetworkPolicy {
+            allow: config.network.allow.clone(),
+            deny: vec![
+                "10.0.0.0/8".into(),
+                "192.168.0.0/16".into(),
+                "172.16.0.0/12".into(),
+                "127.0.0.1".into(),
+                "::1".into(),
+                "169.254.169.254".into(),
+            ],
+        },
+        system: Default::default(),
+        rules: vec![],
+        require_test_before_network: true,
+    }
+}
+
 /// Config Loader และ Validator
 pub mod config {
-    use super::{resolve_runtime_tool, validate_model_security, RuntimeError, VmConfig};
-    use aivm_policy::{Policy, PolicyManager};
+    use super::{absolutize, build_policy, validate_model_security, RuntimeError, VmConfig};
+    use aivm_policy::PolicyManager;
     use std::path::Path;
 
     /// Validation result
@@ -1085,15 +1096,39 @@ pub mod config {
         config_path: &Path,
         policy_manager: &mut PolicyManager,
     ) -> Result<ValidationResult, RuntimeError> {
+        load_and_validate_at(
+            config_path,
+            config_path.parent().unwrap_or(Path::new(".")),
+            policy_manager,
+        )
+    }
+
+    /// ระบุ VM home ชัดเจนเมื่อ config ต้นฉบับอยู่นอก VM home
+    pub fn load_and_validate_at(
+        config_path: &Path,
+        base_dir: &Path,
+        policy_manager: &mut PolicyManager,
+    ) -> Result<ValidationResult, RuntimeError> {
         let config = VmConfig::from_file(config_path)?;
+        let base_dir = absolutize(base_dir);
+        let workspace = absolutize(&base_dir.join("workspace"));
         let mut warnings = Vec::new();
 
         // Validate config structure
         validate_config(&config, &mut warnings)?;
 
-        // Load default policy if not exists
-        if policy_manager.get_active("default").is_none() {
-            let default_policy = build_default_policy(&config);
+        // ห้ามคืน config ใหม่พร้อม policy เก่าที่มีความหมายต่างกันโดยเงียบ
+        let default_policy = build_policy(&config, &base_dir, &workspace);
+        if let Some(active) = policy_manager.get_active("default") {
+            if serde_json::to_value(active).map_err(|e| RuntimeError::Policy(e.to_string()))?
+                != serde_json::to_value(&default_policy)
+                    .map_err(|e| RuntimeError::Policy(e.to_string()))?
+            {
+                return Err(RuntimeError::Policy(
+                    "active default policy differs from config and VM home".into(),
+                ));
+            }
+        } else {
             let doc = aivm_policy::PolicyDocument::new("default".into(), 1, default_policy);
             policy_manager
                 .add_policy(doc)
@@ -1143,7 +1178,7 @@ pub mod config {
         // Policy validation
         if !config.policy.require_test_before_network {
             warnings.push(
-                "require_test_before_network is false - network access allowed without tests"
+                "require_test_before_network=false is ignored; runtime always requires tests before network access"
                     .into(),
             );
         }
@@ -1164,48 +1199,6 @@ pub mod config {
         }
 
         Ok(())
-    }
-
-    fn build_default_policy(config: &VmConfig) -> Policy {
-        let ws_str = format!("/workspace/{}", config.name);
-        Policy {
-            name: format!("{}-default", config.name),
-            deny_overrides: true,
-            filesystem: aivm_policy::FsPolicy {
-                read: vec![ws_str.clone()],
-                write: vec![format!("{}/src", ws_str)],
-                deny: vec![
-                    format!("{}/.git/config", ws_str),
-                    "**/.env*".into(),
-                    "**/secrets/**".into(),
-                    format!("{}/policies", ws_str),
-                    format!("{}/audit", ws_str),
-                ],
-            },
-            process: aivm_policy::ProcessPolicy {
-                allow: config
-                    .tools
-                    .allow
-                    .iter()
-                    .filter_map(|s| resolve_runtime_tool(s, Path::new(&ws_str), &config.build))
-                    .collect(),
-                deny: vec!["/bin/sh".into(), "/bin/bash".into()],
-            },
-            network: aivm_policy::NetworkPolicy {
-                allow: config.network.allow.clone(),
-                deny: vec![
-                    "10.0.0.0/8".into(),
-                    "192.168.0.0/16".into(),
-                    "172.16.0.0/12".into(),
-                    "127.0.0.1".into(),
-                    "::1".into(),
-                    "169.254.169.254".into(),
-                ],
-            },
-            system: Default::default(),
-            rules: vec![],
-            require_test_before_network: config.policy.require_test_before_network,
-        }
     }
 }
 
@@ -1343,6 +1336,88 @@ capabilities:
         ] {
             assert!(VmConfig::from_yaml(yaml).is_err(), "accepted typo: {yaml}");
         }
+    }
+
+    #[test]
+    fn config_loader_and_runtime_build_the_same_policy_for_the_actual_vm_home() {
+        let base =
+            std::env::temp_dir().join(format!("aivm-policy-context-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(base.join("workspace")).unwrap();
+        let path = base.join("aivm.yaml");
+        std::fs::write(&path, "name: policy-context\nfilesystem:\n  read: ['./workspace/src']\n  write: ['/workspace/src']\npolicy:\n  require_test_before_network: false\n").unwrap();
+        let mut manager = aivm_policy::PolicyManager::new();
+        let loaded = config::load_and_validate_at(&path, &base, &mut manager).unwrap();
+        let runtime = Runtime::init(loaded.config.clone(), base.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(manager.get_active("default").unwrap()).unwrap(),
+            serde_json::to_value(&runtime.policy).unwrap()
+        );
+        assert!(runtime.policy.require_test_before_network);
+        assert!(loaded
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("always requires tests")));
+        let mut from_home = aivm_policy::PolicyManager::new();
+        config::load_and_validate(&path, &mut from_home).unwrap();
+        assert_eq!(
+            serde_json::to_value(manager.get_active("default").unwrap()).unwrap(),
+            serde_json::to_value(from_home.get_active("default").unwrap()).unwrap()
+        );
+        std::fs::write(
+            &path,
+            "name: policy-context\nfilesystem:\n  read: ['./workspace/other']\n",
+        )
+        .unwrap();
+        assert!(config::load_and_validate_at(&path, &base, &mut manager).is_err());
+        aivm_audit::clear_flags(&base);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn inspect_reports_real_grants_and_never_invents_read_or_process_counts() {
+        let base =
+            std::env::temp_dir().join(format!("aivm-inspect-grants-{}", uuid::Uuid::new_v4()));
+        let config = VmConfig::from_yaml("name: inspect\ncapabilities:\n  initial: [search:code]\nnetwork:\n  allow: [example.com]\n").unwrap();
+        let mut runtime = Runtime::init(config, base.clone()).unwrap();
+        let initial = runtime.inspect();
+        assert!(initial.contains("\"action\": \"search\""));
+        assert!(!initial.contains("\"action\": \"read\""));
+        assert!(initial.contains("Processes:\n  not measured"));
+        runtime
+            .transition_to(AgentState::Analyze, &Default::default())
+            .unwrap();
+        runtime
+            .transition_to(
+                AgentState::Modify,
+                &TransitionGuards {
+                    confidence: 0.95,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        runtime
+            .transition_to(
+                AgentState::Validate,
+                &TransitionGuards {
+                    tests_passed: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let current = runtime.inspect();
+        assert!(current.contains("network:fetch"));
+        assert!(current.contains("example.com:443"));
+        assert!(current.contains("\"expiration\""));
+        assert!(!current.contains("Denied:\n"));
+        runtime
+            .gateway
+            .caps
+            .caps
+            .iter_mut()
+            .for_each(|cap| cap.expiration = Some(0));
+        assert!(runtime.inspect().contains("\"usable_in_state\": false"));
+        aivm_audit::clear_flags(&base);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

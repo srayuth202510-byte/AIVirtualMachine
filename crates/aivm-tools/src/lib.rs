@@ -30,6 +30,31 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+// RAII ล้าง environment ทั้งเมื่อรันสำเร็จและ return ก่อน spawn
+struct SecretEnvGuard(Vec<(String, String)>);
+impl Drop for SecretEnvGuard {
+    fn drop(&mut self) {
+        zeroize_env(&mut self.0);
+    }
+}
+struct SecretExecSpec(ExecSpec);
+impl std::ops::Deref for SecretExecSpec {
+    type Target = ExecSpec;
+    fn deref(&self) -> &ExecSpec {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for SecretExecSpec {
+    fn deref_mut(&mut self) -> &mut ExecSpec {
+        &mut self.0
+    }
+}
+impl Drop for SecretExecSpec {
+    fn drop(&mut self) {
+        zeroize_env(&mut self.0.env_extra);
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ToolError {
     #[error("denied: {0}")]
@@ -595,15 +620,25 @@ impl ToolGateway {
     }
 
     pub fn read(&mut self, cube: &mut Cube, path: &str) -> Result<ToolResult, ToolError> {
-        self.check_quarantine(cube, "read", path)?;
-        let (canon, cap_index) = self.enforce(cube, "read", path)?;
+        self.read_for(cube, path, "read")
+    }
+
+    /// search อ่านผ่าน capability ของตัวเอง พร้อม policy และโควต้ารายไฟล์เหมือน read
+    fn read_for(
+        &mut self,
+        cube: &mut Cube,
+        path: &str,
+        action: &str,
+    ) -> Result<ToolResult, ToolError> {
+        self.check_quarantine(cube, action, path)?;
+        let (canon, cap_index) = self.enforce(cube, action, path)?;
         if let Some(content) = self.read_cache.get(&canon).cloned() {
             if let Err(error) = self.check_file_size(cap_index, content.len() as u64) {
-                self.audit_decision(cube, "read", path, "deny", "size-constraint", "error")?;
+                self.audit_decision(cube, action, path, "deny", "size-constraint", "error")?;
                 return Err(error);
             }
             self.charge_bytes(cube, cap_index, content.len() as u64)?;
-            self.audit_decision(cube, "read", path, "allow", "cache-hit", "success")?;
+            self.audit_decision(cube, action, path, "allow", "cache-hit", "success")?;
             return Ok(ToolResult {
                 verification: None,
                 ok: true,
@@ -629,15 +664,15 @@ impl ToolGateway {
         let content = match result {
             Ok(content) => content,
             Err(error) => {
-                self.audit_decision(cube, "read", path, "deny", "outcome", "error")?;
+                self.audit_decision(cube, action, path, "deny", "outcome", "error")?;
                 return Err(error);
             }
         };
         if let Err(error) = self.charge_bytes(cube, cap_index, content.len() as u64) {
-            self.audit_decision(cube, "read", path, "deny", "size-constraint", "error")?;
+            self.audit_decision(cube, action, path, "deny", "size-constraint", "error")?;
             return Err(error);
         }
-        self.audit_decision(cube, "read", path, "allow", "outcome", "success")?;
+        self.audit_decision(cube, action, path, "allow", "outcome", "success")?;
         self.read_cache.insert(canon, content.clone());
         Ok(ToolResult {
             verification: None,
@@ -736,6 +771,14 @@ impl ToolGateway {
     /// `code.search`: ค้น substring ในไฟล์ workspace (ใช้ scope แบบ read)
     /// อ่าน context ผ่าน gateway เท่านั้น ไม่รับ root จากผู้เรียก RAG
     pub fn context_files(&mut self, cube: &mut Cube) -> Result<Vec<(String, String)>, ToolError> {
+        self.context_files_for(cube, "read")
+    }
+
+    fn context_files_for(
+        &mut self,
+        cube: &mut Cube,
+        action: &str,
+    ) -> Result<Vec<(String, String)>, ToolError> {
         let paths: Vec<PathBuf> = walkdir::WalkDir::new(&self.workspace)
             .max_depth(8)
             .into_iter()
@@ -754,12 +797,14 @@ impl ToolGateway {
                     .0
                     != Decision::Allow
                 || !self.caps.caps.iter().any(|cap| {
-                    cap.check_usable().is_ok() && cap.covers("read", "filesystem", &scope)
+                    cap.check_usable().is_ok()
+                        && (cap.covers(action, "filesystem", &scope)
+                            || (action == "search" && cap.covers("read", "filesystem", &scope)))
                 })
             {
                 continue;
             }
-            match self.read(cube, &scope) {
+            match self.read_for(cube, &scope, action) {
                 Ok(result) => {
                     total += result.output.len();
                     if total > 8 * 1024 * 1024 {
@@ -783,7 +828,7 @@ impl ToolGateway {
         let workspace = self.workspace.clone();
         self.enforce(cube, "search", &workspace.to_string_lossy())?;
         let mut hits = Vec::new();
-        for (path, content) in self.context_files(cube)? {
+        for (path, content) in self.context_files_for(cube, "search")? {
             for (line_number, line) in content.lines().enumerate() {
                 if line.contains(query) {
                     hits.push(format!(
@@ -898,7 +943,7 @@ impl ToolGateway {
                 "build outputs require a process sandbox without secrets".into(),
             ));
         }
-        let mut spec = ExecSpec {
+        let mut spec = SecretExecSpec(ExecSpec {
             exe: PathBuf::from(exe),
             args: args.to_vec(),
             cwd: self.workspace.clone(),
@@ -907,7 +952,7 @@ impl ToolGateway {
             timeout_ms: 30000,
             build: None,
             limits: self.limits.clone(),
-        };
+        });
         // ประตูชั้นแรก (fail-closed ไม่ spawn) หมายเหตุ: ประตูนี้ตรวจซ้ำ
         // อีกรอบใน run_checked ข้างล่างโดยตั้งใจ
         let canon = aivm_sandbox::validate(&spec, &self.policy).map_err(|e| {
@@ -943,7 +988,7 @@ impl ToolGateway {
         // หมายเหตุ borrow: คุยกับ broker ให้จบใน block เดียว (owned ออกมา)
         // แล้วค่อย audit — ไม่ถือ borrow ข้าม audit call เด็ดขาด
         let mut lease_tag = "-".to_string();
-        let mut secret_env: Vec<(String, String)> = vec![];
+        let mut secret_env = SecretEnvGuard(vec![]);
         if let Some(lid) = lease_id {
             if lid.is_empty() || lid.len() > MAX_LEASE_ID {
                 self.audit_decision(cube, "execute", &scope, "deny", "bad-lease-id", "error")?;
@@ -1010,7 +1055,7 @@ impl ToolGateway {
             match resolved {
                 Resolve::Ready { id, env } => {
                     lease_tag = id;
-                    secret_env = env;
+                    secret_env.0 = env;
                 }
                 Resolve::Deny { rule, msg } => {
                     self.audit_decision(cube, "execute", &scope, "deny", rule, "error")?;
@@ -1062,7 +1107,7 @@ impl ToolGateway {
             }
             None => None,
         };
-        spec.env_extra = secret_env;
+        spec.env_extra = std::mem::take(&mut secret_env.0);
         let mut run_result = if self.level == SandboxLevel::Container {
             aivm_sandbox::container::run(&spec, &self.policy, &self.container_cfg)
                 .map_err(|e| (e, aivm_sandbox::RunVerdict::Clean))
@@ -2083,6 +2128,25 @@ fn zeroize_env(env: &mut [(String, String)]) {
 mod tests {
     use super::*;
     use aivm_capability::Capability;
+
+    #[test]
+    fn search_only_grant_finds_content_and_charges_its_own_byte_budget() {
+        let (mut gw, mut cube, dir) = harness();
+        std::fs::write(dir.join("src/search.txt"), "unique-search-marker").unwrap();
+        gw.caps.caps.retain(|cap| cap.action == "search");
+        gw.caps.caps[0].constraints.max_total_bytes = Some(20);
+        let result = gw.search(&mut cube, "unique-search-marker").unwrap();
+        assert!(result
+            .output
+            .contains("src/search.txt:1: unique-search-marker"));
+        assert_eq!(gw.caps.caps[0].used_bytes, 20);
+        assert!(gw.search(&mut cube, "unique-search-marker").is_err());
+        // search ไม่ได้ให้สิทธิ์ filesystem.read หรือ retrieval context โดยอ้อม
+        assert!(gw.read(&mut cube, "src/search.txt").is_err());
+        assert!(gw.context_files(&mut cube).unwrap().is_empty());
+        aivm_audit::clear_flags(&dir);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn cached_reads_enforce_current_size_constraints() {

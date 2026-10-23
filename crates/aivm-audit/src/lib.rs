@@ -434,6 +434,12 @@ pub fn verify_sequence(paths: &[PathBuf]) -> Result<u64, AuditError> {
         if recs.is_empty() {
             continue;
         }
+        // การตรวจทั้งประวัติต้องเริ่ม genesis; verify() ใช้ตรวจ continuation เดี่ยวได้
+        if first_file && !recs[0].hash_prev.is_empty() {
+            return Err(AuditError::Ser(
+                "audit genesis missing: incomplete history".into(),
+            ));
+        }
         if !first_file && recs[0].hash_prev != expected_prev {
             return Err(AuditError::Ser(format!(
                 "rotation boundary broken before {}",
@@ -535,6 +541,27 @@ mod tests {
         let text = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
         let first: AuditRecord = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(first.seq, 0);
+        clean(&dir);
+    }
+
+    #[test]
+    fn full_history_verification_rejects_a_missing_first_archive() {
+        let dir = test_dir("missing-genesis");
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("audit.jsonl");
+        let mut writer = AuditWriter::open(&live).unwrap();
+        test_record(&mut writer, "before");
+        let archive = writer.rotate("001").unwrap();
+        test_record(&mut writer, "after");
+        assert!(verify_sequence(&[archive.clone(), live.clone()]).is_ok());
+        assert!(AuditWriter::verify(&live).is_ok());
+        assert!(verify_sequence(std::slice::from_ref(&live))
+            .unwrap_err()
+            .to_string()
+            .contains("genesis missing"));
+        clear_flags(&dir);
+        std::fs::remove_file(archive).unwrap();
+        assert!(verify_sequence(&[live]).is_err());
         clean(&dir);
     }
 

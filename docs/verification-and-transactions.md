@@ -1,5 +1,12 @@
 # Verifier contracts และ state/audit transactions
 
+`inspect`, `state` และ `capabilities` ถือ exclusive VM lease ก่อนเปิด runtime
+เพราะการเปิดอาจกู้ transaction และเขียน state/audit หากมี operation ทำงานอยู่
+คำสั่งจะคืน `VM already has an active operation` ให้เรียกใหม่หลัง operation จบ
+แทนการกู้ transaction ซ้อนกับ writer ที่ยังทำงานอยู่ รายการ capabilities แสดง
+grants, state usability, scopes, expiry, quotas และ policy จริง ส่วน process count
+แสดง `not measured` เพราะไม่ได้วัดจาก runtime snapshot นี้
+
 ## ยืนยันผลด้วยสัญญาของ operator
 
 Agent ไม่อนุมานว่า tests ผ่านจากชื่อ test runner, `build:tests`, arguments
