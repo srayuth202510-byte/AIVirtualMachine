@@ -157,6 +157,73 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(self.store.snapshot()["total"], 2)
         self.assertTrue(self.store.snapshot()["coverage_complete"])
 
+    def test_restart_preserves_latest_retention_and_committed_cursor(self):
+        self.write([self.record(index) for index in range(8)])
+        self.store.sync()
+        before = self.store.snapshot()["entries"]
+        reopened = DASHBOARD.EventStore(self.database, self.log, max_entries=3)
+        self.addCleanup(reopened.close)
+        reopened.sync()
+        self.assertEqual(reopened.snapshot()["entries"], before)
+        self.assertTrue(reopened.snapshot()["coverage_complete"])
+        with self.log.open("a") as output:
+            output.write(json.dumps(self.record(8)) + "\n")
+        reopened.sync()
+        self.assertEqual([row["path"] for row in reopened.snapshot()["entries"]],
+                         ["file-8", "file-7", "file-6"])
+
+    def test_backfill_of_an_existing_database_without_cursor_preserves_source_order(self):
+        self.write([self.record(index) for index in range(8)])
+        self.store.sync()
+        expected = self.store.snapshot()["entries"]
+        # จำลอง DB รุ่นเดิมที่เก็บ events แล้วแต่ยังไม่มี persistent cursor
+        with self.store.conn:
+            self.store.conn.execute("DELETE FROM import_cursors")
+        migrated = DASHBOARD.EventStore(self.database, self.log, max_entries=3)
+        self.addCleanup(migrated.close)
+        migrated.sync()
+        self.assertEqual(migrated.snapshot()["entries"], expected)
+
+    def test_cursor_write_failure_rolls_back_events_before_restart(self):
+        self.write([self.record(index) for index in range(8)])
+        with patch.object(self.store, "_save_cursor", side_effect=sqlite3.OperationalError("disk full")):
+            self.store.sync()
+        self.assertFalse(self.store.snapshot()["audit_read_success"])
+        self.assertEqual(self.store.snapshot()["total"], 0)
+        reopened = DASHBOARD.EventStore(self.database, self.log, max_entries=3)
+        self.addCleanup(reopened.close)
+        reopened.sync()
+        self.assertEqual([row["path"] for row in reopened.snapshot()["entries"]],
+                         ["file-7", "file-6", "file-5"])
+        self.assertTrue(reopened.snapshot()["coverage_complete"])
+
+    def test_restart_follows_saved_seal_and_reports_an_unobserved_rotation(self):
+        self.write([self.record(1, hash_prev="", hash_entry="first")])
+        self.store.sync()
+        seal = self.record(2, hash_prev="first", hash_entry="seal")
+        seal.update(action="seal", decision="allow", result="tip:first")
+        with self.log.open("a") as output:
+            output.write(json.dumps(seal) + "\n")
+        self.store.sync()
+        self.log.rename(self.log.with_suffix(".old"))
+        self.write([self.record(3, hash_prev="seal", hash_entry="current")])
+        resumed = DASHBOARD.EventStore(self.database, self.log, max_entries=3)
+        self.addCleanup(resumed.close)
+        resumed.sync()
+        self.assertTrue(resumed.snapshot()["coverage_complete"])
+        self.log.rename(self.log.with_suffix(".next"))
+        self.write([self.record(4, hash_prev="unseen-seal", hash_entry="latest")])
+        missed = DASHBOARD.EventStore(self.database, self.log, max_entries=3)
+        self.addCleanup(missed.close)
+        missed.sync()
+        self.assertFalse(missed.snapshot()["coverage_complete"])
+        self.assertGreater(missed.snapshot()["coverage_gaps"], 0)
+        again = DASHBOARD.EventStore(self.database, self.log, max_entries=3)
+        self.addCleanup(again.close)
+        again.sync()
+        self.assertEqual(again.snapshot()["coverage_gaps"], missed.snapshot()["coverage_gaps"])
+        self.assertFalse(again.snapshot()["coverage_complete"])
+
     def test_rotation_with_backlog_does_not_skip_budget_split_records(self):
         self.write([])
         self.store.sync()  # เปิด inode เก่าก่อน rotate

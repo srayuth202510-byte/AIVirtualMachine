@@ -2,6 +2,11 @@
 
 ## สถานะหลังแก้ใน working tree
 
+ติดตามด้วย [host validation และ dashboard soak](host-validation-2026-10-23.md):
+worker ทั้งสาม tier ผ่านบน host จริง ส่วน soak พบ restart/retention bug เพิ่ม
+จึงเพิ่ม persistent cursor, การรองรับ DB รุ่นเดิม และ regression อีก 4 tests
+ใน working tree รายงานด้านล่างบันทึกการแก้ชุดแรกที่ commit `50b5d0e`
+
 แก้ B1–B4 และ D1–D3 แล้ว รายละเอียดด้านล่างเป็นหลักฐานก่อนแก้ที่ commit
 `48bf35c` ไม่ใช่รายการปัญหาที่ยังค้างใน working tree ปัจจุบัน
 

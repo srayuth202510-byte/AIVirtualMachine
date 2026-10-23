@@ -52,9 +52,17 @@ partial line รอจนเขียนจบ ส่วน malformed/oversized 
 JSON/Prometheus มี `backlog_bytes`, `pending_bytes`, `coverage_gaps` และ
 `coverage_complete` แยกจาก `audit_read_success` ข้อมูลที่ยังอ่านไม่ทันหรืออ่านไม่ครบ
 จะแสดงคำเตือนบนหน้าเว็บ DB failure จะ rollback cursor เพื่อ retry โดยไม่ข้าม events
-coverage หมายถึงสิ่งที่สังเกตได้ใน process นี้ ไม่รับรองประวัติก่อนเริ่ม dashboard
-เมื่อ restart จะ backfill active file ใหม่ตั้งแต่ต้น ไม่ตาม archive ย้อนหลัง
-ถ้า active file เริ่มด้วย continuation จะแจ้งว่าไม่ได้ import ประวัติก่อนหน้า
+cursor (inode/offset และ bytes ก่อน cursor) กับ events ถูก commit ใน SQLite
+transaction เดียวกัน เมื่อ restart จึงอ่านต่อโดยไม่ replay events เก่าที่ถูก purge
+กลับมาเบียด events ล่าสุด หากพบ seal ก่อนหยุด จะใช้ hash นั้นตรวจ continuation
+หลัง restart ได้ ส่วน cursor ที่ไม่ตรงกับไฟล์หรือ rotation ที่ข้ามไปจะแจ้ง gap
+coverage gaps/warnings ถูกเก็บข้าม restart ด้วย
+DB รุ่นเดิมที่ยังไม่มี cursor จะ backfill และจัดลำดับ retained events ตาม source
+ก่อน purge เพื่อรักษารายการล่าสุดเมื่ออ่าน backlog ครบแล้ว
+
+coverage หมายถึง source ที่เคยสังเกตได้ด้วย DB นี้ ไม่รับรองประวัติที่ไม่เคย import
+และไม่ตาม archive ย้อนหลัง หากเริ่มใหม่โดยไม่มี cursor แล้ว active file เป็น
+continuation จะแจ้งว่าไม่ได้ import ประวัติก่อนหน้า
 
 ถ้า log หาย/อ่านไม่ได้ ยังแสดงข้อมูลเดิมพร้อมข้อความแจ้งและ read-success = 0
 จำนวน events เป็นหน้าต่างข้อมูลตาม retention ไม่ใช่จำนวนตลอดอายุ VM
@@ -62,4 +70,5 @@ coverage หมายถึงสิ่งที่สังเกตได้�
 ทดสอบ regression ด้วย `python3 -m unittest discover -s scripts -p 'test_dashboard.py'`
 ครอบคลุม HTTP responses, HTML escaping, metrics labels, retention/dedup,
 partial/oversized input, private storage, schema migration, traffic ระหว่าง polls,
-cursor/backlog, DB retry, truncation และ rotation ระหว่างมี backlog
+cursor/backlog, DB retry, truncation, rotation ระหว่างมี backlog และ restart
+หลัง retention purge/transaction failure

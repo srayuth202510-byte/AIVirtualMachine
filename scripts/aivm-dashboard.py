@@ -61,11 +61,17 @@ class EventStore:
                 timestamp REAL NOT NULL, type TEXT NOT NULL, path TEXT,
                 reason TEXT, fingerprint TEXT UNIQUE);
             CREATE INDEX IF NOT EXISTS idx_ts ON events(timestamp);
+            CREATE TABLE IF NOT EXISTS import_cursors (
+                source TEXT PRIMARY KEY, state TEXT NOT NULL);
         """)
         columns = {row[1] for row in self.conn.execute("PRAGMA table_info(events)")}
         if "fingerprint" not in columns:
             self.conn.execute("ALTER TABLE events ADD COLUMN fingerprint TEXT")
         self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_fingerprint ON events(fingerprint)")
+        self.source_key = str(self.audit_log.absolute())
+        cursor = self.conn.execute("SELECT state FROM import_cursors WHERE source = ?",
+                                   (self.source_key,)).fetchone()
+        self.resume_state = json.loads(cursor[0]) if cursor else None
         self._purge()
         self.conn.commit()
 
@@ -89,6 +95,47 @@ class EventStore:
         self.cursor_tail = b""
         self.discarding = False
         self.check_anchor = True
+        if self.resume_state is not None:
+            state, self.resume_state = self.resume_state, None
+            self.coverage_gaps = state["coverage_gaps"]
+            self.coverage_warning = state["coverage_warning"]
+            position = state["offset"]
+            tail = bytes.fromhex(state["tail"])
+            metadata = os.fstat(self.source.fileno())
+            if (type(position) is not int or position < 0 or len(tail) > 128
+                    or len(tail) > position):
+                raise ValueError("invalid persisted audit cursor")
+            if ((metadata.st_dev, metadata.st_ino) == (state["device"], state["inode"])
+                    and metadata.st_size >= position
+                    and os.pread(self.source.fileno(), len(tail), position-len(tail)) == tail):
+                self.source.seek(position)
+                self.cursor_tail = tail
+                self.discarding = state["discarding"]
+                self.check_anchor = state["check_anchor"]
+                self.expected_anchor = state["expected_anchor"]
+                self.last_hash = state["last_hash"]
+                self.last_action = state["last_action"]
+            elif (state["sealed_end"] and state["last_hash"]
+                  and (metadata.st_dev, metadata.st_ino) != (state["device"], state["inode"])):
+                self.expected_anchor = state["last_hash"]
+            else:
+                self._gap("Persisted audit cursor no longer matches the source; replaying available data.")
+
+    def _save_cursor(self):
+        # cursor กับ events ต้อง commit พร้อมกัน ป้องกัน replay เก่าเบียด retention หลัง restart
+        position = self.source.tell()
+        metadata = os.fstat(self.source.fileno())
+        tail = os.pread(self.source.fileno(), min(position, 128), max(0, position-128))
+        state = dict(device=metadata.st_dev, inode=metadata.st_ino, offset=position,
+                     tail=tail.hex(), discarding=self.discarding, check_anchor=self.check_anchor,
+                     expected_anchor=self.expected_anchor, last_hash=self.last_hash,
+                     last_action=self.last_action, coverage_gaps=self.coverage_gaps,
+                     coverage_warning=self.coverage_warning,
+                     sealed_end=(position == metadata.st_size and not self.discarding
+                                 and self.last_action == "seal"))
+        self.conn.execute("INSERT INTO import_cursors (source, state) VALUES (?, ?) "
+                          "ON CONFLICT(source) DO UPDATE SET state=excluded.state",
+                          (self.source_key, json.dumps(state)))
 
     def _gap(self, warning):
         # แจ้ง coverage แยกจากการเปิดอ่านสำเร็จ ไม่อ้างว่าเก็บครบเมื่อมีช่วงที่ไม่ทราบ
@@ -135,7 +182,9 @@ class EventStore:
         if not all(isinstance(value, str) for value in (action, resource, reason)):
             return
         fingerprint = hashlib.sha256(line.rstrip(b"\r\n")).hexdigest()
-        self.conn.execute("INSERT OR IGNORE INTO events "
+        # backfill ของ DB รุ่นเดิมต้องจัดลำดับซ้ำตาม source ก่อน purge มิฉะนั้นแถวเก่า
+        # ที่ถูก reinsert จะเบียดแถวล่าสุดซึ่งถูก IGNORE เพราะ fingerprint ยังมีอยู่
+        self.conn.execute("INSERT OR REPLACE INTO events "
                           "(timestamp, type, path, reason, fingerprint) VALUES (?, ?, ?, ?, ?)",
                           (timestamp, action[:256], resource[:4096], reason[:4096], fingerprint))
 
@@ -218,6 +267,7 @@ class EventStore:
                     break
                 self._ingest(line)
             self._purge()
+            self._save_cursor()
 
     def snapshot(self):
         with self.lock:
