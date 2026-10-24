@@ -148,7 +148,7 @@ Process ฆ่าทั้ง process group, container ใช้ `cgroup.kill`, 
 Control plane ตรวจ cancellation ระหว่าง copy/hash ทุกไม่เกิน 64 KiB และก่อน/หลัง setup
 รวมทั้งก่อนส่ง streaming delta แต่ละช่วงให้ callback แม้ frame จะรออยู่ใน buffer แล้ว
 copy ตรวจ bytes จริงตาม storage quota จึงปฏิเสธไฟล์ที่โตหลัง fstat ได้ด้วย
-directory ของ config/staging มี RAII owner เพื่อ cleanup เมื่อเตรียมไฟล์ไม่สำเร็จ
+directory ของ config/staging มี lease และ checked cleanup ก่อนคืน completion พร้อม startup recovery ของ orphan ที่ตรวจเจ้าของได้
 
 `InferenceLimits.total_timeout_ms` เป็นงบเวลาเพิ่มเติมแบบ optional ค่าเริ่มต้น `None`
 นับด้วย monotonic clock ตั้งแต่เข้า `WorkerClient::infer`/`infer_stream` รวม
@@ -180,6 +180,10 @@ execution รวมเวลารัน/ยุติ worker และตรว�
 ของ parent ที่ท้าย request ถ้า preparation ล้มและ guard cleanup ระหว่าง unwind
 เวลานั้นจะรวมใน preparation Error คง variant เดิม พร้อม phase และเวลารายช่วง
 เพื่อช่วยวิเคราะห์ deadline failures โดยไม่เพิ่ม prompt ลง diagnostics
+
+การตั้งค่า pinned controller, event API, structured errors, โควตารวม และ sealed model cache
+อยู่ใน [worker control hardening](model-control-hardening.md) Callback เดิมที่ค้างยังขวาง
+caller thread ได้; event API แยกการรอผลออกจาก callback และรายงาน cleanup pending ชัดเจน
 
 Response ถูกตรวจ identity, termination, output budget, frame bytes และ exit status
 Client คำนวณ SHA-256 ของ output และคืน `verification` ที่เขียนทับค่าจาก worker เสมอ

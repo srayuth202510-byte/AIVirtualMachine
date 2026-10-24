@@ -231,6 +231,7 @@ def evaluate(binary, model=None, model_limit=8, corpus=CORPUS):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--corpus", type=Path, default=CORPUS, help="Labeled evaluation corpus; keep holdout separate from rule tuning")
     parser.add_argument("--model", type=Path, help="Optional real local GGUF; never given tools")
     parser.add_argument("--model-limit", type=int, default=8, help="Review first N eligible cases, 1..100 (default 8)")
     parser.add_argument("--output", type=Path, help="Also save the complete report as JSON")
@@ -243,7 +244,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="aivm-detection-bin-") as temporary:
         binary = Path(temporary) / "aivm"
         shutil.copy2(PROJECT / "target/debug/aivm", binary)
-        report = evaluate(binary, model, args.model_limit)
+        report = evaluate(binary, model, args.model_limit, args.corpus.resolve(strict=True))
     output = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

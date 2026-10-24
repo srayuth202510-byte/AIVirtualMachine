@@ -241,7 +241,7 @@ fn real_isolated_worker_failure_recovery() {
         PathBuf::from(std::env::var("AIVM_WORKER_HOST_EVIDENCE").expect("evidence path required"));
     let limits = config.worker_limits.clone().unwrap();
     assert!(limits.memory_mb > 128);
-    let client = WorkerClient::new(local.worker_path.as_ref().unwrap());
+    let client = WorkerClient::from_config(&config).unwrap();
     let request = InferenceRequest {
         protocol_version: PROTOCOL_VERSION,
         request_id: "failure-recovery".into(),

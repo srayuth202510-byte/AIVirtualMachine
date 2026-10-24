@@ -121,3 +121,23 @@ Workflow [real-model-validation](../.github/workflows/model-host-validation.yml)
 
 ขั้นตอนเตรียม runner, register, เปิด service และตั้ง variables อัตโนมัติอยู่ใน
 [Recurring real-model validation](model-validation-runner.md)
+
+## Worker control hardening และคุณภาพโมเดล
+
+ดู [worker control hardening](model-control-hardening.md) สำหรับการทดสอบ sealed executable,
+checked cleanup, blocked controller, slow event consumer, cross-process quotas และ cache
+ตั้ง `AIVM_SUPERVISED_CONTROL=1` เมื่อรัน model-host validator เพื่อทดสอบ controller ใหม่
+เพิ่ม `--quality` เพื่อวัด model-only task oracles 6 งานทั้ง cache ปิด/เปิดด้วย client เดิม
+คะแนน task quality แยกจาก protocol/infrastructure gate และไม่ dispatch intents ที่สร้างขึ้น
+Detector holdout อยู่ใน `examples/detection/holdout.json`; ใช้ `eval-detection.py --corpus ...`
+เพื่อรายงาน FP/FN แยกจาก baseline โดยไม่เปลี่ยน labels ตามผลที่อยากได้
+
+รัน integration tests ของ controller รวม namespace cases บน Linux host ที่เตรียมไว้:
+
+```bash
+cargo test --locked -p aivm-model-worker --features llama,microvm \
+  --test hardening -- --include-ignored
+```
+
+MicroVM socket regression ใช้ Unix socket จริงใน staging path ที่ยาวเกิน `sun_path`
+และไม่ต้องมี KVM; อยู่ใน `cargo test -p aivm-sandbox --features microvm`

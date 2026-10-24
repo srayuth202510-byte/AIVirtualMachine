@@ -7,7 +7,7 @@ TIER=${1:-}
 MODEL=${2:-}
 PINS=${3:-"$HOME/.local/share/aivm/microvm/pins.json"}
 SCENARIO=${4:-baseline}
-case "$SCENARIO" in baseline|failure-recovery) ;; *) echo 'scenario must be baseline or failure-recovery' >&2; exit 2 ;; esac
+case "$SCENARIO" in baseline|failure-recovery|quality|quality-cache) ;; *) echo 'scenario must be baseline, failure-recovery, quality, or quality-cache' >&2; exit 2 ;; esac
 case "$TIER" in container|microvm|process_namespace) ;; *) echo 'usage: sh scripts/test-worker-host.sh container|microvm|process_namespace /path/model.gguf [pins.json] [baseline|failure-recovery]' >&2; exit 2 ;; esac
 [ -f "$MODEL" ] || { echo "model missing: $MODEL" >&2; exit 2; }
 cd "$PROJECT_DIR"
@@ -16,7 +16,7 @@ if [ "${5:-}" != --inside ]; then
     if [ "$TIER" = container ]; then
         exec systemd-run --user --wait --pipe --collect \
             --property='Delegate=cpu memory pids' --setenv="PATH=$PATH" --setenv="AIVM_WORKER_STRACE=${AIVM_WORKER_STRACE:-}" \
-            --setenv="AIVM_GGUF_SHA256=${AIVM_GGUF_SHA256:-}" \
+            --setenv="AIVM_GGUF_SHA256=${AIVM_GGUF_SHA256:-}" --setenv="AIVM_SUPERVISED_CONTROL=${AIVM_SUPERVISED_CONTROL:-0}" \
             --setenv="CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-1}" \
             --setenv="AIVM_WORKER_HOST_EVIDENCE=${AIVM_WORKER_HOST_EVIDENCE:-}" \
             --unit="aivm-worker-host-$(id -u)-$$" \
@@ -34,9 +34,9 @@ fi
 RUN_DIR=$(mktemp -d /tmp/aivm-worker-host-XXXXXX)
 CONFIG="$RUN_DIR/config.json"
 trap 'rm -rf "$RUN_DIR"' EXIT HUP INT TERM
-python3 - "$CONFIG" "$TIER" "$MODEL" "$PROJECT_DIR/target/debug/aivm-model-worker" "$PINS" "$CGROUP_ROOT" <<'PY'
+python3 - "$CONFIG" "$TIER" "$MODEL" "$PROJECT_DIR/target/debug/aivm-model-worker" "$PINS" "$CGROUP_ROOT" "$SCENARIO" <<'PY'
 import hashlib,json,os,pathlib,re,sys
-output,tier,model,worker,pins,cgroup=sys.argv[1:]
+output,tier,model,worker,pins,cgroup,scenario=sys.argv[1:]
 def digest(path):
     with open(path,'rb') as file:
         return hashlib.file_digest(file,'sha256').hexdigest()
@@ -55,10 +55,31 @@ config={'provider':'local','name':'host-model','local':{'model_path':str(pathlib
     'worker_path':worker,'worker_sha256':digest(worker),'worker_launcher':launcher,
     'ctx_size':512,'max_tokens':32,'threads':2,'gpu_layers':0},
     'worker_limits':{'max_context_tokens':512,'max_output_tokens':32,'timeout_ms':120000,'memory_mb':4096,'cpu_seconds':120,'pids_max':64,'storage_mb':5120}}
+if os.environ.get('AIVM_SUPERVISED_CONTROL') == '1':
+    config['local']['controller_path'] = worker
+    config['local']['controller_sha256'] = digest(worker)
+    config['worker_limits']['total_timeout_ms'] = 180000
+if scenario in ('quality', 'quality-cache'):
+    config['local']['controller_path'] = worker
+    config['local']['controller_sha256'] = digest(worker)
+    config['worker_limits']['total_timeout_ms'] = 180000
+    config['local']['max_tokens'] = 96
+    config['worker_limits']['max_output_tokens'] = 96
+    if scenario == 'quality-cache' and tier != 'process_namespace':
+        raise SystemExit('sealed model cache quality test requires process_namespace')
+    config['worker_limits']['host_resources'] = {'root': str(pathlib.Path(output).parent / 'quota'), 'cache_mb': 2048 if scenario == 'quality-cache' else 0}
 pathlib.Path(output).write_text(json.dumps(config))
 PY
 set --
 if [ -n "${AIVM_WORKER_STRACE:-}" ]; then set -- strace -f -o "$AIVM_WORKER_STRACE"; fi
+case "$SCENARIO" in
+    quality|quality-cache)
+        [ -n "${AIVM_WORKER_HOST_EVIDENCE:-}" ] || { echo 'quality requires AIVM_WORKER_HOST_EVIDENCE' >&2; exit 2; }
+        AIVM_WORKER_QUALITY_EVIDENCE="$AIVM_WORKER_HOST_EVIDENCE" AIVM_WORKER_HOST_CONFIG="$CONFIG" "$@" cargo test --locked -p aivm-model-worker --features llama,microvm \
+            --test quality real_model_quality_and_latency -- --exact --ignored --nocapture
+        exit $?
+        ;;
+esac
 if [ "$SCENARIO" = failure-recovery ]; then
     [ -n "${AIVM_WORKER_HOST_EVIDENCE:-}" ] || { echo 'failure-recovery requires AIVM_WORKER_HOST_EVIDENCE' >&2; exit 2; }
     # scratch อยู่ใต้ directory เฉพาะเทสต์; เก็บ serial ชั่วคราวเพื่อแยก OOM จาก error อื่น

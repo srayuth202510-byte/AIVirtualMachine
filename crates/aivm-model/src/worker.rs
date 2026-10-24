@@ -13,11 +13,18 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc,
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
+mod cache;
 mod control;
 mod launcher;
+mod resources;
+mod staging;
+pub use resources::HostResources;
+pub mod supervised;
 use control::{RequestControl, StagedConfig};
 
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -56,6 +63,9 @@ pub struct InferenceLimits {
     pub pids_max: u64,
     #[serde(default = "default_storage_mb")]
     pub storage_mb: u64,
+    /// โควตารวมของ operator สำหรับทุก process ที่ใช้ root เดียวกัน
+    #[serde(default)]
+    pub host_resources: HostResources,
 }
 
 fn default_storage_mb() -> u64 {
@@ -85,6 +95,7 @@ impl Default for InferenceLimits {
             cpu_seconds: default_cpu_seconds(),
             pids_max: default_pids_max(),
             storage_mb: default_storage_mb(),
+            host_resources: HostResources::default(),
         }
     }
 }
@@ -176,6 +187,16 @@ pub struct ControlPlaneUsage {
     pub execution_ms: u64,
     pub cleanup_ms: u64,
     pub total_ms: u64,
+}
+
+impl std::fmt::Display for ControlPlaneUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "preparation_ms={}; execution_ms={}; cleanup_ms={}; total_ms={}",
+            self.preparation_ms, self.execution_ms, self.cleanup_ms, self.total_ms
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -321,6 +342,49 @@ pub enum WorkerError {
     LimitExceeded(String),
     #[error("worker failed: {0}")]
     Failed(String),
+    #[error("inference deadline: {0}")]
+    Deadline(String),
+    #[error("inference cancelled: {0}")]
+    Cancelled(String),
+    #[error("staging cleanup failed: {0}")]
+    Cleanup(String),
+    #[error("staging cleanup failed: {cleanup}; previous failure: {source}")]
+    CleanupAfterFailure {
+        cleanup: String,
+        source: Box<WorkerError>,
+    },
+    #[error("inference resources unavailable: {0}")]
+    Resources(String),
+    #[error("{source}; phase={phase}; {usage}")]
+    Context {
+        source: Box<WorkerError>,
+        phase: String,
+        usage: ControlPlaneUsage,
+    },
+}
+
+impl WorkerError {
+    /// รหัสคงที่สำหรับ operator; ไม่ต้องแยกสาเหตุจากข้อความ stderr
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Protocol(_) => "protocol",
+            Self::InvalidRequest(_) => "invalid_request",
+            Self::LimitExceeded(_) => "limit_exceeded",
+            Self::Failed(_) => "worker_failed",
+            Self::Deadline(_) => "deadline",
+            Self::Cancelled(_) => "cancelled",
+            Self::Cleanup(_) | Self::CleanupAfterFailure { .. } => "cleanup_failed",
+            Self::Resources(_) => "resources_unavailable",
+            Self::Context { source, .. } => source.code(),
+        }
+    }
+
+    pub fn cause(&self) -> &Self {
+        match self {
+            Self::Context { source, .. } => source.cause(),
+            _ => self,
+        }
+    }
 }
 
 /// Control-plane client for the standalone worker executable.
@@ -330,6 +394,14 @@ pub enum WorkerError {
 pub struct WorkerClient {
     pub executable: PathBuf,
     cancelled: Arc<AtomicBool>,
+    controller: Option<supervised::SupervisedClient>,
+    cache: Option<Arc<cache::CachedModel>>,
+}
+
+struct RunContext<'a, 'b> {
+    control: &'a RequestControl<'b>,
+    image: &'a staging::WorkerImage,
+    cache: Option<&'a cache::CachedModel>,
 }
 
 impl WorkerClient {
@@ -337,7 +409,65 @@ impl WorkerClient {
         Self {
             executable: executable.into(),
             cancelled: Arc::new(AtomicBool::new(false)),
+            controller: None,
+            cache: None,
         }
+    }
+
+    /// ตรวจ controller ตอน boot และเก็บ snapshot เดิมไว้ตลอดอายุ client
+    pub fn from_config(config: &ModelConfig) -> Result<Self, WorkerError> {
+        let local = config
+            .local
+            .as_ref()
+            .ok_or_else(|| WorkerError::InvalidRequest("local config required".into()))?;
+        let mut client = Self::new(
+            local
+                .worker_path
+                .clone()
+                .ok_or_else(|| WorkerError::InvalidRequest("worker_path required".into()))?,
+        );
+        match (&local.controller_path, &local.controller_sha256) {
+            (Some(path), Some(pin)) => {
+                let controller = supervised::SupervisedClient::new(Path::new(path), pin)?;
+                client.cancelled = controller.cancellation_token();
+                client.controller = Some(controller);
+            }
+            (None, None) => (),
+            _ => {
+                return Err(WorkerError::InvalidRequest(
+                    "controller_path and controller_sha256 must be provided together".into(),
+                ))
+            }
+        }
+        client.cache = cache::CachedModel::prepare(config)?.map(Arc::new);
+        if let Some(controller) = client.controller.as_mut() {
+            controller.keep_cache(client.cache.clone())?;
+        }
+        Ok(client)
+    }
+
+    fn cached_config(&self, config: &ModelConfig) -> ModelConfig {
+        let mut config = config.clone();
+        if let Some(cache) = &self.cache {
+            if let Some(local) = config.local.as_mut() {
+                local.model_path = cache.child_path().to_string_lossy().into_owned();
+            }
+        }
+        config
+    }
+
+    pub fn start(
+        &self,
+        config: &ModelConfig,
+        request: InferenceRequest,
+        limits: &InferenceLimits,
+    ) -> Result<supervised::WorkerJob, WorkerError> {
+        self.controller
+            .as_ref()
+            .ok_or_else(|| {
+                WorkerError::InvalidRequest("event API requires a pinned controller".into())
+            })?
+            .start(&self.cached_config(config), request, limits)
     }
 
     /// Clone this token into another thread to cancel an active inference.
@@ -372,17 +502,77 @@ impl WorkerClient {
         limits: &InferenceLimits,
         on_delta: &mut dyn FnMut(&str) -> Result<(), WorkerError>,
     ) -> Result<InferenceResponse, WorkerError> {
+        let effective_config = self.cached_config(config);
+        let config = &effective_config;
+        if let Some(controller) = &self.controller {
+            let mut job = controller.start(config, request, limits)?;
+            loop {
+                let event = match job.next_event() {
+                    Ok(event) => event,
+                    Err(error) => {
+                        job.cancel();
+                        if !job.wait_for_cleanup(Duration::from_secs(3))? {
+                            return Err(WorkerError::CleanupAfterFailure {
+                                cleanup: "controller cleanup still pending after grace period"
+                                    .into(),
+                                source: Box::new(error),
+                            });
+                        }
+                        return Err(error);
+                    }
+                };
+                match event {
+                    supervised::WorkerEvent::Delta { text, .. } => {
+                        if let Err(error) = on_delta(&text) {
+                            job.cancel();
+                            if !job.wait_for_cleanup(Duration::from_secs(3))? {
+                                return Err(WorkerError::CleanupAfterFailure {
+                                    cleanup: "callback cancellation cleanup pending".into(),
+                                    source: Box::new(error),
+                                });
+                            }
+                            return Err(error);
+                        }
+                    }
+                    supervised::WorkerEvent::Complete { response } => return Ok(response),
+                    supervised::WorkerEvent::Error { error } => return Err(error),
+                }
+            }
+        }
+        if config
+            .local
+            .as_ref()
+            .is_some_and(|local| local.controller_path.is_some())
+        {
+            return Err(WorkerError::InvalidRequest(
+                "construct this client with WorkerClient::from_config".into(),
+            ));
+        }
         let control = RequestControl::new(&self.cancelled, limits.total_timeout_ms)?;
         let mut staged = None;
+        let mut permit = None;
         let result = (|| {
             control.check("validation")?;
             let token_count = request.prompt.split_whitespace().count();
             request.validate(limits, token_count)?;
-            if let Some(local) = config.local.as_ref() {
-                if let Some(expected) = local.worker_sha256.as_deref() {
-                    control.verify_worker(&self.executable, expected)?;
-                }
-            }
+            permit = Some(resources::Permit::acquire(limits, &control)?);
+            staged = Some(StagedConfig::new()?);
+            let stage = staged.as_ref().unwrap();
+            let executable = staging::prepare_worker(
+                &self.executable,
+                config
+                    .local
+                    .as_ref()
+                    .and_then(|local| local.worker_sha256.as_deref()),
+                stage.directory(),
+                &control,
+                config.local.as_ref().is_none_or(|local| {
+                    matches!(
+                        local.worker_launcher,
+                        WorkerLauncher::Process | WorkerLauncher::ProcessNamespace
+                    )
+                }),
+            )?;
             let mut effective_config = config.clone();
             effective_config.worker_limits = Some(limits.clone());
             let config = &effective_config;
@@ -391,20 +581,20 @@ impl WorkerClient {
                 launcher,
                 Some(WorkerLauncher::Process | WorkerLauncher::ProcessNamespace)
             );
-            staged = Some(write_ephemeral_config(
-                config,
-                limits,
-                stage_process_artifacts,
-                &control,
-            )?);
+            write_ephemeral_config(config, limits, stage_process_artifacts, &control, stage)?;
             let config_path = &staged.as_ref().unwrap().path;
+            let run = RunContext {
+                control: &control,
+                image: &executable,
+                cache: self.cache.as_deref(),
+            };
             match launcher {
                 Some(WorkerLauncher::Container { .. }) => {
-                    self.infer_sandboxed(config, config_path, &request, limits, on_delta, &control)
+                    self.infer_sandboxed(config, config_path, &request, limits, on_delta, &run)
                 }
                 #[cfg(feature = "microvm")]
                 Some(WorkerLauncher::Microvm { .. }) => {
-                    self.infer_sandboxed(config, config_path, &request, limits, on_delta, &control)
+                    self.infer_sandboxed(config, config_path, &request, limits, on_delta, &run)
                 }
                 _ => self.infer_with_config(
                     config_path,
@@ -412,7 +602,7 @@ impl WorkerClient {
                     limits,
                     matches!(launcher, Some(WorkerLauncher::ProcessNamespace)),
                     on_delta,
-                    &control,
+                    &run,
                 ),
             }
             .and_then(|mut response| {
@@ -448,8 +638,23 @@ impl WorkerClient {
             })
         })();
         let cleanup_started = Instant::now();
+        let cleanup = staged.as_mut().map_or(Ok(()), StagedConfig::cleanup);
         drop(staged);
-        control.finish(result, cleanup_started)
+        drop(permit);
+        // cleanup failure ทำให้ completion ล้มเสมอ และยังเก็บสาเหตุเดิมไว้ใน context
+        control.finish(
+            match cleanup {
+                Ok(()) => result,
+                Err(error) => Err(match result {
+                    Ok(_) => error,
+                    Err(source) => WorkerError::CleanupAfterFailure {
+                        cleanup: error.to_string(),
+                        source: Box::new(source),
+                    },
+                }),
+            },
+            cleanup_started,
+        )
     }
 
     fn infer_with_config(
@@ -459,10 +664,16 @@ impl WorkerClient {
         limits: &InferenceLimits,
         network_namespace: bool,
         on_delta: &mut dyn FnMut(&str) -> Result<(), WorkerError>,
-        control: &RequestControl<'_>,
+        run: &RunContext<'_, '_>,
     ) -> Result<InferenceResponse, WorkerError> {
+        let control = run.control;
+        let executable = run.image.child_path();
         control.check("worker launch")?;
-        let mut command = Command::new(&self.executable);
+        let mut command = Command::new(executable);
+        run.image.inherit(&mut command);
+        if let Some(cache) = run.cache {
+            cache.inherit(&mut command);
+        }
         command
             .arg("--config")
             .arg(config_path)
@@ -525,8 +736,8 @@ impl WorkerClient {
             .stderr
             .take()
             .ok_or_else(|| WorkerError::Failed("worker stderr unavailable".into()))?;
-        let payload =
-            serde_json::to_vec(&request).map_err(|e| WorkerError::Protocol(e.to_string()))?;
+        let payload = serde_json::to_vec(&request)
+            .map_err(|_| WorkerError::Protocol("invalid worker JSON".into()))?;
         // Write concurrently so a worker that never reads stdin cannot block the deadline.
         std::thread::spawn(move || {
             let mut stdin = stdin;
@@ -569,7 +780,7 @@ impl WorkerClient {
                             return Err(WorkerError::LimitExceeded("response bytes".into()));
                         }
                         serde_json::from_str::<serde_json::Value>(&line)
-                            .map_err(|e| WorkerError::Protocol(e.to_string()))
+                            .map_err(|_| WorkerError::Protocol("invalid worker JSON".into()))
                     });
                 let done = result
                     .as_ref()
@@ -583,19 +794,16 @@ impl WorkerClient {
         let response_result: Result<InferenceResponse, WorkerError> = (|| loop {
             control.check("worker response")?;
             if Instant::now() >= deadline {
-                return Err(WorkerError::Failed("worker deadline exceeded".into()));
+                return Err(WorkerError::Deadline("worker deadline exceeded".into()));
             }
             match receiver.recv_timeout(Duration::from_millis(10)) {
                 Ok(value) => {
                     // งบหรือ cancellation อาจเปลี่ยนระหว่างรอ frame ใน channel
                     control.check("worker response")?;
                     if Instant::now() >= deadline {
-                        return Err(WorkerError::Failed("worker deadline exceeded".into()));
+                        return Err(WorkerError::Deadline("worker deadline exceeded".into()));
                     }
                     let value = value?;
-                    if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
-                        return Err(WorkerError::Failed(error.into()));
-                    }
                     if value.get("request_id").and_then(serde_json::Value::as_str)
                         != Some(request.request_id.as_str())
                         || value
@@ -604,6 +812,9 @@ impl WorkerClient {
                             != Some(u64::from(PROTOCOL_VERSION))
                     {
                         return Err(WorkerError::Protocol("response identity mismatch".into()));
+                    }
+                    if value.get("error").is_some() {
+                        return Err(remote_worker_error(&value));
                     }
                     if let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str) {
                         if !request.stream {
@@ -615,7 +826,7 @@ impl WorkerClient {
                         continue;
                     }
                     let response: InferenceResponse = serde_json::from_value(value)
-                        .map_err(|e| WorkerError::Protocol(e.to_string()))?;
+                        .map_err(|_| WorkerError::Protocol("invalid worker JSON".into()))?;
                     response.validate(&request)?;
                     if request.stream && response.output.as_deref() != Some(streamed.as_str()) {
                         return Err(WorkerError::Protocol(
@@ -632,15 +843,21 @@ impl WorkerClient {
             Ok(response) => response,
             Err(error) => {
                 child.terminate();
-                let detail = stderr_reader.join().unwrap_or_default();
-                return Err(WorkerError::Failed(format!("{error}; {detail}")));
+                let diagnostic = stderr_reader.join().unwrap_or_default();
+                let summary = safe_worker_diagnostic(&diagnostic);
+                if matches!(error, WorkerError::Failed(_))
+                    && summary != "untrusted worker diagnostics withheld"
+                {
+                    return Err(WorkerError::Failed(summary.into()));
+                }
+                return Err(error);
             }
         };
         let status = loop {
             control.check("worker exit")?;
             if Instant::now() >= deadline {
-                return Err(WorkerError::Failed(
-                    "worker cancelled or exit deadline exceeded".into(),
+                return Err(WorkerError::Deadline(
+                    "worker exit deadline exceeded".into(),
                 ));
             }
             if let Some(status) = child
@@ -656,10 +873,57 @@ impl WorkerClient {
         let detail = stderr_reader.join().unwrap_or_default();
         if !status.success() {
             return Err(WorkerError::Failed(format!(
-                "worker exited with {status}: {detail}"
+                "worker exited with {status}: {}",
+                safe_worker_diagnostic(&detail)
             )));
         }
         Ok(response)
+    }
+}
+
+/// ข้อความจาก worker ไม่ใช่ operator diagnostics: ป้องกัน prompt/secret เข้า error logs
+fn safe_worker_diagnostic(text: &str) -> &'static str {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("sha256 mismatch") {
+        "artifact sha256 mismatch"
+    } else if [
+        "cannot allocate memory",
+        "memory allocation",
+        "failed to allocate",
+        "mmap failed",
+        "out of memory",
+        "tmpfs capacity exhausted",
+    ]
+    .iter()
+    .any(|part| lower.contains(part))
+    {
+        if lower.contains("tmpfs capacity exhausted") {
+            "model snapshot tmpfs capacity exhausted (RAM-backed staging)"
+        } else {
+            "model memory allocation failed"
+        }
+    } else {
+        "untrusted worker diagnostics withheld"
+    }
+}
+
+fn remote_worker_error(value: &serde_json::Value) -> WorkerError {
+    let text = value
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    match value
+        .get("error_kind")
+        .and_then(|value| serde_json::from_value::<WorkerError>(value.clone()).ok())
+    {
+        Some(WorkerError::Protocol(_)) => WorkerError::Protocol("worker rejected protocol".into()),
+        Some(WorkerError::InvalidRequest(_)) => {
+            WorkerError::InvalidRequest("worker rejected request".into())
+        }
+        Some(WorkerError::LimitExceeded(_)) => {
+            WorkerError::LimitExceeded("worker request limits".into())
+        }
+        _ => WorkerError::Failed(safe_worker_diagnostic(text).into()),
     }
 }
 
@@ -670,8 +934,8 @@ fn consume_delta(
     on_delta: &mut dyn FnMut(&str) -> Result<(), WorkerError>,
     control: &RequestControl<'_>,
 ) -> Result<(), WorkerError> {
-    let value: serde_json::Value =
-        serde_json::from_str(line).map_err(|e| WorkerError::Protocol(e.to_string()))?;
+    let value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|_| WorkerError::Protocol("invalid worker JSON".into()))?;
     if value.get("request_id").and_then(serde_json::Value::as_str)
         != Some(request.request_id.as_str())
         || value
@@ -681,8 +945,8 @@ fn consume_delta(
     {
         return Err(WorkerError::Protocol("stream identity mismatch".into()));
     }
-    if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
-        return Err(WorkerError::Failed(error.into()));
+    if value.get("error").is_some() {
+        return Err(remote_worker_error(&value));
     }
     if let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str) {
         // buffer อาจมีหลาย frame: ตรวจใหม่ก่อนส่งแต่ละ delta ให้ผู้เรียก
@@ -746,37 +1010,20 @@ fn write_ephemeral_config(
     limits: &InferenceLimits,
     stage_process_artifacts: bool,
     control: &RequestControl<'_>,
-) -> Result<StagedConfig, WorkerError> {
+    staged: &StagedConfig,
+) -> Result<(), WorkerError> {
     control.check("configuration")?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| WorkerError::Failed(format!("clock: {e}")))?
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("aivm-model-{}-{nonce}", std::process::id()));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .map_err(|e| WorkerError::Failed(format!("private directory: {e}")))?;
-    }
-    #[cfg(not(unix))]
-    std::fs::create_dir(&dir)
-        .map_err(|e| WorkerError::Failed(format!("private directory: {e}")))?;
-    let staged = StagedConfig {
-        path: dir.join("config.json"),
-    };
+    let dir = staged.directory();
     let mut staged_config = config.clone();
     if stage_process_artifacts {
-        stage_local_artifacts(&mut staged_config, &dir, limits, control)?;
+        stage_local_artifacts(&mut staged_config, dir, limits, control)?;
     }
     control.check("configuration")?;
     let bytes = serde_json::to_vec(&staged_config)
         .map_err(|e| WorkerError::Failed(format!("encode model config: {e}")))?;
     write_private(&staged.path, &bytes)?;
     control.check("configuration")?;
-    Ok(staged)
+    Ok(())
 }
 
 /// Process workers receive private copies of model inputs. The worker verifies
@@ -808,6 +1055,25 @@ fn stage_local_artifacts(
     let mut total = 0u64;
     for (index, path) in paths.into_iter().enumerate() {
         control.check("artifact staging")?;
+        #[cfg(target_os = "linux")]
+        if path.starts_with("/proc/") && path.contains("/fd/") {
+            let file = crate::artifact::open_regular(path)
+                .map_err(|_| WorkerError::InvalidRequest("invalid sealed model source".into()))?;
+            if !crate::artifact::is_sealed(&file) {
+                return Err(WorkerError::InvalidRequest(
+                    "model cache must be sealed".into(),
+                ));
+            }
+            let bytes = file
+                .metadata()
+                .map_err(|_| WorkerError::Failed("stat sealed model".into()))?
+                .len();
+            if bytes > maximum.saturating_sub(total) {
+                return Err(WorkerError::LimitExceeded("staging storage".into()));
+            }
+            total += bytes;
+            continue;
+        }
         let source = Path::new(path)
             .canonicalize()
             .map_err(|e| WorkerError::Failed(format!("artifact path: {e}")))?;

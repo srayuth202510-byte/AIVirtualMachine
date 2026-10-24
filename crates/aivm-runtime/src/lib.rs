@@ -143,6 +143,8 @@ pub struct ModelBlock {
     /// งบเวลารวมต่อ WorkerClient request; ต้องใช้ local worker เท่านั้น
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub host_resources: aivm_model::worker::HostResources,
     /// การตั้งค่าแบ็กเอนด์ local (ใช้เมื่อ provider = "local")
     #[serde(default)]
     pub local: Option<LocalModelConfig>,
@@ -160,6 +162,7 @@ impl Default for ModelBlock {
             provider: default_provider(),
             name: default_model(),
             total_timeout_ms: None,
+            host_resources: Default::default(),
             local: None,
             openai: None,
             anthropic: None,
@@ -277,6 +280,7 @@ impl VmConfig {
                     cpu_seconds: u64::from(resources.cpu) * 60,
                     pids_max: resources.pids_max,
                     storage_mb: resources.storage_mb,
+                    host_resources: self.model.host_resources.clone(),
                 }
             }),
         })
@@ -1248,6 +1252,16 @@ fn validate_model_security(config: &VmConfig) -> Result<(), RuntimeError> {
     if config.security.profile == "production" && local.worker_path.is_none() {
         return Err(RuntimeError::Config(
             "security.profile=production requires an isolated model.local.worker_path".into(),
+        ));
+    }
+    verify_optional_artifact_pin(
+        "controller",
+        &local.controller_path,
+        &local.controller_sha256,
+    )?;
+    if local.controller_path.is_some() && config.model.total_timeout_ms.is_none() {
+        return Err(RuntimeError::Config(
+            "controller_path requires model.total_timeout_ms".into(),
         ));
     }
     verify_artifact_pin("model", &local.model_path, &local.model_sha256)?;

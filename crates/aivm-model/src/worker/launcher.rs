@@ -9,11 +9,24 @@ impl WorkerClient {
         request: &InferenceRequest,
         limits: &InferenceLimits,
         on_delta: &mut dyn FnMut(&str) -> Result<(), WorkerError>,
-        control: &RequestControl<'_>,
+        run: &RunContext<'_, '_>,
     ) -> Result<InferenceResponse, WorkerError> {
+        let control = run.control;
+        let executable = &run.image.path;
         control.check("sandbox prerequisites")?;
         use aivm_sandbox::{ExecSpec, ResourceLimits};
-        let fail = |error: &dyn std::fmt::Display| WorkerError::Failed(error.to_string());
+        let fail = |error: &dyn std::fmt::Display| {
+            let text = error.to_string();
+            if text.contains("microvm run timed out") {
+                WorkerError::Deadline("microvm run timed out".into())
+            } else if text.contains("wall-clock timeout") {
+                WorkerError::Deadline("container wall-clock timeout".into())
+            } else if text.contains("artifact hash mismatch") {
+                WorkerError::Failed("artifact sha256 mismatch".into())
+            } else {
+                WorkerError::Failed(safe_worker_diagnostic(&text).into())
+            }
+        };
         let local = config
             .local
             .as_ref()
@@ -36,7 +49,7 @@ impl WorkerClient {
                 &request_path,
                 &serde_json::to_vec(&batch_request).map_err(|e| fail(&e))?,
             )?;
-            let executable = self.executable.canonicalize().map_err(|e| fail(&e))?;
+            let executable = executable.canonicalize().map_err(|e| fail(&e))?;
             let mut policy = aivm_policy::Policy::default();
             policy.process.allow = vec![executable.to_string_lossy().into_owned()];
             let mut guest_config = config.clone();
@@ -249,12 +262,13 @@ impl WorkerClient {
             if !outcome.success() {
                 return Err(WorkerError::Failed(format!(
                     "sandbox worker exit {:?}: {}",
-                    outcome.code, outcome.stderr
+                    outcome.code,
+                    safe_worker_diagnostic(&outcome.stderr)
                 )));
             }
             let mut response: InferenceResponse =
                 serde_json::from_str(outcome.stdout.trim().lines().last().unwrap_or(""))
-                    .map_err(|e| fail(&e))?;
+                    .map_err(|_| WorkerError::Protocol("invalid sandbox completion JSON".into()))?;
             if request.stream && response.output.as_deref() != Some(streamed.as_str()) {
                 return Err(WorkerError::Protocol(
                     "sandbox stream differs from final output".into(),

@@ -126,6 +126,11 @@ pub struct LocalModelConfig {
     /// Optional SHA-256 pin for the worker executable.
     #[serde(default)]
     pub worker_sha256: Option<String>,
+    /// Pinned control process สำหรับ deadline ที่ไม่รอ preparation/helper
+    #[serde(default)]
+    pub controller_path: Option<String>,
+    #[serde(default)]
+    pub controller_sha256: Option<String>,
     #[serde(default)]
     pub worker_launcher: worker::WorkerLauncher,
     /// จำนวนชั้นที่ยกไป GPU (-1 = ทั้งหมด)
@@ -198,6 +203,8 @@ impl Default for LocalModelConfig {
             config_sha256: None,
             worker_path: None,
             worker_sha256: None,
+            controller_path: None,
+            controller_sha256: None,
             worker_launcher: worker::WorkerLauncher::default(),
             gpu_layers: -1,
             ctx_size: default_ctx_size(),
@@ -283,12 +290,13 @@ pub struct WorkerModel {
 }
 
 impl WorkerModel {
-    fn new(config: ModelConfig, worker_path: String) -> Result<Self, ModelError> {
+    fn new(config: ModelConfig, _worker_path: String) -> Result<Self, ModelError> {
         let local = config.local.as_ref().ok_or_else(|| {
             ModelError::LoadFailed("local config required for worker model".into())
         })?;
         Ok(Self {
-            client: worker::WorkerClient::new(worker_path),
+            client: worker::WorkerClient::from_config(&config)
+                .map_err(|error| ModelError::LoadFailed(error.to_string()))?,
             limits: config
                 .worker_limits
                 .clone()

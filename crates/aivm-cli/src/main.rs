@@ -550,7 +550,7 @@ fn main() -> Result<(), AnyErr> {
             let config = VmConfig::from_file(&config).map_err(err)?;
             let model_config = config.inference_model_config().map_err(err)?;
             if let Some(local) = config.model.local.as_ref() {
-                if let Some(worker_path) = local.worker_path.as_deref() {
+                if local.worker_path.is_some() {
                     let request = aivm_model::worker::InferenceRequest {
                         protocol_version: aivm_model::worker::PROTOCOL_VERSION,
                         request_id: format!("reason-{}", std::process::id()),
@@ -561,7 +561,8 @@ fn main() -> Result<(), AnyErr> {
                         timeout_ms: 120_000,
                     };
                     let limits = model_config.worker_limits.clone().unwrap_or_default();
-                    let client = aivm_model::worker::WorkerClient::new(worker_path);
+                    let client = aivm_model::worker::WorkerClient::from_config(&model_config)
+                        .map_err(err)?;
                     if stream {
                         use std::io::Write;
                         client

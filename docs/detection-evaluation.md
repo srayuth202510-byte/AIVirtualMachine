@@ -105,3 +105,12 @@ supervisor สร้างทดแทนตาม policy แม้ไม่ม�
 
 Baseline นี้ยังไม่ยืนยันการตรวจ exploit จริง, ความทนต่อผู้โจมตีที่ควบคุม host,
 การโจมตีที่ไม่ผ่าน audit, ความแม่นยำบน production หรือ TEE/attestation
+
+## Holdout ที่แยกจาก baseline
+
+`examples/detection/holdout.json` เพิ่ม synthetic regression holdout 12 กรณี:
+งานปกติ, sensitive access ที่อนุญาต, quoted injection, rule tag ใหม่, slow probing และ rotation
+ใช้ `python3 scripts/eval-detection.py --corpus examples/detection/holdout.json --output <report.json>`
+รายงาน corpus hash, FP/FN และ ambiguous inputs ตามเดิม ไม่ merge คะแนนกับ baseline
+ชุดนี้ยังมี known blind spots โดยตั้งใจเพื่อกันการซ่อนข้อจำกัด และไม่ใช่ production traffic
+การวัดคุณภาพคำตอบด้วย oracle และ latency ของ worker อยู่ใน [control hardening](model-control-hardening.md)

@@ -324,7 +324,7 @@ fn host_tool(prog: &str, args: &[&str]) -> BootResult<String> {
 fn fc_put(sock: &Path, route: &str, body: &str) -> BootResult<()> {
     let spawn = |m: String| clean_err(SandboxError::Spawn(m));
     let mut s =
-        UnixStream::connect(sock).map_err(|e| spawn(format!("microvm api connect failed: {e}")))?;
+        connect_api_socket(sock).map_err(|e| spawn(format!("microvm api connect failed: {e}")))?;
     s.set_read_timeout(Some(Duration::from_secs(10))).ok();
     s.set_write_timeout(Some(Duration::from_secs(10))).ok();
     let req = format!(
@@ -383,6 +383,18 @@ fn fc_put(sock: &Path, route: &str, body: &str) -> BootResult<()> {
     Ok(())
 }
 
+/// ใช้ fd ของ directory เพื่อให้ sun_path สั้น แม้ TMPDIR ซ้อนหลาย controller
+/// File ถือ directory เดิมไว้จน connect เสร็จ; socket ยังอยู่ใต้ request staging ตามเดิม
+fn connect_api_socket(sock: &Path) -> std::io::Result<UnixStream> {
+    use std::os::fd::AsRawFd;
+    let invalid =
+        || std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid api socket path");
+    let directory = std::fs::File::open(sock.parent().ok_or_else(invalid)?)?;
+    let short = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+        .join(sock.file_name().ok_or_else(invalid)?);
+    UnixStream::connect(short)
+}
+
 /// หาตำแหน่ง slice ย่อยใน buffer (ไม่ใช้ memchr เพื่อไม่เพิ่ม dependency)
 fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
@@ -392,7 +404,7 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
 fn wait_socket(sock: &Path, timeout: Duration) -> BootResult<()> {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if UnixStream::connect(sock).is_ok() {
+        if connect_api_socket(sock).is_ok() {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -924,9 +936,22 @@ fn spawn_firecracker_direct(
     serial_file: std::fs::File,
     err_file: std::fs::File,
 ) -> BootResult<Child> {
-    Command::new(fc_bin)
+    let invalid = || {
+        clean_err(SandboxError::Spawn(
+            "invalid microvm api socket path".into(),
+        ))
+    };
+    let directory = sock.parent().ok_or_else(invalid)?;
+    let name = sock.file_name().ok_or_else(invalid)?;
+    // bind ด้วยชื่อสั้นจาก cwd ของ child เท่านั้น ไม่เปลี่ยน cwd ของ host process
+    // canonicalize executable ก่อนเปลี่ยน cwd เพื่อรักษาความหมายของ PATH แบบ relative
+    let executable = fc_bin
+        .canonicalize()
+        .map_err(|e| clean_err(SandboxError::Spawn(format!("firecracker path failed: {e}"))))?;
+    Command::new(executable)
+        .current_dir(directory)
         .arg("--api-sock")
-        .arg(sock)
+        .arg(name)
         .stdin(Stdio::null())
         .stdout(serial_file)
         .stderr(err_file)
@@ -1047,6 +1072,46 @@ fn spawn_jailer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_socket_supports_deep_request_staging_paths() {
+        use std::os::{fd::AsRawFd, unix::net::UnixListener};
+        // controller ซ้อน TMPDIR ต่อ request; sun_path ต้องไม่จำกัดความลึกของ staging
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("aivm-api-{}-{nonce}", std::process::id()));
+        let directory = root.join("nested-controller-staging-".repeat(5));
+        std::fs::create_dir_all(&directory).unwrap();
+        let owner = std::fs::File::open(&directory).unwrap();
+        let short = PathBuf::from(format!("/proc/self/fd/{}/api.sock", owner.as_raw_fd()));
+        let listener = UnixListener::bind(&short).unwrap();
+        let sock = directory.join("api.sock");
+        let server = std::thread::spawn(move || {
+            // readiness probe เปิด connection แรกโดยไม่มี HTTP request
+            drop(listener.accept().unwrap());
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            assert!(request.starts_with(b"PUT /actions HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let ready = wait_socket(&sock, Duration::from_millis(100));
+        assert!(ready.is_ok(), "deep socket readiness failed: {ready:?}");
+        fc_put(&sock, "/actions", "").unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     // quota guest = ค่าน้อยสุดระหว่าง cfg ระดับ VM กับ limits ระดับ task
     // (task ไม่มีทางได้เกินโควตาตัวเอง; ค่าประหลาดถูกบีบเข้าช่วง boot ได้)

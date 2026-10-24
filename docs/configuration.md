@@ -196,6 +196,12 @@ standalone worker process; หากไม่ตั้งค่า จะใช�
 
 ตั้งค่า `model.local` ต่อไปนี้สำหรับ production ที่ต้องการ deterministic output:
 
+`model.host_resources` คุมจำนวนงานและยอดจอง RAM/staging รวมของ participating clients
+ที่ใช้ root เดียวกัน; `cache_mb` เปิด sealed model cache แบบ opt-in สำหรับ process launcher
+`model.local.controller_path` และ `controller_sha256` เปิด control process แยกและต้องมี
+`model.total_timeout_ms` ดูค่า default, API และขอบเขต deadline ใน
+[worker control hardening](model-control-hardening.md)
+
 เมื่อใช้ `model.local.worker_path` สามารถตั้ง `model.total_timeout_ms` เพิ่มงบเวลารวม
 ต่อ request ได้ ค่าต้องมากกว่า 0; ค่าเริ่มต้นไม่ตั้ง ดูขอบเขต cooperative deadline,
 เวลา setup/cleanup และ `control_plane_usage` ใน [model runtime](model-runtime.md#streaming-cancellation-และ-verification)

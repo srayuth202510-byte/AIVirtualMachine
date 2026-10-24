@@ -44,8 +44,8 @@ AIVM คือ runtime สำหรับรัน open-weight models โดย�
 สถานะ Tier หมายถึงระดับการรองรับในโค้ด ไม่ใช่การรับรองความปลอดภัยของ host ทุกเครื่อง:
 Tier1 process เป็นค่าเริ่มต้น; Container และ MicroVM ต้องเตรียม host ตามคู่มือและ
 ตรวจผล probe/host validation สำหรับเครื่องเป้าหมาย; Hardware ยังเป็น experimental
-และ Generic QEMU ไม่ได้ยืนยัน TEE หรือ attestation. ดู [ผล host validation](./docs/host-validation-2026-10-22.md)
-ซึ่งเป็น snapshot ณ 22 ตุลาคม 2026 ที่ baseline `4a21a8c` พร้อม working-tree changes
+และ Generic QEMU ไม่ได้ยืนยัน TEE หรือ attestation. ดู [ผล host validation](./docs/host-validation-2026-10-25.md)
+ซึ่งเป็น snapshot ณ 25 ตุลาคม 2026 ที่ baseline `16e00f3` พร้อม working-tree changes
 ทดสอบ pinned GGUF loader และ worker ทั้งสาม tier ไม่ใช่ผล probe แบบ live ของทุก host.
 
 รายละเอียดการบังคับใช้และพฤติกรรมที่เปลี่ยนหลัง security review: [`docs/security-hardening.md`](./docs/security-hardening.md)
@@ -145,6 +145,7 @@ crates/
 ## เอกสาร
 
 - [`docs/dashboard.md`](./docs/dashboard.md) — audit dashboard, private SQLite storage และ Prometheus/JSON endpoints
+- [`docs/model-control-hardening.md`](./docs/model-control-hardening.md) — sealed worker/controller, checked cleanup, event deadlines, host quotas/cache และ quality evaluation
 - [`docs/model-validation-runner.md`](./docs/model-validation-runner.md) — เตรียม KVM runner และเปิด recurring real-model CI
 
 - [`docs/verification-and-transactions.md`](./docs/verification-and-transactions.md) — operator verifier contracts, completion receipts และ crash recovery ของ state/audit
@@ -156,7 +157,7 @@ crates/
 - [`docs/recovery-supervisor.md`](./docs/recovery-supervisor.md) — controller ภายนอกสำหรับงานบนเครื่องเดียว: dry-run, กักกัน, สร้างทดแทน, จำกัดการเกิดใหม่ และ drain
 - [`docs/detection-evaluation.md`](./docs/detection-evaluation.md) — พิสูจน์ขอบเขตการตรวจจับด้วย 30 สถานการณ์ วัด false positives/misses แยกจากการทำตาม policy
 - [`docs/immunity-lab.md`](./docs/immunity-lab.md) — ห้องทดลองกฎตรวจจับ: สร้างรูปแบบดัดแปลง ให้ Qwen เสนอ ทดสอบ holdout ออกรุ่น shadow และ rollback
-- [`docs/security-court-roadmap.md`](./docs/security-court-roadmap.md) — แผนงานศาลจำลองที่ยึดกฎเป็นหลัก มีฝ่ายทักท้วง ลูกขุน และผู้พิพากษาแบบ deterministic (ยังไม่ได้พัฒนา)
+- [`docs/security-court-roadmap.md`](./docs/security-court-roadmap.md) — แผนงานศาลจำลองที่ยึดกฎเป็นหลัก มีฝ่ายทักท้วง ลูกขุน และผู้พิพากษาแบบ deterministic (มี deterministic shadow evaluation; ยังไม่เชื่อม enforcement)
 
 - [`docs/audit-reviewer.md`](./docs/audit-reviewer.md) — วิเคราะห์ audit แบบอ่านอย่างเดียว ด้วยกฎและคำแนะนำจาก Qwen
 

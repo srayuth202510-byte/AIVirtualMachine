@@ -37,6 +37,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(enabled: bool) -> Self {
+        Self::with_model(enabled, None)
+    }
+    fn with_model(enabled: bool, model: Option<aivm_runtime::ModelBlock>) -> Self {
         let root = std::env::temp_dir().join(format!(
             "aivm-coding-{}-{}",
             std::process::id(),
@@ -69,7 +72,7 @@ impl Fixture {
                 path
             })
             .collect();
-        let config = VmConfig::from_yaml(&format!(
+        let mut config = VmConfig::from_yaml(&format!(
             r#"
 name: coding
 resources: {{cpu: 1, memory: 1GB, storage: 64MB}}
@@ -84,6 +87,14 @@ tools: {{allow: [cc, as, ld, "build:tests"]}}
             }
         ))
         .unwrap();
+        if let Some(model) = model {
+            config.model = model;
+            config.resources.memory = "4GB".into();
+            config.resources.storage = "5GB".into();
+            // 8k context ใช้ CPU มากกว่า short probes; คง threads=2 แต่ให้ CPU budget 240 วินาที
+            config.resources.cpu = 4;
+            config.filesystem.write = vec!["./workspace/src".into()];
+        }
         let runtime = Runtime::init(config, root.clone()).unwrap();
         std::fs::create_dir_all(runtime.workspace.join("src")).unwrap();
         std::fs::write(runtime.workspace.join("src/main.c"), BROKEN).unwrap();
@@ -401,4 +412,122 @@ int main(void) {{
         .join(".aivm-build/unreserved")
         .exists());
     assert_eq!(std::fs::read_to_string(private).unwrap(), "PRIVATE");
+}
+
+/// คุณภาพของ patch จากโมเดลจริงต้องวัดกับ source และ verifier ของ operator แยกจาก summary
+#[test]
+#[ignore = "requires pinned worker config and quality evidence path"]
+fn real_model_repairs_source_checked_by_an_independent_verifier() {
+    use sha2::{Digest, Sha256};
+    let config_path =
+        std::env::var("AIVM_WORKER_HOST_CONFIG").expect("pinned model config required");
+    let evidence =
+        std::env::var("AIVM_AGENT_QUALITY_EVIDENCE").expect("quality evidence path required");
+    let bytes = std::fs::read(config_path).unwrap();
+    let mut model_config: aivm_model::ModelConfig = serde_json::from_slice(&bytes).unwrap();
+    let local = model_config.local.as_mut().unwrap();
+    assert!(!local.model_sha256.is_empty());
+    assert!(local
+        .worker_sha256
+        .as_ref()
+        .is_some_and(|pin| !pin.is_empty()));
+    local.ctx_size = 8192;
+    local.max_tokens = 384;
+    let limits = model_config.worker_limits.as_mut().unwrap();
+    limits.max_context_tokens = 8192;
+    limits.max_output_tokens = 384;
+    let model_block = aivm_runtime::ModelBlock {
+        provider: model_config.provider.clone(),
+        name: model_config.name.clone(),
+        local: model_config.local.clone(),
+        total_timeout_ms: limits.total_timeout_ms,
+        host_resources: limits.host_resources.clone(),
+        ..Default::default()
+    };
+    let boot = std::time::Instant::now();
+    let mut fixture = Fixture::with_model(true, Some(model_block));
+    let boot_ms = boot.elapsed().as_millis();
+    let effective_model_config = fixture.runtime.config.inference_model_config().unwrap();
+    fixture.modify();
+    let broken = "int add(int a, int b) { return a - b; }\n";
+    let verifier="extern int add(int,int);\nint main(void) { for(int a=-8;a<=8;a++) for(int b=-8;b<=8;b++) if(add(a,b)!=a+b) return 1; return 0; }\n";
+    let source = fixture.runtime.workspace.join("src/main.c");
+    let verifier_path = fixture.runtime.workspace.join("verify.c");
+    std::fs::write(&source, broken).unwrap();
+    // verify.c อยู่นอก src ซึ่งเป็น write capability ของ agent
+    std::fs::write(&verifier_path, verifier).unwrap();
+    assert!(
+        fixture
+            .runtime
+            .gateway
+            .write(&mut fixture.runtime.cube, "verify.c", verifier)
+            .is_err(),
+        "operator verifier must be outside agent write authority"
+    );
+    let verify = |fixture: &mut Fixture| {
+        let steps=vec![
+            intent(&fixture.cc,&json!({"argv":["-pipe","-c","src/main.c","-o",".aivm-build/main.o"],"outputs":["main.o"]}).to_string()),
+            intent(&fixture.cc,&json!({"argv":["-pipe","-c","verify.c","-o",".aivm-build/verify.o"],"outputs":["verify.o"]}).to_string()),
+            intent(&fixture.ld,&json!({"argv":["-o",".aivm-build/tests","--dynamic-linker","/lib64/ld-linux-x86-64.so.2",fixture.crt[0],fixture.crt[1],".aivm-build/main.o",".aivm-build/verify.o","-lc",fixture.crt[2]],"outputs":["tests"]}).to_string()),
+            intent("build:tests","[]"),
+        ];
+        let mut rows = Vec::new();
+        for step in steps {
+            let request: ToolRequest = serde_json::from_str(&step).unwrap();
+            match fixture
+                .runtime
+                .gateway
+                .dispatch(&mut fixture.runtime.cube, &request)
+            {
+                Ok(result) => {
+                    let ok = result.ok;
+                    rows.push(serde_json::to_value(result).unwrap());
+                    if !ok {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    rows.push(json!({"ok":false,"error":error.to_string()}));
+                    break;
+                }
+            }
+        }
+        rows
+    };
+    let baseline = verify(&mut fixture);
+    assert_eq!(
+        baseline.len(),
+        4,
+        "baseline must compile and execute: {baseline:?}"
+    );
+    assert!(baseline[..3].iter().all(|row| row["ok"] == true));
+    assert_eq!(
+        baseline[3]["ok"], false,
+        "oracle must reject the known broken implementation"
+    );
+    let started = std::time::Instant::now();
+    let task="Fix add in src/main.c so it returns the integer sum of its two arguments. Read the source and update only src/main.c through filesystem tools. Do not add a main function. Do not modify verify.c. An independent operator verifier will compile your patch and check 289 input pairs after your bounded run.";
+    let run = fixture.runtime.run_agent(task, 3, Some(&fixture.root));
+    let elapsed_ms = started.elapsed().as_millis();
+    let after = std::fs::read(&source).unwrap();
+    let results = verify(&mut fixture);
+    let task_correct = results.len() == 4 && results.iter().all(|row| row["ok"] == true);
+    assert_eq!(
+        std::fs::read_to_string(verifier_path).unwrap(),
+        verifier,
+        "agent modified operator verifier"
+    );
+    let audit_records = AuditWriter::verify(fixture.root.join("audit.jsonl")).unwrap();
+    let (agent_run, error) = match run {
+        Ok(run) => (Some(run), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    let infrastructure_passed = error.is_none();
+    let report = json!({"schema":1,"scope":"One bounded live-model coding task; independent operator verifier checks 289 pairs via the real tool gateway/sandbox. No production success-rate claim.","config_sha256":format!("{:x}",Sha256::digest(&bytes)),"benchmark_source_sha256":format!("{:x}",Sha256::digest(include_bytes!("coding_workflow.rs"))),"effective_model_config":effective_model_config,"infrastructure_passed":infrastructure_passed,"baseline_rejected":true,"verifier_unchanged":true,"verifier_write_denied":true,"task_correct":task_correct,"source_changed":after!=broken.as_bytes(),"source_sha256":format!("{:x}",Sha256::digest(&after)),"client_boot_ms":boot_ms,"agent_elapsed_ms":elapsed_ms,"agent_run":agent_run,"agent_error":error,"verifier_results":results,"audit_records":audit_records});
+    std::fs::write(evidence, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    assert!(
+        infrastructure_passed,
+        "inspect agent quality evidence for infrastructure failure"
+    );
+    eprintln!("live agent patch quality: {task_correct}; independently verified, not inferred from model summary");
 }

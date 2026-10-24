@@ -87,8 +87,28 @@ def failure_evidence_passed(path):
         return False
 
 
+def quality_evidence_passed(path):
+    # งานผิดต้องสะท้อนคะแนน แต่ห้ามใช้ model-only benchmark เป็นหลักฐานว่า tool task สำเร็จ
+    try:
+        report = json.loads(Path(path).read_text())
+        expected = json.loads((PROJECT / "examples/model-quality.json").read_text())["cases"]
+        # malformed evidence ต้องคืน false เช่นเดียวกับ record ที่ขาด ห้าม crash หรือรับ bool เป็น count
+        if not isinstance(report, dict) or any(type(report.get(key)) is not int
+                for key in ("schema", "completed", "total", "task_correct")):
+            return False
+        rows = report["cases"]
+        return (isinstance(rows, list) and all(isinstance(row, dict) for row in rows)
+                and report["schema"] == 1 and report["completed"] == report["total"] == len(expected)
+                and [row["id"] for row in rows] == [row["id"] for row in expected]
+                and all(row["infrastructure_passed"] is True and type(row["task_correct"]) is bool for row in rows)
+                and report["task_correct"] == sum(row["task_correct"] for row in rows))
+    except (OSError,ValueError,TypeError,KeyError):
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--quality", action="store_true", help="Also measure fixed task oracles and cold/warm preparation with a reused client")
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--model-sha256", required=True)
     parser.add_argument("--pins", required=True, type=Path)
@@ -110,6 +130,9 @@ def main():
         "source_diff_sha256": hashlib.sha256(subprocess.check_output(
             ["git", "diff", "HEAD", "--binary"], cwd=PROJECT)).hexdigest(),
         "platform": platform.platform(),
+        "supervised_control": os.environ.get("AIVM_SUPERVISED_CONTROL") == "1",
+        "quality_requested": args.quality,
+        "meminfo": Path("/proc/meminfo").read_text(),
     }
     save("host.json", metadata)
     sources = [
@@ -117,16 +140,22 @@ def main():
         "crates/aivm-model/src/artifact.rs", "crates/aivm-model-worker/tests/worker.rs",
         "crates/aivm-model/src/worker.rs", "crates/aivm-model/src/worker/control.rs",
         "crates/aivm-model/src/worker/launcher.rs", "crates/aivm-model-worker/src/main.rs",
+        "crates/aivm-model/src/worker/staging.rs", "crates/aivm-model/src/worker/supervised.rs",
+        "crates/aivm-model/src/worker/resources.rs", "crates/aivm-model/src/worker/cache.rs",
+        "crates/aivm-model/src/lib.rs", "crates/aivm-model-worker/tests/hardening.rs",
+        "crates/aivm-model-worker/tests/quality.rs", "examples/model-quality.json",
         "crates/aivm-runtime/src/lib.rs",
         "crates/aivm-model-worker/tests/failure_recovery.rs",
         "crates/aivm-sandbox/src/lib.rs", "crates/aivm-sandbox/src/container.rs",
+        "crates/aivm-sandbox/src/microvm/boot.rs",
+        "crates/aivm-runtime/tests/coding_workflow.rs",
     ]
     save("validation-sources.json", {name: digest(PROJECT / name) for name in sources})
     results = []
     env = dict(os.environ, AIVM_GGUF=str(model), AIVM_GGUF_SHA256=args.model_sha256,
                CARGO_TARGET_DIR=str(PROJECT / "target"))
 
-    def run(name, command, exact=False, extra_env=None, evidence=None):
+    def run(name, command, exact=False, extra_env=None, evidence=None, quality=False):
         print(f"START {name}", flush=True)
         if evidence is not None:
             Path(evidence).unlink(missing_ok=True)
@@ -140,13 +169,16 @@ def main():
         content = (out / f"{name}.log").read_text(errors="replace")
         passed = code == 0 and (not exact or exact_test_passed(content))
         if evidence is not None:
-            passed = passed and failure_evidence_passed(evidence)
+            passed = passed and (quality_evidence_passed(evidence) if quality else failure_evidence_passed(evidence))
         row = {"name": name, "command": command, "returncode": code,
                "passed": passed, "elapsed_seconds": round(time.monotonic() - start, 2),
                "summaries": re.findall(r"^test result:.*$", content, re.M),
                "log": f"{name}.log"}
         if evidence is not None:
             row["evidence"] = Path(evidence).name
+            if quality and quality_evidence_passed(evidence):
+                score = json.loads(Path(evidence).read_text())
+                row["quality"] = {key: score.get(key) for key in ("task_correct", "total", "client_boot_ms")}
         results.append(row)
         save("results.json", results)
         print(f"END {name}: passed={passed}, seconds={row['elapsed_seconds']}", flush=True)
@@ -175,6 +207,11 @@ def main():
             run(f"failure-recovery-{tier}", ["sh", "scripts/test-worker-host.sh", tier,
                 str(model), str(pins), "failure-recovery"], exact=True,
                 extra_env={"AIVM_WORKER_HOST_EVIDENCE": str(evidence)}, evidence=evidence)
+        if args.quality:
+            for scenario in ("quality", "quality-cache"):
+                evidence = out / f"{scenario}.json"
+                run(scenario, ["sh", "scripts/test-worker-host.sh", "process_namespace", str(model), str(pins), scenario], exact=True,
+                    extra_env={"AIVM_WORKER_HOST_EVIDENCE": str(evidence)}, evidence=evidence, quality=True)
     finally:
         # ทดสอบเสร็จแล้วต้องยืนยันว่า fixture/pins/worker ต้นฉบับไม่ถูกเปลี่ยน
         after = snapshot(model, args.model_sha256, pins)

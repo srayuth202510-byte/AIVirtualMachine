@@ -43,7 +43,7 @@ impl<'a> RequestControl<'a> {
     pub(super) fn check(&self, phase: &'static str) -> Result<(), WorkerError> {
         self.phase.set(phase);
         if self.cancelled.load(Ordering::Relaxed) {
-            return Err(WorkerError::Failed(format!(
+            return Err(WorkerError::Cancelled(format!(
                 "inference cancelled during {phase}"
             )));
         }
@@ -51,7 +51,7 @@ impl<'a> RequestControl<'a> {
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            return Err(WorkerError::Failed(format!(
+            return Err(WorkerError::Deadline(format!(
                 "total inference deadline exceeded during {phase}"
             )));
         }
@@ -167,27 +167,10 @@ impl<'a> RequestControl<'a> {
             response.control_plane_usage = Some(usage.clone());
             Ok(response)
         });
-        result.map_err(|error| {
-            let detail = format!(
-                "phase={}; preparation_ms={}; execution_ms={}; cleanup_ms={}; total_ms={}",
-                self.phase.get(),
-                usage.preparation_ms,
-                usage.execution_ms,
-                usage.cleanup_ms,
-                usage.total_ms
-            );
-            match error {
-                WorkerError::Protocol(message) => {
-                    WorkerError::Protocol(format!("{message}; {detail}"))
-                }
-                WorkerError::InvalidRequest(message) => {
-                    WorkerError::InvalidRequest(format!("{message}; {detail}"))
-                }
-                WorkerError::LimitExceeded(message) => {
-                    WorkerError::LimitExceeded(format!("{message}; {detail}"))
-                }
-                WorkerError::Failed(message) => WorkerError::Failed(format!("{message}; {detail}")),
-            }
+        result.map_err(|error| WorkerError::Context {
+            source: Box::new(error),
+            phase: self.phase.get().into(),
+            usage,
         })
     }
 
@@ -221,18 +204,7 @@ impl<'a> RequestControl<'a> {
     }
 }
 
-pub(super) struct StagedConfig {
-    pub(super) path: PathBuf,
-}
-
-impl Drop for StagedConfig {
-    fn drop(&mut self) {
-        // มีเจ้าของตั้งแต่สร้าง directory สำเร็จ จึง cleanup ได้แม้ staging ถูกยกเลิก
-        if let Some(directory) = self.path.parent() {
-            let _ = std::fs::remove_dir_all(directory);
-        }
-    }
-}
+pub(super) use super::staging::StagedConfig;
 
 pub(super) fn open_artifact(path: &Path) -> Result<std::fs::File, WorkerError> {
     let mut options = std::fs::OpenOptions::new();
@@ -427,6 +399,7 @@ mod tests {
         {
             let _owner = StagedConfig {
                 path: directory.join("config.json"),
+                lease: None,
             };
             let result = stage_local_artifacts(
                 &mut config,

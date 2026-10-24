@@ -232,7 +232,7 @@ fn real_isolated_worker_host_validation() {
         timeout_ms: limits.timeout_ms,
         ..request()
     };
-    let client = WorkerClient::new(local.worker_path.as_ref().unwrap());
+    let client = WorkerClient::from_config(&config).unwrap();
     // งบรวมที่สั้นต้องหยุด preparation โดยไม่ส่ง token และใช้ client เดิมทำงานต่อได้
     let bounded = InferenceLimits {
         total_timeout_ms: Some(50),

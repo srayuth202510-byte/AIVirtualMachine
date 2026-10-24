@@ -20,6 +20,12 @@ fn main() {
 }
 
 fn run() -> Result<(), WorkerError> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--control")
+    {
+        return aivm_model::worker::supervised::serve_controller();
+    }
     let config_path = config_path()?;
     let config_text = std::fs::read_to_string(&config_path)
         .map_err(|e| WorkerError::Failed(format!("read model config: {e}")))?;

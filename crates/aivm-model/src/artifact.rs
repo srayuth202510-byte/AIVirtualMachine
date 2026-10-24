@@ -9,6 +9,15 @@ fn failed(message: impl Into<String>) -> ModelError {
 }
 
 pub(super) fn open_regular(path: &str) -> Result<File, ModelError> {
+    #[cfg(target_os = "linux")]
+    if path.starts_with("/proc/") && path.contains("/fd/") {
+        // ตาม descriptor path เฉพาะเมื่อ kernel ยืนยัน seals ครบ; regular symlink ยังถูกปฏิเสธ
+        let file = File::open(path).map_err(|_| failed("sealed artifact not readable"))?;
+        if is_sealed(&file) {
+            return Ok(file);
+        }
+        return Err(failed("descriptor artifact must be kernel sealed"));
+    }
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -28,6 +37,15 @@ pub(super) fn open_regular(path: &str) -> Result<File, ModelError> {
         return Err(failed("model too large"));
     }
     Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn is_sealed(file: &File) -> bool {
+    use std::os::fd::AsRawFd;
+    let required = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    // SAFETY: descriptor ยังมีเจ้าของ และ F_GET_SEALS ไม่แก้สถานะไฟล์
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    seals >= 0 && seals & required == required
 }
 
 pub(super) fn file_sha256(file: &mut File) -> Result<String, ModelError> {
@@ -94,7 +112,7 @@ impl PreparedModelFile {
             && meta.nlink() == 1
             && (meta.uid() == 0 || meta.uid() == unsafe { libc::geteuid() })
             && meta.mode() & 0o022 == 0;
-        let mut file = if read_only_staged {
+        let mut file = if read_only_staged || is_sealed(&source) {
             source
         } else {
             // ชื่อใช้แยกการจอง directory เท่านั้น ไม่ใช่ secret: create + 0700

@@ -42,6 +42,23 @@ class HostEvidenceTests(unittest.TestCase):
                 evidence.write_text(json.dumps(invalid))
                 self.assertFalse(HOST.failure_evidence_passed(evidence), invalid)
 
+    def test_quality_evidence_keeps_wrong_answers_separate_from_execution_failures(self):
+        # คะแนน 0/6 ที่รันครบยังเป็น evidence ที่ถูกต้อง แต่ 5/6 records หรือ infra ล้มไม่ผ่าน
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "quality.json"
+            cases = json.loads((HOST.PROJECT / "examples/model-quality.json").read_text())["cases"]
+            rows = [{"id": case["id"], "infrastructure_passed": True, "task_correct": False} for case in cases]
+            report = {"schema": 1, "completed": len(rows), "total": len(rows), "task_correct": 0, "cases": rows}
+            path.write_text(json.dumps(report))
+            self.assertTrue(HOST.quality_evidence_passed(path))
+            for invalid in ({**report, "cases": rows[:-1]}, {**report, "task_correct": len(rows)},
+                            {**report, "cases": [{**rows[0], "infrastructure_passed": False}] + rows[1:]},
+                            None, [], {**report, "cases": None}, {**report, "cases": [None]},
+                            {**report, "cases": [{}]}, {**report, "cases": {}},
+                            {**report, "task_correct": False}, {**report, "completed": float(len(rows))}):
+                path.write_text(json.dumps(invalid))
+                self.assertFalse(HOST.quality_evidence_passed(path))
+
     def test_container_service_preserves_incremental_build_setting_before_worker_pinning(self):
         # systemd ต้องไม่เปลี่ยน build identity แล้วทำให้ worker pin เก่าหลัง cargo test
         with tempfile.TemporaryDirectory() as temporary:

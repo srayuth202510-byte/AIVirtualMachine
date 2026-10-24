@@ -80,5 +80,18 @@ class ScenarioTests(unittest.TestCase):
         self.assertTrue(any({"clean-read", "allowed-secret-exfiltration"} <= group for group in groups))
 
 
+class HoldoutTests(unittest.TestCase):
+    def test_holdout_preserves_blind_spots_and_reports_metrics_separately(self):
+        # ห้ามปรับ label หรือกฎตามคำตอบโมเดลเพื่อทำคะแนน holdout ให้ผ่าน
+        subprocess.run(["cargo", "build", "-q", "-p", "aivm-cli"], cwd=evaluation.PROJECT, check=True, timeout=600)
+        with contextlib.redirect_stderr(io.StringIO()):
+            report = evaluation.evaluate(evaluation.PROJECT / "target/debug/aivm", corpus=evaluation.PROJECT / "examples/detection/holdout.json")
+        self.assertEqual(report["total"], 12)
+        self.assertEqual(report["policy_regressions"], [])
+        self.assertGreater(report["rules_risk_metrics"]["fn"], 0)
+        self.assertGreater(report["rules_risk_metrics"]["fp"], 0)
+        self.assertTrue(report["indistinguishable_normalized_inputs"])
+
+
 if __name__ == "__main__":
     unittest.main()
