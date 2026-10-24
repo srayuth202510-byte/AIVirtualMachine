@@ -4,10 +4,16 @@ import importlib.util
 import io
 import json
 import os
+from contextlib import closing
 from pathlib import Path
+import socket
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
+import urllib.error
+import urllib.request
 from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("aivm_dashboard", Path(__file__).with_name("aivm-dashboard.py"))
@@ -45,7 +51,9 @@ class DashboardTests(unittest.TestCase):
         self.log.write_text("".join(json.dumps(record) + "\n" for record in records))
 
     def request(self, path):
-        server = type("Server", (), {"store": self.store})()
+        self.store.sync()
+        importer = DASHBOARD.AuditImporter(self.store)
+        server = type("Server", (), {"importer": importer, "graphs": DASHBOARD.GraphCache()})()
         connection = Socket(path)
         with patch.object(DASHBOARD.DashboardHandler, "log_message"):
             DASHBOARD.DashboardHandler(connection, ("127.0.0.1", 1000), server)
@@ -293,7 +301,7 @@ class DashboardTests(unittest.TestCase):
 
     def test_legacy_database_migration_and_cli_environment_overrides(self):
         path = self.root / "legacy.db"
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("CREATE TABLE events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, type TEXT, path TEXT, reason TEXT)")
             connection.execute("INSERT INTO events (timestamp,type) VALUES (1,'legacy')")
         store = DASHBOARD.EventStore(path, self.log)
@@ -476,6 +484,299 @@ class DashboardTests(unittest.TestCase):
             with self.subTest(retention=retention), self.assertRaises(ValueError):
                 DASHBOARD.EventStore(self.root / "invalid.db", self.log, max_entries=retention)
         self.assertFalse((self.root / "invalid.db").exists())
+
+    def test_http_reads_only_published_snapshot_when_import_is_blocked(self):
+        # HTTP ต้องไม่แตะ DB หรือรอ importer lock แม้การอ่าน audit ยังไม่จบ
+        self.write([self.record(1)])
+        self.store.sync()
+        importer = DASHBOARD.AuditImporter(self.store, interval=0.05)
+        entered, release = threading.Event(), threading.Event()
+        def blocked_sync():
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("test did not release importer")
+        with patch.object(self.store, "sync", side_effect=blocked_sync), \
+                patch.object(self.store, "snapshot", side_effect=AssertionError("HTTP accessed SQLite")):
+            importer.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                server = type("Server", (), {"importer": importer, "graphs": DASHBOARD.GraphCache()})()
+                connection = Socket("/metrics.json")
+                with patch.object(DASHBOARD.DashboardHandler, "log_message"):
+                    DASHBOARD.DashboardHandler(connection, ("127.0.0.1", 1000), server)
+                data = json.loads(bytes(connection.output).split(b"\r\n\r\n", 1)[1])
+                self.assertEqual(data["total"], 1)
+                self.assertTrue(data["import_in_progress"])
+                self.assertTrue(data["importer_running"])
+            finally:
+                release.set()
+                importer.stop()
+
+    def test_snapshot_age_marks_stalled_import_and_stopped_importer_incomplete(self):
+        # อายุ snapshot ใช้ monotonic clock เพื่อไม่ให้เวลาเครื่องที่ปรับย้อนหลังซ่อน stale
+        self.write([self.record(1)])
+        self.store.sync()
+        with patch.object(DASHBOARD.time, "monotonic", return_value=100):
+            importer = DASHBOARD.AuditImporter(self.store)
+        with patch.object(importer.thread, "is_alive", return_value=True), \
+                patch.object(DASHBOARD.time, "monotonic", return_value=103):
+            snapshot = importer.snapshot()
+        self.assertEqual(snapshot["snapshot_age_seconds"], 3)
+        self.assertTrue(snapshot["snapshot_stale"])
+        self.assertFalse(snapshot["coverage_complete"])
+        self.assertTrue(snapshot["audit_read_success"])
+        self.assertIn("snapshot is stale", DASHBOARD.render_page(snapshot))
+        metrics = DASHBOARD.prometheus_metrics(snapshot)
+        self.assertIn("aivm_dashboard_snapshot_stale 1\n", metrics)
+        self.assertIn("aivm_dashboard_snapshot_age_seconds 3.000000\n", metrics)
+        importer.stop()
+        self.assertFalse(importer.snapshot()["importer_running"])
+        self.assertFalse(importer.snapshot()["coverage_complete"])
+
+    def test_background_imports_without_http_and_recovers_from_an_unexpected_error(self):
+        # thread ต้อง retry หลัง error และรับข้อมูลใหม่ได้แม้ไม่มีใครเปิดหน้า dashboard
+        self.write([self.record(1)])
+        importer = DASHBOARD.AuditImporter(self.store, interval=0.05)
+        original = self.store.sync
+        failed = threading.Event()
+        def fail_once():
+            if not failed.is_set():
+                failed.set()
+                raise RuntimeError("synthetic importer failure")
+            original()
+        with patch.object(self.store, "sync", side_effect=fail_once):
+            importer.start()
+            try:
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    snapshot = importer.snapshot()
+                    if snapshot["total"] == 1 and not snapshot["snapshot_stale"]:
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(failed.is_set())
+                self.assertEqual(snapshot["total"], 1)
+                self.assertEqual(snapshot["error"], "")
+                self.assertTrue(snapshot["coverage_complete"])
+            finally:
+                importer.stop()
+        self.assertFalse(importer.thread.is_alive())
+
+    def test_graph_cache_bounds_rendering_and_reuses_images(self):
+        # ขณะ render กราฟ คำขอใหม่ต้องไม่รอ lock และไม่เริ่ม render ซ้ำ
+        cache = DASHBOARD.GraphCache()
+        snapshot = {"categories": {"read": 1}}
+        entered, release = threading.Event(), threading.Event()
+        def render(_):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("test did not release graph")
+            return b"PNG"
+        with patch.object(DASHBOARD, "render_graph", side_effect=render) as mocked:
+            thread = threading.Thread(target=cache.get, args=(snapshot,))
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertIsNone(cache.get(snapshot))
+            finally:
+                release.set()
+                thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(cache.get(snapshot), b"PNG")
+            self.assertEqual(mocked.call_count, 1)
+        with patch.object(DASHBOARD.time, "monotonic", return_value=cache.expires + 1), \
+                patch.object(DASHBOARD, "render_graph", return_value=b"new PNG") as mocked:
+            self.assertEqual(cache.get({"categories": {"read": 2}}), b"new PNG")
+            mocked.assert_called_once()
+
+    def test_http_does_not_claim_unknown_snapshot_is_fresh(self):
+        # เริ่มก่อนอ่าน audit สำเร็จต้องรายงาน unknown/NaN โดยยังตอบ JSON มาตรฐานได้
+        importer = DASHBOARD.AuditImporter(self.store)
+        snapshot = importer.snapshot()
+        self.assertIsNone(snapshot["snapshot_age_seconds"])
+        self.assertTrue(snapshot["snapshot_stale"])
+        self.assertFalse(snapshot["coverage_complete"])
+        self.assertIn("aivm_dashboard_snapshot_age_seconds NaN\n", DASHBOARD.prometheus_metrics(snapshot))
+        json.dumps(snapshot, allow_nan=False)
+
+    def test_cached_entries_are_bounded_without_losing_retention_statistics(self):
+        # HTTP ต้องดึงแค่ 20 แถวสำหรับหน้าเว็บ แต่ statistics ยังนับครบ retained window
+        self.write([self.record(index) for index in range(40)])
+        store = DASHBOARD.EventStore(self.root / "larger/events.db", self.log, max_entries=30)
+        self.addCleanup(store.close)
+        store.sync()
+        snapshot = DASHBOARD.AuditImporter(store).snapshot()
+        self.assertEqual(snapshot["total"], 30)
+        self.assertEqual(snapshot["categories"], {"read": 30})
+        self.assertEqual(len(snapshot["entries"]), 20)
+        self.assertEqual(snapshot["entries"][0]["path"], "file-39")
+
+    def test_concurrency_settings_validate_cli_environment_and_nonfinite_values(self):
+        # ไม่รับ NaN/Infinity ที่ทำให้ timeout หรือ refresh ใช้การไม่ได้
+        with patch.dict(os.environ, {"AIVM_DASHBOARD_MAX_CLIENTS": "3",
+                                    "AIVM_DASHBOARD_REQUEST_TIMEOUT": "2",
+                                    "AIVM_DASHBOARD_REFRESH_INTERVAL": "1"}):
+            args = DASHBOARD.parse_args(["--max-clients", "4", "--refresh-interval", "0.25"])
+        self.assertEqual((args.max_clients, args.request_timeout, args.refresh_interval), (4, 2, 0.25))
+        for flag, values in (("--max-clients", ("0", "129")),
+                             ("--request-timeout", ("0", "61", "nan", "inf")),
+                             ("--refresh-interval", ("0", "61", "nan", "inf"))):
+            for value in values:
+                with self.subTest(flag=flag, value=value), patch("sys.stderr", io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        DASHBOARD.parse_args([flag, value])
+
+
+@unittest.skipUnless(os.environ.get("AIVM_DASHBOARD_HTTP_TESTS") == "1",
+                     "set AIVM_DASHBOARD_HTTP_TESTS=1 on a host permitting localhost sockets")
+class DashboardHTTPTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.log = self.root / "audit.jsonl"
+        self.log.write_text("")
+        self.db = self.root / "private/events.db"
+        self.store = DASHBOARD.EventStore(self.db, self.log, max_entries=3)
+        self.addCleanup(self.store.close)
+        self.importer = DASHBOARD.AuditImporter(self.store, interval=0.05, stale_after=0.15)
+        self.importer.start()
+        self.addCleanup(self.importer.stop)
+        self.server = DASHBOARD.DashboardServer(("127.0.0.1", 0), self.importer,
+                                               max_clients=2, request_timeout=0.5)
+        self.server_errors = []
+        self.server.handle_error = lambda *args: self.server_errors.append("unexpected HTTP handler error")
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02})
+        self.thread.start()
+        self.addCleanup(self.close_server)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        self.wait_for(lambda: self.importer.snapshot()["coverage_complete"])
+
+    def close_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(3)
+        self.assertFalse(self.thread.is_alive())
+        self.assertFalse(self.server.clients)
+        self.assertEqual(self.server_errors, [])
+
+    def wait_for(self, condition):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if condition():
+                return
+            time.sleep(0.01)
+        self.fail("condition did not become true")
+
+    def request(self, path="/metrics.json"):
+        with urllib.request.urlopen(self.url + path, timeout=2) as response:
+            return response.read()
+
+    def append(self, index):
+        with self.log.open("a") as output:
+            output.write(json.dumps(dict(timestamp=index, action="read", resource=f"file-{index}",
+                                         decision="deny", result="policy denied")) + "\n")
+
+    def slow_client(self):
+        client = socket.create_connection(self.server.server_address, timeout=2)
+        client.settimeout(4)
+        self.addCleanup(client.close)
+        client.sendall(b"GET /metrics.json HTTP/1.1\r\nHost: ")
+        return client
+
+    def test_real_sqlite_lock_keeps_http_responsive_and_reports_stale_then_recovers(self):
+        # ล็อก DB จริงและยืนยันว่า request ไม่รอ busy timeout 5 วินาทีของ importer
+        entered = threading.Event()
+        original = self.store._ingest
+        def blocked_ingest(line):
+            entered.set()
+            original(line)
+        lock = sqlite3.connect(self.db)
+        lock.execute("BEGIN IMMEDIATE")
+        with patch.object(self.store, "_ingest", side_effect=blocked_ingest):
+            try:
+                self.append(1)
+                self.assertTrue(entered.wait(2))
+                self.wait_for(lambda: self.importer.snapshot()["snapshot_stale"])
+                started = time.monotonic()
+                data = json.loads(self.request())
+                self.assertLess(time.monotonic() - started, 1)
+                self.assertTrue(data["snapshot_stale"])
+                self.assertTrue(data["import_in_progress"])
+                self.assertFalse(data["coverage_complete"])
+            finally:
+                lock.rollback()
+                lock.close()
+            self.wait_for(lambda: self.importer.snapshot()["total"] == 1)
+        self.assertTrue(json.loads(self.request())["coverage_complete"])
+
+    def test_slow_client_does_not_block_metrics_and_is_timed_out(self):
+        # Client ที่ส่ง header ไม่ครบต้องไม่ขวาง metrics และถูกปิดหลัง idle timeout
+        self.server.request_timeout = 2
+        client = self.slow_client()
+        self.wait_for(lambda: len(self.server.clients) == 1)
+        started = time.monotonic()
+        self.assertTrue(json.loads(self.request())["importer_running"])
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(client.recv(1024), b"")
+        self.wait_for(lambda: not self.server.clients)
+
+    def test_saturated_server_returns_503_and_releases_slots(self):
+        # จำนวน handler ต้องไม่เกินเพดาน และรับคำขอใหม่ได้หลังคืน slots
+        self.server.request_timeout = 2
+        clients = [self.slow_client(), self.slow_client()]
+        self.wait_for(lambda: len(self.server.clients) == 2)
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.request()
+        self.assertEqual(caught.exception.code, 503)
+        caught.exception.close()
+        for client in clients:
+            client.close()
+        self.wait_for(lambda: not self.server.clients)
+        self.assertTrue(json.loads(self.request())["coverage_complete"])
+
+    def test_shutdown_closes_idle_sockets_and_joins_handler_threads(self):
+        # การปิด server ต้องปลด handler เองโดยไม่รอ idle timeout ของ client
+        self.server.request_timeout = 5
+        client = self.slow_client()
+        self.wait_for(lambda: len(self.server.clients) == 1)
+        started = time.monotonic()
+        self.close_server()
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(client.recv(1024), b"")
+
+    def test_slow_graph_does_not_block_metrics_or_start_duplicate_renderers(self):
+        # แยก graph lock จาก snapshot lock และตอบ 503 ขณะมีผู้ render อยู่แล้ว
+        entered, release = threading.Event(), threading.Event()
+        image, errors = [], []
+        def render(_):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("test did not release graph")
+            return b"PNG"
+        def graph_request():
+            try:
+                image.append(self.request("/graph"))
+            except Exception as error:
+                errors.append(error)
+        with patch.object(DASHBOARD, "render_graph", side_effect=render) as mocked:
+            thread = threading.Thread(target=graph_request)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertTrue(json.loads(self.request())["coverage_complete"])
+                self.wait_for(lambda: len(self.server.clients) == 1)
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    self.request("/graph")
+                self.assertEqual(caught.exception.code, 503)
+                caught.exception.close()
+            finally:
+                release.set()
+                thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(image, [b"PNG"])
+            self.assertEqual(self.request("/graph"), b"PNG")
+            self.assertEqual(mocked.call_count, 1)
 
 
 if __name__ == "__main__":

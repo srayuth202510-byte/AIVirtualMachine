@@ -23,25 +23,46 @@ python3 scripts/aivm-dashboard.py \
 | `--host` | `AIVM_DASHBOARD_HOST` | `127.0.0.1` |
 | `--port` | `AIVM_DASHBOARD_PORT` | `8000` |
 | `--max-entries` | `AIVM_DASHBOARD_MAX_ENTRIES` | `500` |
+| `--refresh-interval` | `AIVM_DASHBOARD_REFRESH_INTERVAL` | `0.5` วินาที |
+| `--max-clients` | `AIVM_DASHBOARD_MAX_CLIENTS` | `8` |
+| `--request-timeout` | `AIVM_DASHBOARD_REQUEST_TIMEOUT` | `5` วินาที |
 
 CLI มีลำดับเหนือ environment; `--port 0` ให้ระบบเลือก port ว่างและพิมพ์ URL
+refresh interval รับ 0.05–60 วินาที, max clients รับ 1–128 และ request timeout
+รับ 0.1–60 วินาที Timeout จำกัดเวลาที่ socket รออ่าน/เขียนโดยไม่มีความคืบหน้า
+เมื่อ handler slots เต็มจะตอบ HTTP 503 พร้อม `Retry-After: 1` โดยไม่สร้าง thread เพิ่ม
 
 | Endpoint | ผล |
 |---|---|
 | `/` | HTML statistics และ 20 events ล่าสุด พร้อม escape ทุก audit field |
 | `/metrics` | Prometheus text exposition (`text/plain; version=0.0.4`) |
 | `/metrics.json` | สถิติ JSON สำหรับ client ที่ต้องการรูปแบบเดิม |
-| `/graph` | PNG chart เมื่อมี optional `matplotlib`; ถ้าไม่มีคืน HTTP 503 |
+| `/graph` | PNG chart เมื่อมี optional `matplotlib`; ถ้าไม่มีหรือกำลัง render อยู่คืน HTTP 503 |
 
 `/metrics` เปลี่ยนจาก JSON เป็น text; client JSON เดิมต้องใช้ `/metrics.json`
 รูปแบบอ้างอิง [Prometheus exposition specification](https://prometheus.io/docs/instrumenting/exposition_formats/)
 จำนวน events เป็น **gauge** เพราะ retention ทำให้ลดลงได้ ไม่ใช่ cumulative counter
 มี metrics สำหรับ audit read success, last refresh timestamp และ uptime จริง
 
-อ่านจากต้นไฟล์แล้วเดิน cursor ต่อครั้งละไม่เกิน 4 MiB ต่อ request โดยไม่จำกัด
+Importer thread เดียวอ่านจากต้นไฟล์แล้วเดิน cursor ต่อครั้งละไม่เกิน 4 MiB โดยไม่จำกัด
 จำนวน ALLOW lines ก่อนกรอง DENY/budget/quarantine จึงไม่ทำเหตุการณ์ที่ต้องเก็บ
 หลุดเพราะมี ALLOW จำนวนมากระหว่าง polls `max-entries` จำกัดเฉพาะ events ใน DB
 และ deduplicate ด้วย fingerprint ของ record ไม่ใช่จำนวนบรรทัดที่อ่าน
+
+Importer เริ่มพร้อม server และทำงานแม้ไม่มี HTTP clients โดยตรวจทุก
+`refresh-interval` วินาที และระบาย backlog ต่อทุก 0.01 วินาทีเมื่อยังมีข้อมูลครบ
+ให้ประมวลผล HTTP อ่าน snapshot ใน memory พร้อม 20 events ล่าสุด จึงไม่รอ
+SQLite busy timeout หรือ import batch และไม่สร้าง SQL transaction ตามจำนวน requests
+snapshot กับ graph cache ใช้ lock แยกจาก DB และกราฟมีผู้ render ได้ครั้งละหนึ่งราย
+cache กราฟนาน 5 วินาที; ถ้าหมวดหมู่และจำนวนไม่เปลี่ยนจะใช้ภาพเดิมต่อได้
+
+JSON/Prometheus เพิ่ม `snapshot_age_seconds`, `snapshot_stale`, `importer_running`
+และ `import_in_progress` อายุข้อมูลนับจาก import ที่สำเร็จล่าสุดด้วย monotonic clock
+ก่อนสำเร็จครั้งแรกอายุเป็น JSON `null` / Prometheus `NaN` snapshot ถือว่า stale
+เมื่อยังไม่เคยอ่านสำเร็จ, import ล้ม, importer หยุด หรืออายุเกิน
+`max(2, 3 × refresh-interval)` วินาที เมื่อ stale จะรายงาน `coverage_complete = false`
+หน้าเว็บแสดงอายุข้อมูลและคำเตือน ขณะ DB ติด lock ยังตอบ snapshot ก่อนหน้าได้
+และจะ retry import โดยใช้ cursor เดิมหลังปลด lock
 
 partial line รอจนเขียนจบ ส่วน malformed/oversized records (เกิน 1 MiB) ถูกข้าม
 พร้อม coverage warning เมื่อ rotate จะอ่าน inode เก่าที่เปิดไว้ให้จบก่อนเปลี่ยน
@@ -73,5 +94,13 @@ partial/oversized input, private storage, schema migration, traffic ระหว
 cursor/backlog, DB retry, truncation, rotation ระหว่างมี backlog และ restart
 หลัง retention purge/transaction failure
 
+ทดสอบ concurrency บน host ที่เปิด localhost socket ได้ด้วย `make test-dashboard-http`
+ครอบคลุม SQLite lock จริงขณะตอบ HTTP, slow header timeout, HTTP 503 เมื่อเต็ม,
+การคืน slots และกราฟที่ช้า CI เปิดชุดนี้แยกจาก unit tests ปกติ
+
 ผลทดสอบ HTTP server จริงต่อเนื่อง 30 นาที พร้อม restart 5 รอบและ live rotation
 14 รอบ อยู่ใน [รายงาน soak 24 ตุลาคม 2026](dashboard-soak-2026-10-24.md)
+
+ผลหลังแยก importer และเพิ่ม bounded HTTP อยู่ใน
+[รายงาน async validation](dashboard-async-validation-2026-10-24.md): traffic 2 นาที,
+DB lock latency, restart/rotation และ recovery หลัง `SIGKILL`

@@ -54,10 +54,14 @@
 
 ## CI (`.github/workflows/ci.yml` = `make ci`)
 
-fmt → clippy strict → `cargo test --workspace` → Python tests → clippy/test หลังฟีเจอร์ llama → clippy หลังฟีเจอร์ microvm →
+fmt → clippy strict → `cargo test --workspace` → Python tests → `make test-dashboard-http` → clippy/test หลังฟีเจอร์ llama → clippy หลังฟีเจอร์ microvm →
 `make test-microvm` → clippy/test หลังฟีเจอร์ hardware → demo → smoke.sh
 runner ระบุรุ่นเป็น `ubuntu-24.04` (เทสต์บูตจริงข้ามเมื่อไม่มี KVM/pins — unit/plumbing
 ที่เหลือยังจับของพังได้)
+
+`make test-dashboard-http` ต้องเปิด localhost socket ได้ ทดสอบ background importer,
+SQLite lock ขณะตอบ HTTP, slow clients, เพดาน handler และ graph cache
+unit tests ปกติข้ามเฉพาะเคส HTTP จริงจนกว่าจะตั้ง `AIVM_DASHBOARD_HTTP_TESTS=1`
 
 ## Pinned GGUF บน host จริง
 

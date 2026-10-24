@@ -115,7 +115,7 @@ config เขียนยังไงดู [`docs/configuration.md`](./docs/con
 
 ```bash
 make verify      # gate หลัก: fmt + clippy(-D warnings) + tests + demo
-make ci          # เท่า CI บน GitHub (= verify + e2e + llama + microvm + hardware)
+make ci          # เท่า CI บน GitHub (= verify + dashboard HTTP + e2e + llama + microvm + hardware)
 make test-coding # agent อ่าน/แก้ source + compiler/linker/test binary จริง
 make test-adv    # adversarial must-deny อย่างเดียว (สเปก §38)
 make test-microvm# MicroVM ทั้งสาย (บูตจริงถ้าตั้ง AIVM_MICROVM_PINS)

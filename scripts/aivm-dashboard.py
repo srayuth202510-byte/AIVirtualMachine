@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import socket
 import sqlite3
 import stat
 import threading
@@ -272,10 +273,11 @@ class EventStore:
             self._purge()
             self._save_cursor()
 
-    def snapshot(self):
+    def snapshot(self, entry_limit=None):
         with self.lock:
             rows = self.conn.execute("SELECT type, path, reason, timestamp FROM events "
-                                     "ORDER BY event_id DESC LIMIT ?", (self.max_entries,)).fetchall()
+                                     "ORDER BY event_id DESC LIMIT ?",
+                                     (self.max_entries if entry_limit is None else entry_limit,)).fetchall()
             categories = dict(self.conn.execute("SELECT type, COUNT(*) FROM events GROUP BY type"))
             return {
                 "total": sum(categories.values()), "categories": categories,
@@ -289,6 +291,97 @@ class EventStore:
                 "entries": [{"type": kind, "path": path or "", "reason": reason or "", "time": timestamp}
                             for kind, path, reason, timestamp in rows],
             }
+
+
+class AuditImporter:
+    """อ่าน DB ใน thread เดียว แล้วเผยแพร่ snapshot โดยไม่ถือ DB lock ขณะตอบ HTTP."""
+
+    def __init__(self, store, interval=0.5, stale_after=None):
+        if not math.isfinite(interval) or not 0.05 <= interval <= 60:
+            raise ValueError("refresh interval must be between 0.05 and 60 seconds")
+        self.store = store
+        self.interval = interval
+        self.stale_after = max(2.0, interval * 3) if stale_after is None else stale_after
+        if not math.isfinite(self.stale_after) or self.stale_after <= 0:
+            raise ValueError("stale threshold must be positive and finite")
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.cached = store.snapshot(entry_limit=20)
+        self.last_success = time.monotonic() if self.cached["audit_read_success"] else None
+        self.importing = False
+        self.thread = threading.Thread(target=self._run, name="audit-importer")
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread.ident is not None:
+            # รอ DB operation จบก่อนปิด connection เพื่อไม่ให้ thread ใช้ DB ที่ถูกปิด
+            self.thread.join()
+
+    def _run(self):
+        try:
+            while not self.stop_event.is_set():
+                with self.lock:
+                    self.importing = True
+                try:
+                    self.store.sync()
+                    snapshot = self.store.snapshot(entry_limit=20)
+                except Exception as error:
+                    # คงข้อมูลที่เผยแพร่แล้วไว้ และรายงานความล้มเหลวแทน thread ตายเงียบ
+                    with self.lock:
+                        snapshot = dict(self.cached, audit_read_success=False, coverage_complete=False,
+                                        error=f"Audit importer failed: {error}")
+                with self.lock:
+                    self.cached = snapshot
+                    self.importing = False
+                    if snapshot["audit_read_success"]:
+                        self.last_success = time.monotonic()
+                # ระบาย backlog ต่อได้แม้ไม่มี HTTP clients แต่เว้นจังหวะเมื่อรอ partial line
+                delay = (0.01 if snapshot["audit_read_success"] and snapshot["backlog_bytes"]
+                         and not snapshot["pending_bytes"] else self.interval)
+                self.stop_event.wait(delay)
+        finally:
+            with self.lock:
+                self.importing = False
+
+    def snapshot(self):
+        with self.lock:
+            snapshot = dict(self.cached)
+            age = None if self.last_success is None else max(0.0, time.monotonic() - self.last_success)
+            running = self.thread.is_alive() and not self.stop_event.is_set()
+            stale = (not running or not snapshot["audit_read_success"]
+                     or age is None or age > self.stale_after)
+            snapshot.update(snapshot_age_seconds=age, snapshot_stale=stale,
+                            importer_running=running, import_in_progress=self.importing,
+                            uptime_seconds=time.monotonic() - self.store.started)
+            if stale:
+                snapshot["coverage_complete"] = False
+            return snapshot
+
+
+class GraphCache:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.image = None
+        self.key = None
+        self.expires = 0.0
+
+    def get(self, snapshot):
+        # ให้มีผู้ render เพียงรายเดียว; คำขออื่นไม่รอจนใช้ HTTP slots หมด
+        if not self.lock.acquire(blocking=False):
+            return None
+        try:
+            key = tuple(sorted(snapshot["categories"].items()))
+            if self.image is not None and (time.monotonic() < self.expires or key == self.key):
+                return self.image
+            image = render_graph(snapshot)
+            self.image, self.key = image, key
+            self.expires = time.monotonic() + 5.0
+            return image
+        finally:
+            self.lock.release()
 
 
 def prometheus_metrics(snapshot):
@@ -317,6 +410,12 @@ def prometheus_metrics(snapshot):
     for key in ("backlog_bytes", "pending_bytes", "coverage_gaps", "coverage_complete"):
         lines += [f"# TYPE aivm_dashboard_{key} gauge",
                   f"aivm_dashboard_{key} {int(snapshot[key])}"]
+    for key in ("snapshot_stale", "importer_running", "import_in_progress"):
+        lines += [f"# TYPE aivm_dashboard_{key} gauge",
+                  f"aivm_dashboard_{key} {int(snapshot[key])}"]
+    age = snapshot["snapshot_age_seconds"]
+    lines += ["# TYPE aivm_dashboard_snapshot_age_seconds gauge",
+              f"aivm_dashboard_snapshot_age_seconds {'NaN' if age is None else format(age, '.6f')}"]
     return "\n".join(lines) + "\n"
 
 
@@ -327,6 +426,9 @@ def render_page(snapshot):
                                          for key in ("type", "path", "reason")) + "</tr>"
                          for event in snapshot["entries"][:20])
     warnings = [snapshot["error"], snapshot["coverage_warning"]]
+    age = snapshot["snapshot_age_seconds"]
+    if snapshot["snapshot_stale"]:
+        warnings.append("Audit snapshot is stale or has not been refreshed successfully.")
     if snapshot["backlog_bytes"]:
         warnings.append(f"Audit import pending: {snapshot['backlog_bytes']} bytes.")
     warning = "".join(f'<p role="alert">{html.escape(message)}</p>' for message in warnings if message)
@@ -343,6 +445,8 @@ th{{background:#f0f0f0}}td{{overflow-wrap:anywhere}}[role=alert]{{color:#a11}}
 <div class="container"><h2>Statistics</h2><table>
 <tr><th>Retained DENY/Budget events</th><td>{snapshot['total']}</td></tr>{category_rows}
 <tr><th>Uptime (seconds)</th><td>{int(snapshot['uptime_seconds'])}</td></tr></table></div>
+<div class="container"><p>Snapshot age: {'unknown' if age is None else f'{age:.2f} seconds'}
+ · Importer: {'running' if snapshot['importer_running'] else 'stopped'}</p></div>
 <div class="container"><h2>Recent Events (last 20)</h2><table>
 <tr><th>Type</th><th>Path</th><th>Reason</th></tr>{event_rows}</table></div>
 <div class="container"><h2>Graph</h2><p><a href="/graph">PNG chart of retained events</a></p></div>
@@ -366,14 +470,19 @@ def render_graph(snapshot):
 
 
 class DashboardHandler(http.server.BaseHTTPRequestHandler):
+    def handle(self):
+        try:
+            super().handle()
+        except (TimeoutError, BrokenPipeError, ConnectionResetError):
+            # Client ที่ปิดก่อนหรือไม่อ่าน response ต้องคืน slot โดยไม่กระทบคำขออื่น
+            self.close_connection = True
+
     def do_GET(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
         if path not in {"/", "/metrics", "/metrics.json", "/graph"}:
             self.send_error(404)
             return
-        store = self.server.store
-        store.sync()
-        snapshot = store.snapshot()
+        snapshot = self.server.importer.snapshot()
         if path == "/metrics":
             self.respond(200, "text/plain; version=0.0.4; charset=utf-8", prometheus_metrics(snapshot).encode())
         elif path == "/metrics.json":
@@ -381,9 +490,12 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.respond(200, "application/json; charset=utf-8", json.dumps(data, allow_nan=False).encode())
         elif path == "/graph":
             try:
-                image = render_graph(snapshot)
+                image = self.server.graphs.get(snapshot)
             except ImportError:
                 self.respond(503, "text/plain; charset=utf-8", b"Chart unavailable. Metrics and recent events are available.\n")
+                return
+            if image is None:
+                self.respond(503, "text/plain; charset=utf-8", b"Chart is being rendered. Retry shortly.\n")
                 return
             self.respond(200, "image/png", image)
         else:
@@ -399,12 +511,65 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-class DashboardServer(http.server.HTTPServer):
+class DashboardServer(http.server.ThreadingHTTPServer):
     allow_reuse_address = True
+    daemon_threads = False
 
-    def __init__(self, address, store):
-        self.store = store
+    def __init__(self, address, importer, max_clients=8, request_timeout=5.0):
+        if not 1 <= max_clients <= 128:
+            raise ValueError("max clients must be between 1 and 128")
+        if not math.isfinite(request_timeout) or not 0.1 <= request_timeout <= 60:
+            raise ValueError("request timeout must be between 0.1 and 60 seconds")
+        self.importer = importer
+        self.graphs = GraphCache()
+        self.request_timeout = request_timeout
+        self.slots = threading.BoundedSemaphore(max_clients)
+        self.clients_lock = threading.Lock()
+        self.clients = set()
         super().__init__(address, DashboardHandler)
+
+    def process_request(self, request, client_address):
+        request.settimeout(self.request_timeout)
+        if not self.slots.acquire(blocking=False):
+            # ปฏิเสธทันทีเมื่อเต็ม โดยไม่สร้าง thread หรือ queue ที่โตตามจำนวน clients
+            try:
+                request.settimeout(min(0.1, self.request_timeout))
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n"
+                                b"Retry-After: 1\r\nContent-Length: 0\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        with self.clients_lock:
+            self.clients.add(request)
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._release_client(request)
+            raise
+
+    def _release_client(self, request):
+        with self.clients_lock:
+            self.clients.discard(request)
+        self.slots.release()
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._release_client(request)
+
+    def server_close(self):
+        # ปลด socket ที่รออ่านก่อน join handler threads เพื่อปิด server ได้สะอาด
+        with self.clients_lock:
+            clients = list(self.clients)
+        for request in clients:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        super().server_close()
 
 
 def parse_args(argv=None):
@@ -414,20 +579,34 @@ def parse_args(argv=None):
     parser.add_argument("--host", default=os.environ.get("AIVM_DASHBOARD_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=os.environ.get("AIVM_DASHBOARD_PORT", "8000"))
     parser.add_argument("--max-entries", type=int, default=os.environ.get("AIVM_DASHBOARD_MAX_ENTRIES", "500"))
+    parser.add_argument("--refresh-interval", type=float,
+                        default=os.environ.get("AIVM_DASHBOARD_REFRESH_INTERVAL", "0.5"))
+    parser.add_argument("--max-clients", type=int, default=os.environ.get("AIVM_DASHBOARD_MAX_CLIENTS", "8"))
+    parser.add_argument("--request-timeout", type=float,
+                        default=os.environ.get("AIVM_DASHBOARD_REQUEST_TIMEOUT", "5"))
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error("port must be between 0 and 65535")
     if not 1 <= args.max_entries <= 10000:
         parser.error("max-entries must be between 1 and 10000")
+    if not math.isfinite(args.refresh_interval) or not 0.05 <= args.refresh_interval <= 60:
+        parser.error("refresh-interval must be between 0.05 and 60 seconds")
+    if not 1 <= args.max_clients <= 128:
+        parser.error("max-clients must be between 1 and 128")
+    if not math.isfinite(args.request_timeout) or not 0.1 <= args.request_timeout <= 60:
+        parser.error("request-timeout must be between 0.1 and 60 seconds")
     return args
 
 
 def main(argv=None):
     args = parse_args(argv)
     store = None
+    importer = None
     try:
         store = EventStore(args.db.expanduser(), args.log.expanduser(), args.max_entries)
-        with DashboardServer((args.host, args.port), store) as server:
+        importer = AuditImporter(store, args.refresh_interval)
+        with DashboardServer((args.host, args.port), importer, args.max_clients, args.request_timeout) as server:
+            importer.start()
             print(f"Dashboard: http://{args.host}:{server.server_port}", flush=True)
             print(f"Audit log: {store.audit_log}; DB: {store.database}", flush=True)
             server.serve_forever()
@@ -437,6 +616,8 @@ def main(argv=None):
         print(f"Dashboard failed: {error}")
         return 1
     finally:
+        if importer is not None:
+            importer.stop()
         if store is not None:
             store.close()
     return 0
