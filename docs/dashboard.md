@@ -72,3 +72,6 @@ continuation จะแจ้งว่าไม่ได้ import ประว�
 partial/oversized input, private storage, schema migration, traffic ระหว่าง polls,
 cursor/backlog, DB retry, truncation, rotation ระหว่างมี backlog และ restart
 หลัง retention purge/transaction failure
+
+ผลทดสอบ HTTP server จริงต่อเนื่อง 30 นาที พร้อม restart 5 รอบและ live rotation
+14 รอบ อยู่ใน [รายงาน soak 24 ตุลาคม 2026](dashboard-soak-2026-10-24.md)
