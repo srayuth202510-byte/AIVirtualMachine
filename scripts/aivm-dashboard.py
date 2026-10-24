@@ -87,6 +87,7 @@ class EventStore:
                           (self.max_entries,))
 
     def _open_source(self):
+        # ห้ามตาม symlink และเปิดแบบไม่รอ เพื่อให้ FIFO ปลอมไม่ทำให้ dashboard ค้าง
         fd = os.open(self.audit_log, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             os.close(fd)
@@ -108,6 +109,7 @@ class EventStore:
             if ((metadata.st_dev, metadata.st_ino) == (state["device"], state["inode"])
                     and metadata.st_size >= position
                     and os.pread(self.source.fileno(), len(tail), position-len(tail)) == tail):
+                # inode เดิมอย่างเดียวไม่พอ: เทียบท้ายข้อมูลด้วยเพื่อจับการเขียนทับที่ขนาดเท่าเดิม
                 self.source.seek(position)
                 self.cursor_tail = tail
                 self.discarding = state["discarding"]
@@ -253,6 +255,7 @@ class EventStore:
                 remaining -= len(line)
                 complete = line.endswith(b"\n")
                 if self.discarding:
+                    # หลัง restart ก็ต้องทิ้งบรรทัดที่ยาวเกินต่อจนจบ ห้ามตีความเศษท้ายเป็น event
                     self.discarding = not complete
                     continue
                 if len(line) > MAX_LINE_BYTES:

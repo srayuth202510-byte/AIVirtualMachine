@@ -107,7 +107,7 @@ impl Constraints {
         self
     }
 
-    /// Network constraint builders
+    /// กำหนดเงื่อนไขเครือข่ายที่ต้องตรวจร่วมกับข้อมูลคำขอจริง
     pub fn with_allowed_protocols(mut self, protocols: Vec<String>) -> Self {
         self.allowed_protocols = protocols;
         self
@@ -282,7 +282,7 @@ impl Capability {
                 }
             }
         }
-        // Network constraints
+        // allowlist ที่ระบุไว้ต้องมี protocol/port ให้ตรวจด้วย; ข้อมูลหายต้องปฏิเสธ
         if !self.constraints.allowed_protocols.is_empty() {
             if let Some(proto) = protocol {
                 if !self
@@ -319,6 +319,7 @@ impl Capability {
             }
         }
         if self.constraints.require_tls {
+            // เทียบ protocol โดยไม่สนตัวพิมพ์ แต่ไม่ยอมลดระดับจาก HTTPS เป็น HTTP
             if let Some(proto) = protocol {
                 if !proto.eq_ignore_ascii_case("https") {
                     return Err(CapabilityError::ScopeMismatch(
@@ -351,6 +352,7 @@ impl Capability {
             return false;
         }
         if resource == "network" {
+            // แยก host กับ port ก่อนเทียบ wildcard เพื่อกัน suffix ปลอมและการข้ามพอร์ต
             if let (Some((allowed_host, allowed_port)), Some((host, port))) =
                 (self.scope.rsplit_once(':'), scope.rsplit_once(':'))
             {
@@ -964,5 +966,248 @@ mod tests {
         assert!(scope_covers("/workspace", "/workspace"));
         assert!(scope_covers("/workspace", "/workspace/src/main.rs"));
         assert!(!scope_covers("/workspace", "/workspace2"));
+    }
+
+    #[test]
+    fn network_wildcards_respect_host_boundaries_and_ports() {
+        // wildcard ให้สิทธิ์เฉพาะ subdomain; โดเมนแม่และ suffix ที่หน้าตาคล้ายต้องไม่ผ่าน
+        let cap = Capability::new("network:fetch", "network", "*.example.com:443");
+        for (scope, allowed) in [
+            ("api.example.com:443", true),
+            ("deep.api.example.com:443", true),
+            ("example.com:443", false),
+            (".example.com:443", false),
+            ("evilexample.com:443", false),
+            ("api.example.com.evil:443", false),
+            ("api.example.com:80", false),
+            ("api.example.com", false),
+        ] {
+            assert_eq!(
+                cap.covers("network:fetch", "network", scope),
+                allowed,
+                "{scope}"
+            );
+        }
+        assert!(!cap.covers("network:connect", "network", "api.example.com:443"));
+        assert!(!cap.covers("network:fetch", "filesystem", "api.example.com:443"));
+        // wildcard ของ host ก็ยังต้องผูกกับพอร์ตที่อนุมัติไว้
+        let any_host = Capability::new("network:fetch", "network", "*:443");
+        assert!(any_host.covers("network:fetch", "network", "other.test:443"));
+        assert!(!any_host.covers("network:fetch", "network", "other.test:80"));
+    }
+
+    #[test]
+    fn network_protocol_allowlist_denies_missing_or_disallowed_protocol() {
+        let cap = Capability::new("network:fetch", "network", "example.com:443")
+            .with_constraints(Constraints::new().with_allowed_protocols(vec!["https".into()]));
+        let mut set = CapabilitySet::new(vec![cap]);
+        // ปฏิเสธแล้วต้องไม่กินโควต้า เพื่อให้คำขอที่ถูกต้องถัดไปยังใช้สิทธิ์ได้
+        for protocol in [None, Some("http"), Some("ftp")] {
+            let ctx = AuthorizationContext {
+                protocol,
+                ..Default::default()
+            };
+            assert!(set
+                .authorize_with_context("network:fetch", "network", "example.com:443", &ctx)
+                .is_err());
+            assert_eq!(set.caps[0].used_count, 0);
+        }
+        let ctx = AuthorizationContext {
+            protocol: Some("HTTPS"),
+            ..Default::default()
+        };
+        assert_eq!(
+            set.authorize_with_context("network:fetch", "network", "example.com:443", &ctx),
+            Ok(0)
+        );
+        assert_eq!(set.caps[0].used_count, 1);
+    }
+
+    #[test]
+    fn network_port_allowlist_denies_missing_or_disallowed_port() {
+        let cap = Capability::new("network:fetch", "network", "example.com:443")
+            .with_constraints(Constraints::new().with_allowed_ports(vec![443]));
+        let mut set = CapabilitySet::new(vec![cap]);
+        // scope ที่ตรงกันไม่ทดแทน port ใน context ที่เงื่อนไขกำหนดให้ตรวจ
+        for port in [None, Some(80), Some(0)] {
+            let ctx = AuthorizationContext {
+                port,
+                ..Default::default()
+            };
+            assert!(set
+                .authorize_with_context("network:fetch", "network", "example.com:443", &ctx)
+                .is_err());
+            assert_eq!(set.caps[0].used_count, 0);
+        }
+        let ctx = AuthorizationContext {
+            port: Some(443),
+            ..Default::default()
+        };
+        assert_eq!(
+            set.authorize_with_context("network:fetch", "network", "example.com:443", &ctx),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn tls_requirement_is_enforced_without_a_protocol_allowlist() {
+        let cap = Capability::new("network:fetch", "network", "example.com:443")
+            .with_constraints(Constraints::new().with_require_tls(true));
+        let mut set = CapabilitySet::new(vec![cap]);
+        // บังคับ TLS ได้เอง แม้ไม่มีรายการ allowed_protocols
+        for protocol in [None, Some("http")] {
+            let ctx = AuthorizationContext {
+                protocol,
+                ..Default::default()
+            };
+            assert!(set
+                .authorize_with_context("network:fetch", "network", "example.com:443", &ctx)
+                .is_err());
+            assert_eq!(set.caps[0].used_count, 0);
+        }
+        let ctx = AuthorizationContext {
+            protocol: Some("HTTPS"),
+            ..Default::default()
+        };
+        assert_eq!(
+            set.authorize_with_context("network:fetch", "network", "example.com:443", &ctx),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn response_size_budget_accepts_the_boundary_and_denies_overflow() {
+        let cap = Capability::new("network:fetch", "network", "example.com:443")
+            .with_constraints(Constraints::new().with_max_response_bytes(100));
+        let mut set = CapabilitySet::new(vec![cap]);
+        // ขนาดเกินแม้เพียงหนึ่งไบต์ต้องปฏิเสธโดยไม่เพิ่มจำนวนการใช้
+        let oversized = AuthorizationContext {
+            response_bytes: Some(101),
+            ..Default::default()
+        };
+        assert_eq!(
+            set.authorize_with_context("network:fetch", "network", "example.com:443", &oversized),
+            Err(CapabilityError::BudgetExceeded(100))
+        );
+        assert_eq!(set.caps[0].used_count, 0);
+        let exact = AuthorizationContext {
+            response_bytes: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(
+            set.authorize_with_context("network:fetch", "network", "example.com:443", &exact),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn authorization_falls_back_without_consuming_rejected_leases() {
+        // ใบหมดอายุ หมดโควต้า ผิด scope หรือไม่ผ่านเงื่อนไข ต้องไม่บังใบที่ใช้ได้จริง
+        let mut expired = Capability::new("read", "filesystem", "/workspace");
+        expired.expiration = Some(0);
+        let exhausted = Capability::new("read", "filesystem", "/workspace").with_max_uses(0);
+        let unrelated = Capability::new("read", "filesystem", "/other");
+        let constrained = Capability::new("read", "filesystem", "/workspace")
+            .with_constraints(Constraints::new().with_max_bytes(1));
+        let usable = Capability::new("read", "filesystem", "/workspace").with_max_uses(1);
+        let original = CapabilitySet::new(vec![expired, exhausted, unrelated, constrained, usable]);
+        for with_context in [false, true] {
+            let mut set = original.clone();
+            let result = if with_context {
+                set.authorize_with_context(
+                    "read",
+                    "filesystem",
+                    "/workspace/a",
+                    &AuthorizationContext {
+                        request_bytes: Some(2),
+                        ..Default::default()
+                    },
+                )
+            } else {
+                set.authorize("read", "filesystem", "/workspace/a")
+            };
+            assert_eq!(result, Ok(4));
+            assert_eq!(
+                set.caps
+                    .iter()
+                    .map(|cap| cap.used_count)
+                    .collect::<Vec<_>>(),
+                vec![0, 0, 0, 0, 1]
+            );
+        }
+    }
+
+    #[test]
+    fn broad_filesystem_scopes_are_denied_even_when_restored_directly() {
+        // ตรวจทั้งทาง grant และชุดสิทธิ์ที่อ่านกลับจาก storage ซึ่งอาจข้าม grant มา
+        for scope in ["", "/", "*", "/**", "/*", "*/**", "///"] {
+            let cap = Capability::new("read", "filesystem", scope);
+            let mut granted = CapabilitySet::default();
+            assert!(!granted.grant(cap.clone()), "{scope}");
+            assert!(granted.caps.is_empty());
+            let mut restored = CapabilitySet::new(vec![cap]);
+            assert!(restored
+                .authorize("read", "filesystem", "/etc/passwd")
+                .is_err());
+            assert!(restored
+                .authorize_with_context(
+                    "read",
+                    "filesystem",
+                    "/etc/passwd",
+                    &AuthorizationContext::default()
+                )
+                .is_err());
+            assert_eq!(restored.caps[0].used_count, 0);
+        }
+    }
+
+    #[test]
+    fn byte_accounting_saturates_instead_of_restoring_an_exhausted_budget() {
+        // overflow ต้องไม่วนกลับเป็นศูนย์จน lease ที่หมดงบกลับมาใช้ได้
+        let cap = Capability::new("read", "filesystem", "/workspace")
+            .with_constraints(Constraints::new().with_max_total_bytes(u64::MAX));
+        let mut set = CapabilitySet::new(vec![cap]);
+        let index = set.authorize("read", "filesystem", "/workspace/a").unwrap();
+        set.account_bytes(index, u64::MAX - 1);
+        assert_eq!(set.caps[index].bytes_remaining(), Some(1));
+        set.account_bytes(index, 10);
+        assert_eq!(set.caps[index].used_bytes, u64::MAX);
+        assert_eq!(set.caps[index].bytes_remaining(), Some(0));
+        assert_eq!(
+            set.caps[index].check_usable(),
+            Err(CapabilityError::BudgetExceeded(u64::MAX))
+        );
+        assert!(set.authorize("read", "filesystem", "/workspace/a").is_err());
+    }
+
+    #[test]
+    fn context_authorization_enforces_call_budget_without_max_uses() {
+        // max_calls ต้องบังคับได้แม้ไม่ได้ตั้ง max_uses และ DENY ไม่เพิ่มตัวนับ
+        for max_calls in [0, 1] {
+            let cap = Capability::new("read", "filesystem", "/workspace")
+                .with_constraints(Constraints::new().with_max_calls(max_calls));
+            let mut set = CapabilitySet::new(vec![cap]);
+            for _ in 0..max_calls {
+                assert_eq!(
+                    set.authorize_with_context(
+                        "read",
+                        "filesystem",
+                        "/workspace/a",
+                        &AuthorizationContext::default()
+                    ),
+                    Ok(0)
+                );
+            }
+            assert_eq!(
+                set.authorize_with_context(
+                    "read",
+                    "filesystem",
+                    "/workspace/a",
+                    &AuthorizationContext::default()
+                ),
+                Err(CapabilityError::BudgetExceeded(u64::from(max_calls)))
+            );
+            assert_eq!(set.caps[0].used_count, u64::from(max_calls));
+        }
     }
 }
