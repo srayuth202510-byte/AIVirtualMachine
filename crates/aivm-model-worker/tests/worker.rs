@@ -37,6 +37,10 @@ fn actual_worker_stream_matches_final_response() {
         .unwrap();
     assert_eq!(response.output.as_deref(), Some(output.as_str()));
     assert!(output.contains("hello"));
+    let usage = response
+        .control_plane_usage
+        .expect("client timing required");
+    assert!(usage.total_ms >= usage.preparation_ms + usage.execution_ms + usage.cleanup_ms);
 }
 
 struct Script(PathBuf);
@@ -92,12 +96,55 @@ fn response_does_not_allow_worker_to_outlive_deadline() {
     let mut req = request();
     req.timeout_ms = 150;
     let started = Instant::now();
-    assert!(client
+    let error = client
         .infer(&ModelConfig::default(), req, &InferenceLimits::default())
-        .unwrap_err()
-        .to_string()
-        .contains("deadline"));
-    assert!(started.elapsed() < Duration::from_secs(2));
+        .unwrap_err();
+    // เก็บ error จริงและเวลาที่ผ่านไปเมื่อ assertion ล้ม เพื่อวิเคราะห์ flake ได้
+    let elapsed = started.elapsed();
+    assert!(
+        error.to_string().contains("deadline"),
+        "{error}; elapsed={elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "{error}; elapsed={elapsed:?}"
+    );
+}
+
+#[test]
+fn total_deadline_rejects_a_lingering_worker_without_poisoning_the_client() {
+    // total budget ต้องตัดงานแม้ inference timeout ยังเหลือ และ client เดิมใช้ใหม่ได้
+    let response = r#"{"protocol_version":1,"request_id":"req-1","output":"ok","usage":{"input_tokens":1,"output_tokens":1,"elapsed_ms":0},"termination":"completed","artifact_verified":false,"applied_limits":[],"audit_id":null,"control_plane_usage":{"preparation_ms":999999,"execution_ms":999999,"cleanup_ms":999999,"total_ms":999999}}"#;
+    let body = format!("read request\nprintf '%s\\n' '{response}'");
+    let script = Script::new(&format!("{body}\nexec /bin/sleep 30"));
+    let client = WorkerClient::new(&script.0);
+    let limits = InferenceLimits {
+        total_timeout_ms: Some(50),
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let error = client
+        .infer(&ModelConfig::default(), request(), &limits)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("total inference deadline"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("total_ms="), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(1), "{error}");
+    std::fs::write(&script.0, format!("#!/bin/sh\n{body}\n")).unwrap();
+    let response = client
+        .infer(
+            &ModelConfig::default(),
+            request(),
+            &InferenceLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(response.output.as_deref(), Some("ok"));
+    assert!(
+        response.control_plane_usage.unwrap().total_ms < 999999,
+        "worker timing must be replaced by control-plane measurements"
+    );
 }
 
 #[test]
@@ -186,6 +233,25 @@ fn real_isolated_worker_host_validation() {
         ..request()
     };
     let client = WorkerClient::new(local.worker_path.as_ref().unwrap());
+    // งบรวมที่สั้นต้องหยุด preparation โดยไม่ส่ง token และใช้ client เดิมทำงานต่อได้
+    let bounded = InferenceLimits {
+        total_timeout_ms: Some(50),
+        ..limits.clone()
+    };
+    let mut early_deltas = 0;
+    let started = Instant::now();
+    let error = client
+        .infer_stream(&config, req.clone(), &bounded, &mut |_| {
+            early_deltas += 1;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("total inference deadline"),
+        "{error}"
+    );
+    assert_eq!(early_deltas, 0, "setup timeout must not release tokens");
+    assert!(started.elapsed() < Duration::from_secs(5), "{error}");
     // pin ผิดต้องปฏิเสธทุก tier และห้ามปล่อย token ออกมาก่อนตรวจผ่าน
     let mut wrong_pin = config.clone();
     let hash = &mut wrong_pin.local.as_mut().unwrap().model_sha256;

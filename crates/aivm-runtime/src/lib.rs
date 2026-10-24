@@ -140,6 +140,9 @@ pub struct ModelBlock {
     pub provider: String,
     #[serde(default = "default_model")]
     pub name: String,
+    /// งบเวลารวมต่อ WorkerClient request; ต้องใช้ local worker เท่านั้น
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_timeout_ms: Option<u64>,
     /// การตั้งค่าแบ็กเอนด์ local (ใช้เมื่อ provider = "local")
     #[serde(default)]
     pub local: Option<LocalModelConfig>,
@@ -156,6 +159,7 @@ impl Default for ModelBlock {
         Self {
             provider: default_provider(),
             name: default_model(),
+            total_timeout_ms: None,
             local: None,
             openai: None,
             anthropic: None,
@@ -268,6 +272,7 @@ impl VmConfig {
                     max_context_tokens: local.ctx_size,
                     max_output_tokens: local.max_tokens,
                     timeout_ms: 120_000,
+                    total_timeout_ms: self.model.total_timeout_ms,
                     memory_mb: resources.memory_mb,
                     cpu_seconds: u64::from(resources.cpu) * 60,
                     pids_max: resources.pids_max,
@@ -1211,6 +1216,24 @@ fn validate_model_security(config: &VmConfig) -> Result<(), RuntimeError> {
             )))
         }
     }
+    if let Some(timeout) = config.model.total_timeout_ms {
+        if timeout == 0 {
+            return Err(RuntimeError::Config(
+                "model.total_timeout_ms must be positive".into(),
+            ));
+        }
+        if config.model.provider != "local"
+            || config
+                .model
+                .local
+                .as_ref()
+                .is_none_or(|local| local.worker_path.is_none())
+        {
+            return Err(RuntimeError::Config(
+                "model.total_timeout_ms requires a local worker_path".into(),
+            ));
+        }
+    }
     if config.model.provider != "local" {
         return Ok(());
     }
@@ -1462,6 +1485,33 @@ capabilities:
         std::fs::write(&manifest, b"{\"model_sha256\":\"bad\"}").unwrap();
         assert!(validate_model_security(&cfg).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn total_inference_budget_is_forwarded_and_cannot_be_silently_ignored() {
+        // รับ config จาก YAML จริงและห้ามรับ budget เมื่อ backend ไม่มี worker บังคับใช้
+        let mut cfg = VmConfig::from_yaml("name: bounded\nmodel:\n  provider: local\n  total_timeout_ms: 2500\n  local:\n    model_path: unused.gguf\n    worker_path: unused-worker\n").unwrap();
+        let model = cfg.inference_model_config().unwrap();
+        assert_eq!(model.worker_limits.unwrap().total_timeout_ms, Some(2500));
+        cfg.model.total_timeout_ms = Some(0);
+        assert!(cfg
+            .inference_model_config()
+            .unwrap_err()
+            .to_string()
+            .contains("must be positive"));
+        cfg.model.total_timeout_ms = Some(2500);
+        cfg.model.local.as_mut().unwrap().worker_path = None;
+        assert!(cfg
+            .inference_model_config()
+            .unwrap_err()
+            .to_string()
+            .contains("worker_path"));
+        cfg.model.provider = "echo".into();
+        assert!(cfg
+            .inference_model_config()
+            .unwrap_err()
+            .to_string()
+            .contains("worker_path"));
     }
 
     fn test_runtime(tag: &str) -> (Runtime, PathBuf) {

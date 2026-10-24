@@ -16,7 +16,9 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+mod control;
 mod launcher;
+use control::{RequestControl, StagedConfig};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_PROMPT_BYTES: usize = 4 * 1024 * 1024;
@@ -43,6 +45,9 @@ pub struct InferenceLimits {
     pub max_context_tokens: usize,
     pub max_output_tokens: usize,
     pub timeout_ms: u64,
+    /// งบเวลารวมตั้งแต่ control plane เริ่มเตรียม request; None ใช้ timeout ราย worker ตามเดิม
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_timeout_ms: Option<u64>,
     #[serde(default = "default_memory_mb")]
     pub memory_mb: u64,
     #[serde(default = "default_cpu_seconds")]
@@ -75,6 +80,7 @@ impl Default for InferenceLimits {
             max_context_tokens: 8192,
             max_output_tokens: 2048,
             timeout_ms: 120_000,
+            total_timeout_ms: None,
             memory_mb: default_memory_mb(),
             cpu_seconds: default_cpu_seconds(),
             pids_max: default_pids_max(),
@@ -104,6 +110,11 @@ impl InferenceRequest {
         if limits.memory_mb == 0 || limits.cpu_seconds == 0 || limits.pids_max == 0 {
             return Err(WorkerError::InvalidRequest(
                 "resource limits must be positive".into(),
+            ));
+        }
+        if limits.total_timeout_ms == Some(0) {
+            return Err(WorkerError::InvalidRequest(
+                "total timeout must be positive".into(),
             ));
         }
         if self.protocol_version != PROTOCOL_VERSION {
@@ -155,6 +166,16 @@ pub struct InferenceResponse {
     pub audit_id: Option<String>,
     #[serde(default)]
     pub verification: InferenceVerification,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_plane_usage: Option<ControlPlaneUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlPlaneUsage {
+    pub preparation_ms: u64,
+    pub execution_ms: u64,
+    pub cleanup_ms: u64,
+    pub total_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -351,78 +372,84 @@ impl WorkerClient {
         limits: &InferenceLimits,
         on_delta: &mut dyn FnMut(&str) -> Result<(), WorkerError>,
     ) -> Result<InferenceResponse, WorkerError> {
-        if self.cancelled.load(Ordering::Relaxed) {
-            return Err(WorkerError::Failed("inference cancelled".into()));
-        }
-        let token_count = request.prompt.split_whitespace().count();
-        request.validate(limits, token_count)?;
-        if let Some(local) = config.local.as_ref() {
-            if let Some(expected) = local.worker_sha256.as_deref() {
-                let path = self
-                    .executable
-                    .to_str()
-                    .ok_or_else(|| WorkerError::Failed("worker path is not UTF-8".into()))?;
-                crate::verify_model_file(path, expected)
-                    .map_err(|e| WorkerError::Failed(format!("worker verification failed: {e}")))?;
-            }
-        }
-        let mut effective_config = config.clone();
-        effective_config.worker_limits = Some(limits.clone());
-        let config = &effective_config;
-        let launcher = config.local.as_ref().map(|local| &local.worker_launcher);
-        let stage_process_artifacts = matches!(
-            launcher,
-            Some(WorkerLauncher::Process | WorkerLauncher::ProcessNamespace)
-        );
-        let config_path = write_ephemeral_config(config, limits, stage_process_artifacts)?;
-        let result = match launcher {
-            Some(WorkerLauncher::Container { .. }) => {
-                self.infer_sandboxed(config, &config_path, &request, limits, on_delta)
-            }
-            #[cfg(feature = "microvm")]
-            Some(WorkerLauncher::Microvm { .. }) => {
-                self.infer_sandboxed(config, &config_path, &request, limits, on_delta)
-            }
-            _ => self.infer_with_config(
-                &config_path,
-                request.clone(),
-                limits,
-                matches!(launcher, Some(WorkerLauncher::ProcessNamespace)),
-                on_delta,
-            ),
-        }
-        .and_then(|mut response| {
-            response.validate(&request)?;
-            if matches!(launcher, Some(WorkerLauncher::ProcessNamespace)) {
-                response.applied_limits.push("network-namespace".into());
-            }
+        let control = RequestControl::new(&self.cancelled, limits.total_timeout_ms)?;
+        let mut staged = None;
+        let result = (|| {
+            control.check("validation")?;
+            let token_count = request.prompt.split_whitespace().count();
+            request.validate(limits, token_count)?;
             if let Some(local) = config.local.as_ref() {
-                if config.provider == "local"
-                    && !local.model_sha256.is_empty()
-                    && !response.artifact_verified
-                {
-                    return Err(WorkerError::Protocol(
-                        "worker did not verify pinned model".into(),
-                    ));
+                if let Some(expected) = local.worker_sha256.as_deref() {
+                    control.verify_worker(&self.executable, expected)?;
                 }
             }
-            let pinned = config.local.as_ref().is_some_and(|local| {
-                !local.model_sha256.is_empty()
-                    && local
-                        .worker_sha256
-                        .as_ref()
-                        .is_some_and(|hash| !hash.is_empty())
-            });
-            let result = response.verify(&request, pinned);
-            response.verification = InferenceVerification {
-                status: result.status,
-                checks: result.checks,
-                output_sha256: result.output_sha256,
-            };
-            Ok(response)
-        });
-        let _ = std::fs::remove_dir_all(config_path.parent().unwrap());
-        result
+            let mut effective_config = config.clone();
+            effective_config.worker_limits = Some(limits.clone());
+            let config = &effective_config;
+            let launcher = config.local.as_ref().map(|local| &local.worker_launcher);
+            let stage_process_artifacts = matches!(
+                launcher,
+                Some(WorkerLauncher::Process | WorkerLauncher::ProcessNamespace)
+            );
+            staged = Some(write_ephemeral_config(
+                config,
+                limits,
+                stage_process_artifacts,
+                &control,
+            )?);
+            let config_path = &staged.as_ref().unwrap().path;
+            match launcher {
+                Some(WorkerLauncher::Container { .. }) => {
+                    self.infer_sandboxed(config, config_path, &request, limits, on_delta, &control)
+                }
+                #[cfg(feature = "microvm")]
+                Some(WorkerLauncher::Microvm { .. }) => {
+                    self.infer_sandboxed(config, config_path, &request, limits, on_delta, &control)
+                }
+                _ => self.infer_with_config(
+                    config_path,
+                    request.clone(),
+                    limits,
+                    matches!(launcher, Some(WorkerLauncher::ProcessNamespace)),
+                    on_delta,
+                    &control,
+                ),
+            }
+            .and_then(|mut response| {
+                control.check("response verification")?;
+                response.validate(&request)?;
+                if matches!(launcher, Some(WorkerLauncher::ProcessNamespace)) {
+                    response.applied_limits.push("network-namespace".into());
+                }
+                if let Some(local) = config.local.as_ref() {
+                    if config.provider == "local"
+                        && !local.model_sha256.is_empty()
+                        && !response.artifact_verified
+                    {
+                        return Err(WorkerError::Protocol(
+                            "worker did not verify pinned model".into(),
+                        ));
+                    }
+                }
+                let pinned = config.local.as_ref().is_some_and(|local| {
+                    !local.model_sha256.is_empty()
+                        && local
+                            .worker_sha256
+                            .as_ref()
+                            .is_some_and(|hash| !hash.is_empty())
+                });
+                let result = response.verify(&request, pinned);
+                response.verification = InferenceVerification {
+                    status: result.status,
+                    checks: result.checks,
+                    output_sha256: result.output_sha256,
+                };
+                Ok(response)
+            })
+        })();
+        let cleanup_started = Instant::now();
+        drop(staged);
+        control.finish(result, cleanup_started)
     }
 
     fn infer_with_config(
@@ -432,7 +459,9 @@ impl WorkerClient {
         limits: &InferenceLimits,
         network_namespace: bool,
         on_delta: &mut dyn FnMut(&str) -> Result<(), WorkerError>,
+        control: &RequestControl<'_>,
     ) -> Result<InferenceResponse, WorkerError> {
+        control.check("worker launch")?;
         let mut command = Command::new(&self.executable);
         command
             .arg("--config")
@@ -475,6 +504,8 @@ impl WorkerClient {
                 });
             }
         }
+        control.begin_execution()?;
+        let deadline = control.execution_deadline(request.timeout_ms.min(limits.timeout_ms))?;
         let child = command
             .spawn()
             .map_err(|e| WorkerError::Failed(format!("spawn worker: {e}")))?;
@@ -548,18 +579,19 @@ impl WorkerClient {
                 }
             }
         });
-        let deadline =
-            Instant::now() + Duration::from_millis(request.timeout_ms.min(limits.timeout_ms));
         let mut streamed = String::new();
         let response_result: Result<InferenceResponse, WorkerError> = (|| loop {
-            if self.cancelled.load(Ordering::Relaxed) {
-                return Err(WorkerError::Failed("inference cancelled".into()));
-            }
+            control.check("worker response")?;
             if Instant::now() >= deadline {
                 return Err(WorkerError::Failed("worker deadline exceeded".into()));
             }
             match receiver.recv_timeout(Duration::from_millis(10)) {
                 Ok(value) => {
+                    // งบหรือ cancellation อาจเปลี่ยนระหว่างรอ frame ใน channel
+                    control.check("worker response")?;
+                    if Instant::now() >= deadline {
+                        return Err(WorkerError::Failed("worker deadline exceeded".into()));
+                    }
                     let value = value?;
                     if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
                         return Err(WorkerError::Failed(error.into()));
@@ -577,6 +609,7 @@ impl WorkerClient {
                         if !request.stream {
                             return Err(WorkerError::Protocol("unexpected stream event".into()));
                         }
+                        control.check("worker stream")?;
                         streamed.push_str(delta);
                         on_delta(delta)?;
                         continue;
@@ -604,7 +637,8 @@ impl WorkerClient {
             }
         };
         let status = loop {
-            if self.cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            control.check("worker exit")?;
+            if Instant::now() >= deadline {
                 return Err(WorkerError::Failed(
                     "worker cancelled or exit deadline exceeded".into(),
                 ));
@@ -634,6 +668,7 @@ fn consume_delta(
     request: &InferenceRequest,
     streamed: &mut String,
     on_delta: &mut dyn FnMut(&str) -> Result<(), WorkerError>,
+    control: &RequestControl<'_>,
 ) -> Result<(), WorkerError> {
     let value: serde_json::Value =
         serde_json::from_str(line).map_err(|e| WorkerError::Protocol(e.to_string()))?;
@@ -650,6 +685,8 @@ fn consume_delta(
         return Err(WorkerError::Failed(error.into()));
     }
     if let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str) {
+        // buffer อาจมีหลาย frame: ตรวจใหม่ก่อนส่งแต่ละ delta ให้ผู้เรียก
+        control.check("sandbox stream")?;
         streamed.push_str(delta);
         on_delta(delta)?;
     }
@@ -708,7 +745,9 @@ fn write_ephemeral_config(
     config: &ModelConfig,
     limits: &InferenceLimits,
     stage_process_artifacts: bool,
-) -> Result<PathBuf, WorkerError> {
+    control: &RequestControl<'_>,
+) -> Result<StagedConfig, WorkerError> {
+    control.check("configuration")?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| WorkerError::Failed(format!("clock: {e}")))?
@@ -722,15 +761,22 @@ fn write_ephemeral_config(
             .create(&dir)
             .map_err(|e| WorkerError::Failed(format!("private directory: {e}")))?;
     }
+    #[cfg(not(unix))]
+    std::fs::create_dir(&dir)
+        .map_err(|e| WorkerError::Failed(format!("private directory: {e}")))?;
+    let staged = StagedConfig {
+        path: dir.join("config.json"),
+    };
     let mut staged_config = config.clone();
     if stage_process_artifacts {
-        stage_local_artifacts(&mut staged_config, &dir, limits)?;
+        stage_local_artifacts(&mut staged_config, &dir, limits, control)?;
     }
-    let path = dir.join("config.json");
+    control.check("configuration")?;
     let bytes = serde_json::to_vec(&staged_config)
         .map_err(|e| WorkerError::Failed(format!("encode model config: {e}")))?;
-    write_private(&path, &bytes)?;
-    Ok(path)
+    write_private(&staged.path, &bytes)?;
+    control.check("configuration")?;
+    Ok(staged)
 }
 
 /// Process workers receive private copies of model inputs. The worker verifies
@@ -740,6 +786,7 @@ fn stage_local_artifacts(
     config: &mut ModelConfig,
     directory: &Path,
     limits: &InferenceLimits,
+    control: &RequestControl<'_>,
 ) -> Result<(), WorkerError> {
     let Some(local) = config.local.as_mut() else {
         return Ok(());
@@ -760,6 +807,7 @@ fn stage_local_artifacts(
     let maximum = limits.storage_mb.saturating_mul(1024 * 1024);
     let mut total = 0u64;
     for (index, path) in paths.into_iter().enumerate() {
+        control.check("artifact staging")?;
         let source = Path::new(path)
             .canonicalize()
             .map_err(|e| WorkerError::Failed(format!("artifact path: {e}")))?;
@@ -771,13 +819,11 @@ fn stage_local_artifacts(
                 "model artifact must be a regular file".into(),
             ));
         }
-        total = total.saturating_add(metadata.len());
-        if total > maximum {
+        if metadata.len() > maximum.saturating_sub(total) {
             return Err(WorkerError::LimitExceeded("staging storage".into()));
         }
         let destination = directory.join(format!("process-artifact-{index}"));
-        let mut input = std::fs::File::open(&source)
-            .map_err(|e| WorkerError::Failed(format!("open artifact: {e}")))?;
+        let mut input = control::open_artifact(&source)?;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -788,12 +834,13 @@ fn stage_local_artifacts(
         let mut output = options
             .open(&destination)
             .map_err(|e| WorkerError::Failed(format!("stage artifact: {e}")))?;
-        std::io::copy(&mut input, &mut output)
-            .map_err(|e| WorkerError::Failed(format!("copy artifact: {e}")))?;
+        total += control.copy(&mut input, &mut output, maximum - total, "artifact staging")?;
+        control.check("artifact staging")?;
         output
             .sync_all()
             .map_err(|e| WorkerError::Failed(format!("sync artifact: {e}")))?;
         *path = destination.to_string_lossy().into_owned();
+        control.check("artifact staging")?;
     }
     Ok(())
 }

@@ -145,8 +145,41 @@ Rust API ใช้ `WorkerClient::infer_stream` พร้อม callback แล�
 ตั้ง token เป็น `true` เพื่อยกเลิก client นั้น; เริ่มงานใหม่ด้วย client ใหม่
 Callback ที่คืน error จะหยุดงานและ cleanup เช่นกัน
 Process ฆ่าทั้ง process group, container ใช้ `cgroup.kill`, MicroVM ยุติ VMM
-การยกเลิกระหว่าง staging/hash/setup จะถูกรับเมื่อจบขั้นตอนปัจจุบัน; ไม่มี hard deadline
-ครอบ syscall สำหรับ copy/hash/host-tool setup ทั้งหมดในรุ่นนี้
+Control plane ตรวจ cancellation ระหว่าง copy/hash ทุกไม่เกิน 64 KiB และก่อน/หลัง setup
+รวมทั้งก่อนส่ง streaming delta แต่ละช่วงให้ callback แม้ frame จะรออยู่ใน buffer แล้ว
+copy ตรวจ bytes จริงตาม storage quota จึงปฏิเสธไฟล์ที่โตหลัง fstat ได้ด้วย
+directory ของ config/staging มี RAII owner เพื่อ cleanup เมื่อเตรียมไฟล์ไม่สำเร็จ
+
+`InferenceLimits.total_timeout_ms` เป็นงบเวลาเพิ่มเติมแบบ optional ค่าเริ่มต้น `None`
+นับด้วย monotonic clock ตั้งแต่เข้า `WorkerClient::infer`/`infer_stream` รวม
+worker hash verification, staging, worker execution และ cleanup ของ staging
+เมื่อตั้งค่า parent จะลดเวลาที่เหลือของ execution และส่ง cancellation ให้ sandbox
+ด้วย token แยกแต่ละ request จึงใช้ client เดิมต่อได้หลัง timeout
+`timeout_ms` ของ inference ยังคงเป็นงบราย worker ตามเดิม
+
+ตั้งผ่าน VM YAML สำหรับ local worker ได้ดังนี้ (ค่าต้องมากกว่า 0):
+
+```yaml
+model:
+  provider: local
+  total_timeout_ms: 180000
+  local:
+    model_path: /models/model.gguf
+    worker_path: /usr/local/bin/aivm-model-worker
+```
+
+Runtime ปฏิเสธ total budget ที่ใช้กับ inline/remote backend เพื่อไม่ให้ค่าที่ตั้งถูกเพิกเฉย
+การตรวจ operator configuration/artifact pins ตอนบูต runtime อยู่ก่อนเริ่มงบต่อ request
+I/O ใช้ cooperative cancellation: syscall ที่กำลังค้าง, host helper ระหว่าง sandbox
+setup และ cleanup ต้องรอคืนการควบคุมก่อนตรวจงบอีกครั้ง จึงยังไม่มี hard wall-clock
+deadline ครอบทุก syscall การตรวจงบหลัง execution/cleanup ปฏิเสธ completion ที่ช้าเกินงบ
+
+Response มี `control_plane_usage` ซึ่ง client เขียนทับค่าที่ worker ส่งมาเสมอ:
+`preparation_ms`, `execution_ms`, `cleanup_ms`, `total_ms`
+execution รวมเวลารัน/ยุติ worker และตรวจ response; cleanup วัดการล้าง config/staging
+ของ parent ที่ท้าย request ถ้า preparation ล้มและ guard cleanup ระหว่าง unwind
+เวลานั้นจะรวมใน preparation Error คง variant เดิม พร้อม phase และเวลารายช่วง
+เพื่อช่วยวิเคราะห์ deadline failures โดยไม่เพิ่ม prompt ลง diagnostics
 
 Response ถูกตรวจ identity, termination, output budget, frame bytes และ exit status
 Client คำนวณ SHA-256 ของ output และคืน `verification` ที่เขียนทับค่าจาก worker เสมอ

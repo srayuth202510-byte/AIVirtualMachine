@@ -115,6 +115,9 @@ def main():
     sources = [
         "scripts/validate-model-host.py", "scripts/test-worker-host.sh",
         "crates/aivm-model/src/artifact.rs", "crates/aivm-model-worker/tests/worker.rs",
+        "crates/aivm-model/src/worker.rs", "crates/aivm-model/src/worker/control.rs",
+        "crates/aivm-model/src/worker/launcher.rs", "crates/aivm-model-worker/src/main.rs",
+        "crates/aivm-runtime/src/lib.rs",
         "crates/aivm-model-worker/tests/failure_recovery.rs",
         "crates/aivm-sandbox/src/lib.rs", "crates/aivm-sandbox/src/container.rs",
     ]

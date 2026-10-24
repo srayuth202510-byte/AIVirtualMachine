@@ -150,6 +150,7 @@ fn run() -> Result<(), WorkerError> {
             ],
             audit_id: None,
             verification: Default::default(),
+            control_plane_usage: None,
         };
         serde_json::to_writer(&mut stdout, &response)
             .map_err(|e| WorkerError::Failed(format!("write response: {e}")))?;

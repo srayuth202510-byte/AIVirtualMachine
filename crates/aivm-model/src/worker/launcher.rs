@@ -9,7 +9,9 @@ impl WorkerClient {
         request: &InferenceRequest,
         limits: &InferenceLimits,
         on_delta: &mut dyn FnMut(&str) -> Result<(), WorkerError>,
+        control: &RequestControl<'_>,
     ) -> Result<InferenceResponse, WorkerError> {
+        control.check("sandbox prerequisites")?;
         use aivm_sandbox::{ExecSpec, ResourceLimits};
         let fail = |error: &dyn std::fmt::Display| WorkerError::Failed(error.to_string());
         let local = config
@@ -18,6 +20,7 @@ impl WorkerClient {
             .ok_or_else(|| WorkerError::InvalidRequest("local config required".into()))?;
         if let WorkerLauncher::Container { config } = &local.worker_launcher {
             let probe = config.probe();
+            control.check("sandbox prerequisites")?;
             if !probe.bubblewrap || !probe.init || !probe.cgroup_v2_quotas {
                 return Err(WorkerError::Failed(format!(
                     "container prerequisites unavailable: {probe:?}"
@@ -54,17 +57,17 @@ impl WorkerClient {
             let mut mounted = std::collections::BTreeMap::new();
             let mut size = 0u64;
             for (index, artifact) in artifacts.into_iter().enumerate() {
-                if self.cancelled.load(Ordering::Relaxed) {
-                    return Err(WorkerError::Failed("inference cancelled".into()));
-                }
+                control.check("sandbox artifact staging")?;
                 let path = Path::new(&artifact).canonicalize().map_err(|e| fail(&e))?;
                 if !path.is_file() {
                     return Err(WorkerError::InvalidRequest(
                         "artifact must be a file".into(),
                     ));
                 }
-                size = size.saturating_add(std::fs::metadata(&path).map_err(|e| fail(&e))?.len());
-                if size > limits.storage_mb.saturating_mul(1024 * 1024) {
+                let maximum = limits.storage_mb.saturating_mul(1024 * 1024);
+                if std::fs::metadata(&path).map_err(|e| fail(&e))?.len()
+                    > maximum.saturating_sub(size)
+                {
                     return Err(WorkerError::LimitExceeded("staging storage".into()));
                 }
                 // สำเนา private/read-only ทั้งสอง tier: mode ของ source (เช่น 0664)
@@ -73,7 +76,7 @@ impl WorkerClient {
                     .parent()
                     .unwrap()
                     .join(format!("artifact-{index}"));
-                stage_readonly_artifact(&path, &staged).map_err(|e| fail(&e))?;
+                size += stage_readonly_artifact(&path, &staged, control, maximum - size)?;
                 policy
                     .filesystem
                     .read
@@ -127,114 +130,122 @@ impl WorkerClient {
                     pids_max: limits.pids_max,
                     storage_mb: limits.storage_mb,
                 },
-                timeout_ms: request.timeout_ms,
+                timeout_ms: control.remaining_ms(request.timeout_ms)?,
                 build: None,
             };
+            control.begin_execution()?;
             let mut streamed = String::new();
-            let outcome = if request.stream {
-                std::thread::scope(|scope| -> Result<_, WorkerError> {
-                    let (sender, receiver) = mpsc::channel::<Vec<u8>>();
-                    let handle = scope.spawn(|| -> Result<_, WorkerError> {
-                        Ok(match &local.worker_launcher {
-                            WorkerLauncher::Container { config } => {
-                                aivm_sandbox::container::run_observed(
-                                    &spec,
-                                    &policy,
-                                    config,
-                                    &self.cancelled,
-                                    Some(sender),
-                                )
-                                .map_err(|e| fail(&e))?
-                            }
-                            #[cfg(feature = "microvm")]
-                            WorkerLauncher::Microvm { config } => {
-                                if config.fc_sha256.is_empty() {
+            let outcome = control.with_launch_cancellation(|cancelled| -> Result<_, WorkerError> {
+                let outcome = if request.stream {
+                    std::thread::scope(|scope| -> Result<_, WorkerError> {
+                        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+                        let handle = scope.spawn(|| -> Result<_, WorkerError> {
+                            Ok(match &local.worker_launcher {
+                                WorkerLauncher::Container { config } => {
+                                    aivm_sandbox::container::run_observed(
+                                        &spec,
+                                        &policy,
+                                        config,
+                                        cancelled,
+                                        Some(sender),
+                                    )
+                                    .map_err(|e| fail(&e))?
+                                }
+                                #[cfg(feature = "microvm")]
+                                WorkerLauncher::Microvm { config } => {
+                                    if config.fc_sha256.is_empty() {
+                                        return Err(WorkerError::InvalidRequest(
+                                            "MicroVM requires firecracker hash pin".into(),
+                                        ));
+                                    }
+                                    aivm_sandbox::microvm::run_in_microvm_observed(
+                                        &spec,
+                                        &policy,
+                                        config,
+                                        cancelled,
+                                        Some(sender),
+                                    )
+                                    .map_err(|(e, _)| fail(&e))?
+                                }
+                                _ => {
                                     return Err(WorkerError::InvalidRequest(
-                                        "MicroVM requires firecracker hash pin".into(),
-                                    ));
+                                        "expected sandbox launcher".into(),
+                                    ))
                                 }
-                                aivm_sandbox::microvm::run_in_microvm_observed(
-                                    &spec,
-                                    &policy,
-                                    config,
-                                    &self.cancelled,
-                                    Some(sender),
-                                )
-                                .map_err(|(e, _)| fail(&e))?
+                            })
+                        });
+                        let mut pending = Vec::new();
+                        let mut total = 0usize;
+                        let mut failure = None;
+                        while let Ok(bytes) = receiver.recv() {
+                            total = total.saturating_add(bytes.len());
+                            if total > MAX_RESPONSE_BYTES {
+                                failure = Some(WorkerError::LimitExceeded("stream bytes".into()));
+                                cancelled.store(true, Ordering::Relaxed);
                             }
-                            _ => {
+                            if failure.is_none() {
+                                pending.extend_from_slice(&bytes);
+                                while let Some(end) = pending.iter().position(|byte| *byte == b'\n')
+                                {
+                                    let line: Vec<_> = pending.drain(..=end).collect();
+                                    let line = String::from_utf8_lossy(&line);
+                                    if line.trim() == "aivm-container-init:ready-v1" {
+                                        continue;
+                                    }
+                                    let result = consume_delta(
+                                        line.trim(),
+                                        request,
+                                        &mut streamed,
+                                        on_delta,
+                                        control,
+                                    );
+                                    if let Err(error) = result {
+                                        failure = Some(error);
+                                        cancelled.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let outcome = handle
+                            .join()
+                            .map_err(|_| WorkerError::Failed("sandbox launcher panicked".into()))?;
+                        if let Some(error) = failure {
+                            return Err(error);
+                        }
+                        outcome
+                    })?
+                } else {
+                    match &local.worker_launcher {
+                        WorkerLauncher::Container { config } => {
+                            aivm_sandbox::container::run_cancellable(
+                                &spec, &policy, config, cancelled,
+                            )
+                            .map_err(|e| fail(&e))?
+                        }
+                        #[cfg(feature = "microvm")]
+                        WorkerLauncher::Microvm { config } => {
+                            if config.fc_sha256.is_empty() {
                                 return Err(WorkerError::InvalidRequest(
-                                    "expected sandbox launcher".into(),
-                                ))
+                                    "MicroVM requires firecracker hash pin".into(),
+                                ));
                             }
-                        })
-                    });
-                    let mut pending = Vec::new();
-                    let mut total = 0usize;
-                    let mut failure = None;
-                    while let Ok(bytes) = receiver.recv() {
-                        total = total.saturating_add(bytes.len());
-                        if total > MAX_RESPONSE_BYTES {
-                            failure = Some(WorkerError::LimitExceeded("stream bytes".into()));
+                            aivm_sandbox::microvm::run_in_microvm_cancellable(
+                                &spec, &policy, config, cancelled,
+                            )
+                            .map_err(|(e, _)| fail(&e))?
                         }
-                        if failure.is_none() {
-                            pending.extend_from_slice(&bytes);
-                            while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
-                                let line: Vec<_> = pending.drain(..=end).collect();
-                                let line = String::from_utf8_lossy(&line);
-                                if line.trim() == "aivm-container-init:ready-v1" {
-                                    continue;
-                                }
-                                let result =
-                                    consume_delta(line.trim(), request, &mut streamed, on_delta);
-                                if let Err(error) = result {
-                                    failure = Some(error);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    let outcome = handle
-                        .join()
-                        .map_err(|_| WorkerError::Failed("sandbox launcher panicked".into()))?;
-                    if let Some(error) = failure {
-                        return Err(error);
-                    }
-                    outcome
-                })?
-            } else {
-                match &local.worker_launcher {
-                    WorkerLauncher::Container { config } => {
-                        aivm_sandbox::container::run_cancellable(
-                            &spec,
-                            &policy,
-                            config,
-                            &self.cancelled,
-                        )
-                        .map_err(|e| fail(&e))?
-                    }
-                    #[cfg(feature = "microvm")]
-                    WorkerLauncher::Microvm { config } => {
-                        if config.fc_sha256.is_empty() {
+                        _ => {
                             return Err(WorkerError::InvalidRequest(
-                                "MicroVM requires firecracker hash pin".into(),
-                            ));
+                                "expected sandbox launcher".into(),
+                            ))
                         }
-                        aivm_sandbox::microvm::run_in_microvm_cancellable(
-                            &spec,
-                            &policy,
-                            config,
-                            &self.cancelled,
-                        )
-                        .map_err(|(e, _)| fail(&e))?
                     }
-                    _ => {
-                        return Err(WorkerError::InvalidRequest(
-                            "expected sandbox launcher".into(),
-                        ))
-                    }
-                }
-            };
+                };
+                Ok(outcome)
+            });
+            control.check("sandbox execution")?;
+            let outcome = outcome?;
             if !outcome.success() {
                 return Err(WorkerError::Failed(format!(
                     "sandbox worker exit {:?}: {}",
@@ -264,11 +275,34 @@ impl WorkerClient {
     }
 }
 
-fn stage_readonly_artifact(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::copy(source, destination)?;
-    let mut permissions = std::fs::metadata(destination)?.permissions();
+fn stage_readonly_artifact(
+    source: &Path,
+    destination: &Path,
+    control: &RequestControl<'_>,
+    maximum: u64,
+) -> Result<u64, WorkerError> {
+    let mut input = super::control::open_artifact(source)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options
+        .open(destination)
+        .map_err(|e| WorkerError::Failed(format!("stage artifact: {e}")))?;
+    let copied = control.copy(&mut input, &mut output, maximum, "sandbox artifact staging")?;
+    let mut permissions = output
+        .metadata()
+        .map_err(|e| WorkerError::Failed(format!("staged metadata: {e}")))?
+        .permissions();
     permissions.set_readonly(true);
-    std::fs::set_permissions(destination, permissions)
+    output
+        .set_permissions(permissions)
+        .map_err(|e| WorkerError::Failed(format!("protect staged artifact: {e}")))?;
+    control.check("sandbox artifact staging")?;
+    Ok(copied)
 }
 
 #[cfg(all(test, unix))]
@@ -284,7 +318,9 @@ mod tests {
         let staged = directory.join("staged.gguf");
         std::fs::write(&source, b"approved weights").unwrap();
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o666)).unwrap();
-        stage_readonly_artifact(&source, &staged).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let control = RequestControl::new(&cancelled, None).unwrap();
+        stage_readonly_artifact(&source, &staged, &control, 1024).unwrap();
         assert_eq!(std::fs::metadata(&staged).unwrap().mode() & 0o222, 0);
         assert_ne!(
             std::fs::metadata(&staged).unwrap().ino(),
