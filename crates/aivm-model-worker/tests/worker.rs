@@ -65,6 +65,171 @@ impl Drop for Script {
 }
 
 #[test]
+fn early_worker_exit_reports_status_without_disclosing_stderr() {
+    // EOF ต้องเก็บ exit code ของ worker จริง ไม่ใช่ SIGKILL ที่ parent ส่งระหว่าง cleanup
+    let script = Script::new("read request\nprintf '%s\\n' 'EXIT_SECRET_SENTINEL' >&2\nexit 73");
+    let error = WorkerClient::new(&script.0)
+        .infer(
+            &ModelConfig::default(),
+            request(),
+            &InferenceLimits::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "worker_failed", "{error}");
+    assert!(error.to_string().contains("exit_code=73"), "{error}");
+    assert!(!error.to_string().contains("EXIT_SECRET_SENTINEL"));
+    let exit = error.worker_exit().expect("host exit evidence");
+    assert_eq!(exit.exit_code, Some(73));
+    assert_eq!(exit.signal, None);
+    assert!(exit.observed_before_cleanup);
+}
+
+#[test]
+fn worker_sigkill_is_reported_without_guessing_a_resource_failure() {
+    let script = Script::new("read request\nkill -KILL $$");
+    let error = WorkerClient::new(&script.0)
+        .infer(
+            &ModelConfig::default(),
+            request(),
+            &InferenceLimits::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "worker_failed", "{error}");
+    assert!(error.to_string().contains("signal=9"), "{error}");
+    assert!(!error.to_string().contains("memory allocation"));
+    let exit = error.worker_exit().unwrap();
+    assert_eq!(exit.exit_code, None);
+    assert_eq!(exit.signal, Some(9));
+    assert!(exit.observed_before_cleanup);
+}
+
+#[test]
+fn closed_stdout_does_not_bypass_the_exit_deadline() {
+    // worker ปิด stdout ก่อนออกจริง; รอได้เท่างบเดิมและต้องไม่อ้างว่า cleanup SIGKILL คือ crash
+    let script = Script::new("read request\nexec 1>&-\nexec /bin/sleep 30");
+    let mut req = request();
+    req.timeout_ms = 100;
+    let started = Instant::now();
+    let error = WorkerClient::new(&script.0)
+        .infer(&ModelConfig::default(), req, &InferenceLimits::default())
+        .unwrap_err();
+    assert_eq!(error.code(), "deadline", "{error}");
+    assert!(
+        error.to_string().contains("observed_before_cleanup=false"),
+        "{error}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2), "{error}");
+    assert_eq!(error.worker_exit().unwrap().signal, Some(9));
+    assert!(!error.worker_exit().unwrap().observed_before_cleanup);
+    assert!(matches!(error.cause(), WorkerError::Deadline(_)));
+}
+
+#[test]
+fn exit_zero_without_completion_and_nonzero_after_completion_both_fail() {
+    // exit 0 ไม่แทน protocol completion; completion ก็ไม่ลบล้าง exit status ที่ล้ม
+    let response = r#"{"protocol_version":1,"request_id":"req-1","output":"ok","usage":{"input_tokens":1,"output_tokens":1,"elapsed_ms":0},"termination":"completed","artifact_verified":false,"applied_limits":[],"audit_id":null}"#;
+    for (body, code) in [
+        ("read request\nexit 0".to_string(), 0),
+        (
+            format!("read request\nprintf '%s\\n' '{response}'\nexit 74"),
+            74,
+        ),
+    ] {
+        let script = Script::new(&body);
+        let error = WorkerClient::new(&script.0)
+            .infer(
+                &ModelConfig::default(),
+                request(),
+                &InferenceLimits::default(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), "worker_failed", "{error}");
+        let exit = error.worker_exit().unwrap();
+        assert_eq!(exit.exit_code, Some(code));
+        assert!(exit.observed_before_cleanup);
+    }
+}
+
+#[test]
+fn partial_stream_does_not_become_completion_when_worker_exits() {
+    let script = Script::new("read request\nprintf '%s\\n' '{\"protocol_version\":1,\"request_id\":\"req-1\",\"delta\":\"ok\"}'\nexit 64");
+    let mut output = String::new();
+    let error = WorkerClient::new(&script.0)
+        .infer_stream(
+            &ModelConfig::default(),
+            request(),
+            &InferenceLimits::default(),
+            &mut |delta| {
+                output.push_str(delta);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(output, "ok");
+    assert_eq!(error.code(), "worker_failed", "{error}");
+    assert_eq!(error.worker_exit().unwrap().exit_code, Some(64));
+}
+
+#[test]
+fn protocol_failure_retains_its_cause_and_round_trips_exit_evidence() {
+    let script =
+        Script::new("read request\nprintf '%s\\n' 'EXIT_SECRET_SENTINEL'\nexec /bin/sleep 30");
+    let error = WorkerClient::new(&script.0)
+        .infer(
+            &ModelConfig::default(),
+            request(),
+            &InferenceLimits::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "protocol", "{error}");
+    assert!(matches!(error.cause(), WorkerError::Protocol(_)));
+    assert!(!error.worker_exit().unwrap().observed_before_cleanup);
+    let encoded = serde_json::to_string(&error).unwrap();
+    assert!(!encoded.contains("EXIT_SECRET_SENTINEL"));
+    let decoded: WorkerError = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded.code(), "protocol");
+    assert_eq!(decoded.worker_exit(), error.worker_exit());
+}
+
+#[test]
+fn untrusted_worker_cannot_forge_host_exit_evidence() {
+    // error_kind เป็นข้อมูลไม่เชื่อถือ: ต้องทิ้ง exit ที่ worker อ้าง แล้วเก็บจาก wait เท่านั้น
+    let frame = r#"{"protocol_version":1,"request_id":"req-1","error":"EXIT_SECRET_SENTINEL","error_kind":{"Exit":{"source":{"Failed":"EXIT_SECRET_SENTINEL"},"exit":{"exit_code":99,"signal":null,"core_dumped":false,"observed_before_cleanup":true}}}}"#;
+    let script = Script::new(&format!("read request\nprintf '%s\\n' '{frame}'\nexit 73"));
+    let error = WorkerClient::new(&script.0)
+        .infer(
+            &ModelConfig::default(),
+            request(),
+            &InferenceLimits::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "worker_failed", "{error}");
+    assert!(!error.to_string().contains("EXIT_SECRET_SENTINEL"));
+    assert_ne!(error.worker_exit().unwrap().exit_code, Some(99));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn actual_cpu_limit_kill_still_has_an_unclassified_sigkill_status() {
+    // kernel บังคับ hard CPU limit จริง; SIGKILL เดี่ยว ๆ ยังไม่พิสูจน์สาเหตุสำหรับ API ทั่วไป
+    let script = Script::new("read request\nwhile :; do :; done");
+    let limits = InferenceLimits {
+        cpu_seconds: 1,
+        total_timeout_ms: Some(6000),
+        ..Default::default()
+    };
+    let mut req = request();
+    req.timeout_ms = 5000;
+    let error = WorkerClient::new(&script.0)
+        .infer(&ModelConfig::default(), req, &limits)
+        .unwrap_err();
+    assert_eq!(error.code(), "worker_failed", "{error}");
+    let exit = error.worker_exit().unwrap();
+    assert_eq!(exit.signal, Some(9));
+    assert!(exit.observed_before_cleanup);
+}
+
+#[test]
 fn cancellation_kills_a_worker_that_never_reads_input() {
     let script = Script::new("exec /bin/sleep 30");
     let client = WorkerClient::new(&script.0);

@@ -8,7 +8,7 @@ use super::ModelConfig;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc,
@@ -332,6 +332,50 @@ pub struct VerificationResult {
     pub output_sha256: Option<String>,
 }
 
+/// สถานะจาก wait ของ host; signal หลัง cleanup อาจเป็น SIGKILL ที่ client ส่งเอง
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerExit {
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub core_dumped: bool,
+    pub observed_before_cleanup: bool,
+}
+
+impl WorkerExit {
+    fn from_status(status: ExitStatus, observed_before_cleanup: bool) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        Self {
+            exit_code: status.code(),
+            #[cfg(unix)]
+            signal: status.signal(),
+            #[cfg(not(unix))]
+            signal: None,
+            #[cfg(unix)]
+            core_dumped: status.core_dumped(),
+            #[cfg(not(unix))]
+            core_dumped: false,
+            observed_before_cleanup,
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "exit_code={}; signal={}; core_dumped={}; observed_before_cleanup={}",
+            self.exit_code
+                .map_or_else(|| "none".into(), |code| code.to_string()),
+            self.signal
+                .map_or_else(|| "none".into(), |signal| signal.to_string()),
+            self.core_dumped,
+            self.observed_before_cleanup
+        )
+    }
+}
+
 #[derive(Debug, Error, Clone, Serialize, Deserialize)]
 pub enum WorkerError {
     #[error("protocol error: {0}")]
@@ -355,6 +399,11 @@ pub enum WorkerError {
     },
     #[error("inference resources unavailable: {0}")]
     Resources(String),
+    #[error("{source}; worker_exit: {exit}")]
+    Exit {
+        source: Box<WorkerError>,
+        exit: WorkerExit,
+    },
     #[error("{source}; phase={phase}; {usage}")]
     Context {
         source: Box<WorkerError>,
@@ -375,14 +424,35 @@ impl WorkerError {
             Self::Cancelled(_) => "cancelled",
             Self::Cleanup(_) | Self::CleanupAfterFailure { .. } => "cleanup_failed",
             Self::Resources(_) => "resources_unavailable",
-            Self::Context { source, .. } => source.code(),
+            Self::Context { source, .. } | Self::Exit { source, .. } => source.code(),
         }
     }
 
     pub fn cause(&self) -> &Self {
         match self {
-            Self::Context { source, .. } => source.cause(),
+            Self::Context { source, .. } | Self::Exit { source, .. } => source.cause(),
             _ => self,
+        }
+    }
+
+    /// cleanup/context wrappers ต้องไม่ซ่อนหลักฐานการออกของ worker ที่เก็บไว้แล้ว
+    pub fn worker_exit(&self) -> Option<&WorkerExit> {
+        match self {
+            Self::Exit { exit, .. } => Some(exit),
+            Self::Context { source, .. } | Self::CleanupAfterFailure { source, .. } => {
+                source.worker_exit()
+            }
+            _ => None,
+        }
+    }
+
+    fn with_exit(self, exit: Option<WorkerExit>) -> Self {
+        match exit {
+            Some(exit) => Self::Exit {
+                source: Box::new(self),
+                exit,
+            },
+            None => self,
         }
     }
 }
@@ -774,110 +844,128 @@ impl WorkerClient {
                     .and_then(|n| {
                         total = total.saturating_add(n);
                         if n == 0 {
-                            return Err(WorkerError::Failed("worker returned no response".into()));
+                            return Ok(None);
                         }
                         if total > MAX_RESPONSE_BYTES {
                             return Err(WorkerError::LimitExceeded("response bytes".into()));
                         }
                         serde_json::from_str::<serde_json::Value>(&line)
+                            .map(Some)
                             .map_err(|_| WorkerError::Protocol("invalid worker JSON".into()))
                     });
-                let done = result
-                    .as_ref()
-                    .map_or(true, |value| value.get("delta").is_none());
+                let done = result.as_ref().map_or(true, |value| {
+                    value
+                        .as_ref()
+                        .is_none_or(|value| value.get("delta").is_none())
+                });
                 if sender.send(result).is_err() || done {
                     break;
                 }
             }
         });
         let mut streamed = String::new();
-        let response_result: Result<InferenceResponse, WorkerError> = (|| loop {
-            control.check("worker response")?;
-            if Instant::now() >= deadline {
-                return Err(WorkerError::Deadline("worker deadline exceeded".into()));
-            }
-            match receiver.recv_timeout(Duration::from_millis(10)) {
-                Ok(value) => {
-                    // งบหรือ cancellation อาจเปลี่ยนระหว่างรอ frame ใน channel
-                    control.check("worker response")?;
-                    if Instant::now() >= deadline {
-                        return Err(WorkerError::Deadline("worker deadline exceeded".into()));
-                    }
-                    let value = value?;
-                    if value.get("request_id").and_then(serde_json::Value::as_str)
-                        != Some(request.request_id.as_str())
-                        || value
-                            .get("protocol_version")
-                            .and_then(serde_json::Value::as_u64)
-                            != Some(u64::from(PROTOCOL_VERSION))
-                    {
-                        return Err(WorkerError::Protocol("response identity mismatch".into()));
-                    }
-                    if value.get("error").is_some() {
-                        return Err(remote_worker_error(&value));
-                    }
-                    if let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str) {
-                        if !request.stream {
-                            return Err(WorkerError::Protocol("unexpected stream event".into()));
+        let response_result: Result<InferenceResponse, WorkerError> = (|| {
+            let response = loop {
+                control.check("worker response")?;
+                if Instant::now() >= deadline {
+                    return Err(WorkerError::Deadline("worker deadline exceeded".into()));
+                }
+                match receiver.recv_timeout(Duration::from_millis(10)) {
+                    Ok(value) => {
+                        // งบหรือ cancellation อาจเปลี่ยนระหว่างรอ frame ใน channel
+                        control.check("worker response")?;
+                        if Instant::now() >= deadline {
+                            return Err(WorkerError::Deadline("worker deadline exceeded".into()));
                         }
-                        control.check("worker stream")?;
-                        streamed.push_str(delta);
-                        on_delta(delta)?;
-                        continue;
+                        let Some(value) = value? else {
+                            // EOF อาจมาก่อน wait status พร้อม: รอออกจริงภายใต้งบเดิมก่อนเริ่ม cleanup
+                            wait_for_worker_exit(&mut child, control, deadline)?;
+                            return Err(WorkerError::Failed(
+                                "worker returned no completion".into(),
+                            ));
+                        };
+                        if value.get("request_id").and_then(serde_json::Value::as_str)
+                            != Some(request.request_id.as_str())
+                            || value
+                                .get("protocol_version")
+                                .and_then(serde_json::Value::as_u64)
+                                != Some(u64::from(PROTOCOL_VERSION))
+                        {
+                            return Err(WorkerError::Protocol("response identity mismatch".into()));
+                        }
+                        if value.get("error").is_some() {
+                            return Err(remote_worker_error(&value));
+                        }
+                        if let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str)
+                        {
+                            if !request.stream {
+                                return Err(WorkerError::Protocol(
+                                    "unexpected stream event".into(),
+                                ));
+                            }
+                            control.check("worker stream")?;
+                            streamed.push_str(delta);
+                            on_delta(delta)?;
+                            continue;
+                        }
+                        let response: InferenceResponse = serde_json::from_value(value)
+                            .map_err(|_| WorkerError::Protocol("invalid worker JSON".into()))?;
+                        response.validate(&request)?;
+                        if request.stream && response.output.as_deref() != Some(streamed.as_str()) {
+                            return Err(WorkerError::Protocol(
+                                "stream differs from final output".into(),
+                            ));
+                        }
+                        break response;
                     }
-                    let response: InferenceResponse = serde_json::from_value(value)
-                        .map_err(|_| WorkerError::Protocol("invalid worker JSON".into()))?;
-                    response.validate(&request)?;
-                    if request.stream && response.output.as_deref() != Some(streamed.as_str()) {
-                        return Err(WorkerError::Protocol(
-                            "stream differs from final output".into(),
-                        ));
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(_) => {
+                        return Err(WorkerError::Failed("worker response channel closed".into()))
                     }
-                    break Ok(response);
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(_) => return Err(WorkerError::Failed("worker response channel closed".into())),
+            };
+            let status = wait_for_worker_exit(&mut child, control, deadline)?;
+            if !status.success() {
+                return Err(WorkerError::Failed("worker exited unsuccessfully".into()));
             }
+            Ok(response)
         })();
-        let response = match response_result {
-            Ok(response) => response,
-            Err(error) => {
-                child.terminate();
-                let diagnostic = stderr_reader.join().unwrap_or_default();
-                let summary = safe_worker_diagnostic(&diagnostic);
-                if matches!(error, WorkerError::Failed(_))
-                    && summary != "untrusted worker diagnostics withheld"
-                {
-                    return Err(WorkerError::Failed(summary.into()));
-                }
-                return Err(error);
-            }
-        };
-        let status = loop {
-            control.check("worker exit")?;
-            if Instant::now() >= deadline {
-                return Err(WorkerError::Deadline(
-                    "worker exit deadline exceeded".into(),
-                ));
-            }
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|e| WorkerError::Failed(e.to_string()))?
-            {
-                break status;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        };
         // A descendant cannot hold the response or diagnostics pipe open after exit.
-        child.terminate();
+        let exit = child.terminate_with_exit();
         let detail = stderr_reader.join().unwrap_or_default();
-        if !status.success() {
-            return Err(WorkerError::Failed(format!(
-                "worker exited with {status}: {}",
-                safe_worker_diagnostic(&detail)
-            )));
+        response_result.map_err(|error| {
+            let summary = safe_worker_diagnostic(&detail);
+            let error = if matches!(error, WorkerError::Failed(_))
+                && summary != "untrusted worker diagnostics withheld"
+            {
+                WorkerError::Failed(summary.into())
+            } else {
+                error
+            };
+            error.with_exit(exit)
+        })
+    }
+}
+
+fn wait_for_worker_exit(
+    child: &mut ChildGuard,
+    control: &RequestControl<'_>,
+    deadline: Instant,
+) -> Result<ExitStatus, WorkerError> {
+    loop {
+        control.check("worker exit")?;
+        if Instant::now() >= deadline {
+            return Err(WorkerError::Deadline(
+                "worker exit deadline exceeded".into(),
+            ));
         }
-        Ok(response)
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|_| WorkerError::Failed("wait worker exit".into()))?
+        {
+            return Ok(status);
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -973,6 +1061,16 @@ impl std::ops::DerefMut for ChildGuard {
     }
 }
 impl ChildGuard {
+    fn terminate_with_exit(&mut self) -> Option<WorkerExit> {
+        // อ่านก่อนส่ง signal เพื่อแยกสถานะที่มีอยู่ก่อน cleanup จากสถานะที่เห็นหลัง cleanup เริ่ม
+        let before = self.child.try_wait().ok().flatten();
+        let observed_before_cleanup = before.is_some();
+        self.terminate();
+        before
+            .or_else(|| self.child.try_wait().ok().flatten())
+            .map(|status| WorkerExit::from_status(status, observed_before_cleanup))
+    }
+
     fn terminate(&mut self) {
         if self.terminated {
             return;

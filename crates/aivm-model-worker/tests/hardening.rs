@@ -71,6 +71,65 @@ fn request() -> InferenceRequest {
 const RESPONSE: &str = r#"{"protocol_version":1,"request_id":"req-1","output":"ok","usage":{"input_tokens":1,"output_tokens":1,"elapsed_ms":0},"termination":"completed","artifact_verified":false,"applied_limits":[],"audit_id":null}"#;
 
 #[test]
+fn controller_preserves_the_worker_exit_status() {
+    // controller ที่มี pin ต้องส่งต่อสถานะจาก kernel แยกจาก error text ของ worker
+    let fixture = Fixture::new("read request\nexit 73");
+    let error = fixture
+        .client()
+        .infer(&fixture.config, request(), &fixture.limits(2000))
+        .unwrap_err();
+    assert_eq!(error.code(), "worker_failed", "{error}");
+    assert!(error.to_string().contains("exit_code=73"), "{error}");
+    let exit = error.worker_exit().unwrap();
+    assert_eq!(exit.exit_code, Some(73));
+    assert!(exit.observed_before_cleanup);
+}
+
+#[test]
+fn cleanup_failure_keeps_the_original_worker_exit_evidence() {
+    use std::os::unix::fs::PermissionsExt;
+    // primary failure และ wait status ต้องยังอยู่เมื่อ staging cleanup ล้มตามหลัง
+    let fixture = Fixture::new(
+        r#"read request
+printf '{"protocol_version":1,"request_id":"req-1","delta":"%s"}\n' "$2"
+exit 73"#,
+    );
+    let local = fixture.config.local.as_ref().unwrap();
+    let client = WorkerClient::new(local.worker_path.as_ref().unwrap());
+    let mut config = fixture.config.clone();
+    config.local.as_mut().unwrap().controller_path = None;
+    config.local.as_mut().unwrap().controller_sha256 = None;
+    let mut directory = None;
+    let error = client
+        .infer_stream(
+            &config,
+            request(),
+            &fixture.limits(2000),
+            &mut |config_path| {
+                let path = std::path::Path::new(config_path)
+                    .parent()
+                    .unwrap()
+                    .to_path_buf();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+                directory = Some(path);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    let path = directory.unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+    assert_eq!(error.code(), "cleanup_failed", "{error}");
+    assert!(matches!(
+        error.cause(),
+        WorkerError::CleanupAfterFailure { .. }
+    ));
+    let exit = error.worker_exit().unwrap();
+    assert_eq!(exit.exit_code, Some(73));
+    assert!(exit.observed_before_cleanup);
+}
+
+#[test]
 fn event_api_streams_and_completes_through_the_pinned_controller() {
     let fixture=Fixture::new(&format!("read request\nprintf '%s\\n' '{{\"protocol_version\":1,\"request_id\":\"req-1\",\"delta\":\"ok\"}}' '{RESPONSE}'"));
     let client = fixture.client();

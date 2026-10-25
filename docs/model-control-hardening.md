@@ -2,7 +2,7 @@
 
 การปรับปรุงนี้ครอบคลุม executable identity, checked cleanup, supervised deadline,
 structured errors, admission/cache และการประเมินคุณภาพแยกจาก protocol success
-ผลทดสอบรอบล่าสุดเก็บใน `target/control-hardening-2026-10-25/` เมื่อรันบน host
+ผล real-model validation รอบล่าสุดเก็บใน `target/control-hardening-2026-10-25/` เมื่อรันบน host
 สรุปผลและข้อจำกัดของรอบนี้: [host validation 25 ตุลาคม 2026](host-validation-2026-10-25.md)
 
 ## ไฟล์ที่ตรวจต้องเป็นไฟล์ที่รัน
@@ -91,6 +91,38 @@ worker_failed, deadline, cancelled, cleanup_failed และ resources_unavailab
 protocol/limit failures ไม่ถูกบีบให้เป็น generic Failed ในเส้นทาง process อีก
 ข้อความ stderr และ error string จาก worker ไม่ถูกส่งต่อดิบ ใช้เฉพาะคำอธิบายคงที่
 สำหรับ diagnostic ที่รู้จัก และไม่ถือข้อความจาก worker เป็น host attestation
+
+### Exit status ของ process worker
+
+`WorkerError::worker_exit()` คืน `Option<&WorkerExit>` สำหรับ process/process_namespace
+worker ที่เริ่มทำงานแล้วและ host เก็บ wait status ได้ โดยมี `exit_code`, `signal`,
+`core_dumped` และ `observed_before_cleanup` ข้อมูลถูกเก็บใน `WorkerError::Exit`
+และส่งผ่าน pinned controller ได้; `code()` และ `cause()` ยังให้สาเหตุหลักเดิม
+หาก checked staging cleanup ล้มตามหลัง ยังเข้าถึง exit evidence ผ่าน
+`CleanupAfterFailure` ได้ Raw worker frames ไม่มีสิทธิ์อ้าง host exit evidence
+
+Client อ่านสถานะก่อนเริ่ม cleanup และเมื่อเจอ stdout EOF จะรอ process ออกจริง
+ภายใน execution/total deadline เดิม ถ้า worker ปิด stdout แต่ยังรันต่อ จะคืน deadline
+และ cleanup ตามปกติ Exit 0 ที่ไม่มี completion หรือ completion ที่ตามด้วย exit ไม่สำเร็จ
+ยังเป็น failure เสมอ ไม่ปล่อย partial stream เป็น completion
+
+`observed_before_cleanup=false` หมายถึงเห็นสถานะหลังเริ่ม cleanup ซึ่งอาจรวม SIGKILL
+ที่ client ส่งเอง ค่า true บอกจังหวะที่อ่านสถานะเท่านั้น ไม่ได้พิสูจน์ว่า worker ถูก
+ฆ่าด้วยสาเหตุใด SIGKILL ไม่ถูกเปลี่ยนเป็น OOM หรือ CPU-limit diagnosis โดยไม่มี
+หลักฐานเพิ่มเติม และ `core_dumped` เป็น wait-status flag ไม่ใช่หลักฐานว่าเก็บ core file
+Error ที่เกิดก่อน spawn หรือ event deadline ที่กลับก่อน controller ส่งผล cleanup
+อาจยังไม่มี exit evidence จึงไม่เติมค่าขึ้นมาเอง
+
+ตัวอย่าง diagnostic ใหม่เมื่อ worker ออกด้วย code 73 ก่อนส่ง completion:
+
+```text
+worker failed: worker returned no completion; worker_exit: exit_code=73; signal=none; core_dumped=false; observed_before_cleanup=true
+```
+
+การเปลี่ยนนี้ช่วยวิเคราะห์ failure ครั้งถัดไป ไม่ได้ระบุย้อนหลังว่าสาเหตุของ
+`worker returned no response` ใน [ผลรอบก่อน](host-validation-2026-10-25.md) คืออะไร
+หลักฐาน CI, process-failure และ namespace regressions ของ exit diagnostics อยู่ใน
+`target/worker-exit-diagnostics-2026-10-25/`; ผล GGUF/coding quality ยังคงอ้าง snapshot รอบก่อน
 
 ## Admission และ cache
 
