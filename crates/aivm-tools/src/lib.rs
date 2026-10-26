@@ -2458,6 +2458,7 @@ network: {{allow: [], deny: ['10.0.0.0/8']}}
             argv: args.clone(),
             executable_sha256: Some(verification::digest(&std::fs::read(&exe).unwrap())),
             stdout_contains: None,
+            prepare: Vec::new(),
         });
         let result = gateway.exec(&mut cube, &exe, &args).unwrap();
         let record = result.verification.unwrap();

@@ -175,7 +175,7 @@ validator ปฏิเสธ JSON ที่ชนิดผิด, records ที
 agent/compiler/gateway integration ยังตรวจแยกด้วย `make test-coding`
 มี ignored host benchmark `real_model_repairs_source_checked_by_an_independent_verifier`
 ใน `crates/aivm-runtime/tests/coding_workflow.rs` ให้โมเดลจริงแก้ฟังก์ชัน C ผ่าน gateway
-ภายใน 3 agent steps แล้ว operator verifier ที่ agent เขียนไม่ได้ตรวจ 289 input pairs
+ภายใน 8 ก้าวรวม model intents และ build ตาม operator verifier contract แล้ว operator verifier ที่ agent เขียนไม่ได้ตรวจ 289 input pairs
 compiler/linker/test binary ทั้งหมดผ่าน gateway/sandbox; baseline ที่ผิดต้องถูกปฏิเสธก่อน
 รายงาน `task_correct` แยกจาก summary/verification status ของ agent ไม่อนุมานอัตรา
 แก้ repository จริงจาก task เดียวหรือ model-only probes เหล่านี้
@@ -188,6 +188,46 @@ Coding benchmark ใช้ 8k context, 2 model threads, RAM 4 GiB และ CPU 
 ยังรายงาน `task_correct=false` แยกจาก infrastructure status ตามเดิม
 การผ่าน operator verifier ไม่เปลี่ยนสถานะ completion ของ agent เป็น `verified`
 โดยอัตโนมัติ; ผลทั้งสองอยู่คนละ field และอาจไม่ตรงกัน
+
+### เปรียบเทียบคุณภาพ prompt โดยไม่เปลี่ยน oracle
+
+`scripts/eval-model-quality.py` เปรียบเทียบ prompt เดิมกับ suffix ใน
+`examples/model-quality-format.json` โดยใช้ pinned ModelConfig เดิมตลอดทั้งสี่รัน
+รัน corpus เดิม 6 งานและ synthetic transfer corpus ใหม่ 8 งานแยกกัน:
+
+```bash
+python3 scripts/eval-model-quality.py \
+  --config /absolute/path/pinned-quality-config.json \
+  --out target/quality-comparison-new-run
+```
+
+ต้องใช้ output directory ใหม่เพื่อไม่เขียนทับหลักฐานเก่า ต้องเตรียม worker
+ด้วย `cargo build --locked -p aivm-model-worker --features llama,microvm`
+และตรวจ worker pin ของ build ที่อนุมัติก่อนรัน ห้าม build worker คนละ features
+หรือเปลี่ยน model/config/profile/corpora ระหว่างรัน
+ถ้าใช้ host quota ให้แยก root จาก workload ที่มี quota policy ต่างกัน
+
+Suffix เป็นคำกำกับรูปแบบทั่วไป ไม่มีคำตอบ oracle และไม่ได้แก้ prompt เดิม
+ใน corpus หลัก เกณฑ์เดิมยังปฏิเสธ Markdown, extra fields และคำตอบผิด
+`failure_kind=markdown_fence` ใช้อธิบายข้อผิดพลาดเท่านั้น ไม่ตัด fence เพื่อเพิ่มคะแนน
+รายงานเก็บ prompt/output จริง, config/corpus/profile hashes, latency, คะแนน
+และรายชื่อ cases ที่ดีขึ้นหรือถดถอย พร้อมตรวจคะแนนซ้ำจาก output ก่อนรับรายงาน
+Infrastructure ผ่านไม่ได้แปลว่าคุณภาพผ่าน threshold; ไม่มีการปรับ weights
+หรืออ้าง production accuracy จาก corpus เล็กนี้
+
+Corpus ใหม่เขียนหลังเห็น baseline จึงไม่ใช่ independent holdout
+การกำกับรูปแบบใช้เฉพาะรัน `strict` ของการเปรียบเทียบ ไม่ได้เปลี่ยนคำตอบ
+ของ model clients ทุกตัวโดยอัตโนมัติ ผู้เรียกที่ต้องการ JSON/plain output
+นำ suffix ที่ประเมินแล้วไปต่อท้าย prompt ก่อนส่ง request ได้ โดยเก็บ prompt
+เต็มเพื่อให้ context/output limits และหลักฐานตรงกับงานที่รันจริง
+
+ผล [เปรียบเทียบวันที่ 26 ตุลาคม](model-quality-2026-10-26.md): baseline ดีขึ้น
+4/6 → 5/6 แต่ synthetic transfer คงที่ 3/8 และยังมี semantic errors
+suffix นี้จึงยังเป็น candidate สำหรับการประเมิน ไม่ใช่ production default
+
+ผล [coding validation วันที่ 26 ตุลาคม](coding-validation-2026-10-26.md):
+ใช้ `verification.prepare` จาก operator ให้ runtime build/test ผ่าน gateway
+หลัง model edit ได้ทั้ง `agent_verified=true` และผลตรวจอิสระ 289 input pairs ผ่าน
 
 ตัวอย่างรัน coding benchmark บน host หลังเตรียม pinned ModelConfig JSON แล้ว:
 

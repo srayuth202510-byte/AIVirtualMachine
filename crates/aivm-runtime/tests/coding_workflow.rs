@@ -132,10 +132,44 @@ tools: {{allow: [cc, as, ld, "build:tests"]}}
         ]
     }
     fn execute(&mut self, steps: Vec<String>) -> aivm_runtime::agent::AgentRun {
+        // กรณีตั้งใจให้ verifier ไม่ผ่านจะถูกปฏิเสธ finish จึงหยุดตาม budget ของ script
+        let writes = steps
+            .iter()
+            .filter(|step| {
+                serde_json::from_str::<ToolRequest>(step)
+                    .is_ok_and(|request| request.tool == "filesystem.write")
+            })
+            .count();
+        let max_steps = steps.len()
+            + writes
+                * self
+                    .runtime
+                    .gateway
+                    .verifier
+                    .as_ref()
+                    .map(|contract| contract.execution_plan().unwrap().len())
+                    .unwrap_or(0);
         self.runtime.model = Box::new(Script(Mutex::new(steps.into())));
         self.runtime
-            .run_agent("fix add and run the tests", 10, Some(&self.root))
+            .run_agent("fix add and run the tests", max_steps, Some(&self.root))
             .unwrap()
+    }
+    fn prepare_verifier(&mut self, commands: &[String]) {
+        let prepare = commands
+            .iter()
+            .map(|command| {
+                let request: ToolRequest = serde_json::from_str(command).unwrap();
+                let body: aivm_tools::ExecContent =
+                    serde_json::from_str(request.content.as_deref().unwrap()).unwrap();
+                aivm_tools::verification::VerifierStep {
+                    executable: request.path,
+                    argv: body.argv,
+                    outputs: body.outputs,
+                }
+            })
+            .collect::<Vec<_>>();
+        self.runtime.gateway.verifier.as_mut().unwrap().prepare = prepare.clone();
+        self.runtime.config.verification.as_mut().unwrap().prepare = prepare;
     }
 }
 impl Drop for Fixture {
@@ -197,6 +231,9 @@ fn agent_reads_fixes_builds_and_tests_with_audited_limits() {
         run.steps
     );
     assert!(run.steps[4].outcome.contains("exit status: 0"));
+    assert!(run.steps[2].outcome.contains("Executed request:"));
+    assert!(run.steps[2].outcome.contains("main.o"));
+    assert!(run.steps[3].outcome.contains("--dynamic-linker"));
     assert_eq!(
         std::fs::read_to_string(fixture.runtime.workspace.join("src/main.c")).unwrap(),
         FIXED
@@ -228,6 +265,53 @@ fn agent_reads_fixes_builds_and_tests_with_audited_limits() {
         .gateway
         .write(&mut fixture.runtime.cube, ".aivm-build/tests", "tampered")
         .is_err());
+}
+
+#[test]
+fn operator_verifier_builds_after_edit_and_repairs_a_failed_test_without_model_build_commands() {
+    let mut fixture = Fixture::new(true);
+    fixture.modify();
+    fixture.prepare_verifier(&fixture.build_steps()[..2]);
+    let run = fixture.execute(vec![
+        json!({"tool":"filesystem.write","path":"src/main.c","content":BROKEN}).to_string(),
+        json!({"tool":"filesystem.write","path":"src/main.c","content":FIXED}).to_string(),
+    ]);
+    assert_eq!(run.steps.len(), 8);
+    assert!(run.steps[3].outcome.contains("exit status: 1"));
+    assert_eq!(run.steps[4].origin, "model");
+    for index in [1, 2, 3, 5, 6, 7] {
+        assert_eq!(run.steps[index].origin, "operator_verifier");
+    }
+    assert_eq!(run.stopped, "done");
+    assert!(matches!(
+        run.verification_status,
+        aivm_tools::verification::VerificationStatus::Verified
+    ));
+    assert!(!fixture.runtime.cube.tests_passed());
+    assert!(AuditWriter::verify(fixture.root.join("audit.jsonl")).is_ok());
+}
+
+#[test]
+fn operator_prepare_cannot_bypass_gateway_authorization() {
+    let mut fixture = Fixture::new(true);
+    fixture.modify();
+    fixture.prepare_verifier(&[intent("/bin/sh", r#"{"argv":[]}"#)]);
+    fixture.runtime.model = Box::new(Script(Mutex::new(
+        vec![json!({"tool":"filesystem.write","path":"src/main.c","content":FIXED}).to_string()]
+            .into(),
+    )));
+    let run = fixture
+        .runtime
+        .run_agent("Fix the code and run tests", 2, Some(&fixture.root))
+        .unwrap();
+    assert_eq!(run.steps.len(), 2);
+    assert_eq!(run.steps[1].origin, "operator_verifier");
+    assert!(run.steps[1].outcome.starts_with("DENY process.exec"));
+    assert!(matches!(
+        run.verification_status,
+        aivm_tools::verification::VerificationStatus::Unverified
+    ));
+    assert!(AuditWriter::verify(fixture.root.join("audit.jsonl")).is_ok());
 }
 
 #[test]
@@ -355,6 +439,37 @@ fn symlink_output_roots_and_secret_builds_fail_closed() {
 }
 
 #[test]
+fn gcc_requires_pipe_and_cannot_create_unreserved_temporary_files() {
+    let mut fixture = Fixture::new(true);
+    fixture.modify();
+    let compile = |pipe: bool| {
+        let mut argv = vec!["-c", "src/main.c", "-o", ".aivm-build/main.o"];
+        if pipe {
+            argv.insert(0, "-pipe");
+        }
+        intent(
+            &fixture.cc,
+            &json!({"argv":argv,"outputs":["main.o"]}).to_string(),
+        )
+    };
+    let steps = vec![compile(false), compile(true), done()];
+    let run = fixture.execute(steps);
+    assert!(run.steps[0].outcome.starts_with("FAIL"), "{:?}", run.steps);
+    assert!(run.steps[0]
+        .outcome
+        .contains("Cannot create temporary file"));
+    assert!(run.steps[1].outcome.starts_with("OK"), "{:?}", run.steps);
+    assert!(
+        std::fs::metadata(fixture.runtime.workspace.join(".aivm-build/main.o"))
+            .unwrap()
+            .len()
+            > 0
+    );
+    assert!(!fixture.runtime.cube.tests_passed());
+    assert!(AuditWriter::verify(fixture.root.join("audit.jsonl")).is_ok());
+}
+
+#[test]
 fn compiler_errors_are_failures_with_diagnostics_and_no_state_escalation() {
     let mut fixture = Fixture::new(true);
     fixture.modify();
@@ -464,16 +579,38 @@ fn real_model_repairs_source_checked_by_an_independent_verifier() {
             .is_err(),
         "operator verifier must be outside agent write authority"
     );
-    let verify = |fixture: &mut Fixture| {
-        let steps=vec![
+    let commands=vec![
             intent(&fixture.cc,&json!({"argv":["-pipe","-c","src/main.c","-o",".aivm-build/main.o"],"outputs":["main.o"]}).to_string()),
             intent(&fixture.cc,&json!({"argv":["-pipe","-c","verify.c","-o",".aivm-build/verify.o"],"outputs":["verify.o"]}).to_string()),
             intent(&fixture.ld,&json!({"argv":["-o",".aivm-build/tests","--dynamic-linker","/lib64/ld-linux-x86-64.so.2",fixture.crt[0],fixture.crt[1],".aivm-build/main.o",".aivm-build/verify.o","-lc",fixture.crt[2]],"outputs":["tests"]}).to_string()),
             intent("build:tests","[]"),
-        ];
+    ];
+    let prepare = commands[..3]
+        .iter()
+        .map(|command| {
+            let request: ToolRequest = serde_json::from_str(command).unwrap();
+            let body: aivm_tools::ExecContent =
+                serde_json::from_str(request.content.as_deref().unwrap()).unwrap();
+            aivm_tools::verification::VerifierStep {
+                executable: request.path,
+                argv: body.argv,
+                outputs: body.outputs,
+            }
+        })
+        .collect::<Vec<_>>();
+    fixture.runtime.gateway.verifier.as_mut().unwrap().prepare = prepare.clone();
+    fixture
+        .runtime
+        .config
+        .verification
+        .as_mut()
+        .unwrap()
+        .prepare = prepare;
+    let verifier_contract = fixture.runtime.gateway.verifier.clone().unwrap();
+    let verify = |fixture: &mut Fixture| {
         let mut rows = Vec::new();
-        for step in steps {
-            let request: ToolRequest = serde_json::from_str(&step).unwrap();
+        for step in &commands {
+            let request: ToolRequest = serde_json::from_str(step).unwrap();
             match fixture
                 .runtime
                 .gateway
@@ -506,8 +643,11 @@ fn real_model_repairs_source_checked_by_an_independent_verifier() {
         "oracle must reject the known broken implementation"
     );
     let started = std::time::Instant::now();
-    let task="Fix add in src/main.c so it returns the integer sum of its two arguments. Read the source and update only src/main.c through filesystem tools. Do not add a main function. Do not modify verify.c. An independent operator verifier will compile your patch and check 289 input pairs after your bounded run.";
-    let run = fixture.runtime.run_agent(task, 3, Some(&fixture.root));
+    let task = "Fix add in src/main.c so it returns the integer sum of its two arguments. Read the source and update only src/main.c through filesystem tools. Do not add a main function. Do not modify verify.c. The runtime will compile and run tests with the operator verifier after your edit, checking 289 input pairs.";
+    let max_steps = 8;
+    let run = fixture
+        .runtime
+        .run_agent(task, max_steps, Some(&fixture.root));
     let elapsed_ms = started.elapsed().as_millis();
     let after = std::fs::read(&source).unwrap();
     let results = verify(&mut fixture);
@@ -523,7 +663,13 @@ fn real_model_repairs_source_checked_by_an_independent_verifier() {
         Err(error) => (None, Some(error.to_string())),
     };
     let infrastructure_passed = error.is_none();
-    let report = json!({"schema":1,"scope":"One bounded live-model coding task; independent operator verifier checks 289 pairs via the real tool gateway/sandbox. No production success-rate claim.","config_sha256":format!("{:x}",Sha256::digest(&bytes)),"benchmark_source_sha256":format!("{:x}",Sha256::digest(include_bytes!("coding_workflow.rs"))),"effective_model_config":effective_model_config,"infrastructure_passed":infrastructure_passed,"baseline_rejected":true,"verifier_unchanged":true,"verifier_write_denied":true,"task_correct":task_correct,"source_changed":after!=broken.as_bytes(),"source_sha256":format!("{:x}",Sha256::digest(&after)),"client_boot_ms":boot_ms,"agent_elapsed_ms":elapsed_ms,"agent_run":agent_run,"agent_error":error,"verifier_results":results,"audit_records":audit_records});
+    let agent_verified = agent_run.as_ref().is_some_and(|run| {
+        matches!(
+            run.verification_status,
+            aivm_tools::verification::VerificationStatus::Verified
+        )
+    });
+    let report = json!({"schema":1,"scope":"One bounded live-model coding task; independent operator verifier checks 289 pairs via the real tool gateway/sandbox. No production success-rate claim.","config_sha256":format!("{:x}",Sha256::digest(&bytes)),"benchmark_source_sha256":format!("{:x}",Sha256::digest(include_bytes!("coding_workflow.rs"))),"effective_model_config":effective_model_config,"max_steps":max_steps,"build_commands":commands,"verifier_contract":verifier_contract,"infrastructure_passed":infrastructure_passed,"baseline_rejected":true,"verifier_unchanged":true,"verifier_write_denied":true,"task_correct":task_correct,"agent_verified":agent_verified,"source_changed":after!=broken.as_bytes(),"source_sha256":format!("{:x}",Sha256::digest(&after)),"client_boot_ms":boot_ms,"agent_elapsed_ms":elapsed_ms,"agent_run":agent_run,"agent_error":error,"verifier_results":results,"audit_records":audit_records});
     std::fs::write(evidence, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     assert!(
         infrastructure_passed,

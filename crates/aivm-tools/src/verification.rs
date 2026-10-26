@@ -16,10 +16,42 @@ pub struct VerifierConfig {
     pub executable_sha256: Option<String>,
     #[serde(default)]
     pub stdout_contains: Option<String>,
+    /// คำสั่ง build จาก operator; runtime ส่งผ่าน gateway หลังโมเดลแก้ source
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepare: Vec<VerifierStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierStep {
+    pub executable: String,
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub outputs: Vec<String>,
 }
 
 impl VerifierConfig {
     pub fn validate(&self) -> Result<(), ToolError> {
+        if self.prepare.len() > 16 {
+            return Err(denied("too many verifier preparation steps"));
+        }
+        for step in &self.prepare {
+            if !Path::new(&step.executable).is_absolute()
+                || step.executable.len() > 4096
+                || step.executable.contains('\0')
+                || step.argv.len() > 256
+                || step
+                    .argv
+                    .iter()
+                    .any(|arg| arg.len() > 4096 || arg.contains('\0'))
+                || step.outputs.len() > 64
+            {
+                return Err(denied("invalid verifier preparation step"));
+            }
+            for output in &step.outputs {
+                build::validate_name(output)?;
+            }
+        }
         if let Some(name) = self.executable.strip_prefix("build:") {
             build::validate_name(name)?;
         } else if !Path::new(&self.executable).is_absolute() || self.executable_sha256.is_none() {
@@ -44,6 +76,30 @@ impl VerifierConfig {
             return Err(denied("invalid verifier contract"));
         }
         Ok(())
+    }
+
+    pub fn execution_plan(&self) -> Result<Vec<crate::ToolRequest>, ToolError> {
+        self.validate()?;
+        if self.prepare.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut plan = self
+            .prepare
+            .iter()
+            .map(|step| crate::ToolRequest {
+                tool: "process.exec".into(),
+                path: step.executable.clone(),
+                content: Some(
+                    serde_json::json!({"argv":step.argv,"outputs":step.outputs}).to_string(),
+                ),
+            })
+            .collect::<Vec<_>>();
+        plan.push(crate::ToolRequest {
+            tool: "process.exec".into(),
+            path: self.executable.clone(),
+            content: Some(serde_json::json!({"argv":self.argv}).to_string()),
+        });
+        Ok(plan)
     }
 }
 
@@ -246,6 +302,7 @@ mod tests {
                 argv: vec![],
                 executable_sha256: None,
                 stdout_contains: Some("2 tests passed".into()),
+                prepare: Vec::new(),
             }
         }
         fn prepare(&self) -> PreparedVerification {
@@ -256,6 +313,29 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn preparation_is_bounded_and_preserves_legacy_contracts() {
+        let fixture = Fixture::new();
+        let mut config = fixture.config();
+        assert!(!serde_json::to_string(&config).unwrap().contains("prepare"));
+        assert!(config.execution_plan().unwrap().is_empty());
+        config.prepare = vec![VerifierStep {
+            executable: "/usr/bin/cc".into(),
+            argv: vec!["-pipe".into()],
+            outputs: vec!["main.o".into()],
+        }];
+        assert_eq!(config.execution_plan().unwrap().len(), 2);
+        let mut invalid = config.clone();
+        invalid.prepare[0].outputs = vec!["../escape".into()];
+        assert!(invalid.validate().is_err());
+        invalid = config.clone();
+        invalid.prepare[0].executable = "cc".into();
+        assert!(invalid.validate().is_err());
+        invalid = config.clone();
+        invalid.prepare = vec![config.prepare[0].clone(); 17];
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

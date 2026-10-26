@@ -87,11 +87,11 @@ def failure_evidence_passed(path):
         return False
 
 
-def quality_evidence_passed(path):
+def quality_evidence_passed(path, corpus_path=None):
     # งานผิดต้องสะท้อนคะแนน แต่ห้ามใช้ model-only benchmark เป็นหลักฐานว่า tool task สำเร็จ
     try:
         report = json.loads(Path(path).read_text())
-        expected = json.loads((PROJECT / "examples/model-quality.json").read_text())["cases"]
+        expected = json.loads(Path(corpus_path or PROJECT / "examples/model-quality.json").read_text())["cases"]
         # malformed evidence ต้องคืน false เช่นเดียวกับ record ที่ขาด ห้าม crash หรือรับ bool เป็น count
         if not isinstance(report, dict) or any(type(report.get(key)) is not int
                 for key in ("schema", "completed", "total", "task_correct")):

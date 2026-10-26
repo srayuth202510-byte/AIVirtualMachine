@@ -72,6 +72,8 @@ pub enum Intent {
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentStep {
     pub index: usize,
+    /// แยกข้อเสนอของโมเดลจากคำสั่งใน verifier contract ของ operator
+    pub origin: String,
     /// Current coding subtask, or "general" for tasks outside the coding workflow.
     pub subtask: String,
     /// สรุปการกระทำ เช่น "filesystem.read src/main.rs" หรือ "invalid-intent"
@@ -333,9 +335,19 @@ fn coding_subtasks(task: &str) -> Vec<String> {
 fn task_requires_test_completion(task: &str) -> bool {
     let task = task.to_ascii_lowercase();
     let asks_for_tests = task.contains("test") || task.contains("ทดสอบ");
-    let asks_for_code_change = ["fix", "bug", "code", "implement", "แก้", "โค้ด"]
-        .iter()
-        .any(|word| task.contains(word));
+    // คำว่า code/tests อย่างเดียวอาจเป็นงานอ่านหรืออธิบาย ไม่ใช่คำสั่งแก้แล้วทดสอบ
+    let asks_for_code_change = [
+        "fix",
+        "implement",
+        "write",
+        "modify",
+        "repair",
+        "debug",
+        "แก้",
+        "เขียน",
+    ]
+    .iter()
+    .any(|word| task.contains(word));
     asks_for_tests && asks_for_code_change
 }
 
@@ -431,12 +443,27 @@ pub fn run_loop(
     let mut inspection_notes: Vec<String> = Vec::new();
     let mut last_successful_request: Option<ToolRequest> = None;
     let mut last_successful_write: Option<ToolRequest> = None;
-    let mut edited_this_run = false;
     let mut verification = None;
+    let operator_plan = gateway
+        .verifier
+        .as_ref()
+        .map(|contract| contract.execution_plan())
+        .transpose()
+        .map_err(|error| RuntimeError::Config(error.to_string()))?
+        .unwrap_or_default();
+    let mut operator_next: Option<usize> = None;
     let mut last_guarded_action: Option<String> = None;
     let mut guarded_action_streak = 0usize;
 
     for index in 0..max_steps {
+        let operator_request = operator_next
+            .and_then(|step| operator_plan.get(step))
+            .cloned();
+        let origin = if operator_request.is_some() {
+            "operator_verifier"
+        } else {
+            "model"
+        };
         // RAG: ค้นหา context ที่เกี่ยวข้องกับ task (ถ้ามี index)
         let context_hint = if let Some(idx) = rag_index {
             let retriever = rag::Retriever {
@@ -477,21 +504,37 @@ pub fn run_loop(
                 )
             })
             .unwrap_or_else(|| SYSTEM_PROMPT.to_string());
+        // Known-output profile ไม่เปิดพื้นที่ temp: บอกข้อจำกัดก่อนให้โมเดลเลือก compiler flags
+        let system_prompt = if gateway.build.enabled && operator_plan.is_empty() {
+            format!("{system_prompt}\nBuild profile: only declared output slots under .aivm-build are writable. Temporary files in /tmp and arbitrary new files are denied. For GCC, compile each source separately using -pipe -c SOURCE -o .aivm-build/NAME.o and declare NAME.o in outputs. Link the objects using the operator's ld command and declared output slots; do not use the GCC driver to link or invent startup-object paths. Follow the project's build/test instructions, then execute the configured verifier. A successful compile alone does not verify completion.")
+        } else {
+            system_prompt
+        };
         let system_prompt = if let Some(contract) = &gateway.verifier {
+            let summary = serde_json::json!({"executable":contract.executable,"argv":contract.argv,"stdout_contains":contract.stdout_contains});
             format!("{system_prompt}\nOnly the gateway may verify completion. Operator verifier contract: {}",
-                serde_json::to_string(contract).expect("verifier config serializes"))
+                summary)
         } else {
             format!("{system_prompt}\nNo operator verifier is configured; command output cannot establish verified completion.")
         };
-        let raw = model
-            .reason_with_system(&system_prompt, &prompt)
-            .map_err(|e| RuntimeError::Config(format!("model: {e}")))?;
+        let system_prompt = if operator_plan.is_empty() {
+            system_prompt
+        } else {
+            format!("{system_prompt}\nAfter your source edit, the runtime will compile and run the operator verifier through the gateway. Read and edit the source; do not compile or repeat a successful edit yourself. If the operator build or verifier fails, repair the source using the diagnostics.")
+        };
+        let raw = if let Some(request) = operator_request {
+            serde_json::to_string(&request).expect("operator request serializes")
+        } else {
+            model
+                .reason_with_system(&system_prompt, &prompt)
+                .map_err(|e| RuntimeError::Config(format!("model: {e}")))?
+        };
 
         match parse_intent(&raw) {
             Ok(Intent::Finish(s)) => {
-                if task_requires_test_completion(task) && edited_this_run {
+                if task_requires_test_completion(task) {
                     let reason =
-                        "requested tests have not passed under an operator verifier contract; continue with the verify subtask";
+                        "requested tests have not passed under an operator verifier contract; complete the current subtask and run the verifier before finishing";
                     gateway
                         .audit_agent_guard_deny(cube, "finish", reason)
                         .map_err(|e| RuntimeError::Io(e.to_string()))?;
@@ -499,6 +542,7 @@ pub fn run_loop(
                     observations.push(outcome.clone());
                     steps.push(AgentStep {
                         index,
+                        origin: origin.into(),
                         subtask: subtask
                             .map(CodingSubtask::name)
                             .unwrap_or("general")
@@ -517,11 +561,12 @@ pub fn run_loop(
                 let is_same_request = |last: &ToolRequest| {
                     last.tool == req.tool && last.path == req.path && last.content == req.content
                 };
-                let repeated = last_successful_request
-                    .as_ref()
-                    .is_some_and(is_same_request)
-                    || (req.tool == "filesystem.write"
-                        && last_successful_write.as_ref().is_some_and(is_same_request));
+                let repeated = origin == "model"
+                    && (last_successful_request
+                        .as_ref()
+                        .is_some_and(is_same_request)
+                        || (req.tool == "filesystem.write"
+                            && last_successful_write.as_ref().is_some_and(is_same_request)));
                 let action_subtask = subtask.map(CodingSubtask::name).unwrap_or("general");
                 let disallowed_for_phase = subtask.is_some_and(|phase| !phase.allows(&req.tool));
                 // Every non-guarded intent passes the gateway; repeated or
@@ -549,7 +594,25 @@ pub fn run_loop(
                                 req.path,
                                 clip(&res.output, MAX_OBS_CHARS)
                             );
+                            // cc สองคำสั่งอาจได้ exit 0 เหมือนกัน: เก็บ argv/outputs ให้โมเดลแยกก้าวที่ทำแล้วได้
+                            let outcome = if req.tool == "process.exec" {
+                                format!(
+                                    "{outcome}\nExecuted request: {}",
+                                    clip(req.content.as_deref().unwrap_or("[]"), MAX_OBS_CHARS)
+                                )
+                            } else {
+                                outcome
+                            };
                             if res.ok {
+                                if origin == "operator_verifier" {
+                                    operator_next = operator_next
+                                        .map(|step| step + 1)
+                                        .filter(|step| *step < operator_plan.len());
+                                } else if req.tool == "filesystem.write"
+                                    && !operator_plan.is_empty()
+                                {
+                                    operator_next = Some(0);
+                                }
                                 last_successful_request = Some(req.clone());
                                 if req.tool == "filesystem.write" {
                                     last_successful_write = Some(req.clone());
@@ -562,7 +625,6 @@ pub fn run_loop(
                                             subtask = Some(CodingSubtask::Implement);
                                         }
                                         "filesystem.write" => {
-                                            edited_this_run = true;
                                             subtask = Some(CodingSubtask::Verify);
                                         }
                                         _ => {}
@@ -595,6 +657,7 @@ pub fn run_loop(
                                         observations.push(outcome.clone());
                                         steps.push(AgentStep {
                                             index,
+                                            origin: origin.into(),
                                             subtask: action_subtask.to_string(),
                                             action: format!("{} {}", req.tool, req.path),
                                             outcome,
@@ -603,6 +666,7 @@ pub fn run_loop(
                                     }
                                 }
                             } else {
+                                operator_next = None;
                                 if res.verification.is_some() {
                                     verification = res.verification;
                                 }
@@ -614,6 +678,7 @@ pub fn run_loop(
                             outcome
                         }
                         Err(e) => {
+                            operator_next = None;
                             last_successful_request = None;
                             if req.tool == "process.exec" && subtask.is_some() {
                                 subtask = Some(CodingSubtask::Repair);
@@ -640,6 +705,7 @@ pub fn run_loop(
                 observations.push(outcome.clone());
                 steps.push(AgentStep {
                     index,
+                    origin: origin.into(),
                     subtask: action_subtask.to_string(),
                     action: format!("{} {}", req.tool, req.path),
                     outcome,
@@ -658,6 +724,7 @@ pub fn run_loop(
                 observations.push(outcome.clone());
                 steps.push(AgentStep {
                     index,
+                    origin: origin.into(),
                     subtask: subtask
                         .map(CodingSubtask::name)
                         .unwrap_or("general")
@@ -715,17 +782,23 @@ mod tests {
     /// โมเดลสคริปต์: คืนข้อความที่กำหนดตามลำดับ (ไว้ทดสอบ loop แบบ deterministic)
     struct ScriptedModel {
         outputs: Mutex<VecDeque<String>>,
+        system_prompts: Mutex<Vec<String>>,
     }
 
     impl ScriptedModel {
         fn new(outputs: &[&str]) -> Self {
             Self {
                 outputs: Mutex::new(outputs.iter().map(|s| s.to_string()).collect()),
+                system_prompts: Mutex::new(Vec::new()),
             }
         }
     }
 
     impl Model for ScriptedModel {
+        fn reason_with_system(&self, system: &str, context: &str) -> Result<String, ModelError> {
+            self.system_prompts.lock().unwrap().push(system.into());
+            self.reason(context)
+        }
         fn reason(&self, _context: &str) -> Result<String, ModelError> {
             self.outputs
                 .lock()
@@ -934,6 +1007,61 @@ mod tests {
         assert!(!phase_task(task, Some(CodingSubtask::Verify)).contains("Read it and edit"));
         assert!(is_build_instruction_path("Makefile"));
         assert!(task_requires_test_completion("Fix the code and run tests"));
+        assert!(!task_requires_test_completion(
+            "Read the code and explain its tests"
+        ));
+    }
+
+    #[test]
+    fn enabled_build_profile_explains_compiler_constraints_before_execution() {
+        for enabled in [false, true] {
+            let mut fx = fixture("build-guidance");
+            fx.gateway.build.enabled = enabled;
+            let model = ScriptedModel::new(&[r#"{"tool":"filesystem.read","path":"src/seed.rs"}"#]);
+            run_loop(
+                &model,
+                &mut fx.gateway,
+                &mut fx.cube,
+                "Fix src/seed.rs and run tests",
+                1,
+                None,
+            )
+            .unwrap();
+            let prompts = model.system_prompts.lock().unwrap();
+            assert_eq!(prompts[0].contains("-pipe -c SOURCE"), enabled);
+            if enabled {
+                assert!(prompts[0]
+                    .contains("Temporary files in /tmp and arbitrary new files are denied"));
+                assert!(prompts[0].contains("do not use the GCC driver to link"));
+            }
+        }
+    }
+
+    #[test]
+    fn coding_task_cannot_finish_before_any_edit_or_verifier() {
+        let mut fx = fixture("premature-finish");
+        let model = ScriptedModel::new(&[
+            r#"{"done":true,"summary":"I fixed everything and tests pass"}"#,
+            r#"{"tool":"filesystem.read","path":"src/seed.rs"}"#,
+        ]);
+        let run = run_loop(
+            &model,
+            &mut fx.gateway,
+            &mut fx.cube,
+            "Fix src/seed.rs and run tests",
+            2,
+            None,
+        )
+        .unwrap();
+        assert_eq!(run.stopped, "max-steps");
+        assert!(run.steps[0].outcome.starts_with("DENY finish"));
+        assert!(run.steps[1].outcome.starts_with("OK filesystem.read"));
+        assert!(run.summary.is_none());
+        assert!(matches!(
+            run.verification_status,
+            aivm_tools::verification::VerificationStatus::Unverified
+        ));
+        assert!(audit_contains(&fx, "agent-guard"));
     }
 
     #[test]

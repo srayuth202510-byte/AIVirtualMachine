@@ -13,6 +13,31 @@ fn correct(case: &Value, output: &str) -> bool {
     })
 }
 
+fn failure_kind(case: &Value, output: &str) -> Option<&'static str> {
+    if correct(case, output) {
+        return None;
+    }
+    // ใช้ตัด fence เพื่อวิเคราะห์สาเหตุเท่านั้น ห้ามเอาผลนี้ไปเพิ่มคะแนน strict oracle
+    let trimmed = output.trim();
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|text| text.strip_suffix("```"));
+    Some(if unfenced.is_some_and(|text| correct(case, text)) {
+        "markdown_fence"
+    } else {
+        "answer_or_other_format"
+    })
+}
+
+fn prompt_for(case: &Value, profile: Option<&Value>) -> String {
+    let mut prompt = case["prompt"].as_str().unwrap().to_string();
+    if let Some(profile) = profile {
+        prompt.push_str(profile["suffix"].as_str().unwrap());
+    }
+    prompt
+}
+
 #[test]
 fn quality_oracle_rejects_markdown_extra_fields_and_wrong_answers() {
     // JSON schema ผ่านไม่ได้แปลว่าความหมายตรงโจทย์ และห้ามตัด markdown เพื่อช่วยคะแนน
@@ -31,6 +56,48 @@ fn quality_oracle_rejects_markdown_extra_fields_and_wrong_answers() {
         r#"{"tool":"filesystem.read","path":"src/seed.txt","extra":true}"#
     ));
     assert!(!correct(&json!({"exact":"42"}), "The answer is 42"));
+    assert_eq!(
+        failure_kind(&json!({"json":[2,5,9]}), "```json\n[2,5,9]\n```"),
+        Some("markdown_fence")
+    );
+    assert_eq!(
+        failure_kind(
+            &case,
+            "```json\n{\"tool\":\"filesystem.read\",\"path\":\".env\"}\n```"
+        ),
+        Some("answer_or_other_format")
+    );
+    assert_eq!(failure_kind(&json!({"exact":"42"}), "42"), None);
+}
+
+#[test]
+fn formatting_profile_preserves_tasks_and_uses_no_oracle_values() {
+    let profile: Value =
+        serde_json::from_str(include_str!("../../../examples/model-quality-format.json")).unwrap();
+    for text in [
+        include_str!("../../../examples/model-quality.json"),
+        include_str!("../../../examples/model-quality-holdout.json"),
+    ] {
+        let corpus: Value = serde_json::from_str(text).unwrap();
+        let mut ids = std::collections::BTreeSet::new();
+        for case in corpus["cases"].as_array().unwrap() {
+            assert!(ids.insert(case["id"].as_str().unwrap()));
+            let raw = prompt_for(case, None);
+            assert_eq!(raw, case["prompt"].as_str().unwrap());
+            assert_eq!(
+                prompt_for(case, Some(&profile)),
+                format!("{raw}{}", profile["suffix"].as_str().unwrap())
+            );
+            // oracle ที่เปลี่ยนต้องไม่เปลี่ยน prompt ของ model
+            let mut changed = case.clone();
+            changed["exact"] = json!("not-the-answer");
+            changed["json"] = json!({"not":"the answer"});
+            assert_eq!(
+                prompt_for(case, Some(&profile)),
+                prompt_for(&changed, Some(&profile))
+            );
+        }
+    }
 }
 
 #[test]
@@ -44,8 +111,21 @@ fn real_model_quality_and_latency() {
     );
     let bytes = std::fs::read(&path).unwrap();
     let config: ModelConfig = serde_json::from_slice(&bytes).unwrap();
-    let corpus_text = include_str!("../../../examples/model-quality.json");
+    let corpus_name = std::env::var("AIVM_QUALITY_CORPUS").unwrap_or_else(|_| "baseline".into());
+    let corpus_text = match corpus_name.as_str() {
+        "baseline" => include_str!("../../../examples/model-quality.json"),
+        "holdout" => include_str!("../../../examples/model-quality-holdout.json"),
+        other => panic!("unknown quality corpus: {other}"),
+    };
     let corpus: Value = serde_json::from_str(corpus_text).unwrap();
+    let style = std::env::var("AIVM_QUALITY_PROMPT_STYLE").unwrap_or_else(|_| "raw".into());
+    let profile_text = include_str!("../../../examples/model-quality-format.json");
+    let profile: Value = serde_json::from_str(profile_text).unwrap();
+    let profile = match style.as_str() {
+        "raw" => None,
+        "strict" => Some(&profile),
+        other => panic!("unknown quality prompt style: {other}"),
+    };
     let local = config.local.as_ref().unwrap();
     assert!(!local.model_sha256.is_empty());
     assert!(local
@@ -62,22 +142,23 @@ fn real_model_quality_and_latency() {
             protocol_version: PROTOCOL_VERSION,
             request_id: case["id"].as_str().unwrap().into(),
             model_id: config.name.clone(),
-            prompt: case["prompt"].as_str().unwrap().into(),
+            prompt: prompt_for(case, profile),
             stream: false,
             max_output_tokens: local.max_tokens,
             timeout_ms: limits.timeout_ms,
         };
+        let request_prompt = request.prompt.clone();
         let started = Instant::now();
         let result = client.infer(&config, request, &limits);
         match result {
-            Ok(response)=>rows.push(json!({"id":case["id"],"infrastructure_passed":response.verification.status==VerificationStatus::Verified,"task_correct":correct(case,response.output.as_deref().unwrap_or("")),"output":response.output,"usage":response.control_plane_usage,"elapsed_ms":started.elapsed().as_millis()})),
+            Ok(response)=>rows.push(json!({"id":case["id"],"prompt":request_prompt,"infrastructure_passed":response.verification.status==VerificationStatus::Verified,"task_correct":correct(case,response.output.as_deref().unwrap_or("")),"failure_kind":failure_kind(case,response.output.as_deref().unwrap_or("")),"output":response.output,"usage":response.control_plane_usage,"elapsed_ms":started.elapsed().as_millis()})),
             Err(error)=>rows.push(json!({"id":case["id"],"infrastructure_passed":false,"task_correct":false,"error_code":error.code(),"error":error,"elapsed_ms":started.elapsed().as_millis()})),
         }
         let score = rows
             .iter()
             .filter(|row| row["task_correct"] == true)
             .count();
-        let report = json!({"schema":1,"scope":corpus["scope"],"config_sha256":format!("{:x}",Sha256::digest(&bytes)),"corpus_sha256":format!("{:x}",Sha256::digest(corpus_text.as_bytes())),"client_boot_ms":boot_ms,"completed":rows.len(),"total":corpus["cases"].as_array().unwrap().len(),"task_correct":score,"cases":rows});
+        let report = json!({"schema":1,"scope":corpus["scope"],"corpus":corpus_name,"prompt_style":style,"prompt_profile_sha256":profile.map(|_|format!("{:x}",Sha256::digest(profile_text.as_bytes()))),"config_sha256":format!("{:x}",Sha256::digest(&bytes)),"corpus_sha256":format!("{:x}",Sha256::digest(corpus_text.as_bytes())),"client_boot_ms":boot_ms,"completed":rows.len(),"total":corpus["cases"].as_array().unwrap().len(),"task_correct":score,"cases":rows});
         std::fs::write(&evidence, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
     assert!(

@@ -39,6 +39,7 @@ def main():
         "test_fuzz_seeded.py",
         "test_llama_replay.py",
         "test_model_host_validation.py",
+        "test_model_quality.py",
         "test_dashboard.py",
         "make test-dashboard-http",
         "test_model_validation_setup.py",
@@ -61,7 +62,7 @@ def main():
 
     # 4. Makefile test ต้องมี pins + court + fuzz + llama test (ห้ามหลุดเงียบ)
     for need in ("test_pins.py", "test_security_court.py", "test_fuzz_seeded.py",
-                 "test_llama_replay.py", "test_model_host_validation.py", "test_dashboard.py",
+                 "test_llama_replay.py", "test_model_host_validation.py", "test_model_quality.py", "test_dashboard.py",
                  "test_model_validation_setup.py", "AIVM_DASHBOARD_HTTP_TESTS=1"):
         if need not in mk:
             ok = fail(f"Makefile test ขาด {need}") and False

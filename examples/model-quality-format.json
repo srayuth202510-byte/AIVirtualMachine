@@ -1,0 +1,5 @@
+{
+  "schema": 1,
+  "name": "plain-response-v1",
+  "suffix": "\n\nResponse format: Output only the requested value. Never use Markdown or code fences (```). Do not add explanations or labels. If the task requests JSON, begin directly with the JSON value and end immediately after it."
+}
