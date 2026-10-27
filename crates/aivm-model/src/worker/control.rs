@@ -254,6 +254,7 @@ mod tests {
     fn assert_buffered_delta_is_rejected(control: &RequestControl<'_>) {
         let request = InferenceRequest {
             protocol_version: PROTOCOL_VERSION,
+            output_mode: Default::default(),
             request_id: "req-1".into(),
             model_id: "echo".into(),
             prompt: "hello".into(),

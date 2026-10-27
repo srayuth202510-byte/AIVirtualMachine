@@ -146,6 +146,9 @@ crates/
 
 - [`docs/dashboard.md`](./docs/dashboard.md) — audit dashboard, private SQLite storage และ Prometheus/JSON endpoints
 - [`docs/model-control-hardening.md`](./docs/model-control-hardening.md) — sealed worker/controller, checked cleanup, event deadlines, host quotas/cache และ quality evaluation
+- [`docs/structured-output-validation-2026-10-27.md`](./docs/structured-output-validation-2026-10-27.md) — หลักฐานการตรวจ GBNF + Serde และผลเทียบโมเดล
+- [`docs/structured-output.md`](./docs/structured-output.md) — เลือกโหมด text/JSON/agent intent, GBNF + Serde และ protocol migration
+- [`docs/structured-output-quality-test-plan.md`](./docs/structured-output-quality-test-plan.md) — แผน GBNF + Serde, verifier + Proptest และ staging recovery ด้วย nextest/strace พร้อมเกณฑ์ผ่าน
 - [`docs/model-validation-runner.md`](./docs/model-validation-runner.md) — เตรียม KVM runner และเปิด recurring real-model CI
 
 - [`docs/verification-and-transactions.md`](./docs/verification-and-transactions.md) — operator verifier contracts, completion receipts และ crash recovery ของ state/audit

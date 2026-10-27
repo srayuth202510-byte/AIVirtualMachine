@@ -60,6 +60,7 @@ impl Drop for Fixture {
 fn request() -> InferenceRequest {
     InferenceRequest {
         protocol_version: 1,
+        output_mode: Default::default(),
         request_id: "req-1".into(),
         model_id: "echo".into(),
         prompt: "PROMPT_SECRET_SENTINEL".into(),

@@ -106,6 +106,8 @@ pub struct InferenceRequest {
     pub request_id: String,
     pub model_id: String,
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "crate::OutputMode::is_text")]
+    pub output_mode: crate::OutputMode,
     #[serde(default)]
     pub stream: bool,
     pub max_output_tokens: usize,
@@ -128,7 +130,7 @@ impl InferenceRequest {
                 "total timeout must be positive".into(),
             ));
         }
-        if self.protocol_version != PROTOCOL_VERSION {
+        if self.protocol_version != self.output_mode.protocol_version() {
             return Err(WorkerError::Protocol(format!(
                 "unsupported protocol version {}",
                 self.protocol_version
@@ -170,6 +172,10 @@ pub struct InferenceResponse {
     pub protocol_version: u16,
     pub request_id: String,
     pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "crate::OutputMode::is_text")]
+    pub output_mode: crate::OutputMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar_id: Option<String>,
     pub usage: InferenceUsage,
     pub termination: String,
     pub artifact_verified: bool,
@@ -217,7 +223,9 @@ pub enum VerificationStatus {
 
 impl InferenceResponse {
     pub fn validate(&self, request: &InferenceRequest) -> Result<(), WorkerError> {
-        if self.protocol_version != PROTOCOL_VERSION || self.request_id != request.request_id {
+        if self.protocol_version != request.protocol_version
+            || self.request_id != request.request_id
+        {
             return Err(WorkerError::Protocol("response identity mismatch".into()));
         }
         if !matches!(self.termination.as_str(), "completed" | "length") || self.output.is_none() {
@@ -234,7 +242,27 @@ impl InferenceResponse {
                 "response exceeds request limits".into(),
             ));
         }
-        Ok(())
+        self.validate_output(request)
+    }
+
+    fn validate_output(&self, request: &InferenceRequest) -> Result<(), WorkerError> {
+        // worker เก่าหรือหลักฐานโหมดไม่ตรงต้องไม่ผ่านแม้ JSON บังเอิญถูกต้อง
+        if self.output_mode != request.output_mode
+            || self.grammar_id.as_deref() != request.output_mode.grammar_id()
+        {
+            return Err(WorkerError::Protocol(
+                "output mode/grammar evidence mismatch".into(),
+            ));
+        }
+        if !request.output_mode.is_text() && self.termination != "completed" {
+            return Err(WorkerError::InvalidOutput(
+                "incomplete structured output".into(),
+            ));
+        }
+        request
+            .output_mode
+            .validate(self.output.as_deref().unwrap_or(""))
+            .map_err(|e| WorkerError::InvalidOutput(e.to_string()))
     }
 
     /// ตรวจผล inference ทุกมิติ: output length, termination, usage, artifact
@@ -296,11 +324,23 @@ impl InferenceResponse {
         }
 
         // 5. Identity
-        if self.protocol_version == PROTOCOL_VERSION && self.request_id == request.request_id {
+        if self.protocol_version == request.protocol_version
+            && self.request_id == request.request_id
+        {
             checks.push("identity:match".into());
         } else {
             checks.push("identity:mismatch".into());
             failures.push("response identity mismatch".into());
+        }
+
+        if let Err(error) = self.validate_output(request) {
+            failures.push(error.to_string());
+            checks.push("output-schema:failed".into());
+        } else {
+            checks.push(format!("output-mode:{:?}", request.output_mode));
+            if let Some(grammar) = request.output_mode.grammar_id() {
+                checks.push(format!("output-schema:ok;grammar:{grammar}"));
+            }
         }
 
         let status = if !failures.is_empty() {
@@ -378,6 +418,8 @@ impl std::fmt::Display for WorkerExit {
 
 #[derive(Debug, Error, Clone, Serialize, Deserialize)]
 pub enum WorkerError {
+    #[error("invalid structured output: {0}")]
+    InvalidOutput(String),
     #[error("protocol error: {0}")]
     Protocol(String),
     #[error("invalid inference request: {0}")]
@@ -416,6 +458,7 @@ impl WorkerError {
     /// รหัสคงที่สำหรับ operator; ไม่ต้องแยกสาเหตุจากข้อความ stderr
     pub fn code(&self) -> &'static str {
         match self {
+            Self::InvalidOutput(_) => "invalid_output",
             Self::Protocol(_) => "protocol",
             Self::InvalidRequest(_) => "invalid_request",
             Self::LimitExceeded(_) => "limit_exceeded",
@@ -562,7 +605,25 @@ impl WorkerClient {
         on_delta: &mut dyn FnMut(&str) -> Result<(), WorkerError>,
     ) -> Result<InferenceResponse, WorkerError> {
         request.stream = true;
-        self.infer_controlled(config, request, limits, on_delta)
+        if request.output_mode.is_text() {
+            return self.infer_controlled(config, request, limits, on_delta);
+        }
+        // กัก delta จากทุก launcher/controller จนตรวจ final schema และ cleanup เสร็จ
+        let mut buffered = String::new();
+        let response = self.infer_controlled(config, request, limits, &mut |delta| {
+            if buffered.len().saturating_add(delta.len()) > MAX_RESPONSE_BYTES {
+                return Err(WorkerError::LimitExceeded("structured stream bytes".into()));
+            }
+            buffered.push_str(delta);
+            Ok(())
+        })?;
+        if response.output.as_deref() != Some(buffered.as_str()) {
+            return Err(WorkerError::Protocol(
+                "structured stream differs from final output".into(),
+            ));
+        }
+        on_delta(&buffered)?;
+        Ok(response)
     }
 
     fn infer_controlled(
@@ -604,7 +665,7 @@ impl WorkerClient {
                             return Err(error);
                         }
                     }
-                    supervised::WorkerEvent::Complete { response } => return Ok(response),
+                    supervised::WorkerEvent::Complete { response } => return Ok(*response),
                     supervised::WorkerEvent::Error { error } => return Err(error),
                 }
             }
@@ -889,7 +950,7 @@ impl WorkerClient {
                             || value
                                 .get("protocol_version")
                                 .and_then(serde_json::Value::as_u64)
-                                != Some(u64::from(PROTOCOL_VERSION))
+                                != Some(u64::from(request.protocol_version))
                         {
                             return Err(WorkerError::Protocol("response identity mismatch".into()));
                         }
@@ -1005,6 +1066,9 @@ fn remote_worker_error(value: &serde_json::Value) -> WorkerError {
         .and_then(|value| serde_json::from_value::<WorkerError>(value.clone()).ok())
     {
         Some(WorkerError::Protocol(_)) => WorkerError::Protocol("worker rejected protocol".into()),
+        Some(WorkerError::InvalidOutput(_)) => WorkerError::InvalidOutput(
+            "worker rejected incomplete or invalid structured output".into(),
+        ),
         Some(WorkerError::InvalidRequest(_)) => {
             WorkerError::InvalidRequest("worker rejected request".into())
         }
@@ -1029,7 +1093,7 @@ fn consume_delta(
         || value
             .get("protocol_version")
             .and_then(serde_json::Value::as_u64)
-            != Some(u64::from(PROTOCOL_VERSION))
+            != Some(u64::from(request.protocol_version))
     {
         return Err(WorkerError::Protocol("stream identity mismatch".into()));
     }
@@ -1232,6 +1296,7 @@ mod tests {
     fn request() -> InferenceRequest {
         InferenceRequest {
             protocol_version: PROTOCOL_VERSION,
+            output_mode: Default::default(),
             request_id: "req-1".into(),
             model_id: "model-1".into(),
             prompt: "hello".into(),

@@ -244,6 +244,7 @@ fn real_isolated_worker_failure_recovery() {
     let client = WorkerClient::from_config(&config).unwrap();
     let request = InferenceRequest {
         protocol_version: PROTOCOL_VERSION,
+        output_mode: Default::default(),
         request_id: "failure-recovery".into(),
         model_id: config.name.clone(),
         prompt: "Reply with the word hello.".into(),

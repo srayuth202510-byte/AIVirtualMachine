@@ -60,6 +60,27 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(result["improved"], ["1", "2"])
         self.assertEqual(result["regressed"], ["0"])
 
+    def test_structured_evidence_rechecks_output_schema_and_completion(self):
+        # format ผ่านไม่ได้ทำให้คำตอบถูก และ report ปลอม schema/grammar ไม่ได้
+        case = {"id": "different-read-intent"}
+        valid = {"output_mode": "agent_intent", "grammar_id": "aivm-agent-intent-v1",
+                 "termination": "completed", "format_valid": True, "schema_valid": True,
+                 "output": '{"tool":"filesystem.read","path":".env"}'}
+        self.assertTrue(QUALITY.structured_evidence(case, valid))
+        for output in ('{"done":true,"done":true}', '{"done":false}',
+                       '{"tool":"shell.exec","path":"sh"}',
+                       '{"tool":"filesystem.write","path":"x"}',
+                       '{"tool":"process.exec","path":"cc","content":{"argv":[],"extra":1}}',
+                       '```json\n{"done":true}\n```', '{"done":true'):
+            self.assertFalse(QUALITY.structured_evidence(case, {**valid, "output": output}))
+        for key, value in (("grammar_id", None), ("output_mode", "text"),
+                           ("termination", "length"), ("schema_valid", False)):
+            self.assertFalse(QUALITY.structured_evidence(case, {**valid, key: value}))
+        for output in ('{"tool":"process.exec","path":"cc","content":{"argv":[]}}',
+                       '{"tool":"filesystem.write","path":"x","content":["a","b"]}'):
+            self.assertTrue(QUALITY.structured_evidence(case, {**valid, "output": output}))
+        self.assertEqual(QUALITY.task_mode({"id": "nested-extract", "json": {}}), "text")
+
 
 if __name__ == "__main__":
     unittest.main()

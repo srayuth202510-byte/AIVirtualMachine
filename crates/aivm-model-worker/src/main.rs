@@ -81,10 +81,11 @@ fn run() -> Result<(), WorkerError> {
             }
         };
         let request_id = request.request_id.clone();
+        let identity = Some((request.protocol_version, request_id.as_str()));
         if request.model_id != config.name {
             write_error(
                 &mut stdout,
-                Some(&request_id),
+                identity,
                 WorkerError::InvalidRequest("model_id does not match loaded model".into()),
             )?;
             continue;
@@ -95,26 +96,35 @@ fn run() -> Result<(), WorkerError> {
             ..limits.clone()
         };
         if let Err(error) = request.validate(&effective_limits, token_count) {
-            write_error(&mut stdout, Some(&request_id), error)?;
+            write_error(&mut stdout, identity, error)?;
             continue;
         }
         let started = Instant::now();
         let generation = if request.stream {
-            model.reason_stream(&request.prompt, request.max_output_tokens, &mut |delta| {
-                let event = serde_json::json!({"protocol_version": aivm_model::worker::PROTOCOL_VERSION, "request_id": request_id, "delta": delta});
+            model.reason_stream_with_mode(&request.prompt, request.max_output_tokens, request.output_mode, &mut |delta| {
+                let event = serde_json::json!({"protocol_version": request.protocol_version, "request_id": request_id, "delta": delta});
                 serde_json::to_writer(&mut stdout, &event).map_err(|e| aivm_model::ModelError::InferenceFailed(e.to_string()))?;
                 stdout.write_all(b"\n").and_then(|_| stdout.flush()).map_err(|e| aivm_model::ModelError::InferenceFailed(e.to_string()))
             })
         } else {
-            model.reason_with_max_output(&request.prompt, request.max_output_tokens)
+            model.reason_with_mode(
+                &request.prompt,
+                request.max_output_tokens,
+                request.output_mode,
+            )
         };
         let output = match generation {
             Ok(output) => output,
             Err(error) => {
                 write_error(
                     &mut stdout,
-                    Some(&request_id),
-                    WorkerError::Failed(error.to_string()),
+                    identity,
+                    match error {
+                        aivm_model::ModelError::InvalidOutput(message) => {
+                            WorkerError::InvalidOutput(message)
+                        }
+                        other => WorkerError::Failed(other.to_string()),
+                    },
                 )?;
                 continue;
             }
@@ -123,13 +133,15 @@ fn run() -> Result<(), WorkerError> {
         if output_tokens > request.max_output_tokens {
             write_error(
                 &mut stdout,
-                Some(&request_id),
+                identity,
                 WorkerError::LimitExceeded("output tokens".into()),
             )?;
             continue;
         }
         let response = InferenceResponse {
-            protocol_version: aivm_model::worker::PROTOCOL_VERSION,
+            protocol_version: request.protocol_version,
+            output_mode: request.output_mode,
+            grammar_id: request.output_mode.grammar_id().map(str::to_string),
             request_id,
             usage: InferenceUsage {
                 input_tokens: token_count,
@@ -137,7 +149,9 @@ fn run() -> Result<(), WorkerError> {
                 elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             },
             output: Some(output),
-            termination: if output_tokens == request.max_output_tokens {
+            termination: if request.output_mode.is_text()
+                && output_tokens == request.max_output_tokens
+            {
                 "length"
             } else {
                 "completed"
@@ -187,12 +201,12 @@ fn config_path() -> Result<PathBuf, WorkerError> {
 
 fn write_error(
     stdout: &mut impl Write,
-    request_id: Option<&str>,
+    identity: Option<(u16, &str)>,
     error: WorkerError,
 ) -> Result<(), WorkerError> {
     let value = serde_json::json!({
-        "protocol_version": aivm_model::worker::PROTOCOL_VERSION,
-        "request_id": request_id,
+        "protocol_version": identity.map_or(aivm_model::worker::PROTOCOL_VERSION, |i| i.0),
+        "request_id": identity.map(|i| i.1),
         "error": error.to_string(),
         "error_kind": error,
     });

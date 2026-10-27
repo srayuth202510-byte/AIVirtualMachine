@@ -14,7 +14,7 @@ pub struct ControllerRequest {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum WorkerEvent {
     Delta { request_id: String, text: String },
-    Complete { response: InferenceResponse },
+    Complete { response: Box<InferenceResponse> },
     Error { error: WorkerError },
 }
 
@@ -223,7 +223,9 @@ impl WorkerJob {
             }
             if let Some(response) = self.completion.take() {
                 self.finished = true;
-                return Ok(WorkerEvent::Complete { response });
+                return Ok(WorkerEvent::Complete {
+                    response: Box::new(response),
+                });
             }
             match self.receiver.recv_timeout(
                 Duration::from_millis(2)
@@ -474,7 +476,7 @@ fn supervise(
                 usage.cleanup_ms = usage.cleanup_ms.saturating_add(cleanup_ms);
                 usage.total_ms = elapsed;
             }
-            Ok(response)
+            Ok(*response)
         }
         Ok(_) => Err(WorkerError::Protocol("controller did not complete".into())),
         Err(error) => Err(WorkerError::Context {
@@ -684,7 +686,9 @@ pub fn serve_controller() -> Result<(), WorkerError> {
         client.infer(&input.config, input.request.clone(), &input.limits)
     };
     match result {
-        Ok(response) => emit(&WorkerEvent::Complete { response }),
+        Ok(response) => emit(&WorkerEvent::Complete {
+            response: Box::new(response),
+        }),
         Err(error) => emit(&WorkerEvent::Error { error }),
     }
 }

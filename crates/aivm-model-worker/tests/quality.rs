@@ -1,5 +1,5 @@
 //! วัดคุณภาพคำตอบจริงแยกจากการผ่าน protocol; oracle คงที่และไม่มีการ execute output
-use aivm_model::{worker::*, ModelConfig};
+use aivm_model::{worker::*, ModelConfig, OutputMode};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, time::Instant};
@@ -11,6 +11,29 @@ fn correct(case: &Value, output: &str) -> bool {
     case.get("json").is_some_and(|expected| {
         serde_json::from_str::<Value>(output.trim()).ok().as_ref() == Some(expected)
     })
+}
+
+// เลือกตามชนิดงานที่ freeze ไว้ ไม่อ่านค่า expected answer มาสร้าง grammar
+fn task_mode(case: &Value) -> OutputMode {
+    match case["id"].as_str().unwrap() {
+        "extract" | "nested-extract" => OutputMode::Text,
+        "strict-read-intent"
+        | "untrusted-override"
+        | "different-read-intent"
+        | "injected-read-intent" => OutputMode::AgentIntent,
+        _ => OutputMode::Json,
+    }
+}
+
+fn format_metrics(case: &Value, output: &str) -> (Option<bool>, Option<bool>) {
+    let mode = task_mode(case);
+    if mode.is_text() {
+        return (None, None);
+    }
+    (
+        Some(serde_json::from_str::<Value>(output).is_ok()),
+        Some(mode.validate(output).is_ok()),
+    )
 }
 
 fn failure_kind(case: &Value, output: &str) -> Option<&'static str> {
@@ -96,6 +119,7 @@ fn formatting_profile_preserves_tasks_and_uses_no_oracle_values() {
                 prompt_for(case, Some(&profile)),
                 prompt_for(&changed, Some(&profile))
             );
+            assert_eq!(task_mode(case), task_mode(&changed));
         }
     }
 }
@@ -122,7 +146,7 @@ fn real_model_quality_and_latency() {
     let profile_text = include_str!("../../../examples/model-quality-format.json");
     let profile: Value = serde_json::from_str(profile_text).unwrap();
     let profile = match style.as_str() {
-        "raw" => None,
+        "raw" | "structured" => None,
         "strict" => Some(&profile),
         other => panic!("unknown quality prompt style: {other}"),
     };
@@ -138,8 +162,14 @@ fn real_model_quality_and_latency() {
     let boot_ms = boot.elapsed().as_millis();
     let mut rows = Vec::new();
     for case in corpus["cases"].as_array().unwrap() {
+        let mode = if style == "structured" {
+            task_mode(case)
+        } else {
+            OutputMode::Text
+        };
         let request = InferenceRequest {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: mode.protocol_version(),
+            output_mode: mode,
             request_id: case["id"].as_str().unwrap().into(),
             model_id: config.name.clone(),
             prompt: prompt_for(case, profile),
@@ -151,8 +181,11 @@ fn real_model_quality_and_latency() {
         let started = Instant::now();
         let result = client.infer(&config, request, &limits);
         match result {
-            Ok(response)=>rows.push(json!({"id":case["id"],"prompt":request_prompt,"infrastructure_passed":response.verification.status==VerificationStatus::Verified,"task_correct":correct(case,response.output.as_deref().unwrap_or("")),"failure_kind":failure_kind(case,response.output.as_deref().unwrap_or("")),"output":response.output,"usage":response.control_plane_usage,"elapsed_ms":started.elapsed().as_millis()})),
-            Err(error)=>rows.push(json!({"id":case["id"],"infrastructure_passed":false,"task_correct":false,"error_code":error.code(),"error":error,"elapsed_ms":started.elapsed().as_millis()})),
+            Ok(response)=> {
+                let (format_valid, schema_valid) = format_metrics(case, response.output.as_deref().unwrap_or(""));
+                rows.push(json!({"format_valid":format_valid,"schema_valid":schema_valid,"output_mode":response.output_mode,"grammar_id":response.grammar_id,"termination":response.termination,"id":case["id"],"prompt":request_prompt,"infrastructure_passed":response.verification.status==VerificationStatus::Verified,"task_correct":correct(case,response.output.as_deref().unwrap_or("")),"failure_kind":failure_kind(case,response.output.as_deref().unwrap_or("")),"output":response.output,"usage":response.control_plane_usage,"elapsed_ms":started.elapsed().as_millis()}));
+            },
+            Err(error)=>rows.push(json!({"id":case["id"],"prompt":request_prompt,"output_mode":mode,"grammar_id":mode.grammar_id(),"format_valid":false,"schema_valid":false,"termination":error.code(),"infrastructure_passed":false,"task_correct":false,"error_code":error.code(),"error":error,"elapsed_ms":started.elapsed().as_millis()})),
         }
         let score = rows
             .iter()

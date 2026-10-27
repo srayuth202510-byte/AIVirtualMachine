@@ -13,7 +13,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod artifact;
+pub mod output;
 pub mod worker;
+pub use output::OutputMode;
 
 pub mod providers;
 
@@ -38,6 +40,8 @@ pub enum ModelError {
     LoadFailed(String),
     #[error("inference failed: {0}")]
     InferenceFailed(String),
+    #[error("invalid structured output: {0}")]
+    InvalidOutput(String),
     #[error("tokenizer: {0}")]
     Tokenizer(String),
     #[error("context overflow: max {max}, got {actual}")]
@@ -278,6 +282,42 @@ pub trait Model: Send + Sync {
     fn reason_with_system(&self, system: &str, context: &str) -> Result<String, ModelError> {
         self.reason(&format!("{system}\n\n{context}"))
     }
+    /// เลือกรูปแบบต่อ request; backend ทั่วไปตรวจผลสุดท้าย ส่วน local ใช้ grammar ด้วย
+    fn reason_with_mode(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+        mode: OutputMode,
+    ) -> Result<String, ModelError> {
+        let output = self.reason_with_max_output(context, max_output_tokens)?;
+        mode.validate(&output)?;
+        Ok(output)
+    }
+    fn reason_stream_with_mode(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+        mode: OutputMode,
+        on_delta: &mut dyn FnMut(&str) -> Result<(), ModelError>,
+    ) -> Result<String, ModelError> {
+        if mode.is_text() {
+            return self.reason_stream(context, max_output_tokens, on_delta);
+        }
+        // structured stream ไม่ส่งผลบางส่วนก่อน schema ผ่าน
+        let output = self.reason_with_mode(context, max_output_tokens, mode)?;
+        on_delta(&output)?;
+        Ok(output)
+    }
+    fn reason_with_system_mode(
+        &self,
+        system: &str,
+        context: &str,
+        mode: OutputMode,
+    ) -> Result<String, ModelError> {
+        let output = self.reason_with_system(system, context)?;
+        mode.validate(&output)?;
+        Ok(output)
+    }
     fn token_count(&self, text: &str) -> usize;
     fn max_context(&self) -> usize;
 }
@@ -313,23 +353,40 @@ impl WorkerModel {
 
 impl Model for WorkerModel {
     fn reason(&self, context: &str) -> Result<String, ModelError> {
+        self.reason_with_mode(context, self.limits.max_output_tokens, OutputMode::Text)
+    }
+
+    fn reason_with_max_output(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+    ) -> Result<String, ModelError> {
+        self.reason_with_mode(context, max_output_tokens, OutputMode::Text)
+    }
+
+    fn reason_with_mode(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+        mode: OutputMode,
+    ) -> Result<String, ModelError> {
         let request = worker::InferenceRequest {
-            protocol_version: worker::PROTOCOL_VERSION,
+            protocol_version: mode.protocol_version(),
+            output_mode: mode,
             request_id: format!("infer-{}", uuid_like_id()),
             model_id: self.config.name.clone(),
-            prompt: context.to_string(),
+            prompt: context.into(),
             stream: false,
-            max_output_tokens: self.limits.max_output_tokens,
+            max_output_tokens: max_output_tokens.min(self.limits.max_output_tokens),
             timeout_ms: self.limits.timeout_ms,
         };
-        self.client
+        let response = self
+            .client
             .infer(&self.config, request, &self.limits)
-            .map_err(|e| ModelError::InferenceFailed(e.to_string()))
-            .and_then(|response| {
-                response
-                    .output
-                    .ok_or_else(|| ModelError::InferenceFailed("worker returned no output".into()))
-            })
+            .map_err(worker_model_error)?;
+        response
+            .output
+            .ok_or_else(|| ModelError::InferenceFailed("worker returned no output".into()))
     }
 
     fn reason_stream(
@@ -338,8 +395,19 @@ impl Model for WorkerModel {
         max_output_tokens: usize,
         on_delta: &mut dyn FnMut(&str) -> Result<(), ModelError>,
     ) -> Result<String, ModelError> {
+        self.reason_stream_with_mode(context, max_output_tokens, OutputMode::Text, on_delta)
+    }
+
+    fn reason_stream_with_mode(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+        mode: OutputMode,
+        on_delta: &mut dyn FnMut(&str) -> Result<(), ModelError>,
+    ) -> Result<String, ModelError> {
         let request = worker::InferenceRequest {
-            protocol_version: worker::PROTOCOL_VERSION,
+            protocol_version: mode.protocol_version(),
+            output_mode: mode,
             request_id: format!("infer-{}", uuid_like_id()),
             model_id: self.config.name.clone(),
             prompt: context.into(),
@@ -352,10 +420,23 @@ impl Model for WorkerModel {
             .infer_stream(&self.config, request, &self.limits, &mut |delta| {
                 on_delta(delta).map_err(|e| worker::WorkerError::Failed(e.to_string()))
             })
-            .map_err(|e| ModelError::InferenceFailed(e.to_string()))?;
+            .map_err(worker_model_error)?;
         response
             .output
             .ok_or_else(|| ModelError::InferenceFailed("worker returned no output".into()))
+    }
+
+    fn reason_with_system_mode(
+        &self,
+        system: &str,
+        context: &str,
+        mode: OutputMode,
+    ) -> Result<String, ModelError> {
+        self.reason_with_mode(
+            &format!("{system}\n\n{context}"),
+            self.limits.max_output_tokens,
+            mode,
+        )
     }
 
     fn token_count(&self, text: &str) -> usize {
@@ -364,6 +445,14 @@ impl Model for WorkerModel {
 
     fn max_context(&self) -> usize {
         self.limits.max_context_tokens
+    }
+}
+
+fn worker_model_error(error: worker::WorkerError) -> ModelError {
+    if error.code() == "invalid_output" {
+        ModelError::InvalidOutput(error.to_string())
+    } else {
+        ModelError::InferenceFailed(error.to_string())
     }
 }
 
@@ -465,6 +554,15 @@ impl LocalLlamaModel {
         messages: &[(&str, &str)],
         max_output_tokens: usize,
     ) -> Result<String, ModelError> {
+        self.reason_with_messages_mode(messages, max_output_tokens, OutputMode::Text)
+    }
+
+    fn reason_with_messages_mode(
+        &self,
+        messages: &[(&str, &str)],
+        max_output_tokens: usize,
+        mode: OutputMode,
+    ) -> Result<String, ModelError> {
         let prompt = if let Some(template) = &self.chat_template {
             let messages = messages
                 .iter()
@@ -489,6 +587,7 @@ impl LocalLlamaModel {
         self.generate(
             &prompt,
             max_output_tokens.min(self.config.max_tokens),
+            mode,
             &mut |_| Ok(()),
         )
     }
@@ -497,6 +596,7 @@ impl LocalLlamaModel {
         &self,
         prompt: &str,
         max_output_tokens: usize,
+        mode: OutputMode,
         on_delta: &mut dyn FnMut(&str) -> Result<(), ModelError>,
     ) -> Result<String, ModelError> {
         let n_ctx = self.config.ctx_size as u32;
@@ -529,21 +629,33 @@ impl LocalLlamaModel {
         ctx.decode(&mut batch)
             .map_err(|e| ModelError::InferenceFailed(e.to_string()))?;
 
-        let mut sampler = LlamaSampler::chain_simple([
+        // grammar ต้องมาก่อนการเลือก token และสร้าง state ใหม่ทุก inference
+        let mut samplers = Vec::new();
+        if let Some(grammar) = mode.grammar() {
+            samplers.push(
+                LlamaSampler::grammar(&self.model, &grammar, "root").map_err(|_| {
+                    ModelError::InvalidOutput("grammar initialization failed".into())
+                })?,
+            );
+        }
+        samplers.extend([
             LlamaSampler::temp(self.config.temperature),
             LlamaSampler::top_k(self.config.top_k),
             LlamaSampler::top_p(self.config.top_p, 1),
             LlamaSampler::dist(self.config.seed),
         ]);
+        let mut sampler = LlamaSampler::chain_simple(samplers);
 
+        let mut completed = false;
         let mut generated: Vec<LlamaToken> = Vec::new();
         let mut emitted = 0;
         while generated.len() < max_output_tokens {
             let token = sampler.sample(&ctx, -1);
             if vocab.is_eog(token) {
+                completed = true;
                 break;
             }
-            sampler.accept(token);
+            // sample() accept token แล้ว; accept ซ้ำจะเลื่อน grammar state สองครั้ง
 
             let pos = (tokens.len() + generated.len()) as i32;
             generated.push(token);
@@ -552,7 +664,7 @@ impl LocalLlamaModel {
                 Ok(text) => text.len(),
                 Err(error) => error.valid_up_to(),
             };
-            if valid > emitted {
+            if mode.is_text() && valid > emitted {
                 on_delta(
                     std::str::from_utf8(&decoded[emitted..valid])
                         .map_err(|e| ModelError::Tokenizer(e.to_string()))?,
@@ -569,7 +681,18 @@ impl LocalLlamaModel {
         }
 
         let bytes = vocab.detokenize(&generated, true, true);
-        let output = String::from_utf8_lossy(&bytes).into_owned();
+        if !mode.is_text() && !completed {
+            return Err(ModelError::InvalidOutput(
+                "structured output token budget exhausted".into(),
+            ));
+        }
+        let output = if mode.is_text() {
+            String::from_utf8_lossy(&bytes).into_owned()
+        } else {
+            String::from_utf8(bytes)
+                .map_err(|_| ModelError::InvalidOutput("invalid UTF-8".into()))?
+        };
+        mode.validate(&output)?;
         if output.len() > emitted {
             on_delta(&output[emitted..])?;
         }
@@ -609,12 +732,35 @@ impl Model for LocalLlamaModel {
         self.generate(
             &prompt,
             max_output_tokens.min(self.config.max_tokens),
+            OutputMode::Text,
             on_delta,
         )
     }
 
     fn reason_with_system(&self, system: &str, context: &str) -> Result<String, ModelError> {
         self.reason_with_messages(&[("system", system), ("user", context)])
+    }
+
+    fn reason_with_mode(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+        mode: OutputMode,
+    ) -> Result<String, ModelError> {
+        self.reason_with_messages_mode(&[("user", context)], max_output_tokens, mode)
+    }
+
+    fn reason_with_system_mode(
+        &self,
+        system: &str,
+        context: &str,
+        mode: OutputMode,
+    ) -> Result<String, ModelError> {
+        self.reason_with_messages_mode(
+            &[("system", system), ("user", context)],
+            self.config.max_tokens,
+            mode,
+        )
     }
 
     fn token_count(&self, text: &str) -> usize {

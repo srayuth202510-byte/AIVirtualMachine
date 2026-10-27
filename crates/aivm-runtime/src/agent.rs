@@ -14,9 +14,10 @@
 use crate::RuntimeError;
 use aivm_cube::rag;
 use aivm_cube::Cube;
+use aivm_model::output::{AgentIntent as ParsedIntent, IntentContent};
 use aivm_model::Model;
 use aivm_tools::{ExecContent, ToolGateway, ToolRequest};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// สร้าง RAG ผ่าน gateway: ไม่มี API ให้เลือก root ที่ข้าม policy
 pub fn build_workspace_index(
@@ -31,15 +32,7 @@ pub fn build_workspace_index(
 /// ต้องตรงกับ `ToolGateway::dispatch`
 /// หมายเหตุ G4b: `secret.request` แสดงออกได้ แต่ gateway กั้นด้วย capability
 /// + policy + HITL อยู่ดี (expressible ไม่เท่ากับ authorized)
-pub const KNOWN_TOOLS: &[&str] = &[
-    "filesystem.read",
-    "filesystem.write",
-    "code.search",
-    "process.exec",
-    "network.fetch",
-    "network.connect",
-    "secret.request",
-];
+pub use aivm_model::output::KNOWN_TOOLS;
 
 /// จำนวนก้าวสูงสุดโดยปริยายของ agent loop
 pub const DEFAULT_MAX_STEPS: usize = 8;
@@ -102,35 +95,6 @@ pub struct AgentRun {
 ///
 /// ทุกความผิดพลาด (ไม่มี JSON, JSON พัง, ขาด field, tool ไม่อยู่ในลิสต์)
 /// คืน `Err` — ผู้เรียกต้องถือเป็น DENY และห้ามรันอะไรทั้งสิ้น
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FinishIntent {
-    done: bool,
-    #[serde(default)]
-    summary: String,
-}
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum IntentContent {
-    Text(String),
-    Exec(ExecContent),
-    Lines(Vec<String>),
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ToolIntent {
-    tool: String,
-    path: String,
-    #[serde(default)]
-    content: Option<IntentContent>,
-}
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum ParsedIntent {
-    Tool(ToolIntent),
-    Finish(FinishIntent),
-}
-
 pub fn parse_intent(raw: &str) -> Result<Intent, String> {
     // Small local models often wrap an otherwise exact JSON response in a
     // Markdown fence. Accept only a fence around the entire response; prose,
@@ -142,7 +106,7 @@ pub fn parse_intent(raw: &str) -> Result<Intent, String> {
         .map(str::trim)
         .unwrap_or(trimmed);
     // serde ตรวจ duplicate fields ด้วย ไม่ผ่าน Value ที่จะทับค่าซ้ำเงียบ ๆ
-    match serde_json::from_str::<ParsedIntent>(json)
+    match aivm_model::output::parse_agent_intent(json)
         .map_err(|e| format!("invalid intent JSON: {e}"))?
     {
         ParsedIntent::Tool(request) => {
@@ -522,15 +486,26 @@ pub fn run_loop(
         } else {
             format!("{system_prompt}\nAfter your source edit, the runtime will compile and run the operator verifier through the gateway. Read and edit the source; do not compile or repeat a successful edit yourself. If the operator build or verifier fails, repair the source using the diagnostics.")
         };
-        let raw = if let Some(request) = operator_request {
-            serde_json::to_string(&request).expect("operator request serializes")
+        let generated = if let Some(request) = operator_request {
+            Ok(serde_json::to_string(&request).expect("operator request serializes"))
         } else {
-            model
-                .reason_with_system(&system_prompt, &prompt)
-                .map_err(|e| RuntimeError::Config(format!("model: {e}")))?
+            model.reason_with_system_mode(
+                &system_prompt,
+                &prompt,
+                aivm_model::OutputMode::AgentIntent,
+            )
+        };
+        let (raw, intent) = match generated {
+            Ok(raw) => {
+                let intent = parse_intent(&raw);
+                (raw, intent)
+            }
+            // schema ที่ปฏิเสธยังเข้าทาง audit invalid-intent; ไม่สร้างข้อความปลอมแทน output
+            Err(aivm_model::ModelError::InvalidOutput(reason)) => (String::new(), Err(reason)),
+            Err(error) => return Err(RuntimeError::Config(format!("model: {error}"))),
         };
 
-        match parse_intent(&raw) {
+        match intent {
             Ok(Intent::Finish(s)) => {
                 if task_requires_test_completion(task) {
                     let reason =
@@ -910,7 +885,9 @@ mod tests {
         let mut fx = fixture("unknown");
         let model = ScriptedModel::new(&[r#"{"tool":"shell.exec","path":"rm -rf /"}"#]);
         let run = run_loop(&model, &mut fx.gateway, &mut fx.cube, "escape", 1, None).unwrap();
-        assert!(run.steps[0].outcome.contains("unknown tool: shell.exec"));
+        assert!(run.steps[0]
+            .outcome
+            .contains("agent intent schema mismatch"));
         assert!(audit_contains(&fx, "invalid-intent"));
     }
 
