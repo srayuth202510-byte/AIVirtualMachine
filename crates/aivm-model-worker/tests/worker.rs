@@ -1,9 +1,12 @@
 use aivm_model::{worker::*, LocalModelConfig, ModelConfig, OutputMode};
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
+
+mod support;
+use support::TestResources;
 
 fn request() -> InferenceRequest {
     InferenceRequest {
@@ -23,13 +26,14 @@ fn worker() -> WorkerClient {
 
 #[test]
 fn actual_worker_stream_matches_final_response() {
+    let resources = TestResources::new();
     let client = worker();
     let mut output = String::new();
     let response = client
         .infer_stream(
             &ModelConfig::default(),
             request(),
-            &InferenceLimits::default(),
+            &resources.limits(),
             &mut |delta| {
                 output.push_str(delta);
                 Ok(())
@@ -44,24 +48,19 @@ fn actual_worker_stream_matches_final_response() {
     assert!(usage.total_ms >= usage.preparation_ms + usage.execution_ms + usage.cleanup_ms);
 }
 
-struct Script(PathBuf);
+struct Script(PathBuf, TestResources);
 impl Script {
     fn new(body: &str) -> Self {
         use std::os::unix::fs::PermissionsExt;
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "aivm-hostile-worker-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let resources = TestResources::new();
+        let path = resources.root().join("worker");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Self(path)
+        Self(path, resources)
     }
-}
-impl Drop for Script {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+
+    fn limits(&self) -> InferenceLimits {
+        self.1.limits()
     }
 }
 
@@ -70,11 +69,7 @@ fn early_worker_exit_reports_status_without_disclosing_stderr() {
     // EOF ต้องเก็บ exit code ของ worker จริง ไม่ใช่ SIGKILL ที่ parent ส่งระหว่าง cleanup
     let script = Script::new("read request\nprintf '%s\\n' 'EXIT_SECRET_SENTINEL' >&2\nexit 73");
     let error = WorkerClient::new(&script.0)
-        .infer(
-            &ModelConfig::default(),
-            request(),
-            &InferenceLimits::default(),
-        )
+        .infer(&ModelConfig::default(), request(), &script.limits())
         .unwrap_err();
     assert_eq!(error.code(), "worker_failed", "{error}");
     assert!(error.to_string().contains("exit_code=73"), "{error}");
@@ -89,11 +84,7 @@ fn early_worker_exit_reports_status_without_disclosing_stderr() {
 fn worker_sigkill_is_reported_without_guessing_a_resource_failure() {
     let script = Script::new("read request\nkill -KILL $$");
     let error = WorkerClient::new(&script.0)
-        .infer(
-            &ModelConfig::default(),
-            request(),
-            &InferenceLimits::default(),
-        )
+        .infer(&ModelConfig::default(), request(), &script.limits())
         .unwrap_err();
     assert_eq!(error.code(), "worker_failed", "{error}");
     assert!(error.to_string().contains("signal=9"), "{error}");
@@ -112,7 +103,7 @@ fn closed_stdout_does_not_bypass_the_exit_deadline() {
     req.timeout_ms = 100;
     let started = Instant::now();
     let error = WorkerClient::new(&script.0)
-        .infer(&ModelConfig::default(), req, &InferenceLimits::default())
+        .infer(&ModelConfig::default(), req, &script.limits())
         .unwrap_err();
     assert_eq!(error.code(), "deadline", "{error}");
     assert!(
@@ -138,11 +129,7 @@ fn exit_zero_without_completion_and_nonzero_after_completion_both_fail() {
     ] {
         let script = Script::new(&body);
         let error = WorkerClient::new(&script.0)
-            .infer(
-                &ModelConfig::default(),
-                request(),
-                &InferenceLimits::default(),
-            )
+            .infer(&ModelConfig::default(), request(), &script.limits())
             .unwrap_err();
         assert_eq!(error.code(), "worker_failed", "{error}");
         let exit = error.worker_exit().unwrap();
@@ -159,7 +146,7 @@ fn partial_stream_does_not_become_completion_when_worker_exits() {
         .infer_stream(
             &ModelConfig::default(),
             request(),
-            &InferenceLimits::default(),
+            &script.limits(),
             &mut |delta| {
                 output.push_str(delta);
                 Ok(())
@@ -176,11 +163,7 @@ fn protocol_failure_retains_its_cause_and_round_trips_exit_evidence() {
     let script =
         Script::new("read request\nprintf '%s\\n' 'EXIT_SECRET_SENTINEL'\nexec /bin/sleep 30");
     let error = WorkerClient::new(&script.0)
-        .infer(
-            &ModelConfig::default(),
-            request(),
-            &InferenceLimits::default(),
-        )
+        .infer(&ModelConfig::default(), request(), &script.limits())
         .unwrap_err();
     assert_eq!(error.code(), "protocol", "{error}");
     assert!(matches!(error.cause(), WorkerError::Protocol(_)));
@@ -198,11 +181,7 @@ fn untrusted_worker_cannot_forge_host_exit_evidence() {
     let frame = r#"{"protocol_version":1,"request_id":"req-1","error":"EXIT_SECRET_SENTINEL","error_kind":{"Exit":{"source":{"Failed":"EXIT_SECRET_SENTINEL"},"exit":{"exit_code":99,"signal":null,"core_dumped":false,"observed_before_cleanup":true}}}}"#;
     let script = Script::new(&format!("read request\nprintf '%s\\n' '{frame}'\nexit 73"));
     let error = WorkerClient::new(&script.0)
-        .infer(
-            &ModelConfig::default(),
-            request(),
-            &InferenceLimits::default(),
-        )
+        .infer(&ModelConfig::default(), request(), &script.limits())
         .unwrap_err();
     assert_eq!(error.code(), "worker_failed", "{error}");
     assert!(!error.to_string().contains("EXIT_SECRET_SENTINEL"));
@@ -217,7 +196,7 @@ fn actual_cpu_limit_kill_still_has_an_unclassified_sigkill_status() {
     let limits = InferenceLimits {
         cpu_seconds: 1,
         total_timeout_ms: Some(6000),
-        ..Default::default()
+        ..script.limits()
     };
     let mut req = request();
     req.timeout_ms = 5000;
@@ -241,11 +220,7 @@ fn cancellation_kills_a_worker_that_never_reads_input() {
     });
     let started = Instant::now();
     let error = client
-        .infer(
-            &ModelConfig::default(),
-            request(),
-            &InferenceLimits::default(),
-        )
+        .infer(&ModelConfig::default(), request(), &script.limits())
         .unwrap_err();
     cancel.join().unwrap();
     assert!(error.to_string().contains("cancelled"), "{error}");
@@ -263,7 +238,7 @@ fn response_does_not_allow_worker_to_outlive_deadline() {
     req.timeout_ms = 150;
     let started = Instant::now();
     let error = client
-        .infer(&ModelConfig::default(), req, &InferenceLimits::default())
+        .infer(&ModelConfig::default(), req, &script.limits())
         .unwrap_err();
     // เก็บ error จริงและเวลาที่ผ่านไปเมื่อ assertion ล้ม เพื่อวิเคราะห์ flake ได้
     let elapsed = started.elapsed();
@@ -286,7 +261,7 @@ fn total_deadline_rejects_a_lingering_worker_without_poisoning_the_client() {
     let client = WorkerClient::new(&script.0);
     let limits = InferenceLimits {
         total_timeout_ms: Some(50),
-        ..Default::default()
+        ..script.limits()
     };
     let started = Instant::now();
     let error = client
@@ -300,11 +275,7 @@ fn total_deadline_rejects_a_lingering_worker_without_poisoning_the_client() {
     assert!(started.elapsed() < Duration::from_secs(1), "{error}");
     std::fs::write(&script.0, format!("#!/bin/sh\n{body}\n")).unwrap();
     let response = client
-        .infer(
-            &ModelConfig::default(),
-            request(),
-            &InferenceLimits::default(),
-        )
+        .infer(&ModelConfig::default(), request(), &script.limits())
         .unwrap();
     assert_eq!(response.output.as_deref(), Some("ok"));
     assert!(
@@ -320,11 +291,7 @@ fn mismatched_response_is_rejected() {
 printf '%s\n' '{"protocol_version":1,"request_id":"wrong","output":"ok"}'"#,
     );
     assert!(WorkerClient::new(&script.0)
-        .infer(
-            &ModelConfig::default(),
-            request(),
-            &InferenceLimits::default()
-        )
+        .infer(&ModelConfig::default(), request(), &script.limits())
         .unwrap_err()
         .to_string()
         .contains("identity"));
@@ -332,6 +299,7 @@ printf '%s\n' '{"protocol_version":1,"request_id":"wrong","output":"ok"}'"#,
 
 #[test]
 fn unavailable_container_cannot_fall_back_to_process() {
+    let resources = TestResources::new();
     let config = ModelConfig {
         local: Some(LocalModelConfig {
             worker_launcher: WorkerLauncher::Container {
@@ -345,7 +313,7 @@ fn unavailable_container_cannot_fall_back_to_process() {
         ..Default::default()
     };
     assert!(worker()
-        .infer(&config, request(), &InferenceLimits::default())
+        .infer(&config, request(), &resources.limits())
         .unwrap_err()
         .to_string()
         .contains("container prerequisites"));
@@ -365,9 +333,7 @@ fn invalid_microvm_pins_cannot_fall_back_to_process() {
         }),
         ..Default::default()
     };
-    assert!(worker()
-        .infer(&config, request(), &InferenceLimits::default())
-        .is_err());
+    assert!(worker().infer(&config, request(), &file.limits()).is_err());
 }
 
 /// Explicit host gate: never silently skip missing configuration/prerequisites.
@@ -482,7 +448,7 @@ exec /bin/sleep 30"#,
         .infer_stream(
             &ModelConfig::default(),
             request(),
-            &InferenceLimits::default(),
+            &script.limits(),
             &mut |delta| {
                 partial.push_str(delta);
                 token.store(true, Ordering::Relaxed);
@@ -554,7 +520,7 @@ fn structured_worker_requires_matching_version_mode_and_grammar_evidence() {
             .infer(
                 &ModelConfig::default(),
                 structured_request(mode),
-                &InferenceLimits::default(),
+                &script.limits(),
             )
             .unwrap_err();
         assert_eq!(error.code(), "protocol", "{field}: {error}");
@@ -578,7 +544,7 @@ fn structured_worker_output_is_validated_independently_of_worker_claims() {
             .infer(
                 &ModelConfig::default(),
                 structured_request(OutputMode::AgentIntent),
-                &InferenceLimits::default(),
+                &script.limits(),
             )
             .unwrap_err();
         assert_eq!(error.code(), "invalid_output", "{output}: {error}");
@@ -591,7 +557,7 @@ fn structured_worker_output_is_validated_independently_of_worker_claims() {
             .infer(
                 &ModelConfig::default(),
                 structured_request(OutputMode::Json),
-                &InferenceLimits::default()
+                &script.limits()
             )
             .unwrap_err()
             .code(),
@@ -613,7 +579,7 @@ fn structured_stream_releases_one_validated_result_and_no_partial_failures() {
         let result = WorkerClient::new(&script.0).infer_stream(
             &ModelConfig::default(),
             structured_request(OutputMode::AgentIntent),
-            &InferenceLimits::default(),
+            &script.limits(),
             &mut |delta| {
                 callbacks.push(delta.to_string());
                 Ok(())
@@ -642,7 +608,7 @@ fn structured_deadline_and_cancellation_do_not_deliver_partial_json() {
     req.timeout_ms = 100;
     let limits = InferenceLimits {
         timeout_ms: 100,
-        ..Default::default()
+        ..script.limits()
     };
     let mut delivered = false;
     let error = client
@@ -712,7 +678,7 @@ fn structured_rejection_keeps_error_code_without_echoing_worker_diagnostics() {
         .infer(
             &ModelConfig::default(),
             structured_request(OutputMode::Json),
-            &InferenceLimits::default(),
+            &script.limits(),
         )
         .unwrap_err();
     assert_eq!(error.code(), "invalid_output");

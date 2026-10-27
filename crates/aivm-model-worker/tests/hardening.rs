@@ -6,22 +6,19 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod support;
+use support::TestResources;
+
 struct Fixture {
     root: PathBuf,
     config: ModelConfig,
+    resources: TestResources,
 }
 impl Fixture {
     fn new(script: &str) -> Self {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!(
-            "aivm-hardening-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&root).unwrap();
+        let resources = TestResources::new();
+        let root = resources.root().to_path_buf();
         let worker = root.join("worker");
         std::fs::write(&worker, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -36,25 +33,20 @@ impl Fixture {
             }),
             ..Default::default()
         };
-        Self { root, config }
+        Self {
+            root,
+            config,
+            resources,
+        }
     }
     fn limits(&self, total: u64) -> InferenceLimits {
         InferenceLimits {
             total_timeout_ms: Some(total),
-            host_resources: HostResources {
-                root: self.root.join("quota"),
-                ..Default::default()
-            },
-            ..Default::default()
+            ..self.resources.limits()
         }
     }
     fn client(&self) -> WorkerClient {
         WorkerClient::from_config(&self.config).unwrap()
-    }
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 fn request() -> InferenceRequest {
@@ -143,6 +135,21 @@ fn event_api_streams_and_completes_through_the_pinned_controller() {
     assert!(
         matches!(job.next_event().unwrap(),supervised::WorkerEvent::Complete { response } if response.output.as_deref()==Some("ok"))
     );
+}
+
+#[test]
+fn controller_reuses_a_single_slot_fixture_quota_after_completion() {
+    // controller ต้องคืน lease ก่อนตอบสำเร็จ เพื่อให้คำขอถัดไปใช้ slot เดิมได้แม้พื้นที่ host น้อย
+    let fixture = Fixture::new(&format!("read request\nprintf '%s\\n' '{RESPONSE}'"));
+    let client = fixture.client();
+    let mut limits = fixture.limits(2000);
+    limits.host_resources.max_requests = 1;
+    let mut req = request();
+    req.stream = false;
+    for _ in 0..2 {
+        let response = client.infer(&fixture.config, req.clone(), &limits).unwrap();
+        assert_eq!(response.output.as_deref(), Some("ok"));
+    }
 }
 
 #[test]
