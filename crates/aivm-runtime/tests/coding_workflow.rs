@@ -36,6 +36,33 @@ struct Fixture {
     crt: Vec<String>,
 }
 impl Fixture {
+    fn semantic(task: &aivm_runtime::semantic::SemanticTask) -> Self {
+        Self::semantic_with_model(task, None)
+    }
+    fn semantic_with_model(
+        task: &aivm_runtime::semantic::SemanticTask,
+        model: Option<aivm_runtime::ModelBlock>,
+    ) -> Self {
+        let mut fixture = Self::with_model(true, model);
+        fixture.modify();
+        std::fs::write(
+            fixture
+                .runtime
+                .workspace
+                .join(aivm_runtime::semantic::SOURCE_PATH),
+            task.program_source().unwrap(),
+        )
+        .unwrap();
+        let contract = fixture.runtime.gateway.verifier.as_mut().unwrap();
+        contract.executable = "build:tests".into();
+        // semantic helper มี main ของตัวเองและอยู่เหนือ src ที่ model เขียนได้
+        let steps = vec![
+            intent(&fixture.cc, &json!({"argv":["-pipe","-std=c11","-c","semantic.c","-o",".aivm-build/main.o"],"outputs":["main.o"]}).to_string()),
+            intent(&fixture.ld, &json!({"argv":["-o",".aivm-build/tests","--dynamic-linker","/lib64/ld-linux-x86-64.so.2",fixture.crt[0],fixture.crt[1],".aivm-build/main.o","-lc",fixture.crt[2]],"outputs":["tests"]}).to_string()),
+        ];
+        fixture.prepare_verifier(&steps);
+        fixture
+    }
     fn new(enabled: bool) -> Self {
         Self::with_model(enabled, None)
     }
@@ -92,7 +119,16 @@ tools: {{allow: [cc, as, ld, "build:tests"]}}
             config.resources.memory = "4GB".into();
             config.resources.storage = "5GB".into();
             // 8k context ใช้ CPU มากกว่า short probes; คง threads=2 แต่ให้ CPU budget 240 วินาที
-            config.resources.cpu = 4;
+            config.resources.cpu = if config
+                .model
+                .local
+                .as_ref()
+                .is_some_and(|local| local.ctx_size <= 512)
+            {
+                2
+            } else {
+                4
+            };
             config.filesystem.write = vec!["./workspace/src".into()];
         }
         let runtime = Runtime::init(config, root.clone()).unwrap();
@@ -676,4 +712,284 @@ fn real_model_repairs_source_checked_by_an_independent_verifier() {
         "inspect agent quality evidence for infrastructure failure"
     );
     eprintln!("live agent patch quality: {task_correct}; independently verified, not inferred from model summary");
+}
+
+#[test]
+fn semantic_rejects_known_wrong_answers_and_computes_verified_tool_results() {
+    use aivm_runtime::semantic::{SemanticBudget, SemanticTask};
+    for (task, wrong, expected) in [
+        (
+            SemanticTask::Sort {
+                values: vec![3, -2, 3, 0],
+            },
+            "[0,-2,3,3]",
+            "[-2,0,3,3]",
+        ),
+        (SemanticTask::CAdd { left: -8, right: 3 }, "11", "-5"),
+    ] {
+        let mut fixture = Fixture::semantic(&task);
+        fixture.runtime.model = Box::new(Script(Mutex::new(
+            vec![wrong.to_string(), wrong.to_string()].into(),
+        )));
+        let source = std::fs::read(fixture.runtime.workspace.join("semantic.c")).unwrap();
+        assert!(fixture
+            .runtime
+            .gateway
+            .write(&mut fixture.runtime.cube, "semantic.c", "tampered")
+            .is_err());
+        let run = fixture
+            .runtime
+            .run_semantic(&task, "Return JSON only.", &SemanticBudget::default())
+            .unwrap();
+        assert_eq!(run.output.as_deref(), Some(expected), "{run:?}");
+        assert_eq!(run.origin.as_deref(), Some("tool_solver"));
+        assert!(matches!(
+            run.status,
+            aivm_tools::verification::VerificationStatus::Verified
+        ));
+        assert_eq!(run.attempts.len(), 2);
+        assert!(run
+            .attempts
+            .iter()
+            .all(|a| a.format_valid && a.schema_valid && !a.task_correct));
+        assert!(run.attempts.iter().all(|a| matches!(
+            a.verification.as_ref().unwrap().status,
+            aivm_tools::verification::VerificationStatus::Failed
+        )));
+        assert_eq!(
+            source,
+            std::fs::read(fixture.runtime.workspace.join("semantic.c")).unwrap()
+        );
+        assert!(AuditWriter::verify(fixture.root.join("audit.jsonl")).unwrap() > 10);
+        assert!(!fixture.runtime.cube.tests_passed());
+    }
+}
+
+#[test]
+fn semantic_repairs_with_feedback_and_never_accepts_a_claimed_receipt() {
+    use aivm_runtime::semantic::{SemanticBudget, SemanticTask};
+    let task = SemanticTask::CAdd { left: -8, right: 3 };
+    let mut fixture = Fixture::semantic(&task);
+    fixture.runtime.model = Box::new(Script(Mutex::new(
+        vec![r#"{"result":-5,"verified":true}"#.into(), "-5".into()].into(),
+    )));
+    let run = fixture
+        .runtime
+        .run_semantic(&task, "Return JSON only.", &SemanticBudget::default())
+        .unwrap();
+    assert!(!run.attempts[0].schema_valid);
+    assert!(run.attempts[0].verification.is_none());
+    assert_eq!(run.origin.as_deref(), Some("model_repair_with_verifier"));
+    assert!(run.attempts[1].prompt.contains("Verifier feedback"));
+    assert_eq!(run.output.as_deref(), Some("-5"));
+}
+
+#[test]
+fn semantic_budget_and_gateway_denials_cannot_produce_verified_results() {
+    use aivm_runtime::semantic::{SemanticBudget, SemanticTask};
+    let task = SemanticTask::Sort { values: vec![2, 1] };
+    let mut fixture = Fixture::semantic(&task);
+    let run = fixture
+        .runtime
+        .run_semantic(
+            &task,
+            "JSON",
+            &SemanticBudget {
+                max_actions: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(run.output.is_none());
+    assert!(run.verification.is_none());
+    assert!(run.termination.contains("budget"));
+    let mut fixture = Fixture::semantic(&task);
+    fixture.runtime.gateway.verifier.as_mut().unwrap().prepare[0].executable = "/bin/sh".into();
+    let run = fixture
+        .runtime
+        .run_semantic(&task, "JSON", &SemanticBudget::default())
+        .unwrap();
+    assert!(run.output.is_none());
+    assert!(matches!(
+        run.status,
+        aivm_tools::verification::VerificationStatus::Failed
+    ));
+    assert!(run.attempts.is_empty());
+}
+
+#[test]
+fn semantic_refuses_model_writable_or_mismatched_operator_sources() {
+    use aivm_runtime::semantic::{SemanticBudget, SemanticTask};
+    let task = SemanticTask::CAdd { left: 2, right: 3 };
+    let mut fixture = Fixture::semantic(&task);
+    fixture
+        .runtime
+        .gateway
+        .caps
+        .grant(aivm_capability::Capability::new(
+            "write",
+            "filesystem",
+            &fixture.runtime.workspace.display().to_string(),
+        ));
+    assert!(fixture
+        .runtime
+        .run_semantic(&task, "JSON", &SemanticBudget::default())
+        .unwrap_err()
+        .to_string()
+        .contains("write capabilities"));
+    let mut fixture = Fixture::semantic(&task);
+    std::fs::write(
+        fixture.runtime.workspace.join("semantic.c"),
+        "int main(void){return 0;}",
+    )
+    .unwrap();
+    let run = fixture
+        .runtime
+        .run_semantic(&task, "JSON", &SemanticBudget::default())
+        .unwrap();
+    assert!(run.output.is_none());
+    assert!(run.attempts.is_empty());
+    assert!(run.termination.contains("does not match"));
+}
+
+fn evaluate_semantic_corpus(fresh: bool) {
+    use aivm_runtime::semantic::{SemanticBudget, SemanticTask};
+    use sha2::{Digest, Sha256};
+    let text = include_str!("../../../examples/semantic-quality.json");
+    let corpus: serde_json::Value = serde_json::from_str(text).unwrap();
+    let output = std::env::var_os("AIVM_SEMANTIC_EVIDENCE").map(PathBuf::from);
+    let model_bytes = fresh.then(|| {
+        std::fs::read(
+            std::env::var("AIVM_WORKER_HOST_CONFIG").expect("pinned worker config required"),
+        )
+        .unwrap()
+    });
+    let mut live_fixture = model_bytes.as_ref().map(|bytes| {
+        let config: aivm_model::ModelConfig = serde_json::from_slice(bytes).unwrap();
+        assert!(!config.local.as_ref().unwrap().model_sha256.is_empty());
+        let limits = config.worker_limits.as_ref().unwrap();
+        let block = aivm_runtime::ModelBlock {
+            provider: config.provider.clone(),
+            name: config.name.clone(),
+            local: config.local.clone(),
+            total_timeout_ms: limits.total_timeout_ms,
+            host_resources: limits.host_resources.clone(),
+            ..Default::default()
+        };
+        let task = serde_json::from_value(corpus["cases"][0]["task"].clone()).unwrap();
+        Fixture::semantic_with_model(&task, Some(block))
+    });
+    let mut rows = Vec::new();
+    for case in corpus["cases"].as_array().unwrap() {
+        let task: SemanticTask = serde_json::from_value(case["task"].clone()).unwrap();
+        let mut replay_fixture = if fresh {
+            None
+        } else {
+            Some(Fixture::semantic(&task))
+        };
+        let fixture = live_fixture.as_mut().or(replay_fixture.as_mut()).unwrap();
+        if fresh {
+            // operator เปลี่ยนโจทย์/ตัวตรวจระหว่าง runs; โมเดลยังเขียน semantic.c ไม่ได้
+            std::fs::write(
+                fixture.runtime.workspace.join("semantic.c"),
+                task.program_source().unwrap(),
+            )
+            .unwrap();
+        } else {
+            let candidate = case["initial_candidate"].as_str().unwrap().to_string();
+            fixture.runtime.model = Box::new(Script(Mutex::new(
+                vec![candidate.clone(), candidate].into(),
+            )));
+        }
+        let source_before = std::fs::read(fixture.runtime.workspace.join("semantic.c")).unwrap();
+        let run = fixture
+            .runtime
+            .run_semantic(
+                &task,
+                case["prompt"].as_str().unwrap(),
+                &SemanticBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            source_before,
+            std::fs::read(fixture.runtime.workspace.join("semantic.c")).unwrap()
+        );
+        if fresh {
+            assert!(
+                run.attempts
+                    .iter()
+                    .all(|attempt| attempt.infrastructure_status != "model_error"),
+                "fresh model infrastructure failed: {:?}",
+                run.attempts
+            );
+        }
+        let first = run
+            .attempts
+            .first()
+            .and_then(|a| a.output.as_deref())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+        let final_value = run
+            .output
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+        let first_correct = first.as_ref() == Some(&case["expected"]);
+        let assisted_correct = run.is_verified() && final_value.as_ref() == Some(&case["expected"]);
+        assert!(assisted_correct, "{}: {run:?}", case["id"]);
+        assert!(AuditWriter::verify(fixture.root.join("audit.jsonl")).unwrap() > 5);
+        let audit = std::fs::read(fixture.root.join("audit.jsonl")).unwrap();
+        let id = case["id"].as_str().unwrap();
+        assert!(id.len() < 64 && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'));
+        let audit_name = format!("{id}.audit.jsonl");
+        if let Some(path) = &output {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path.join(&audit_name))
+                .unwrap();
+            file.write_all(&audit).unwrap();
+        }
+        eprintln!(
+            "semantic case {id}: first={first_correct}, assisted={assisted_correct}, origin={:?}",
+            run.origin
+        );
+        rows.push(json!({"id":id,"task":task,"prompt":case["prompt"],"candidate_origin":if fresh {"fresh_model"}else{case["candidate_origin"].as_str().unwrap()},"first_correct":first_correct,"assisted_correct":assisted_correct,"audit_file":audit_name,"audit_sha256":format!("{:x}",Sha256::digest(&audit)),"run":run}));
+    }
+    let first_correct = rows.iter().filter(|r| r["first_correct"] == true).count();
+    let assisted_correct = rows
+        .iter()
+        .filter(|r| r["assisted_correct"] == true)
+        .count();
+    let report = json!({"schema":1,"mode":if fresh {"fresh_model"}else{"replay"},"scope":if fresh {json!("Fresh pinned Qwen inference on two original regressions and six frozen semantic transfer probes; not a general benchmark.")} else {corpus["scope"].clone()},"corpus_sha256":format!("{:x}",Sha256::digest(text.as_bytes())),"model_config_sha256":model_bytes.map(|bytes|format!("{:x}",Sha256::digest(&bytes))),"completed":rows.len(),"total":corpus["cases"].as_array().unwrap().len(),"first_correct":first_correct,"assisted_correct":assisted_correct,"cases":rows});
+    if let Some(path) = output {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path.join("evidence.json"))
+            .unwrap();
+        file.write_all(&serde_json::to_vec_pretty(&report).unwrap())
+            .unwrap();
+    }
+    eprintln!(
+        "semantic {}: first {first_correct}/{}; assisted {assisted_correct}/{}",
+        if fresh {
+            "fresh model"
+        } else {
+            "replayed/probe candidates"
+        },
+        rows.len(),
+        rows.len()
+    );
+}
+
+#[test]
+fn semantic_quality_replay() {
+    evaluate_semantic_corpus(false);
+}
+
+#[test]
+#[ignore = "requires pinned GGUF worker; keep fresh model scores separate from replay/probe evidence"]
+fn real_model_semantic_quality() {
+    evaluate_semantic_corpus(true);
 }

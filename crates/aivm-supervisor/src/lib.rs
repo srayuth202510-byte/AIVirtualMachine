@@ -221,6 +221,32 @@ impl Supervisor {
         Ok(run)
     }
 
+    /// Operator semantic workflow ถือ VM lease เดียวกับ agent; ไม่เปิดทางรันข้าม lifecycle
+    pub fn run_semantic(
+        &mut self,
+        name: &str,
+        task: &aivm_runtime::semantic::SemanticTask,
+        prompt: &str,
+        budget: &aivm_runtime::semantic::SemanticBudget,
+    ) -> Result<aivm_runtime::semantic::SemanticRun, SupervisorError> {
+        let dir = self.resolve(name)?;
+        let _lease = lifecycle::Lease::acquire(&dir, true)?;
+        let cfg = VmConfig::from_file(&dir.join("aivm.yaml"))
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        let mut runtime =
+            Runtime::init(cfg, dir).map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        if let Some((status, _)) = self.vms.get_mut(name) {
+            *status = VmStatus::Running;
+        }
+        let result = runtime
+            .run_semantic(task, prompt, budget)
+            .map_err(|e| SupervisorError::Runtime(e.to_string()));
+        runtime
+            .persist()
+            .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        result
+    }
+
     /// เดิน state ไปข้างหน้าแบบ validate พร้อมให้/เพิกถอนสิทธิ์แบบ dynamic (§14)
     /// guard มาจาก operator (confidence ผลเทสต์ ผล policy)
     /// ไม่รับจาก agent คืน `(granted, revoked)`

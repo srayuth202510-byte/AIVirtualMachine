@@ -117,6 +117,21 @@ def valid_report(path, corpus, style, config_hash):
                     for case, row in zip(cases, report["cases"])))
 
 
+def semantic_observation(output):
+    if not isinstance(output, str):
+        return None
+    text = output.strip()
+    fenced = text.startswith("```json") and text.endswith("```")
+    if fenced:
+        text = text[7:-3].strip()
+    try:
+        value = json.loads(text)
+        json.dumps(value, allow_nan=False, ensure_ascii=False).encode("utf-8")
+        return {"value": value, "format_valid": not fenced}
+    except (ValueError, TypeError, UnicodeError):
+        return None
+
+
 def compare(raw, strict, candidate="strict"):
     # คะแนนที่ดีขึ้นไม่กลบ regressions รายงานทุก case ที่เปลี่ยนแยกกัน
     return {"raw_correct": raw["task_correct"], f"{candidate}_correct": strict["task_correct"],
@@ -124,7 +139,16 @@ def compare(raw, strict, candidate="strict"):
             "improved": [a["id"] for a, b in zip(raw["cases"], strict["cases"])
                          if not a["task_correct"] and b["task_correct"]],
             "regressed": [a["id"] for a, b in zip(raw["cases"], strict["cases"])
-                          if a["task_correct"] and not b["task_correct"]]}
+                          if a["task_correct"] and not b["task_correct"]],
+            # แกะ fence เพื่อวิเคราะห์เท่านั้น ไม่เปลี่ยน strict oracle หรือคะแนนเดิม
+            "semantic_changes": [{"id": a["id"], "raw": before, candidate: after,
+                                  "raw_task_correct": a["task_correct"],
+                                  f"{candidate}_task_correct": b["task_correct"]}
+                                 for a, b in zip(raw["cases"], strict["cases"])
+                                 for before, after in [(semantic_observation(a.get("output")),
+                                                        semantic_observation(b.get("output")))]
+                                 if before is not None and after is not None
+                                 and json.dumps(before["value"], sort_keys=True) != json.dumps(after["value"], sort_keys=True)]}
 
 
 def main():

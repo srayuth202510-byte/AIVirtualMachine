@@ -1,0 +1,32 @@
+# Operator semantic workflow สำหรับ Linux x86_64/glibc; default model เป็น Echo
+# ตรวจ compiler/linker/CRT paths บน host ก่อนใช้ เปลี่ยน model block เพื่อใช้ pinned Qwen
+name: semantic
+runtime:
+  isolation: sandbox
+resources:
+  cpu: 1
+  memory: 1GB
+  storage: 64MB
+build:
+  enabled: true
+  max_files: 4
+  max_bytes: 1048576
+filesystem:
+  read: [./workspace]
+  write: [./workspace/src]
+tools:
+  allow: [cc, as, ld, "build:tests"]
+capabilities:
+  initial: ["read:workspace", "search:code"]
+verification:
+  executable: "build:tests"
+  argv: []
+  prepare:
+    - executable: /usr/bin/cc
+      argv: [-pipe, -std=c11, -c, semantic.c, -o, .aivm-build/main.o]
+      outputs: [main.o]
+    - executable: /usr/bin/ld
+      argv: [-o, .aivm-build/tests, --dynamic-linker, /lib64/ld-linux-x86-64.so.2,
+             /usr/lib/x86_64-linux-gnu/crt1.o, /usr/lib/x86_64-linux-gnu/crti.o,
+             .aivm-build/main.o, -lc, /usr/lib/x86_64-linux-gnu/crtn.o]
+      outputs: [tests]

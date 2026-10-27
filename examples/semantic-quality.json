@@ -1,0 +1,131 @@
+{
+  "schema": 1,
+  "scope": "Two recorded Qwen failures replayed as data plus six frozen synthetic probes; not a fresh-model accuracy benchmark. Inputs/oracles fixed before evaluation.",
+  "recorded_worker_sha256": "3f5658e9062cb79e6c4aabd4605b4ee533e82714d8b0048ce9dfb931078ca90c",
+  "cases": [
+    {
+      "id": "sort-negative-duplicates",
+      "candidate_origin": "recorded_qwen",
+      "task": {
+        "kind": "sort",
+        "values": [
+          3,
+          -2,
+          3,
+          0
+        ]
+      },
+      "prompt": "Sort [3, -2, 3, 0] ascending. Return only a JSON array, without explanation or markdown.",
+      "initial_candidate": "[0, -2, 3, 3]",
+      "expected": [
+        -2,
+        0,
+        3,
+        3
+      ],
+      "recording_sha256": "9fc8c5a70d81d331392fb6646a35b17e16c2703a2e6eb0252f2f88322747bf13"
+    },
+    {
+      "id": "code-result",
+      "candidate_origin": "recorded_qwen",
+      "task": {
+        "kind": "c_add",
+        "left": -8,
+        "right": 3
+      },
+      "prompt": "Given C code int add(int a, int b) { return a + b; }, what is add(-8, 3)? Return only the integer result.",
+      "initial_candidate": "11",
+      "expected": -5,
+      "recording_sha256": "9fc8c5a70d81d331392fb6646a35b17e16c2703a2e6eb0252f2f88322747bf13"
+    },
+    {
+      "id": "transfer-negative-duplicates",
+      "candidate_origin": "synthetic_probe",
+      "task": {
+        "kind": "sort",
+        "values": [
+          -9,
+          0,
+          -9,
+          4
+        ]
+      },
+      "prompt": "Sort [-9,0,-9,4] ascending. Return only a JSON array.",
+      "initial_candidate": "[0,-9,-9,4]",
+      "expected": [
+        -9,
+        -9,
+        0,
+        4
+      ]
+    },
+    {
+      "id": "transfer-empty",
+      "candidate_origin": "synthetic_probe",
+      "task": {
+        "kind": "sort",
+        "values": []
+      },
+      "prompt": "Sort [] ascending. Return only a JSON array.",
+      "initial_candidate": "[0]",
+      "expected": []
+    },
+    {
+      "id": "transfer-i32-bounds",
+      "candidate_origin": "synthetic_probe",
+      "task": {
+        "kind": "sort",
+        "values": [
+          2147483647,
+          -2147483648,
+          0,
+          -2147483648
+        ]
+      },
+      "prompt": "Sort [2147483647,-2147483648,0,-2147483648] ascending. Return only a JSON array.",
+      "initial_candidate": "[2147483647,-2147483648,0,-2147483648]",
+      "expected": [
+        -2147483648,
+        -2147483648,
+        0,
+        2147483647
+      ]
+    },
+    {
+      "id": "transfer-c-add-bounds",
+      "candidate_origin": "synthetic_probe",
+      "task": {
+        "kind": "c_add",
+        "left": -2147483648,
+        "right": 2147483647
+      },
+      "prompt": "Given C int add(int a,int b){return a+b;}, return only add(-2147483648,2147483647).",
+      "initial_candidate": "0",
+      "expected": -1
+    },
+    {
+      "id": "transfer-c-add-negatives",
+      "candidate_origin": "synthetic_probe",
+      "task": {
+        "kind": "c_add",
+        "left": -17,
+        "right": -6
+      },
+      "prompt": "Given C int add(int a,int b){return a+b;}, return only add(-17,-6).",
+      "initial_candidate": "11",
+      "expected": -23
+    },
+    {
+      "id": "transfer-c-add-min",
+      "candidate_origin": "synthetic_probe",
+      "task": {
+        "kind": "c_add",
+        "left": 0,
+        "right": -2147483648
+      },
+      "prompt": "Given C int add(int a,int b){return a+b;}, return only add(0,-2147483648).",
+      "initial_candidate": "0",
+      "expected": -2147483648
+    }
+  ]
+}

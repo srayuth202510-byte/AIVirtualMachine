@@ -144,6 +144,28 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Operator: สร้าง source ตัวช่วยที่ต้องวางเป็น semantic.c นอก write scope ของโมเดล
+    SemanticSource {
+        #[arg(long)]
+        task: PathBuf,
+    },
+    /// Operator: ตรวจคำตอบ ซ่อมแบบจำกัดรอบ และใช้ตัวช่วยผ่าน gateway ตาม contract
+    Semantic {
+        name: String,
+        #[arg(long)]
+        task: PathBuf,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value_t = 2)]
+        max_model_attempts: usize,
+        #[arg(long, default_value_t = 12)]
+        max_actions: usize,
+        /// ตรวจงบเวลาที่ขอบเขตแต่ละ phase; worker ยังคุม deadline ราย inference
+        #[arg(long, default_value_t = 300_000)]
+        timeout_ms: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// สร้าง inverted index สำหรับ workspace
     ///
     /// เป็นคำสั่งของ operator (ไม่ใช่ agent) — อ่านต้นทางที่ระบุโดยตรง และ
@@ -350,6 +372,46 @@ fn main() -> Result<(), AnyErr> {
             match &run.summary {
                 Some(s) => println!("summary: {s}"),
                 None => println!("(stopped: {})", run.stopped),
+            }
+        }
+        Cmd::SemanticSource { task } => {
+            print!(
+                "{}",
+                load_semantic_task(&task)?.program_source().map_err(err)?
+            );
+        }
+        Cmd::Semantic {
+            name,
+            task,
+            prompt,
+            max_model_attempts,
+            max_actions,
+            timeout_ms,
+            json,
+        } => {
+            let task = load_semantic_task(&task)?;
+            let budget = aivm_runtime::semantic::SemanticBudget {
+                max_model_attempts,
+                max_actions,
+                max_duration_ms: timeout_ms,
+                ..Default::default()
+            };
+            let run = sup
+                .run_semantic(&name, &task, &prompt, &budget)
+                .map_err(err)?;
+            if json {
+                println!("{}", serde_json::to_string(&run)?);
+            } else {
+                println!(
+                    "status: {}\norigin: {}\noutput: {}\ntermination: {}",
+                    serde_json::to_value(&run.status)?,
+                    run.origin.as_deref().unwrap_or("none"),
+                    run.output.as_deref().unwrap_or("none"),
+                    run.termination
+                );
+            }
+            if !run.is_verified() {
+                return Err(err("semantic task was not verified"));
             }
         }
         Cmd::Index {
@@ -786,6 +848,23 @@ fn inspect_manifest(local: &aivm_model::LocalModelConfig, production: bool) -> M
 
 fn err<E: std::fmt::Display>(e: E) -> AnyErr {
     Box::<dyn std::error::Error>::from(format!("{e}"))
+}
+
+/// task file เป็น input ของ operator แบบ bounded ไม่รับคำสั่งจากโมเดล
+fn load_semantic_task(
+    path: &std::path::Path,
+) -> Result<aivm_runtime::semantic::SemanticTask, AnyErr> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(16_385)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 16_384 {
+        return Err(err("semantic task file exceeds 16384 bytes"));
+    }
+    let task: aivm_runtime::semantic::SemanticTask = serde_json::from_slice(&bytes)?;
+    task.validate().map_err(err)?;
+    Ok(task)
 }
 
 #[cfg(test)]

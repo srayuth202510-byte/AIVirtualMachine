@@ -1,7 +1,7 @@
 # แผน: Structured output, semantic verification และ staging recovery
 
-สถานะ: **ส่วน 1 (GBNF + Serde) เสร็จและตรวจแล้ว; ส่วน 2–3 ยังไม่ได้ implement** — อัปเดต 27 ตุลาคม 2026
-ผลและข้อจำกัด: [validation](structured-output-validation-2026-10-27.md)
+สถานะ: **ส่วน 1–2 เสร็จและตรวจแล้ว รวม Qwen รอบสด; ส่วน 3 ยังไม่ได้ implement** — อัปเดต 27 ตุลาคม 2026
+ผลและข้อจำกัด: [structured output](structured-output-validation-2026-10-27.md), [semantic verification](semantic-validation-2026-10-27.md)
 Baseline: `aee1c18` พร้อมผล [coding validation](coding-validation-2026-10-26.md)
 และ [model quality](model-quality-2026-10-26.md)
 
@@ -68,22 +68,22 @@ worker protocol/quality tests และ agent integration ที่ใช้ int
 
 ### งานที่จะทำ
 
-- [ ] ใช้ `verification.prepare` และ protected operator verifier เดิม
+- [x] ใช้ `verification.prepare` และ protected operator verifier เดิม
   สำหรับ compile/link/test; งานคำนวณหรือ sort ที่ใช้โปรแกรมช่วยต้องมี
   executable/arguments ที่อนุญาตและวิ่งผ่าน gateway ปกติ
-- [ ] เพิ่ม Proptest เป็น dev dependency เพื่อสร้างและย่อกรณีทดสอบที่ล้ม
+- [x] เพิ่ม Proptest เป็น dev dependency เพื่อสร้างและย่อกรณีทดสอบที่ล้ม
   เก็บ seed/minimal regression case ให้ replay ได้
-- [ ] เพิ่ม properties ของ sorting: เรียงตามลำดับ, สมาชิกและจำนวนซ้ำคงเดิม,
+- [x] เพิ่ม properties ของ sorting: เรียงตามลำดับ, สมาชิกและจำนวนซ้ำคงเดิม,
   ครอบคลุม array ว่าง ค่าติดลบและค่าซ้ำ ไม่ทดสอบด้วยตัวอย่างบวกเพียงชุดเดียว
-- [ ] เพิ่ม verifier cases ของ arithmetic/code execution ที่มีเครื่องหมายลบ
+- [x] เพิ่ม verifier cases ของ arithmetic/code execution ที่มีเครื่องหมายลบ
   และกำหนดขอบเขต/นโยบาย overflow ชัดเจน ไม่ใช้ C undefined behavior เป็น oracle
-- [ ] ใช้ generated cases กับ verifier/runtime tests ที่รันเร็ว
+- [x] ใช้ generated cases กับ verifier/runtime tests ที่รันเร็ว
   ไม่เรียกโมเดลจริงหลายร้อยครั้งใน unit gate
-- [ ] แยก metrics อย่างน้อยเป็น `format_valid`, `schema_valid`, `task_correct`,
+- [x] แยก metrics อย่างน้อยเป็น `format_valid`, `schema_valid`, `task_correct`,
   infrastructure status และ termination reason พร้อม raw output
-- [ ] รายงาน semantic changes ของเคสที่ strict oracle ตกทั้งสองฝั่งด้วย
+- [x] รายงาน semantic changes ของเคสที่ strict oracle ตกทั้งสองฝั่งด้วย
   เช่นเดิม sort ถูกแต่ครอบ fence กลายเป็น JSON ถูกแต่เรียงผิด
-- [ ] เพิ่มชุดประเมินแยกที่ไม่ใช้ปรับ prompt และ freeze inputs/oracles ก่อนทดลอง
+- [x] เพิ่มชุดประเมินแยกที่ไม่ใช้ปรับ prompt และ freeze inputs/oracles ก่อนทดลอง
   คงผลเดิมให้เทียบย้อนหลังได้
 
 จุดแก้หลัก: `crates/aivm-runtime/tests/coding_workflow.rs`, verifier tests,
@@ -92,13 +92,13 @@ worker protocol/quality tests และ agent integration ที่ใช้ int
 
 ### เกณฑ์ผ่าน
 
-- [ ] Known-broken implementations และคำตอบผิดในรายงานเดิมถูก verifier ปฏิเสธ
+- [x] Known-broken implementations และคำตอบผิดในรายงานเดิมถูก verifier ปฏิเสธ
   ขณะที่ implementation ที่ถูกต้องผ่าน properties และ regression cases
-- [ ] Agent เขียน verifier/expected answers ไม่ได้ และ model summary
+- [x] Agent เขียน verifier/expected answers ไม่ได้ และ model summary
   ไม่สามารถสร้าง verification receipt เอง
-- [ ] หลักฐานขาด คะแนนไม่ตรง output หรือใช้ corpus/config คนละชุด
+- [x] หลักฐานขาด คะแนนไม่ตรง output หรือใช้ corpus/config คนละชุด
   ถูก validator ปฏิเสธ
-- [ ] ผล model-only และผลที่ใช้โปรแกรมช่วยถูกรายงานแยกกัน
+- [x] ผล model-only และผลที่ใช้โปรแกรมช่วยถูกรายงานแยกกัน
   ไม่อ้างว่า Proptest หรือ tool assistance ทำให้โมเดลตอบถูกทุกเรื่อง
 
 ## 3. Test ไม่เสถียร: reproduction + nextest + strace

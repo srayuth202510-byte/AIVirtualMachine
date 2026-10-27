@@ -20,6 +20,7 @@ use thiserror::Error;
 
 pub mod agent;
 pub mod demo;
+pub mod semantic;
 mod transaction;
 
 /// เกณฑ์ confidence สำหรับ ANALYZE -> MODIFY (ตัวอย่างในสเปก §15)
@@ -742,6 +743,40 @@ impl Runtime {
             Ok(_) => Ok(intent),
             Err(e) => Ok(format!("{intent} [tool denied: {e}]")),
         }
+    }
+
+    /// Workflow แบบ opt-in ของ operator; model-only reason/agent เดิมไม่เปลี่ยนโดยปริยาย
+    pub fn run_semantic(
+        &mut self,
+        task: &semantic::SemanticTask,
+        prompt: &str,
+        budget: &semantic::SemanticBudget,
+    ) -> Result<semantic::SemanticRun, RuntimeError> {
+        self.ensure_ready()?;
+        let name = self.model_cfg.name.clone();
+        self.audit_op("inference", &name, "started", "semantic")?;
+        let result = semantic::run(
+            &*self.model,
+            &mut self.gateway,
+            &mut self.cube,
+            task,
+            prompt,
+            budget,
+        )
+        .map_err(RuntimeError::Config);
+        let outcome = match &result {
+            Ok(run)
+                if matches!(
+                    run.status,
+                    aivm_tools::verification::VerificationStatus::Verified
+                ) =>
+            {
+                "verified"
+            }
+            _ => "failed",
+        };
+        self.audit_op("inference", &name, outcome, "semantic")?;
+        result
     }
 
     /// Agent loop เต็มรอบ (Phase 5): observe → reason → intent → execute → observe

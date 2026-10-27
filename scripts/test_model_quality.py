@@ -81,6 +81,19 @@ class QualityTests(unittest.TestCase):
             self.assertTrue(QUALITY.structured_evidence(case, {**valid, "output": output}))
         self.assertEqual(QUALITY.task_mode({"id": "nested-extract", "json": {}}), "text")
 
+    def test_semantic_changes_are_reported_when_both_strict_scores_fail(self):
+        raw = {"task_correct": 0, "total": 1, "cases": [
+            {"id": "sort", "task_correct": False, "output": "```json\n[-2,0,3,3]\n```"}]}
+        structured = {"task_correct": 0, "total": 1, "cases": [
+            {"id": "sort", "task_correct": False, "output": "[0,-2,3,3]"}]}
+        compared = QUALITY.compare(raw, structured, "structured")
+        self.assertEqual(compared["raw_correct"], 0)
+        self.assertEqual(compared["structured_correct"], 0)
+        self.assertEqual(compared["regressed"], [])
+        self.assertEqual(compared["semantic_changes"][0]["raw"]["value"], [-2, 0, 3, 3])
+        self.assertFalse(compared["semantic_changes"][0]["raw"]["format_valid"])
+        self.assertEqual(compared["semantic_changes"][0]["structured"]["value"], [0, -2, 3, 3])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -30,3 +30,6 @@ llama = ["aivm-model/llama"]
 microvm = ["aivm-model/microvm", "aivm-sandbox/microvm", "aivm-tools/microvm"]
 # ส่งต่อฟีเจอร์ Hardware Isolation backend (config + backend) ทั้งสาย tools -> sandbox
 hardware = ["aivm-sandbox/hardware", "aivm-tools/hardware"]
+
+[dev-dependencies]
+proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
