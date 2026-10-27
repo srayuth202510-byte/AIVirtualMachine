@@ -115,6 +115,15 @@ impl Permit {
         control: &RequestControl<'_>,
         cache_request: bool,
     ) -> Result<Self, WorkerError> {
+        Self::reserve_with_capacity(limits, control, cache_request, staging_capacity)
+    }
+
+    fn reserve_with_capacity(
+        limits: &InferenceLimits,
+        control: &RequestControl<'_>,
+        cache_request: bool,
+        mut capacity: impl FnMut() -> Result<(bool, u64), WorkerError>,
+    ) -> Result<Self, WorkerError> {
         #[cfg(not(unix))]
         return Err(WorkerError::Resources(
             "host admission requires Unix file locks".into(),
@@ -127,7 +136,7 @@ impl Permit {
                 unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
             };
             let cfg = &limits.host_resources;
-            let (ram_backed, _) = staging_capacity()?;
+            let (ram_backed, _) = capacity()?;
             let requested_memory = limits
                 .memory_mb
                 .checked_add(if ram_backed && !cache_request {
@@ -289,7 +298,7 @@ impl Permit {
                             }
                         }
                     }
-                    let (_, free_staging) = staging_capacity()?;
+                    let (_, free_staging) = capacity()?;
                     if (cache_request && cached > cfg.cache_mb.saturating_sub(limits.memory_mb))
                         || memory > cfg.memory_mb.saturating_sub(requested_memory)
                         || storage > cfg.storage_mb.saturating_sub(limits.storage_mb)
@@ -328,6 +337,59 @@ impl Permit {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_staging_admits_fixtures_but_still_rejects_production_reservations() {
+        // CI อาจเหลือพื้นที่ไม่ถึง 5 GiB; จำลอง probe โดยไม่เติมดิสก์หรือเปลี่ยน TMPDIR ของ test อื่น
+        for ram_backed in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("aivm-quota-test-{}", uuid::Uuid::new_v4()));
+            let mut fixture = InferenceLimits::test_fixture(root.clone());
+            fixture.host_resources.memory_mb = 16 * 1024;
+            fixture.host_resources.storage_mb = 16 * 1024;
+            fixture.host_resources.queue_timeout_ms = 20;
+            let production = InferenceLimits {
+                host_resources: fixture.host_resources.clone(),
+                ..Default::default()
+            };
+            let token = AtomicBool::new(false);
+            let control = RequestControl::new(&token, None).unwrap();
+            let error = Permit::reserve_with_capacity(&production, &control, false, || {
+                Ok((ram_backed, 2048))
+            })
+            .err()
+            .expect("5 GiB reservation must wait when only 2 GiB is free");
+            assert!(error
+                .to_string()
+                .contains("admission queue deadline exceeded"));
+            let permit =
+                Permit::reserve_with_capacity(&fixture, &control, false, || Ok((ram_backed, 2048)))
+                    .expect("small fixture must reach the behavior under test");
+            drop(permit);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn physical_staging_capacity_counts_active_reservations_and_recovers_after_release() {
+        // มี slot และ host quota เหลือก็ต้องรอ ถ้าพื้นที่จริงถูกงานที่ยัง active จองหมดแล้ว
+        let root = std::env::temp_dir().join(format!("aivm-quota-test-{}", uuid::Uuid::new_v4()));
+        let mut limits = InferenceLimits::test_fixture(root.clone());
+        limits.host_resources.queue_timeout_ms = 20;
+        let token = AtomicBool::new(false);
+        let control = RequestControl::new(&token, None).unwrap();
+        let first =
+            Permit::reserve_with_capacity(&limits, &control, false, || Ok((false, 1))).unwrap();
+        let error = Permit::reserve_with_capacity(&limits, &control, false, || Ok((false, 1)))
+            .err()
+            .expect("two reservations cannot share one MiB of physical capacity");
+        assert!(error
+            .to_string()
+            .contains("admission queue deadline exceeded"));
+        drop(first);
+        drop(Permit::reserve_with_capacity(&limits, &control, false, || Ok((false, 1))).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn reservations_wait_cancel_and_release_without_oversubscribing() {
@@ -396,9 +458,7 @@ mod tests {
     fn empty_inherited_probe_lock_waits_until_release_instead_of_reporting_corruption() {
         use std::os::fd::AsRawFd;
         let root = std::env::temp_dir().join(format!("aivm-quota-test-{}", uuid::Uuid::new_v4()));
-        let mut limits = InferenceLimits::default();
-        limits.host_resources.root = root.clone();
-        limits.host_resources.queue_timeout_ms = 1000;
+        let limits = InferenceLimits::test_fixture(root.clone());
         let token = AtomicBool::new(false);
         let control = RequestControl::new(&token, None).unwrap();
         drop(Permit::acquire(&limits, &control).unwrap());
@@ -433,8 +493,7 @@ mod tests {
     #[test]
     fn quota_policy_cannot_be_silently_weakened_by_another_client() {
         let root = std::env::temp_dir().join(format!("aivm-quota-test-{}", uuid::Uuid::new_v4()));
-        let mut limits = InferenceLimits::default();
-        limits.host_resources.root = root.clone();
+        let mut limits = InferenceLimits::test_fixture(root.clone());
         let token = AtomicBool::new(false);
         let control = RequestControl::new(&token, None).unwrap();
         drop(Permit::acquire(&limits, &control).unwrap());

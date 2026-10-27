@@ -1003,7 +1003,7 @@ mod tests {
             local: Some(local),
             worker_limits: Some(worker::InferenceLimits {
                 pids_max: 8192,
-                ..worker::InferenceLimits::default()
+                ..worker::InferenceLimits::test_fixture(dir.join("quota"))
             }),
             ..Default::default()
         };

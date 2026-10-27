@@ -100,6 +100,26 @@ impl Default for InferenceLimits {
     }
 }
 
+#[cfg(test)]
+impl InferenceLimits {
+    // fixture ใช้ shell/ไฟล์เล็ก จึงไม่จองทรัพยากรเท่าโมเดลจริงหรือใช้ quota ร่วมกับ operator
+    pub(crate) fn test_fixture(root: PathBuf) -> Self {
+        Self {
+            memory_mb: 64,
+            storage_mb: 1,
+            host_resources: HostResources {
+                root,
+                max_requests: 2,
+                memory_mb: 128,
+                storage_mb: 16,
+                queue_timeout_ms: 1_000,
+                cache_mb: 0,
+            },
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
     pub protocol_version: u16,
@@ -1381,7 +1401,11 @@ mod tests {
         };
         let client = WorkerClient::new(&script);
         let error = client
-            .infer(&config, request(), &InferenceLimits::default())
+            .infer(
+                &config,
+                request(),
+                &InferenceLimits::test_fixture(dir.join("quota")),
+            )
             .unwrap_err();
         assert!(
             error.to_string().contains("container prerequisites"),
@@ -1435,7 +1459,11 @@ mod tests {
         let client = WorkerClient::new(&script);
         assert!(
             client
-                .infer(&config, request(), &InferenceLimits::default())
+                .infer(
+                    &config,
+                    request(),
+                    &InferenceLimits::test_fixture(dir.join("quota")),
+                )
                 .is_err(),
             "container launcher must not fall back to process execution"
         );
