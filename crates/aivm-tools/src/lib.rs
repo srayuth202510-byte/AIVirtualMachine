@@ -1291,6 +1291,7 @@ impl ToolGateway {
         use std::io::Read;
         let req: NetworkFetchRequest = serde_json::from_str(content.unwrap_or("{}"))
             .map_err(|e| ToolError::Denied(format!("invalid network.fetch request: {e}")))?;
+        req.validate_read_only(self.policy.network.read_only)?;
         let (host, port, protocol) = parse_url(url)?;
         let scope = network_scope(&host, port);
         let action =
@@ -1347,6 +1348,9 @@ impl ToolGateway {
         self.caps.account_bytes(idx, request_bytes);
         self.checkpoint(cube)?;
         let agent = ureq::AgentBuilder::new()
+            // ไม่รับ proxy จาก environment แม้ dependency เปิด feature เพิ่มภายหลัง
+            .try_proxy_from_env(false)
+            .https_only(true)
             .redirects(0)
             .resolver(move |_: &str| Ok(addresses.clone()))
             .build();
@@ -1445,6 +1449,12 @@ impl ToolGateway {
         content: Option<&str>,
     ) -> Result<ToolResult, ToolError> {
         use aivm_capability::AuthorizationContext;
+        // raw connection ไม่มี HTTP method ให้บังคับอ่านเท่านั้น จึงปฏิเสธก่อน DNS
+        if self.policy.network.read_only {
+            return Err(ToolError::Denied(
+                "read-only network forbids raw connections".into(),
+            ));
+        }
         let req: NetworkConnectRequest = serde_json::from_str(content.unwrap_or("{}"))
             .map_err(|e| ToolError::Denied(format!("invalid network.connect request: {e}")))?;
         if req.protocol != "tcp" {
@@ -2014,6 +2024,26 @@ struct NetworkFetchRequest {
     body: Option<String>,
     #[serde(default = "default_timeout")]
     timeout_ms: Option<u64>,
+}
+
+impl NetworkFetchRequest {
+    fn validate_read_only(&self, read_only: bool) -> Result<(), ToolError> {
+        // ตรวจทุก request รวม credential เก่าที่เคยมีสิทธิ์เขียน ก่อนหัก quota
+        if read_only
+            && (!(self.method.eq_ignore_ascii_case("GET")
+                || self.method.eq_ignore_ascii_case("HEAD"))
+                || self.body.is_some()
+                || self.headers.keys().any(|key| {
+                    let key = key.to_ascii_lowercase();
+                    key == "x-http-method" || key.contains("method-override")
+                }))
+        {
+            return Err(ToolError::Denied(
+                "read-only network requires GET/HEAD without body or method override".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn default_get() -> String {
@@ -3167,8 +3197,30 @@ network: {{allow: [], deny: ['10.0.0.0/8']}}
     }
 
     #[test]
+    fn read_only_http_accepts_only_bodyless_reads_without_method_overrides() {
+        // ทดสอบทางอนุญาตด้วยโดยไม่เปิด socket ไปยังระบบภายนอก
+        for method in ["GET", "HEAD", "get", "head"] {
+            let req: NetworkFetchRequest =
+                serde_json::from_value(serde_json::json!({"method":method})).unwrap();
+            assert!(req.validate_read_only(true).is_ok());
+        }
+        for json in [
+            serde_json::json!({"method":"POST"}),
+            serde_json::json!({"method":"OPTIONS"}),
+            serde_json::json!({"body":""}),
+            serde_json::json!({"headers":{"X-HTTP-Method-Override":"PUT"}}),
+            serde_json::json!({"headers":{"X-HTTP-Method":"PUT"}}),
+        ] {
+            let req: NetworkFetchRequest = serde_json::from_value(json).unwrap();
+            assert!(req.validate_read_only(true).is_err());
+            assert!(req.validate_read_only(false).is_ok());
+        }
+    }
+
+    #[test]
     fn network_constraints_cannot_be_skipped_when_quota_exhausts() {
         let (mut gw, mut cube, _) = harness();
+        gw.policy.network.read_only = false;
         gw.policy.network.allow = vec!["example.com".into()];
         gw.policy.require_test_before_network = false;
         gw.caps.grant(

@@ -50,6 +50,7 @@ filesystem:
   write: [./workspace/src]
 
 network:
+  read_only: true                 # default: GET/HEAD ไม่มี body; ไม่ให้ raw connect
   allow: [github.com, crates.io]   # นอกนี้ + deny list บังคับ = DENY
   # เพดานต่อ lease เน็ตเวิร์ก (operator กำหนด ไม่ตั้ง = ไม่จำกัดข้อนั้น)
   # ใช้ตอน state VALIDATE จำกัดทั้งจำนวนครั้งและ _bytes สะสม_

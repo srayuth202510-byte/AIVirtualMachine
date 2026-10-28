@@ -42,12 +42,25 @@ pub struct ProcessPolicy {
     pub deny: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkPolicy {
+    /// ค่าเริ่มต้นให้อ่านเท่านั้น ป้องกันใช้ registry เป็นพื้นที่เขียนร่วม
+    #[serde(default = "default_true")]
+    pub read_only: bool,
     #[serde(default)]
     pub allow: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+}
+
+impl Default for NetworkPolicy {
+    fn default() -> Self {
+        Self {
+            read_only: true,
+            allow: vec![],
+            deny: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -499,13 +512,15 @@ pub fn is_public_address(ip: std::net::IpAddr) -> bool {
             if let Some(v4) = ip.to_ipv4_mapped() {
                 return is_public_address(IpAddr::V4(v4));
             }
-            let a = ip.segments()[0];
-            !(ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || a & 0xfe00 == 0xfc00
-                || a & 0xffc0 == 0xfe80
-                || (a == 0x2001 && ip.segments()[1] == 0x0db8))
+            let [a, b, ..] = ip.segments();
+            // อนุญาตเฉพาะ global unicast ปกติ; ตัด translation/tunnel และ
+            // special-purpose ตาม IANA แม้บางช่วงจะ route ได้ในบางเครือข่าย
+            // ไม่อ้างว่ารองรับ NAT64 prefix ที่ operator กำหนดเอง
+            a & 0xe000 == 0x2000
+                && !(a == 0x2001 && b < 0x0200)
+                && !(a == 0x2001 && b == 0x0db8)
+                && a != 0x2002
+                && !(a == 0x3fff && b & 0xf000 == 0)
         }
     }
 }
@@ -1255,6 +1270,29 @@ network:
         let (d, _, _) = evaluator.evaluate(allowed, &mut caps);
         assert_eq!(d, Decision::Allow);
         assert_eq!(caps.caps[0].used_count, 1);
+    }
+
+    #[test]
+    fn special_ipv6_routes_cannot_reach_metadata_or_reserved_destinations() {
+        // ต้องปฏิเสธทางแปลง/อุโมงค์ IPv6 แม้ hostname จะอยู่ใน allowlist
+        for ip in [
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::a00:1",
+            "::127.0.0.1",
+            "fec0::1",
+            "100::1",
+            "2001::1",
+            "2001:2::1",
+            "2001:20::1",
+            "2002:a9fe:a9fe::1",
+            "3fff::1",
+            "5f00::1",
+        ] {
+            assert!(!is_public_address(ip.parse().unwrap()), "must deny {ip}");
+        }
+        for ip in ["2606:4700:4700::1111", "2001:4860:4860::8888", "8.8.8.8"] {
+            assert!(is_public_address(ip.parse().unwrap()), "must allow {ip}");
+        }
     }
 
     #[test]

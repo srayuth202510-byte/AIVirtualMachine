@@ -46,6 +46,7 @@ filesystem:
     - ./workspace/src
 
 network:
+  read_only: true
   allow: []            # local-first = ตัดเน็ตทั้งหมด (deny-by-default อยู่แล้ว ขีดเส้นให้ชัด)
   # ถ้าเปิดเพดานต่อ lease network ภายหลัง: (ใช้ตอน state VALIDATE)
   # max_calls: 20

@@ -8,6 +8,10 @@
 
 ## คำสั่งหลัก
 
+ทดสอบการจำกัด registry writes, IPv6 SSRF และข้อมูล template ที่ไม่ถูกรัน:
+`cargo test --locked -p aivm-adversarial --test registry_containment`
+ดูขอบเขตใน [Registry containment](registry-containment.md)
+
 | คำสั่ง | วิ่งอะไร | เมื่อไหร่ที่ใช้ |
 |---|---|---|
 | `make demo` | self-test 14 เคส ALLOW/DENY ใน temp dir (~1 วินาที) | ดีบักเส้น enforcement — เร็วสุด พิมพ์ decision/reason ต่อเคส |

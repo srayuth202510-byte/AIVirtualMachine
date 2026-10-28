@@ -70,6 +70,9 @@ Container backend บังคับ namespaces + Landlock/seccomp + cgroups v2 
 
 ## Policy และเครือข่าย
 
+ค่าเริ่มต้นเครือข่ายเป็น read-only และบล็อก IPv6 translation/tunnel เพิ่มเติม
+ดูขอบเขต ผลต่อ config เดิม และชุดทดสอบใน [Registry containment](registry-containment.md)
+
 - Predicate/pattern ที่ parse ไม่ได้ทำให้ policy ทั้งชุดถูกปฏิเสธ ไม่มี fallback glob เป็น substring
 - Intent รับ JSON ทั้งข้อความ ตรวจ unknown/duplicate fields และปฏิเสธ prose/code fences
 - Confidence ต้องเป็น finite number ในช่วง 0..1

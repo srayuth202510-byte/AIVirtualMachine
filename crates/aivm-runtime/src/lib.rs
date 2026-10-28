@@ -215,9 +215,12 @@ pub struct FilesystemBlock {
     pub write: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkBlock {
+    /// operator ต้องเปิดสิทธิ์เขียนอย่างชัดเจน ค่าเริ่มต้นคืออ่านเท่านั้น
+    #[serde(default = "default_network_read_only")]
+    pub read_only: bool,
     #[serde(default)]
     pub allow: Vec<String>,
     /// เพดานจำนวนครั้งต่อ lease เน็ตเวิร์ก (None = ไม่จำกัดด้วยจำนวนครั้ง)
@@ -226,6 +229,21 @@ pub struct NetworkBlock {
     /// เพดานไบต์สะสมต่อ lease เน็ตเวิร์ก (None = ไม่จำกัดด้วยยอดรวม)
     #[serde(default)]
     pub max_total_bytes: Option<u64>,
+}
+
+fn default_network_read_only() -> bool {
+    true
+}
+
+impl Default for NetworkBlock {
+    fn default() -> Self {
+        Self {
+            read_only: true,
+            allow: vec![],
+            max_calls: None,
+            max_total_bytes: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -879,6 +897,9 @@ fn state_grants(
                 format!("{host}:443")
             };
             for action in ["network:fetch", "network:connect"] {
+                if network.read_only && action == "network:connect" {
+                    continue;
+                }
                 let mut net = Capability::new(action, "network", &scope);
                 net.condition = Some(Condition {
                     protocol: Some("https".into()),
@@ -1106,6 +1127,7 @@ fn build_policy(config: &VmConfig, base_dir: &Path, workspace: &Path) -> Policy 
             deny: vec!["/bin/sh".into(), "/bin/bash".into()],
         },
         network: aivm_policy::NetworkPolicy {
+            read_only: config.network.read_only,
             allow: config.network.allow.clone(),
             deny: vec![
                 "10.0.0.0/8".into(),
@@ -2378,10 +2400,35 @@ secrets:
     }
 
     #[test]
+    fn read_only_network_defaults_and_runtime_policy_match() {
+        for yaml in [
+            "name: default",
+            "name: explicit\nnetwork:\n  allow: [registry.invalid]",
+        ] {
+            let config = VmConfig::from_yaml(yaml).unwrap();
+            assert!(config.network.read_only);
+        }
+        let (rt, base) = test_runtime("readonly-policy");
+        assert!(rt.gateway.policy.network.read_only);
+        let network = NetworkBlock {
+            allow: vec!["registry.invalid".into()],
+            ..Default::default()
+        };
+        let caps = state_grants(AgentState::Validate, Path::new("/workspace"), &network, &[]);
+        assert_eq!(caps.iter().filter(|c| c.resource == "network").count(), 1);
+        assert!(caps.iter().any(|c| c.action == "network:fetch"));
+        assert!(!caps.iter().any(|c| c.action == "network:connect"));
+        drop(rt);
+        aivm_audit::clear_flags(&base);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn validate_grants_network_actions_with_tls_and_matching_ports() {
         use crate::NetworkBlock;
         let ws = std::path::Path::new("/workspace");
         let network = NetworkBlock {
+            read_only: false,
             allow: vec!["api.example.com".into()],
             max_calls: Some(5),
             max_total_bytes: Some(1024),
@@ -2401,6 +2448,7 @@ secrets:
     #[test]
     fn restart_uses_fresh_grants_and_limits_with_legacy_usage() {
         let (mut rt, base) = test_runtime("fresh-caps");
+        rt.config.network.read_only = false;
         rt.config.tools.allow = vec!["/bin/true".into()];
         rt.policy.process.allow = vec![std::fs::canonicalize("/bin/true")
             .unwrap()
@@ -2492,7 +2540,16 @@ secrets:
             assert!(cap.check_usable().is_err());
         }
         cfg.capabilities.initial = vec!["read:workspace".into()];
+        // เปลี่ยน policy เป็นอ่านเท่านั้นตอน restart ต้องถอดสิทธิ์ connect เก่าด้วย
+        cfg.network.read_only = true;
         let reduced = Runtime::init(cfg, base.clone()).unwrap();
+        assert!(reduced.gateway.policy.network.read_only);
+        assert!(!reduced
+            .gateway
+            .caps
+            .caps
+            .iter()
+            .any(|c| c.action == "network:connect"));
         assert!(!reduced
             .gateway
             .caps

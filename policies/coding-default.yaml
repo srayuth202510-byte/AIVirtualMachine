@@ -22,6 +22,7 @@ process:
     - /usr/bin/python3
 
 network:
+  read_only: true
   allow:
     - github.com
     - crates.io

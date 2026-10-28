@@ -68,6 +68,7 @@ filesystem:
     - ./workspace/src
 
 network:
+  read_only: true
   allow:
     - github.com
     - crates.io
