@@ -1,5 +1,8 @@
 # AI Virtual Machine (AIVM)
 
+Milestone ปัจจุบัน: [รับบั๊ก → protected verifier → diff สำหรับ operator](docs/repair-milestone.md)
+พร้อม benchmark 24 งาน, task/artifact contracts และ release gate ที่ผูก exact commit
+
 «A secure model runtime for open-weight models, with optional agent capabilities layered above it.»
 
 AIVM คือ runtime สำหรับรัน open-weight models โดยให้ model worker แยกจาก control plane,

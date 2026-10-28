@@ -319,6 +319,10 @@ pub trait Model: Send + Sync {
         Ok(output)
     }
     fn token_count(&self, text: &str) -> usize;
+    /// Telemetry ของ request ล่าสุด ไม่ใช้เป็นหลักฐาน verification; None เมื่อ backend ไม่รายงาน
+    fn last_usage(&self) -> Option<worker::InferenceUsage> {
+        None
+    }
     fn max_context(&self) -> usize;
 }
 
@@ -327,6 +331,7 @@ pub struct WorkerModel {
     client: worker::WorkerClient,
     config: ModelConfig,
     limits: worker::InferenceLimits,
+    last_usage: std::sync::Mutex<Option<worker::InferenceUsage>>,
 }
 
 impl WorkerModel {
@@ -335,6 +340,7 @@ impl WorkerModel {
             ModelError::LoadFailed("local config required for worker model".into())
         })?;
         Ok(Self {
+            last_usage: std::sync::Mutex::new(None),
             client: worker::WorkerClient::from_config(&config)
                 .map_err(|error| ModelError::LoadFailed(error.to_string()))?,
             limits: config
@@ -370,6 +376,7 @@ impl Model for WorkerModel {
         max_output_tokens: usize,
         mode: OutputMode,
     ) -> Result<String, ModelError> {
+        *self.last_usage.lock().unwrap() = None;
         let request = worker::InferenceRequest {
             protocol_version: mode.protocol_version(),
             output_mode: mode,
@@ -384,6 +391,7 @@ impl Model for WorkerModel {
             .client
             .infer(&self.config, request, &self.limits)
             .map_err(worker_model_error)?;
+        *self.last_usage.lock().unwrap() = Some(response.usage.clone());
         response
             .output
             .ok_or_else(|| ModelError::InferenceFailed("worker returned no output".into()))
@@ -405,6 +413,7 @@ impl Model for WorkerModel {
         mode: OutputMode,
         on_delta: &mut dyn FnMut(&str) -> Result<(), ModelError>,
     ) -> Result<String, ModelError> {
+        *self.last_usage.lock().unwrap() = None;
         let request = worker::InferenceRequest {
             protocol_version: mode.protocol_version(),
             output_mode: mode,
@@ -421,6 +430,7 @@ impl Model for WorkerModel {
                 on_delta(delta).map_err(|e| worker::WorkerError::Failed(e.to_string()))
             })
             .map_err(worker_model_error)?;
+        *self.last_usage.lock().unwrap() = Some(response.usage.clone());
         response
             .output
             .ok_or_else(|| ModelError::InferenceFailed("worker returned no output".into()))
@@ -441,6 +451,10 @@ impl Model for WorkerModel {
 
     fn token_count(&self, text: &str) -> usize {
         text.split_whitespace().count()
+    }
+
+    fn last_usage(&self) -> Option<worker::InferenceUsage> {
+        self.last_usage.lock().unwrap().clone()
     }
 
     fn max_context(&self) -> usize {
@@ -1008,7 +1022,10 @@ mod tests {
             ..Default::default()
         };
         let model = create_model(&config).unwrap();
+        assert!(model.last_usage().is_none());
         assert_eq!(model.reason("hello").unwrap(), "worker-ok");
+        let usage = model.last_usage().unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (1, 1));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

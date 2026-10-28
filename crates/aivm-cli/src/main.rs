@@ -359,6 +359,7 @@ fn main() -> Result<(), AnyErr> {
             for s in &run.steps {
                 println!("#{} [{}] {} -> {}", s.index, s.subtask, s.action, s.outcome);
             }
+            println!("outcome: {}", serde_json::to_string(&run.outcome)?);
             println!(
                 "verification: {}",
                 serde_json::to_value(&run.verification_status)?

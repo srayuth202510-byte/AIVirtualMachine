@@ -8,6 +8,9 @@
 
 ## คำสั่งหลัก
 
+milestone แก้บั๊กมี corpus 24 งาน, canonical outcomes, task/artifact contracts,
+SIGKILL recovery 20 จุด และ gate ที่ผูกกับ exact commit ดู [Repair milestone](repair-milestone.md)
+
 ทดสอบการจำกัด registry writes, IPv6 SSRF และข้อมูล template ที่ไม่ถูกรัน:
 `cargo test --locked -p aivm-adversarial --test registry_containment`
 ดูขอบเขตใน [Registry containment](registry-containment.md)

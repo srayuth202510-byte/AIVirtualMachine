@@ -160,6 +160,8 @@ pub struct AgentStep {
 /// ผลลัพธ์ของ agent loop ทั้งรอบ
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentRun {
+    pub task_contract: aivm_tools::contracts::TaskContract,
+    pub outcome: aivm_tools::contracts::TaskOutcome,
     pub task: String,
     /// Pre-split steps supplied to the model for coding work.
     pub subtasks: Vec<String>,
@@ -168,6 +170,7 @@ pub struct AgentRun {
     pub summary: Option<String>,
     /// เหตุที่หยุด: "done" | "max-steps"
     pub stopped: String,
+    pub error: Option<String>,
     /// หลักฐานจาก gateway เท่านั้น; summary ของ model ไม่ใช่ผลยืนยัน
     pub verification_status: aivm_tools::verification::VerificationStatus,
     pub verification: Option<aivm_tools::verification::VerificationRecord>,
@@ -479,11 +482,15 @@ pub fn run_loop(
     max_steps: usize,
     rag_index: Option<&aivm_cube::rag::RagIndex>,
 ) -> Result<AgentRun, RuntimeError> {
+    let task_contract = gateway
+        .begin_task(cube, task)
+        .map_err(|error| RuntimeError::Io(error.to_string()))?;
     gateway.clear_read_cache();
     let mut steps: Vec<AgentStep> = Vec::new();
     let mut observations: Vec<String> = Vec::new();
     let mut summary: Option<String> = None;
     let mut stopped = "max-steps".to_string();
+    let mut run_error = None;
     let subtasks = coding_subtasks(task);
     let mut subtask = (!subtasks.is_empty()).then_some(CodingSubtask::Inspect);
     let mut inspection_notes: Vec<String> = Vec::new();
@@ -589,7 +596,15 @@ pub fn run_loop(
             }
             // schema ที่ปฏิเสธยังเข้าทาง audit invalid-intent; ไม่สร้างข้อความปลอมแทน output
             Err(aivm_model::ModelError::InvalidOutput(reason)) => (String::new(), Err(reason)),
-            Err(error) => return Err(RuntimeError::Config(format!("model: {error}"))),
+            Err(error) => {
+                let reason = format!("model: {error}");
+                gateway
+                    .audit_intent_deny(cube, &reason, "")
+                    .map_err(|error| RuntimeError::Io(error.to_string()))?;
+                stopped = "model-error".into();
+                run_error = Some(reason);
+                break;
+            }
         };
 
         match intent {
@@ -804,16 +819,38 @@ pub fn run_loop(
         }
     }
 
+    let execution = match stopped.as_str() {
+        "done" => aivm_tools::contracts::Execution::Completed,
+        "stalled" => aivm_tools::contracts::Execution::Stalled,
+        "model-error" => aivm_tools::contracts::Execution::Failed,
+        _ => aivm_tools::contracts::Execution::BudgetExhausted,
+    };
+    let origin = if steps.iter().any(|step| {
+        step.outcome.starts_with("OK filesystem.write") && step.outcome.ends_with(":: written")
+    }) {
+        aivm_tools::contracts::SolutionOrigin::ModelRepair
+    } else {
+        aivm_tools::contracts::SolutionOrigin::Model
+    };
+    let outcome = gateway
+        .finalize_task(
+            cube,
+            &task_contract,
+            execution,
+            origin,
+            verification.as_ref(),
+        )
+        .map_err(|error| RuntimeError::Io(error.to_string()))?;
     Ok(AgentRun {
+        verification_status: outcome.legacy_status(),
+        task_contract,
+        outcome,
         task: task.to_string(),
         subtasks,
         steps,
         summary,
         stopped,
-        verification_status: verification
-            .as_ref()
-            .map(|record: &aivm_tools::verification::VerificationRecord| record.status.clone())
-            .unwrap_or(aivm_tools::verification::VerificationStatus::Unverified),
+        error: run_error,
         verification,
     })
 }

@@ -1,5 +1,9 @@
 # Verifier contracts และ state/audit transactions
 
+ผลสุดท้ายของ agent และ semantic ใช้ `outcome` โครงสร้างเดียวกัน แยก execution,
+verification, solution origin และ tested/current workspace digest ฟิลด์สถานะเดิมเป็น mirrors
+ดู [Repair milestone และ release gate](repair-milestone.md)
+
 `inspect`, `state` และ `capabilities` ถือ exclusive VM lease ก่อนเปิด runtime
 เพราะการเปิดอาจกู้ transaction และเขียน state/audit หากมี operation ทำงานอยู่
 คำสั่งจะคืน `VM already has an active operation` ให้เรียกใหม่หลัง operation จบ

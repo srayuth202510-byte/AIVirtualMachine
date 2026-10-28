@@ -11,6 +11,8 @@ use std::sync::Mutex;
 
 const BROKEN: &str = "int add(int a, int b) { return a - b; }\nint main(void) { return add(2, 3) == 5 && add(-1, 1) == 0 ? 0 : 1; }\n";
 const FIXED: &str = "int add(int a, int b) { return a + b; }\nint main(void) { return add(2, 3) == 5 && add(-1, 1) == 0 ? 0 : 1; }\n";
+#[path = "support/repair_benchmark.rs"]
+mod repair_benchmark;
 struct Script(Mutex<VecDeque<String>>);
 impl Model for Script {
     fn reason(&self, _: &str) -> Result<String, ModelError> {
@@ -780,6 +782,11 @@ fn semantic_repairs_with_feedback_and_never_accepts_a_claimed_receipt() {
     assert!(!run.attempts[0].schema_valid);
     assert!(run.attempts[0].verification.is_none());
     assert_eq!(run.origin.as_deref(), Some("model_repair_with_verifier"));
+    assert!(run.outcome.is_verified());
+    assert_eq!(
+        run.outcome.solution_origin,
+        aivm_tools::contracts::SolutionOrigin::ModelRepair
+    );
     assert!(run.attempts[1].prompt.contains("Verifier feedback"));
     assert_eq!(run.output.as_deref(), Some("-5"));
 }

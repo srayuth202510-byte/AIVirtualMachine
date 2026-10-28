@@ -425,6 +425,25 @@ impl Runtime {
         let mut audit = AuditWriter::open(base_dir.join("audit.jsonl"))
             .map_err(|e| RuntimeError::Io(e.to_string()))?;
         transaction::recover(&base_dir, &mut audit)?;
+        let recovered = aivm_tools::recover_workspace_writes(&workspace)
+            .map_err(|error| RuntimeError::Io(error.to_string()))?;
+        if recovered > 0 {
+            let mut record = aivm_audit::AuditRecord::new(
+                0,
+                &config.name,
+                "recovery",
+                &format!("workspace-recovery-{}", uuid::Uuid::new_v4()),
+                "INIT",
+                "recovery",
+                "workspace",
+                "allow",
+                &policy.name,
+            );
+            record.result = format!("removed {recovered} interrupted atomic writes");
+            audit
+                .append(record)
+                .map_err(|error| RuntimeError::Io(error.to_string()))?;
+        }
         let mut gateway = ToolGateway::new(
             workspace.clone(),
             policy.clone(),

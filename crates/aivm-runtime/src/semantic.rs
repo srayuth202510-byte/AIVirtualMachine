@@ -209,6 +209,8 @@ pub struct SemanticAction {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SemanticRun {
+    pub task_contract: aivm_tools::contracts::TaskContract,
+    pub outcome: aivm_tools::contracts::TaskOutcome,
     pub task: SemanticTask,
     pub attempts: Vec<SemanticAttempt>,
     pub actions: Vec<SemanticAction>,
@@ -221,9 +223,7 @@ pub struct SemanticRun {
 
 impl SemanticRun {
     pub fn is_verified(&self) -> bool {
-        matches!(self.status, VerificationStatus::Verified)
-            && verified(&self.verification)
-            && self.output.is_some()
+        self.outcome.is_verified() && self.output.is_some()
     }
 }
 
@@ -354,6 +354,12 @@ pub fn run(
     {
         return Err("semantic verifier source must be outside model write capabilities".into());
     }
+    let task_contract = gateway
+        .begin_task(
+            cube,
+            &serde_json::to_string(task).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
     let mut runner = Runner {
         gateway,
         cube,
@@ -364,6 +370,21 @@ pub fn run(
         actions: Vec::new(),
     };
     let mut result = SemanticRun {
+        task_contract: task_contract.clone(),
+        // ตั้งค่าเริ่มต้นเป็น unverified แล้วแทนด้วยผลจาก gateway ตอนจบเพียงจุดเดียว
+        outcome: aivm_tools::contracts::TaskOutcome {
+            schema: 1,
+            task_id: task_contract.task_id.clone(),
+            task_revision: task_contract.revision,
+            execution: aivm_tools::contracts::Execution::Failed,
+            verification: aivm_tools::contracts::Verification::Unverified,
+            solution_origin: aivm_tools::contracts::SolutionOrigin::Unknown,
+            tested_workspace_digest: None,
+            current_workspace_digest: None,
+            receipt_ids: Vec::new(),
+            reason: "not finalized".into(),
+            audit_id: String::new(),
+        },
         task: task.clone(),
         attempts: Vec::new(),
         actions: Vec::new(),
@@ -514,5 +535,27 @@ pub fn run(
         result.termination = reason;
     }
     result.actions = runner.actions;
+    let origin = match result.origin.as_deref() {
+        Some("tool_solver") => aivm_tools::contracts::SolutionOrigin::ToolSolver,
+        Some("model_repair_with_verifier") => aivm_tools::contracts::SolutionOrigin::ModelRepair,
+        Some("model_with_verifier") => aivm_tools::contracts::SolutionOrigin::Model,
+        _ => aivm_tools::contracts::SolutionOrigin::Unknown,
+    };
+    let execution = if result.termination == "verified" {
+        aivm_tools::contracts::Execution::Completed
+    } else {
+        aivm_tools::contracts::Execution::Failed
+    };
+    result.outcome = runner
+        .gateway
+        .finalize_task(
+            runner.cube,
+            &task_contract,
+            execution,
+            origin,
+            result.verification.as_ref(),
+        )
+        .map_err(|error| error.to_string())?;
+    result.status = result.outcome.legacy_status();
     Ok(result)
 }

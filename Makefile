@@ -25,6 +25,7 @@ test: ## เทสต์ unit + integration ทั้งหมด
 	python3 -m unittest discover -s scripts -p 'test_model_host_validation.py'
 	python3 -m unittest discover -s scripts -p 'test_model_quality.py'
 	python3 -m unittest discover -s scripts -p 'test_semantic_quality.py'
+	python3 -m unittest discover -s scripts -p 'test_release_gate.py'
 	python3 scripts/smoke-semantic.py
 	python3 -m unittest discover -s scripts -p 'test_dashboard.py'
 	python3 -m unittest discover -s scripts -p 'test_model_validation_setup.py'

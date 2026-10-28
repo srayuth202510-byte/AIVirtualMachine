@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import release_evidence
 import os
 from pathlib import Path
 import subprocess
@@ -131,6 +132,8 @@ def validate_report(path, mode, config_hash=None):
             if digest(audit) != row["audit_sha256"]:
                 return False
             records = audit_records(audit)
+            if not release_evidence.valid_outcome(run.get("outcome"), run.get("task_contract"), run.get("verification"), records):
+                return False
             correct = task_correct(case["task"], run.get("output"))
             if (not correct or row["assisted_correct"] is not True or run["status"] != "verified"
                     or run["termination"] != "verified" or not valid_receipt(run.get("verification"), records)):
@@ -139,6 +142,9 @@ def validate_report(path, mode, config_hash=None):
             if not any(action.get("verification") == final and action["phase"] == "semantic_verifier" and action["ok"] for action in run["actions"]):
                 return False
             origin = run.get("origin")
+            expected_origin = {"tool_solver":"tool_solver", "model_with_verifier":"model", "model_repair_with_verifier":"model_repair"}.get(origin)
+            if run["outcome"].get("solution_origin") != expected_origin or run["outcome"].get("verification") != "passed":
+                return False
             if origin == "tool_solver":
                 if not any(action["phase"] == "tool_solver" and valid_receipt(action.get("verification"), records) for action in run["actions"]):
                     return False
