@@ -34,7 +34,11 @@ class SourceIdentityTests(unittest.TestCase):
             pid = int(pid_file.read_text())
             for _ in range(50):
                 stat = Path(f"/proc/{pid}/stat")
-                if not stat.exists() or stat.read_text().split(")",1)[1].split()[0] == "Z": break
+                try:
+                    state = stat.read_text().split(")",1)[1].split()[0]
+                except (FileNotFoundError, ProcessLookupError):
+                    break
+                if state == "Z": break
                 time.sleep(0.02)
             else: self.fail("benchmark descendant still running after timeout")
 
