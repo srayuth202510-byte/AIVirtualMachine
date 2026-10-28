@@ -126,8 +126,13 @@ worker failed: worker returned no completion; worker_exit: exit_code=73; signal=
 
 ## Admission และ cache
 
-ค่าเริ่มต้นของ pool คือ max_requests=2, memory_mb=75% ของ MemTotal (fallback 4096),
-storage_mb=16384, queue_timeout_ms=30000 และ cache_mb=0 ต้องปรับตาม host ที่ใช้งานจริง
+ค่าเริ่มต้นของ pool คือ max_requests=2, storage_mb=16384, queue_timeout_ms=30000
+และ cache_mb=0 บน Linux ค่า `memory_mb` ใช้ 75% ของค่าต่ำสุดระหว่าง MemTotal
+กับ hard memory limits ของ cgroup v1/v2 ของ process รวม parent ที่มองเห็นได้
+เช่น host 64 GiB แต่ service จำกัด 8 GiB จะได้ pool 6 GiB ไม่ใช่ 48 GiB
+อ่าน limit ไม่ได้หรือข้อมูลเสียจะตั้ง auto budget เป็น 0 เพื่อปฏิเสธ admission
+แทน fallback 4 GiB; operator ยัง override ด้วย `model.host_resources.memory_mb` ได้
+ดูขอบเขต namespace และการทดสอบใน [Review fixes](review-p2-fixes.md)
 File-lock reservations คุมจำนวนงาน, RAM budget และ staging budget รวมข้าม process
 ที่ใช้ quota root เดียวกัน งานที่ยังไม่มี capacity รอแบบตรวจ deadline/cancellation ได้
 policy ใน root ต้องตรงกันทุก client; การเปลี่ยน cap ฝั่ง client เดียวจะ fail-closed

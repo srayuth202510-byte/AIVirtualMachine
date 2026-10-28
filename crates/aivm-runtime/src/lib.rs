@@ -813,14 +813,8 @@ impl Runtime {
         let model_name = self.model_cfg.name.clone();
         self.audit_op("inference", &model_name, "started", "agent")?;
         // RAG อ่านจาก gateway workspace ที่ runtime เป็นเจ้าของเท่านั้น
-        let rag_index = if workspace.is_some() {
-            Some(
-                agent::build_workspace_index(&mut self.gateway, &mut self.cube)
-                    .map_err(|e| RuntimeError::Io(e.to_string()))?,
-            )
-        } else {
-            None
-        };
+        // loop สร้างและตรวจ snapshot ผ่าน gateway ก่อน inference แต่ละรอบ
+        let rag_index = workspace.map(|_| aivm_cube::rag::RagIndex::default());
         let result = agent::run_loop(
             &*self.model,
             &mut self.gateway,

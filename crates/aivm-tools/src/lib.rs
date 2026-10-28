@@ -1288,7 +1288,6 @@ impl ToolGateway {
         content: Option<&str>,
     ) -> Result<ToolResult, ToolError> {
         use aivm_capability::AuthorizationContext;
-        use std::io::Read;
         let req: NetworkFetchRequest = serde_json::from_str(content.unwrap_or("{}"))
             .map_err(|e| ToolError::Denied(format!("invalid network.fetch request: {e}")))?;
         req.validate_read_only(self.policy.network.read_only)?;
@@ -1374,35 +1373,7 @@ impl ToolGateway {
                 "redirects are disabled; authorize target separately".into(),
             ));
         }
-        let limit = self.caps.caps[idx]
-            .constraints
-            .max_response_bytes
-            .unwrap_or(MAX_FILE_BYTES)
-            .min(MAX_FILE_BYTES);
-        let mut body = Vec::new();
-        response
-            .into_reader()
-            .take(limit + 1)
-            .read_to_end(&mut body)
-            .map_err(|e| ToolError::Io(e.to_string()))?;
-        if body.len() as u64 > limit {
-            return Err(ToolError::Denied("response size limit exceeded".into()));
-        }
-        if self.caps.caps[idx]
-            .constraints
-            .max_total_bytes
-            .is_some_and(|max| {
-                self.caps.caps[idx]
-                    .used_bytes
-                    .saturating_add(body.len() as u64)
-                    > max
-            })
-        {
-            return Err(ToolError::Denied("network byte budget exceeded".into()));
-        }
-        // นับไบต์ขากลับด้วย เพื่อให้โควต้าเครือข่ายครอบคลุมทั้งสองทิศทาง
-        self.caps.account_bytes(idx, body.len() as u64);
-        self.checkpoint(cube)?;
+        let body = self.read_network_response(cube, idx, response.into_reader())?;
         let output =
             String::from_utf8(body).map_err(|_| ToolError::Io("response is not UTF-8".into()))?;
         self.audit_decision(
@@ -1419,6 +1390,44 @@ impl ToolGateway {
             decision: "allow".into(),
             output,
         })
+    }
+
+    /// นับ payload ที่ reader ส่งให้แอป แม้คำตอบถูกปฏิเสธหรือขาดกลางทาง
+    fn read_network_response(
+        &mut self,
+        cube: &Cube,
+        idx: usize,
+        mut reader: impl std::io::Read,
+    ) -> Result<Vec<u8>, ToolError> {
+        let limit = self.caps.caps[idx]
+            .constraints
+            .max_response_bytes
+            .unwrap_or(MAX_FILE_BYTES)
+            .min(MAX_FILE_BYTES);
+        let mut body = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            let total_remaining = self.caps.caps[idx].bytes_remaining().unwrap_or(u64::MAX);
+            let remaining = total_remaining.min(limit.saturating_sub(body.len() as u64));
+            // lookahead สูงสุดหนึ่งไบต์เพื่อแยก EOF พอดีงบออกจาก oversized response
+            let size = remaining.saturating_add(1).min(buffer.len() as u64) as usize;
+            let count = match reader.read(&mut buffer[..size]) {
+                Ok(0) => return Ok(body),
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(ToolError::Io(error.to_string())),
+            };
+            self.caps.account_bytes(idx, count as u64);
+            self.checkpoint(cube)?;
+            // เทียบกับงบก่อนบวกด้วย เพื่อไม่ให้ saturating counter กลบ overrun ที่ u64::MAX
+            if count as u64 > total_remaining {
+                return Err(ToolError::Denied("network byte budget exceeded".into()));
+            }
+            if body.len() as u64 + count as u64 > limit {
+                return Err(ToolError::Denied("response size limit exceeded".into()));
+            }
+            body.extend_from_slice(&buffer[..count]);
+        }
     }
 
     pub fn network_connect(
@@ -3215,6 +3224,115 @@ network: {{allow: [], deny: ['10.0.0.0/8']}}
             assert!(req.validate_read_only(true).is_err());
             assert!(req.validate_read_only(false).is_ok());
         }
+    }
+
+    #[test]
+    fn rejected_network_responses_consume_and_persist_the_remaining_budget() {
+        // อ่าน response ที่ใหญ่เกินสองครั้งแล้วต้องหมดงบ แม้ไม่คืนข้อมูลให้ agent
+        let (mut gw, mut cube, dir) = harness();
+        gw.state_path = Some(dir.join("state.json"));
+        gw.caps.grant(
+            Capability::new("network:fetch", "network", "registry.invalid:443").with_constraints(
+                aivm_capability::Constraints {
+                    max_response_bytes: Some(3),
+                    max_total_bytes: Some(8),
+                    ..Default::default()
+                },
+            ),
+        );
+        let idx = gw.caps.caps.len() - 1;
+        for expected in [4, 8] {
+            let mut response = std::io::Cursor::new(vec![b'x'; 100]);
+            assert!(gw.read_network_response(&cube, idx, &mut response).is_err());
+            assert_eq!(response.position(), 4);
+            assert_eq!(gw.caps.caps[idx].used_bytes, expected);
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(gw.state_path.as_ref().unwrap()).unwrap())
+                    .unwrap();
+            assert_eq!(saved["caps"]["caps"][idx]["used_bytes"], expected);
+        }
+        // ต้องหยุดที่ capability ก่อน DNS ของ .invalid โดยไม่พึ่งเพดานจำนวน calls
+        let error = gw
+            .network_fetch(&mut cube, "https://registry.invalid/", None)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("network capability or constraint"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn network_reader_bounds_total_bytes_and_charges_partial_read_errors() {
+        struct BrokenResponse(bool);
+        impl std::io::Read for BrokenResponse {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("response interrupted"));
+                }
+                self.0 = true;
+                buffer[..3].copy_from_slice(b"abc");
+                Ok(3)
+            }
+        }
+        let (mut gw, cube, dir) = harness();
+        gw.state_path = Some(dir.join("state.json"));
+        gw.caps.grant(
+            Capability::new("network:fetch", "network", "registry.invalid:443").with_constraints(
+                aivm_capability::Constraints {
+                    max_response_bytes: Some(100),
+                    max_total_bytes: Some(5),
+                    ..Default::default()
+                },
+            ),
+        );
+        let idx = gw.caps.caps.len() - 1;
+        assert!(matches!(
+            gw.read_network_response(&cube, idx, BrokenResponse(false)),
+            Err(ToolError::Io(_))
+        ));
+        assert_eq!(gw.caps.caps[idx].used_bytes, 3);
+        let mut response = std::io::Cursor::new(vec![b'x'; 100]);
+        assert!(gw.read_network_response(&cube, idx, &mut response).is_err());
+        assert_eq!(response.position(), 3, "เหลืองบสองไบต์พร้อม lookahead อีกหนึ่ง");
+        assert_eq!(gw.caps.caps[idx].used_bytes, 6);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(gw.state_path.as_ref().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(saved["caps"]["caps"][idx]["used_bytes"], 6);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn network_response_exactly_at_budget_is_accepted_and_charged() {
+        let (mut gw, cube, dir) = harness();
+        gw.caps.grant(
+            Capability::new("network:fetch", "network", "registry.invalid:443").with_constraints(
+                aivm_capability::Constraints {
+                    max_response_bytes: Some(3),
+                    max_total_bytes: Some(3),
+                    ..Default::default()
+                },
+            ),
+        );
+        let idx = gw.caps.caps.len() - 1;
+        assert_eq!(
+            gw.read_network_response(&cube, idx, &b"abc"[..]).unwrap(),
+            b"abc"
+        );
+        assert_eq!(gw.caps.caps[idx].used_bytes, 3);
+        // ขอบบนของ counter ต้องยังปฏิเสธ lookahead ที่เกินงบ แม้ยอดจะ saturate
+        gw.caps.caps[idx].constraints.max_total_bytes = Some(u64::MAX);
+        gw.caps.caps[idx].used_bytes = u64::MAX - 1;
+        let mut oversized = std::io::Cursor::new(b"abc");
+        assert!(gw
+            .read_network_response(&cube, idx, &mut oversized)
+            .is_err());
+        assert_eq!(oversized.position(), 2);
+        assert_eq!(gw.caps.caps[idx].used_bytes, u64::MAX);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

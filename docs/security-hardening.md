@@ -80,6 +80,9 @@ Container backend บังคับ namespaces + Landlock/seccomp + cgroups v2 
 - Default network grants ใช้ HTTPS และ port ที่กำหนด ตรวจ IP หลัง DNS resolve และตรึง resolver ไม่เชื่อม private/loopback/mapped IPv6; ไม่ตาม redirect
 - network.connect ทำ TLS handshake และตรวจ certificate ก่อนรายงาน tls-connected
 - จำกัด timeout, response size และปฏิเสธ headers ที่เปลี่ยน host/framing ของ request
+- โควต้า network นับ response payload ที่อ่านแม้ oversized/read error และบันทึกทุก chunk
+  จำกัดอ่านตามงบที่เหลือพร้อม lookahead หนึ่งไบต์ที่นับด้วย ไม่ใช่ quota ของ TCP/TLS traffic
+  ดู semantics และ regression tests ใน [Review fixes](review-p2-fixes.md)
 
 ## By-design items (documented for auditors)
 

@@ -18,6 +18,8 @@ use aivm_model::output::{AgentIntent as ParsedIntent, IntentContent};
 use aivm_model::Model;
 use aivm_tools::{ExecContent, ToolGateway, ToolRequest};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// สร้าง RAG ผ่าน gateway: ไม่มี API ให้เลือก root ที่ข้าม policy
 pub fn build_workspace_index(
@@ -26,6 +28,86 @@ pub fn build_workspace_index(
 ) -> Result<rag::RagIndex, aivm_tools::ToolError> {
     let files = gateway.context_files(cube)?;
     Ok(rag::build_index(&files, cube.current_state() as u32))
+}
+
+/// snapshot ใช้ได้เฉพาะหลังตรวจ bytes และสิทธิ์ผ่าน gateway ใน inference รอบนั้น
+struct WorkspaceRag {
+    index: rag::RagIndex,
+    hashes: Option<BTreeMap<String, [u8; 32]>>,
+    state: u32,
+    changed_query: String,
+}
+
+impl WorkspaceRag {
+    fn new(index: &rag::RagIndex) -> Self {
+        Self {
+            index: index.clone(),
+            hashes: None,
+            state: 0,
+            changed_query: String::new(),
+        }
+    }
+
+    fn refresh(&mut self, gateway: &mut ToolGateway, cube: &mut Cube) -> Result<(), RuntimeError> {
+        // ห้าม read cache ทำให้การตรวจ hash เห็น bytes เก่าหลัง external edit หรือ compiler
+        gateway.clear_read_cache();
+        let files = gateway
+            .context_files(cube)
+            .map_err(|error| RuntimeError::Io(error.to_string()))?;
+        let hashes: BTreeMap<String, [u8; 32]> = files
+            .iter()
+            .map(|(path, text)| (path.clone(), Sha256::digest(text.as_bytes()).into()))
+            .collect();
+        if self.hashes.as_ref() != Some(&hashes) {
+            if let Some(old) = &self.hashes {
+                let mut changes = Vec::new();
+                for (path, text) in &files {
+                    if old.get(path) == hashes.get(path) {
+                        continue;
+                    }
+                    let previous: BTreeSet<_> = self
+                        .index
+                        .chunks
+                        .values()
+                        .filter(|chunk| &chunk.file_path == path)
+                        .flat_map(|chunk| rag::tokenize(&chunk.content))
+                        .collect();
+                    let current: BTreeSet<_> = rag::tokenize(text).into_iter().collect();
+                    let symbols = current
+                        .difference(&previous)
+                        .take(16)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    changes.push(format!("{path}: {}", symbols.join(" ")));
+                    if changes.len() == 4 {
+                        break;
+                    }
+                }
+                self.changed_query = clip(&changes.join("\n"), 1000);
+            }
+            // rebuild ล้าง chunks ของไฟล์ที่เปลี่ยน/ลบ/หมดสิทธิ์ทั้งหมด ก่อนประกอบ prompt
+            self.index = rag::build_index(&files, cube.current_state() as u32);
+        } else if self.state != cube.current_state() as u32 {
+            self.index = rag::build_index(&files, cube.current_state() as u32);
+        }
+        self.state = cube.current_state() as u32;
+        self.hashes = Some(hashes);
+        Ok(())
+    }
+
+    fn query(&self, task: &str, diagnostic: Option<&str>) -> String {
+        let mut query = task.to_string();
+        if !self.changed_query.is_empty() {
+            query.push_str(&format!(
+                "\nChanged files and symbols: {}",
+                self.changed_query
+            ));
+        }
+        if let Some(diagnostic) = diagnostic {
+            query.push_str(&format!("\nLatest diagnostic: {}", clip(diagnostic, 1000)));
+        }
+        query
+    }
 }
 
 /// tool ที่ยอมรับในระดับ intent (deny-by-default: นอกลิสต์ = ปฏิเสธ)
@@ -418,6 +500,8 @@ pub fn run_loop(
     let mut operator_next: Option<usize> = None;
     let mut last_guarded_action: Option<String> = None;
     let mut guarded_action_streak = 0usize;
+    let mut live_rag = rag_index.map(WorkspaceRag::new);
+    let mut latest_diagnostic: Option<String> = None;
 
     for index in 0..max_steps {
         let operator_request = operator_next
@@ -428,21 +512,24 @@ pub fn run_loop(
         } else {
             "model"
         };
-        // RAG: ค้นหา context ที่เกี่ยวข้องกับ task (ถ้ามี index)
-        let context_hint = if let Some(idx) = rag_index {
-            let retriever = rag::Retriever {
-                top_k: 3,
-                current_state: cube.current_state() as u32,
-            };
-            let hits = retriever.retrieve(idx, task);
-            if hits.is_empty() {
-                None
+        // ตรวจ snapshot ใหม่ก่อน model inference; operator plan ไม่ต้องใช้ model context
+        let context_hint =
+            if let Some(live) = live_rag.as_mut().filter(|_| operator_request.is_none()) {
+                live.refresh(gateway, cube)?;
+                let query = live.query(task, latest_diagnostic.as_deref());
+                let retriever = rag::Retriever {
+                    top_k: 3,
+                    current_state: cube.current_state() as u32,
+                };
+                let hits = retriever.retrieve(&live.index, &query);
+                if hits.is_empty() {
+                    None
+                } else {
+                    Some(aivm_cube::rag::assemble_context(&query, &hits, 2000))
+                }
             } else {
-                Some(aivm_cube::rag::assemble_context(task, &hits, 2000))
-            }
-        } else {
-            None
-        };
+                None
+            };
 
         let verification_notes = (subtask == Some(CodingSubtask::Verify)
             && !inspection_notes.is_empty())
@@ -562,6 +649,9 @@ pub fn run_loop(
                 } else {
                     match gateway.dispatch(cube, &req) {
                         Ok(res) => {
+                            if req.tool == "process.exec" {
+                                latest_diagnostic = (!res.ok).then(|| clip(&res.output, 1000));
+                            }
                             let outcome = format!(
                                 "{} {} {} :: {}",
                                 if res.ok { "OK" } else { "FAIL" },
@@ -653,6 +743,9 @@ pub fn run_loop(
                             outcome
                         }
                         Err(e) => {
+                            if req.tool == "process.exec" {
+                                latest_diagnostic = Some(clip(&e.to_string(), 1000));
+                            }
                             operator_next = None;
                             last_successful_request = None;
                             if req.tool == "process.exec" && subtask.is_some() {
@@ -758,6 +851,7 @@ mod tests {
     struct ScriptedModel {
         outputs: Mutex<VecDeque<String>>,
         system_prompts: Mutex<Vec<String>>,
+        prompts: Mutex<Vec<String>>,
     }
 
     impl ScriptedModel {
@@ -765,6 +859,7 @@ mod tests {
             Self {
                 outputs: Mutex::new(outputs.iter().map(|s| s.to_string()).collect()),
                 system_prompts: Mutex::new(Vec::new()),
+                prompts: Mutex::new(Vec::new()),
             }
         }
     }
@@ -774,7 +869,8 @@ mod tests {
             self.system_prompts.lock().unwrap().push(system.into());
             self.reason(context)
         }
-        fn reason(&self, _context: &str) -> Result<String, ModelError> {
+        fn reason(&self, context: &str) -> Result<String, ModelError> {
+            self.prompts.lock().unwrap().push(context.into());
             self.outputs
                 .lock()
                 .unwrap()
@@ -838,6 +934,161 @@ mod tests {
         std::fs::read_to_string(&fx.audit_path)
             .map(|t| t.contains(needle))
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn rag_refreshes_written_files_before_the_next_inference() {
+        let mut fx = fixture("rag-write");
+        std::fs::write(
+            fx.gateway.workspace.join("src/seed.rs"),
+            "fn seed() { STALE_VERSION }\n",
+        )
+        .unwrap();
+        let index = build_workspace_index(&mut fx.gateway, &mut fx.cube).unwrap();
+        let model = ScriptedModel::new(&[
+            r#"{"tool":"filesystem.write","path":"src/seed.rs","content":"fn seed() { FRESH_VERSION }\n"}"#,
+            r#"{"done":true,"summary":"finished"}"#,
+        ]);
+        run_loop(
+            &model,
+            &mut fx.gateway,
+            &mut fx.cube,
+            "seed",
+            2,
+            Some(&index),
+        )
+        .unwrap();
+        let prompts = model.prompts.lock().unwrap();
+        assert!(prompts[0].contains("STALE_VERSION"));
+        assert!(prompts[1].contains("FRESH_VERSION"));
+        assert!(!prompts[1].contains("STALE_VERSION"), "{}", prompts[1]);
+    }
+
+    #[test]
+    fn rag_refreshes_external_edits_between_inferences() {
+        struct EditingModel {
+            script: ScriptedModel,
+            path: PathBuf,
+            edited: std::sync::atomic::AtomicBool,
+        }
+        impl Model for EditingModel {
+            fn reason(&self, context: &str) -> Result<String, ModelError> {
+                let output = self.script.reason(context)?;
+                if !self.edited.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    std::fs::write(&self.path, "fn seed() { FRESH_VERSION }").unwrap();
+                }
+                Ok(output)
+            }
+            fn token_count(&self, text: &str) -> usize {
+                text.len()
+            }
+            fn max_context(&self) -> usize {
+                4096
+            }
+        }
+        let mut fx = fixture("rag-external");
+        let path = fx.gateway.workspace.join("src/seed.rs");
+        std::fs::write(&path, "fn seed() { STALE_VERSION }").unwrap();
+        let model = EditingModel {
+            script: ScriptedModel::new(&[
+                r#"{"tool":"code.search","path":"no-such-token"}"#,
+                r#"{"done":true,"summary":"finished"}"#,
+            ]),
+            path,
+            edited: std::sync::atomic::AtomicBool::new(false),
+        };
+        run_loop(
+            &model,
+            &mut fx.gateway,
+            &mut fx.cube,
+            "seed",
+            2,
+            Some(&rag::RagIndex::default()),
+        )
+        .unwrap();
+        let prompts = model.script.prompts.lock().unwrap();
+        assert!(prompts[0].contains("STALE_VERSION"));
+        assert!(prompts[1].contains("FRESH_VERSION"));
+        assert!(!prompts[1].contains("STALE_VERSION"));
+    }
+
+    #[test]
+    fn rag_query_uses_changed_symbols_and_the_latest_exec_failure() {
+        let mut fx = fixture("rag-diagnostic");
+        let exe = std::fs::canonicalize("/bin/false")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        fx.gateway.policy.process.allow = vec![exe.clone()];
+        fx.gateway
+            .caps
+            .grant(Capability::new("execute", "process", &exe));
+        let exec = serde_json::json!({"tool":"process.exec","path":exe,"content":"[]"}).to_string();
+        let model = ScriptedModel::new(&[
+            r#"{"tool":"filesystem.write","path":"src/seed.rs","content":"fn seed() { new_symbol() }"}"#,
+            &exec,
+            r#"{"done":true,"summary":"finished"}"#,
+        ]);
+        let run = run_loop(
+            &model,
+            &mut fx.gateway,
+            &mut fx.cube,
+            "seed",
+            3,
+            Some(&rag::RagIndex::default()),
+        )
+        .unwrap();
+        assert!(
+            run.steps[1].outcome.starts_with("FAIL process.exec"),
+            "{:?}",
+            run.steps
+        );
+        let prompts = model.prompts.lock().unwrap();
+        let query = prompts[2]
+            .split("Query: ")
+            .nth(1)
+            .unwrap()
+            .split("=== Retrieved Context")
+            .next()
+            .unwrap();
+        assert!(query.contains("Changed files and symbols: src/seed.rs"));
+        assert!(query.contains("symbol"));
+        assert!(query.contains("Latest diagnostic:"), "{query}");
+    }
+
+    #[test]
+    fn rag_revalidates_changed_deleted_and_revoked_source_files() {
+        for change in ["changed", "deleted", "revoked"] {
+            let mut fx = fixture(&format!("rag-{change}"));
+            let path = fx.gateway.workspace.join("src/seed.rs");
+            std::fs::write(&path, "fn seed() { STALE_VERSION }").unwrap();
+            let index = build_workspace_index(&mut fx.gateway, &mut fx.cube).unwrap();
+            match change {
+                "changed" => std::fs::write(&path, "fn seed() { FRESH_VERSION }").unwrap(),
+                "deleted" => std::fs::remove_file(&path).unwrap(),
+                "revoked" => fx.gateway.caps.caps.clear(),
+                _ => unreachable!(),
+            }
+            let model = ScriptedModel::new(&[r#"{"done":true,"summary":"finished"}"#]);
+            run_loop(
+                &model,
+                &mut fx.gateway,
+                &mut fx.cube,
+                "seed",
+                1,
+                Some(&index),
+            )
+            .unwrap();
+            let prompts = model.prompts.lock().unwrap();
+            assert!(
+                !prompts[0].contains("STALE_VERSION"),
+                "{change}: {}",
+                prompts[0]
+            );
+            if change == "changed" {
+                assert!(prompts[0].contains("FRESH_VERSION"));
+            }
+        }
     }
 
     #[test]

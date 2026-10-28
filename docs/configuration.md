@@ -199,6 +199,8 @@ standalone worker process; หากไม่ตั้งค่า จะใช�
 
 `model.host_resources` คุมจำนวนงานและยอดจอง RAM/staging รวมของ participating clients
 ที่ใช้ root เดียวกัน; `cache_mb` เปิด sealed model cache แบบ opt-in สำหรับ process launcher
+บน Linux ค่า RAM เริ่มต้นคำนึงถึง cgroup hard limits รวม parent และเผื่อ headroom 25%
+ระบุ `model.host_resources.memory_mb` เพื่อ override; อ่าน auto ceiling ไม่ได้จะปฏิเสธ admission
 `model.local.controller_path` และ `controller_sha256` เปิด control process แยกและต้องมี
 `model.total_timeout_ms` ดูค่า default, API และขอบเขต deadline ใน
 [worker control hardening](model-control-hardening.md)

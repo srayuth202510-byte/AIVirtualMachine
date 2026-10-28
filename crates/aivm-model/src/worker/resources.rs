@@ -1,6 +1,8 @@
 //! คุมจำนวนงานและยอดจอง RAM/staging รวมข้าม process ที่ใช้ quota root เดียวกัน
 use super::*;
 use std::fs::File;
+#[cfg(target_os = "linux")]
+mod memory;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -32,18 +34,15 @@ impl Default for HostResources {
 }
 
 fn default_memory_budget() -> u64 {
-    // จองให้ participating workers สูงสุด 75% ของ RAM; โปรแกรมอื่นยังต้องมี host-level capacity planning
-    std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|text| {
-            text.lines().find_map(|line| {
-                line.strip_prefix("MemTotal:")
-                    .and_then(|tail| tail.split_whitespace().next())
-                    .and_then(|value| value.parse::<u64>().ok())
-            })
-        })
-        .map(|kb| kb / 1024 * 3 / 4)
-        .unwrap_or(4096)
+    #[cfg(target_os = "linux")]
+    // อ่าน limit ไม่ได้ต้องไม่เดาว่ามี RAM 4 GiB; operator ยังระบุ memory_mb เองได้
+    {
+        memory::default_budget().unwrap_or(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        4096
+    }
 }
 
 fn staging_capacity() -> Result<(bool, u64), WorkerError> {

@@ -12,6 +12,9 @@
 `cargo test --locked -p aivm-adversarial --test registry_containment`
 ดูขอบเขตใน [Registry containment](registry-containment.md)
 
+Regression tests สำหรับ response quota, RAG freshness และ cgroup RAM defaults
+อยู่ใน [Review fixes](review-p2-fixes.md)
+
 | คำสั่ง | วิ่งอะไร | เมื่อไหร่ที่ใช้ |
 |---|---|---|
 | `make demo` | self-test 14 เคส ALLOW/DENY ใน temp dir (~1 วินาที) | ดีบักเส้น enforcement — เร็วสุด พิมพ์ decision/reason ต่อเคส |
