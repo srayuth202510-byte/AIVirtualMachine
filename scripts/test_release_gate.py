@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
+import time
 import tempfile
 import unittest
 from unittest import mock
@@ -14,9 +16,28 @@ import release_evidence as evidence
 SPEC = importlib.util.spec_from_file_location("release_gate", Path(__file__).with_name("release-gate.py"))
 GATE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(GATE)
+RUNNER_SPEC = importlib.util.spec_from_file_location("repair_runner", Path(__file__).with_name("run-repair-benchmark.py"))
+RUNNER = importlib.util.module_from_spec(RUNNER_SPEC)
+RUNNER_SPEC.loader.exec_module(RUNNER)
 
 
 class SourceIdentityTests(unittest.TestCase):
+    def test_benchmark_timeout_stops_its_child_process_group(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); pid_file = root / "child.pid"
+            program = ("import subprocess,sys,time;from pathlib import Path;"
+                       "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']);"
+                       "Path(sys.argv[1]).write_text(str(child.pid));time.sleep(60)")
+            with (root / "run.log").open("w") as log:
+                code = RUNNER.run_group([sys.executable,"-c",program,str(pid_file)],dict(os.environ),log,1)
+            self.assertEqual(code,124)
+            pid = int(pid_file.read_text())
+            for _ in range(50):
+                stat = Path(f"/proc/{pid}/stat")
+                if not stat.exists() or stat.read_text().split(")",1)[1].split()[0] == "Z": break
+                time.sleep(0.02)
+            else: self.fail("benchmark descendant still running after timeout")
+
     def test_identity_includes_untracked_files_and_rejects_dirty_commits(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -78,7 +99,7 @@ class HostGateTests(unittest.TestCase):
                         for case in ("timeout","recovery-after-timeout","memory","recovery-after-memory")]))
                     row.update(evidence=recovery.name,evidence_sha256=evidence.digest(recovery))
                 rows.append(row)
-            host = {"schema":1,"source_before":current,"source_after":current,"candidate_config_sha256":evidence.digest(config),
+            host = {"schema":1,"worker_build_profile":"release","built_worker_sha256":artifacts["worker"]["sha256"],"source_before":current,"source_after":current,"candidate_config_sha256":evidence.digest(config),
                 "pins_sha256":evidence.digest(pins),"artifacts_before":artifacts,"artifacts_after":copy.deepcopy(artifacts),"results":rows,"passed":True}
             path = root / "host.json"; path.write_text(json.dumps(host))
             benchmark = root / "benchmark.json"; benchmark.write_text("{}")
@@ -125,6 +146,10 @@ class RepairEvidenceTests(unittest.TestCase):
         self.assertEqual(self.validate()["successes"], 24)
         with self.assertRaises(ValueError):
             evidence.validate_benchmark(self.path, self.source, None)
+        self.report["mode"] = "fresh_model"
+        self.path.write_text(json.dumps(self.report))
+        with self.assertRaisesRegex(ValueError,"release profile"):
+            evidence.validate_benchmark(self.path,self.source,None)
 
     def test_canonical_outcome_task_revision_and_receipt_tampering_is_rejected(self):
         for field, value in [("task_id","another-task"),("task_revision",99),("solution_origin","model_repair"),

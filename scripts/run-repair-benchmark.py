@@ -5,14 +5,34 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import signal
 import time
 import release_evidence as evidence
+
+
+def run_group(command, env, log, timeout):
+    process = subprocess.Popen(command, cwd=evidence.PROJECT, env=env, stdout=log, stderr=subprocess.STDOUT,
+                               start_new_session=True)
+    try:
+        return process.wait(timeout=timeout)
+    except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        return 124 if isinstance(error, subprocess.TimeoutExpired) else 130
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("fresh_model", "reference_control"), default="fresh_model")
     parser.add_argument("--model-config", type=Path)
+    parser.add_argument("--profile", choices=("release", "debug"), default="release")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=7200)
     args = parser.parse_args()
@@ -24,6 +44,8 @@ def main():
     source = evidence.source_identity()
     config_hash = None
     command = ["cargo", "test", "--locked", "-p", "aivm-runtime", "--test", "coding_workflow"]
+    if args.profile == "release":
+        command.append("--release")
     if args.mode == "fresh_model":
         if args.model_config is None:
             raise ValueError("fresh_model requires --model-config with approved pins")
@@ -40,13 +62,9 @@ def main():
     env = dict(os.environ, AIVM_REPAIR_BENCHMARK_OUT=str(out), AIVM_SOURCE_IDENTITY=json.dumps(source))
     if args.model_config:
         env["AIVM_WORKER_HOST_CONFIG"] = str(args.model_config.resolve())
-    try:
-        with (out / "run.log").open("w") as log:
-            code = subprocess.run(command, cwd=evidence.PROJECT, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                  timeout=args.timeout_seconds).returncode
-    except subprocess.TimeoutExpired:
-        code = 124
-    result = {"schema": 1, "returncode": code, "command": command, "elapsed_seconds": time.monotonic() - started,
+    with (out / "run.log").open("w") as log:
+        code = run_group(command, env, log, args.timeout_seconds)
+    result = {"schema": 1, "returncode": code, "command": command, "build_profile":args.profile,"elapsed_seconds": time.monotonic() - started,
               "source_before": source, "source_after": evidence.source_identity(), "passed": False}
     try:
         result["score"] = evidence.validate_benchmark(out / "report.json", source, config_hash,

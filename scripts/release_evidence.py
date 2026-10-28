@@ -121,6 +121,8 @@ def validate_benchmark(path, expected_source, config_sha256, *, allow_control=Fa
     corpus_path = PROJECT / "examples/repair-benchmark.json"
     corpus = load(corpus_path)
     cases = report["cases"]
+    if not allow_control and report.get("build_profile") != "release":
+        raise ValueError("fresh-model performance evidence requires release profile")
     expected_mode = "reference_control" if allow_control else "fresh_model"
     if (report.get("schema") != 2 or report.get("mode") != expected_mode
             or report.get("source_identity") != expected_source

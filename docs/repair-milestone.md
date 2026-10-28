@@ -77,11 +77,14 @@ python3 scripts/run-repair-benchmark.py --mode reference_control \
 
 # ใช้ ModelConfig JSON ที่ pin model/worker และเตรียม host launcher ไว้แล้ว
 python3 scripts/run-repair-benchmark.py --mode fresh_model \
-  --model-config /path/approved-candidate.json --out target/repair-model-new
+  --profile release --model-config /path/approved-candidate.json --out target/repair-model-new
 ```
 
 runner ไม่เปลี่ยน pins ให้เข้ากับ binary ที่พบ เมื่อ pin ไม่ตรงจะเก็บ preflight failure
 candidate ใหม่ที่ build จาก source ต้องมี identity/hash ของ build output แยกจาก config ที่อนุมัติเดิม
+runner ใช้ release build โดยค่าเริ่มต้นและบันทึก profile; release gate ไม่รับ fresh-model debug benchmark
+worker candidate ที่ใช้วัดต้นทุนควร build ด้วย `cargo build --release --locked -p aivm-model-worker --features llama,microvm`
+timeout/interrupt ของ runner ส่งสัญญาณหยุด cargo/test process group ไม่ทิ้ง test รันต่ออย่างเงียบ ๆ
 ผลของ development candidate บน dirty tree ยังไม่ใช่ release approval แม้ benchmark รันครบ
 output เป็น report พร้อม patches; correctness ต้องตรงกับ canonical outcome และ receipts
 partial runs, skipped tests, artifact/audit ที่เปลี่ยน และคะแนนที่ไม่ตรงหลักฐานไม่ผ่าน validator
@@ -123,13 +126,14 @@ make verify
 host validator เก็บ source manifest ก่อน/หลัง ครอบ tracked และ untracked source,
 candidate config digest, model/worker/kernel/rootfs/VMM pins, scenario logs และ recovery evidence
 candidate config ต้องผ่าน `candidate-worker` โดยใช้ config นั้นจริง เพิ่มจาก validation ทั้ง 3 tiers
+ทั้งสาม tiers ใช้สำเนา validated worker ที่ pin ไว้ชุดเดียวกัน ไม่รับ binary ที่ถูก rebuild เปลี่ยนระหว่าง scenarios
 ตัว gate ต้องได้ clean tree ของ commit เดียวกันทุก evidence ไม่มีการนับผลของ ancestor หรือ dirty build แทน
 
 ```sh
 python3 scripts/validate-model-host.py \
   --model /path/model.gguf --model-sha256 '<approved-model-pin>' \
   --pins /path/pins.json --candidate-config /path/approved-candidate.json \
-  --out target/release-host-new
+  --worker-profile release --out target/release-host-new
 
 python3 scripts/release-gate.py --commit '<full-40-hex-commit>' \
   --config /path/approved-candidate.json --pins /path/pins.json \

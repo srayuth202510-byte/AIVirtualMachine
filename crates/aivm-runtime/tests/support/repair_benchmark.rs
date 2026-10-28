@@ -337,8 +337,8 @@ fn run_case(
                 .saturating_sub(1)
         })
         .unwrap_or(0);
-    let elapsed_ms = started.elapsed().as_millis();
     let sampled_tree_peak_rss_bytes = sample.finish();
+    let elapsed_ms = started.elapsed().as_millis();
     let infrastructure_failure =
         error.is_some() || run.as_ref().is_some_and(|run| run.error.is_some());
     json!({"id":case.id,"revision":case.revision,"category":case.category,"baseline_reproduced":reproduced,
@@ -420,6 +420,7 @@ fn suite(fresh: bool) {
             .filter_map(|row| row["cost"]["total_elapsed_ms"].as_u64())
             .sum();
         let report = json!({"schema":2,"mode":if fresh {"fresh_model"} else {"reference_control"},"scope":corpus.scope,
+            "build_profile":if cfg!(debug_assertions) {"debug"} else {"release"},
             "corpus_sha256":format!("{:x}",Sha256::digest(CORPUS.as_bytes())),"model_config_sha256":model.as_ref().map(|entry| &entry.1),
             "source_identity":std::env::var("AIVM_SOURCE_IDENTITY").ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok()),
             "completed":rows.len(),"total":corpus.cases.len(),"task_successes":success,"elapsed_ms":started.elapsed().as_millis(),
