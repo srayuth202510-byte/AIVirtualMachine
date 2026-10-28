@@ -22,6 +22,8 @@ jobs:
       AIVM_GGUF_SHA256: ${{ vars.AIVM_GGUF_SHA256 }}
       AIVM_MICROVM_PINS: ${{ vars.AIVM_MICROVM_PINS }}
       AIVM_REPOSITORY: ${{ github.repository }}
+      AIVM_CANDIDATE_CONFIG: ${{ vars.AIVM_CANDIDATE_CONFIG }}
+      AIVM_RELEASE_MIN_SUCCESSES: ${{ vars.AIVM_RELEASE_MIN_SUCCESSES }}
       EVIDENCE_DIR: target/model-host-validation/${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v5
@@ -40,9 +42,28 @@ jobs:
       # fixture/helper/KVM/delegation เตรียมโดย operator; ไม่ download หรือ repin เอง
       - name: Validate pinned model on process, container, and MicroVM
         run: |
+          set --
+          if [ -n "$AIVM_CANDIDATE_CONFIG" ]; then
+            set -- --candidate-config "$AIVM_CANDIDATE_CONFIG"
+          fi
           python3 scripts/validate-model-host.py \
             --model "$AIVM_GGUF" --model-sha256 "$AIVM_GGUF_SHA256" \
-            --pins "$AIVM_MICROVM_PINS" --out "$EVIDENCE_DIR"
+            --pins "$AIVM_MICROVM_PINS" --out "$EVIDENCE_DIR" "$@"
+
+      - name: Measure model repair quality and cost on the same source
+        if: vars.AIVM_ENABLE_REPAIR_BENCHMARK == '1' && vars.AIVM_CANDIDATE_CONFIG != ''
+        run: |
+          python3 scripts/run-repair-benchmark.py --mode fresh_model \
+            --model-config "$AIVM_CANDIDATE_CONFIG" --out "$EVIDENCE_DIR/repair"
+
+      - name: Require exact commit, candidate pins, host evidence, and repair quality
+        if: vars.AIVM_ENABLE_REPAIR_BENCHMARK == '1' && vars.AIVM_CANDIDATE_CONFIG != '' && vars.AIVM_RELEASE_MIN_SUCCESSES != ''
+        run: |
+          python3 scripts/release-gate.py --commit "$GITHUB_SHA" \
+            --config "$AIVM_CANDIDATE_CONFIG" --pins "$AIVM_MICROVM_PINS" \
+            --host-evidence "$EVIDENCE_DIR/release-evidence.json" \
+            --benchmark "$EVIDENCE_DIR/repair/report.json" \
+            --minimum-successes "$AIVM_RELEASE_MIN_SUCCESSES" --out "$EVIDENCE_DIR/release-gate.json"
 
       - name: Retain host validation evidence
         if: always()

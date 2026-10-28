@@ -11,6 +11,7 @@ import re
 import subprocess
 import time
 from datetime import datetime, timezone
+import release_evidence
 
 
 PROJECT = Path(__file__).resolve().parent.parent
@@ -112,8 +113,11 @@ def main():
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--model-sha256", required=True)
     parser.add_argument("--pins", required=True, type=Path)
+    parser.add_argument("--candidate-config", type=Path, help="Bind the exact release candidate worker config to host evidence")
     parser.add_argument("--out", type=Path, default=PROJECT / "target/model-host-validation")
     args = parser.parse_args()
+    source_before = release_evidence.source_identity()
+    candidate_hash = digest(args.candidate_config) if args.candidate_config else None
     model = args.model.resolve(strict=True)
     pins = args.pins.resolve(strict=True)
     out = args.out.resolve()
@@ -171,11 +175,14 @@ def main():
         if evidence is not None:
             passed = passed and (quality_evidence_passed(evidence) if quality else failure_evidence_passed(evidence))
         row = {"name": name, "command": command, "returncode": code,
+               "exact": exact, "log_sha256": digest(out / f"{name}.log"),
                "passed": passed, "elapsed_seconds": round(time.monotonic() - start, 2),
                "summaries": re.findall(r"^test result:.*$", content, re.M),
                "log": f"{name}.log"}
         if evidence is not None:
             row["evidence"] = Path(evidence).name
+            if Path(evidence).is_file():
+                row["evidence_sha256"] = digest(evidence)
             if quality and quality_evidence_passed(evidence):
                 score = json.loads(Path(evidence).read_text())
                 row["quality"] = {key: score.get(key) for key in ("task_correct", "total", "client_boot_ms")}
@@ -196,6 +203,11 @@ def main():
     save("artifacts-before.json", before)
     run("probe", ["cargo", "run", "--locked", "-q", "-p", "aivm-cli", "--", "probe"])
     try:
+        if args.candidate_config:
+            release_evidence.candidate_config(args.candidate_config, before)
+            run("candidate-worker", ["cargo", "test", "--locked", "-p", "aivm-model-worker", "--features", "llama,microvm",
+                "--test", "worker", "real_isolated_worker_host_validation", "--", "--exact", "--ignored", "--nocapture"], exact=True,
+                extra_env={"AIVM_WORKER_HOST_CONFIG": str(args.candidate_config.resolve())})
         run("protected-loader", ["cargo", "test", "--locked", "-p", "aivm-model",
                                  "--features", "llama,microvm",
                                  "artifact::tests::real_loader_uses_verified_snapshot_after_source_tampering",
@@ -218,7 +230,19 @@ def main():
         after["worker"] = {"path": str(worker), "sha256": digest(worker)}
         save("artifacts-after.json", after)
         save("integrity.json", {"artifacts_unchanged": before == after})
-    return 0 if before == after and all(row["passed"] for row in results) else 1
+        source_after = release_evidence.source_identity()
+        candidate_ok = True
+        if args.candidate_config:
+            try:
+                release_evidence.candidate_config(args.candidate_config, before)
+                candidate_ok = digest(args.candidate_config) == candidate_hash
+            except (OSError, ValueError, KeyError, TypeError):
+                candidate_ok = False
+        save("release-evidence.json", {"schema": 1, "source_before": source_before, "source_after": source_after,
+            "candidate_config_sha256": candidate_hash,
+            "pins_sha256": digest(pins), "artifacts_before": before, "artifacts_after": after, "results": results,
+            "passed": before == after and source_before == source_after and candidate_ok and all(row["passed"] for row in results)})
+    return 0 if before == after and source_before == source_after and candidate_ok and all(row["passed"] for row in results) else 1
 
 
 if __name__ == "__main__":

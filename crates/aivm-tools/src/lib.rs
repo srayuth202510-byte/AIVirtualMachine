@@ -128,9 +128,15 @@ const MAX_SECRET_FIELD: usize = 256;
 const MAX_LEASE_ID: usize = 128;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 pub mod build;
+pub mod contracts;
 mod secure_fs;
 pub mod state_store;
 pub mod verification;
+
+/// Runtime เรียกตอนถือ VM lease ก่อนรับงาน; ไม่เป็น tool ที่โมเดลเรียกได้
+pub fn recover_workspace_writes(workspace: &Path) -> Result<usize, ToolError> {
+    secure_fs::recover_pending(workspace)
+}
 
 pub struct ToolGateway {
     pub workspace: PathBuf,
@@ -164,6 +170,9 @@ pub struct ToolGateway {
     /// File contents read during the current agent run. Authorization and audit
     /// still happen on every request; writes and process execution invalidate it.
     read_cache: HashMap<PathBuf, String>,
+    active_task: Option<contracts::TaskContract>,
+    last_outcome: Option<(contracts::TaskContract, contracts::TaskOutcome)>,
+    issued_verifications: HashMap<String, verification::VerificationRecord>,
     /// Secret broker (G4 §26): `None` = ไม่ตั้งค่า → `secret.request` และ
     /// exec แบบแนบ secret ถูก DENY (fail-closed ไม่มีทางเงียบผ่าน)
     secret_broker: Option<SecretBroker>,
@@ -283,6 +292,9 @@ impl ToolGateway {
             req_counter: 0,
             deny_tracker: DenyTracker::default(),
             read_cache: HashMap::new(),
+            active_task: None,
+            last_outcome: None,
+            issued_verifications: HashMap::new(),
             secret_broker: None,
         }
     }
@@ -343,12 +355,23 @@ impl ToolGateway {
 
     /// consume quota/lease ลงดิสก์ก่อน side effect ป้องกัน replay หลัง crash
     fn checkpoint(&self, cube: &Cube) -> Result<(), ToolError> {
+        self.checkpoint_with_hook(cube, &mut |_| Ok(()))
+    }
+
+    fn checkpoint_with_hook(
+        &self,
+        cube: &Cube,
+        hook: &mut impl FnMut(&str) -> std::io::Result<()>,
+    ) -> Result<(), ToolError> {
         if let Some(path) = &self.state_path {
             let text = serde_json::to_string(&serde_json::json!({
                 "cube": cube, "caps": self.caps, "leases": self.live_secret_leases()
             }))
             .map_err(|e| ToolError::Io(e.to_string()))?;
-            state_store::write_private(path, &text).map_err(|e| ToolError::Io(e.to_string()))?;
+            state_store::write_private_with_hook(path, &text, &mut |stage| {
+                hook(&format!("quota-{stage}"))
+            })
+            .map_err(|e| ToolError::Io(e.to_string()))?;
         }
         Ok(())
     }
@@ -688,9 +711,19 @@ impl ToolGateway {
         path: &str,
         content: &str,
     ) -> Result<ToolResult, ToolError> {
+        self.write_with_hook(cube, path, content, &mut |_| Ok(()))
+    }
+
+    fn write_with_hook(
+        &mut self,
+        cube: &mut Cube,
+        path: &str,
+        content: &str,
+        hook: &mut impl FnMut(&str) -> std::io::Result<()>,
+    ) -> Result<ToolResult, ToolError> {
         self.check_quarantine(cube, "write", path)?;
         let (canon, cap_index) = self.enforce(cube, "write", path)?;
-        use std::io::{Read, Write};
+        use std::io::Read;
         if let Err(error) = self.check_file_size(cap_index, content.len() as u64) {
             self.audit_decision(cube, "write", path, "deny", "size-constraint", "error")?;
             return Err(error);
@@ -744,11 +777,11 @@ impl ToolGateway {
                 return Err(ToolError::Denied("workspace storage quota exceeded".into()));
             }
             // บันทึกโควต้าไบต์ก่อนแก้ไฟล์ เพื่อไม่ให้การทำงานซ้ำหลัง crash ใช้งบเดิม
-            self.charge_bytes(cube, cap_index, content.len() as u64)?;
-            secure_fs::open(&self.workspace, &canon, true).and_then(|mut file| {
-                file.write_all(content.as_bytes())
-                    .map_err(|e| ToolError::Io(e.to_string()))
-            })
+            self.check_file_size(cap_index, content.len() as u64)?;
+            self.caps.account_bytes(cap_index, content.len() as u64);
+            self.checkpoint_with_hook(cube, hook)?;
+            hook("quota-checkpointed").map_err(|error| ToolError::Io(error.to_string()))?;
+            secure_fs::replace_with_hook(&self.workspace, &canon, content.as_bytes(), hook)
         })();
         self.audit_decision(
             cube,
@@ -1208,31 +1241,8 @@ impl ToolGateway {
             "success",
         )?;
         let verification = if let Some(prepared) = verification {
-            let mut record = prepared.finish(&self.workspace, outcome.code, &outcome.stdout);
-            self.req_counter += 1;
-            let mut audit = AuditRecord::new(
-                0,
-                &self.agent,
-                &self.session_id,
-                &format!("verification_{:06}", self.req_counter),
-                &cube.current_state().to_string(),
-                "verification",
-                &scope,
-                if matches!(record.status, verification::VerificationStatus::Verified) {
-                    "allow"
-                } else {
-                    "deny"
-                },
-                &self.policy.name,
-            );
-            audit.result =
-                serde_json::to_string(&record).map_err(|e| ToolError::Io(e.to_string()))?;
-            let audit = self
-                .audit
-                .append(audit)
-                .map_err(|e| ToolError::Audit(e.to_string()))?;
-            record.audit_id = audit.hash_entry;
-            Some(record)
+            let record = prepared.finish(&self.workspace, outcome.code, &outcome.stdout);
+            Some(self.publish_verification_with_hook(cube, &scope, record, &mut |_| Ok(()))?)
         } else {
             None
         };
@@ -1254,6 +1264,44 @@ impl ToolGateway {
                 )
             },
         })
+    }
+
+    fn publish_verification_with_hook(
+        &mut self,
+        cube: &Cube,
+        scope: &str,
+        mut record: verification::VerificationRecord,
+        hook: &mut impl FnMut(&str) -> std::io::Result<()>,
+    ) -> Result<verification::VerificationRecord, ToolError> {
+        self.req_counter += 1;
+        let mut audit = AuditRecord::new(
+            0,
+            &self.agent,
+            &self.session_id,
+            &format!("verification_{:06}", self.req_counter),
+            &cube.current_state().to_string(),
+            "verification",
+            scope,
+            if record.status == verification::VerificationStatus::Verified {
+                "allow"
+            } else {
+                "deny"
+            },
+            &self.policy.name,
+        );
+        audit.result =
+            serde_json::to_string(&record).map_err(|error| ToolError::Io(error.to_string()))?;
+        let audit = self
+            .audit
+            .append_with_hook(audit, &mut |stage| hook(&format!("receipt-{stage}")))
+            .map_err(|error| ToolError::Audit(error.to_string()))?;
+        record.audit_id = audit.hash_entry;
+        if self.active_task.is_some() {
+            self.issued_verifications
+                .insert(record.audit_id.clone(), record.clone());
+        }
+        hook("receipt-delivered").map_err(|error| ToolError::Io(error.to_string()))?;
+        Ok(record)
     }
 
     /// `network.fetch`: HTTP request ผ่าน policy/network capability
@@ -1873,6 +1921,11 @@ fn is_boundary_path(p: &Path) -> bool {
         || s.ends_with("/state.json")
         || p.components()
             .any(|part| part.as_os_str() == build::DIRECTORY)
+        || p.components().any(|part| {
+            part.as_os_str()
+                .to_string_lossy()
+                .starts_with(secure_fs::WRITE_PREFIX)
+        })
         || s.contains("/.git/config")
 }
 
@@ -2020,6 +2073,9 @@ impl AuditSink for LocalJsonlSink {
 }
 
 use std::collections::HashMap;
+
+#[cfg(test)]
+mod failure_tests;
 
 /// Network fetch request structure
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2473,6 +2529,63 @@ network: {{allow: [], deny: ['10.0.0.0/8']}}
         let r = gw.dispatch(&mut cube, &exe("/bin/false")).unwrap();
         assert!(!r.ok);
         assert_eq!(r.decision, "allow");
+    }
+
+    #[test]
+    fn final_outcome_rejects_stale_forged_and_previous_task_receipts() {
+        use contracts::{Execution, SolutionOrigin, Verification};
+        for mode in ["current", "stale", "forged", "previous", "summary_only"] {
+            let (mut gateway, mut cube, dir) = exec_harness();
+            gateway.workspace = dir.join("workspace");
+            std::fs::create_dir(&gateway.workspace).unwrap();
+            std::fs::write(gateway.workspace.join("source.c"), "version-one").unwrap();
+            let executable = std::fs::canonicalize("/bin/true")
+                .unwrap()
+                .display()
+                .to_string();
+            gateway.verifier = Some(verification::VerifierConfig {
+                executable: executable.clone(),
+                argv: vec![],
+                executable_sha256: Some(verification::digest(&std::fs::read(&executable).unwrap())),
+                stdout_contains: None,
+                prepare: vec![],
+            });
+            let mut task = gateway.begin_task(&mut cube, "repair bug").unwrap();
+            let mut receipt = gateway
+                .exec(&mut cube, &executable, &[])
+                .unwrap()
+                .verification
+                .unwrap();
+            match mode {
+                "stale" => {
+                    std::fs::write(gateway.workspace.join("source.c"), "version-two").unwrap()
+                }
+                "forged" => receipt.contract_sha256 = "f".repeat(64),
+                "previous" => task = gateway.begin_task(&mut cube, "another bug").unwrap(),
+                _ => {}
+            }
+            let outcome = gateway
+                .finalize_task(
+                    &mut cube,
+                    &task,
+                    Execution::Completed,
+                    SolutionOrigin::ModelRepair,
+                    (mode != "summary_only").then_some(&receipt),
+                )
+                .unwrap();
+            assert_eq!(
+                outcome.is_verified(),
+                mode == "current",
+                "{mode}: {outcome:?}"
+            );
+            if mode == "stale" {
+                assert_eq!(outcome.verification, Verification::Stale);
+            }
+            assert_eq!(outcome.task_id, task.task_id);
+            AuditWriter::verify(dir.join("audit.jsonl")).unwrap();
+            aivm_audit::clear_flags(&dir);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

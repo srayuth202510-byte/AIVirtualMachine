@@ -103,7 +103,7 @@ impl VerifierConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationStatus {
     Verified,
@@ -111,7 +111,7 @@ pub enum VerificationStatus {
     Unverified,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationRecord {
     pub status: VerificationStatus,
     pub contract_sha256: String,
@@ -174,7 +174,7 @@ fn executable_digest(workspace: &Path, path: &Path) -> Result<String, ToolError>
 }
 
 /// รวมชื่อและเนื้อหาไฟล์ทุกใบ ยกเว้น build slots; ไม่ตาม symlink และไม่ข้าม error
-fn workspace_digest(workspace: &Path) -> Result<String, ToolError> {
+pub(crate) fn workspace_digest(workspace: &Path) -> Result<String, ToolError> {
     let mut paths = Vec::new();
     let build_root = workspace.join(build::DIRECTORY);
     for (count, entry) in walkdir::WalkDir::new(workspace)

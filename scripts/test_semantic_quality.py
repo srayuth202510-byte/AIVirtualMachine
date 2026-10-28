@@ -35,14 +35,27 @@ class SemanticEvidenceTests(unittest.TestCase):
                 receipt = {"status": "verified", "exit_code": 0, "contract_sha256": "a" * 64,
                            "executable_sha256": "b" * 64, "workspace_sha256": "c" * 64,
                            "reason": "verified", "audit_id": ""}
-                audit = dict.fromkeys(SEMANTIC.AUDIT_FIELDS, "")
-                audit.update(hash_version=2, seq=0, timestamp=1, action="verification", decision="allow",
-                             result=json.dumps(receipt, separators=(",", ":")))
-                canonical = json.dumps([audit[key] for key in SEMANTIC.AUDIT_FIELDS], separators=(",", ":"))
-                audit["hash_entry"] = hashlib.sha256(canonical.encode()).hexdigest()
-                receipt["audit_id"] = audit["hash_entry"]
+                audit_rows = []
+                def append(action, value, rule=""):
+                    audit = dict.fromkeys(SEMANTIC.AUDIT_FIELDS, "")
+                    audit.update(hash_version=2, seq=len(audit_rows), timestamp=1, action=action,
+                        resource=case["id"], rule_matched=rule, decision="allow",
+                        hash_prev=audit_rows[-1]["hash_entry"] if audit_rows else "",
+                        result=json.dumps(value, separators=(",", ":")))
+                    canonical = json.dumps([audit[key] for key in SEMANTIC.AUDIT_FIELDS], separators=(",", ":"))
+                    audit["hash_entry"] = hashlib.sha256(canonical.encode()).hexdigest()
+                    audit_rows.append(audit)
+                    return audit["hash_entry"]
+                task_contract = {"schema":1, "task_id":case["id"], "revision":1, "task_digest":"sha256:"+"d"*64,
+                                 "base_workspace_digest":"sha256:"+"c"*64, "audit_id":""}
+                task_contract["audit_id"] = append("task", task_contract, "task-start")
+                receipt["audit_id"] = append("verification", receipt)
+                outcome = {"schema":1,"task_id":case["id"],"task_revision":1,"execution":"completed",
+                    "verification":"passed","solution_origin":"tool_solver","tested_workspace_digest":"sha256:"+"c"*64,
+                    "current_workspace_digest":"sha256:"+"c"*64,"receipt_ids":[receipt["audit_id"]],"reason":"verified","audit_id":""}
+                outcome["audit_id"] = append("task", outcome, "task-outcome")
                 audit_file = root / f'{case["id"]}.audit.jsonl'
-                audit_file.write_text(json.dumps(audit) + "\n")
+                audit_file.write_text("".join(json.dumps(audit)+"\n" for audit in audit_rows))
                 attempt = {"prompt": case["prompt"], "output": case["initial_candidate"],
                            "format_valid": True, "schema_valid": True, "task_correct": False,
                            "infrastructure_status": "completed", "termination": "completed"}
@@ -52,6 +65,7 @@ class SemanticEvidenceTests(unittest.TestCase):
                              "audit_sha256": SEMANTIC.digest(audit_file),
                              "run": {"task": case["task"], "attempts": [attempt], "output": json.dumps(case["expected"]),
                                      "origin": "tool_solver", "status": "verified", "termination": "verified",
+                                     "task_contract":task_contract, "outcome":outcome,
                                      "verification": receipt,
                                      "actions": [{"phase": phase, "ok": True, "verification": receipt}
                                                  for phase in ("tool_solver", "semantic_verifier")]}})
