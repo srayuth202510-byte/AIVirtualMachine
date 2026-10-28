@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -114,8 +115,10 @@ def main():
     parser.add_argument("--model-sha256", required=True)
     parser.add_argument("--pins", required=True, type=Path)
     parser.add_argument("--candidate-config", type=Path, help="Bind the exact release candidate worker config to host evidence")
+    parser.add_argument("--worker-profile", choices=("debug", "release"), default="release")
     parser.add_argument("--out", type=Path, default=PROJECT / "target/model-host-validation")
     args = parser.parse_args()
+    profile_args = ["--release"] if args.worker_profile == "release" else []
     source_before = release_evidence.source_identity()
     candidate_hash = digest(args.candidate_config) if args.candidate_config else None
     model = args.model.resolve(strict=True)
@@ -157,6 +160,7 @@ def main():
     save("validation-sources.json", {name: digest(PROJECT / name) for name in sources})
     results = []
     env = dict(os.environ, AIVM_GGUF=str(model), AIVM_GGUF_SHA256=args.model_sha256,
+               AIVM_WORKER_PROFILE=args.worker_profile,
                CARGO_TARGET_DIR=str(PROJECT / "target"))
 
     def run(name, command, exact=False, extra_env=None, evidence=None, quality=False):
@@ -195,20 +199,27 @@ def main():
 
     before = snapshot(model, args.model_sha256, pins)
     save("artifacts-before.json", before)
-    if not run("build-worker", ["cargo", "build", "--locked", "-p", "aivm-model-worker",
+    if not run("build-worker", ["cargo", "build", "--locked", *profile_args, "-p", "aivm-model-worker",
                                 "--features", "llama,microvm"]):
         return 1
-    worker = PROJECT / "target/debug/aivm-model-worker"
+    built_worker = PROJECT / "target" / args.worker_profile / "aivm-model-worker"
+    built_worker_sha256 = digest(built_worker)
+    worker = out / "validated-worker"
+    shutil.copyfile(built_worker, worker)
+    worker.chmod(0o500)
+    if digest(worker) != built_worker_sha256:
+        raise ValueError("worker changed during validation snapshot")
+    env.update(AIVM_VALIDATED_WORKER=str(worker), AIVM_VALIDATED_WORKER_SHA256=built_worker_sha256)
     before["worker"] = {"path": str(worker), "sha256": digest(worker)}
     save("artifacts-before.json", before)
     run("probe", ["cargo", "run", "--locked", "-q", "-p", "aivm-cli", "--", "probe"])
     try:
         if args.candidate_config:
             release_evidence.candidate_config(args.candidate_config, before)
-            run("candidate-worker", ["cargo", "test", "--locked", "-p", "aivm-model-worker", "--features", "llama,microvm",
+            run("candidate-worker", ["cargo", "test", "--locked", *profile_args, "-p", "aivm-model-worker", "--features", "llama,microvm",
                 "--test", "worker", "real_isolated_worker_host_validation", "--", "--exact", "--ignored", "--nocapture"], exact=True,
                 extra_env={"AIVM_WORKER_HOST_CONFIG": str(args.candidate_config.resolve())})
-        run("protected-loader", ["cargo", "test", "--locked", "-p", "aivm-model",
+        run("protected-loader", ["cargo", "test", "--locked", *profile_args, "-p", "aivm-model",
                                  "--features", "llama,microvm",
                                  "artifact::tests::real_loader_uses_verified_snapshot_after_source_tampering",
                                  "--", "--exact", "--ignored", "--nocapture"], exact=True)
@@ -239,6 +250,8 @@ def main():
             except (OSError, ValueError, KeyError, TypeError):
                 candidate_ok = False
         save("release-evidence.json", {"schema": 1, "source_before": source_before, "source_after": source_after,
+            "worker_build_profile":args.worker_profile,
+            "built_worker_sha256":built_worker_sha256,
             "candidate_config_sha256": candidate_hash,
             "pins_sha256": digest(pins), "artifacts_before": before, "artifacts_after": after, "results": results,
             "passed": before == after and source_before == source_after and candidate_ok and all(row["passed"] for row in results)})

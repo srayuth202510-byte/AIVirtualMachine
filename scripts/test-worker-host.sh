@@ -7,17 +7,23 @@ TIER=${1:-}
 MODEL=${2:-}
 PINS=${3:-"$HOME/.local/share/aivm/microvm/pins.json"}
 SCENARIO=${4:-baseline}
+TASK_WORKER_PROFILE=${AIVM_WORKER_PROFILE:-debug}
+case "$TASK_WORKER_PROFILE" in debug) TASK_CARGO_PROFILE=dev ;; release) TASK_CARGO_PROFILE=release ;; *) echo 'worker profile must be debug or release' >&2; exit 2 ;; esac
 case "$SCENARIO" in baseline|failure-recovery|quality|quality-cache) ;; *) echo 'scenario must be baseline, failure-recovery, quality, or quality-cache' >&2; exit 2 ;; esac
 case "$TIER" in container|microvm|process_namespace) ;; *) echo 'usage: sh scripts/test-worker-host.sh container|microvm|process_namespace /path/model.gguf [pins.json] [baseline|failure-recovery]' >&2; exit 2 ;; esac
 [ -f "$MODEL" ] || { echo "model missing: $MODEL" >&2; exit 2; }
 cd "$PROJECT_DIR"
 if [ "${5:-}" != --inside ]; then
-    cargo build --locked -q -p aivm-model-worker --features llama,microvm
+    if [ -z "${AIVM_VALIDATED_WORKER:-}" ]; then
+        cargo build --locked -q --profile "$TASK_CARGO_PROFILE" -p aivm-model-worker --features llama,microvm
+    fi
     if [ "$TIER" = container ]; then
         exec systemd-run --user --wait --pipe --collect \
             --property='Delegate=cpu memory pids' --setenv="PATH=$PATH" --setenv="AIVM_WORKER_STRACE=${AIVM_WORKER_STRACE:-}" \
             --setenv="AIVM_GGUF_SHA256=${AIVM_GGUF_SHA256:-}" --setenv="AIVM_SUPERVISED_CONTROL=${AIVM_SUPERVISED_CONTROL:-0}" \
             --setenv="CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-1}" \
+            --setenv="AIVM_WORKER_PROFILE=$TASK_WORKER_PROFILE" \
+            --setenv="AIVM_VALIDATED_WORKER=${AIVM_VALIDATED_WORKER:-}" --setenv="AIVM_VALIDATED_WORKER_SHA256=${AIVM_VALIDATED_WORKER_SHA256:-}" \
             --setenv="AIVM_WORKER_HOST_EVIDENCE=${AIVM_WORKER_HOST_EVIDENCE:-}" \
             --unit="aivm-worker-host-$(id -u)-$$" \
             /bin/sh "$SCRIPT_DIR/test-worker-host.sh" "$TIER" "$MODEL" "$PINS" "$SCENARIO" --inside
@@ -34,13 +40,16 @@ fi
 RUN_DIR=$(mktemp -d /tmp/aivm-worker-host-XXXXXX)
 CONFIG="$RUN_DIR/config.json"
 trap 'rm -rf "$RUN_DIR"' EXIT HUP INT TERM
-python3 - "$CONFIG" "$TIER" "$MODEL" "$PROJECT_DIR/target/debug/aivm-model-worker" "$PINS" "$CGROUP_ROOT" "$SCENARIO" <<'PY'
+python3 - "$CONFIG" "$TIER" "$MODEL" "${AIVM_VALIDATED_WORKER:-$PROJECT_DIR/target/$TASK_WORKER_PROFILE/aivm-model-worker}" "$PINS" "$CGROUP_ROOT" "$SCENARIO" <<'PY'
 import hashlib,json,os,pathlib,re,sys
 output,tier,model,worker,pins,cgroup,scenario=sys.argv[1:]
 def digest(path):
     with open(path,'rb') as file:
         return hashlib.file_digest(file,'sha256').hexdigest()
 expected=os.environ.get('AIVM_GGUF_SHA256') or digest(model)
+worker_pin=os.environ.get('AIVM_VALIDATED_WORKER_SHA256')
+if os.environ.get('AIVM_VALIDATED_WORKER') and (not worker_pin or digest(worker)!=worker_pin):
+    raise SystemExit('validated worker pin mismatch')
 if not re.fullmatch(r'[0-9a-fA-F]{64}',expected) or digest(model)!=expected.lower():
     raise SystemExit('model sha256 mismatch or invalid operator pin')
 launcher={'tier':tier}
@@ -75,7 +84,7 @@ if [ -n "${AIVM_WORKER_STRACE:-}" ]; then set -- strace -f -o "$AIVM_WORKER_STRA
 case "$SCENARIO" in
     quality|quality-cache)
         [ -n "${AIVM_WORKER_HOST_EVIDENCE:-}" ] || { echo 'quality requires AIVM_WORKER_HOST_EVIDENCE' >&2; exit 2; }
-        AIVM_WORKER_QUALITY_EVIDENCE="$AIVM_WORKER_HOST_EVIDENCE" AIVM_WORKER_HOST_CONFIG="$CONFIG" "$@" cargo test --locked -p aivm-model-worker --features llama,microvm \
+        AIVM_WORKER_QUALITY_EVIDENCE="$AIVM_WORKER_HOST_EVIDENCE" AIVM_WORKER_HOST_CONFIG="$CONFIG" "$@" cargo test --locked --profile "$TASK_CARGO_PROFILE" -p aivm-model-worker --features llama,microvm \
             --test quality real_model_quality_and_latency -- --exact --ignored --nocapture
         exit $?
         ;;
@@ -85,9 +94,9 @@ if [ "$SCENARIO" = failure-recovery ]; then
     # scratch อยู่ใต้ directory เฉพาะเทสต์; เก็บ serial ชั่วคราวเพื่อแยก OOM จาก error อื่น
     FAIL_TMP=$(mktemp -d "$RUN_DIR/aivm-worker-failures-XXXXXX")
     TMPDIR="$FAIL_TMP" AIVM_WORKER_HOST_TMPDIR="$FAIL_TMP" AIVM_MICROVM_KEEP_SCRATCH=1 \
-        AIVM_WORKER_HOST_CONFIG="$CONFIG" "$@" cargo test --locked -p aivm-model-worker --features llama,microvm \
+        AIVM_WORKER_HOST_CONFIG="$CONFIG" "$@" cargo test --locked --profile "$TASK_CARGO_PROFILE" -p aivm-model-worker --features llama,microvm \
         --test failure_recovery real_isolated_worker_failure_recovery -- --exact --ignored --nocapture
     exit $?
 fi
-AIVM_WORKER_HOST_CONFIG="$CONFIG" "$@" cargo test --locked -p aivm-model-worker --features llama,microvm \
+AIVM_WORKER_HOST_CONFIG="$CONFIG" "$@" cargo test --locked --profile "$TASK_CARGO_PROFILE" -p aivm-model-worker --features llama,microvm \
     --test worker real_isolated_worker_host_validation -- --exact --ignored --nocapture

@@ -13,10 +13,11 @@ def evaluate(commit, config, pins, host_path, benchmark, minimum_successes):
     if not re.fullmatch(r"[0-9a-f]{40}", commit) or current["commit"] != commit or not current["clean"]:
         raise ValueError("release requires the requested exact commit and a clean source tree")
     host = evidence.load(host_path)
-    if (host.get("schema") != 1 or host.get("source_before") != current or host.get("source_after") != current
+    if (host.get("schema") != 1 or host.get("worker_build_profile") != "release" or host.get("source_before") != current or host.get("source_after") != current
             or host.get("candidate_config_sha256") != evidence.digest(config)
             or host.get("pins_sha256") != evidence.digest(pins)
             or host.get("artifacts_before") != host.get("artifacts_after")
+            or host.get("built_worker_sha256") != host.get("artifacts_before", {}).get("worker", {}).get("sha256")
             or host.get("passed") is not True):
         raise ValueError("host validation belongs to another source/config/pin set or failed")
     required = {"build-worker", "candidate-worker", "protected-loader", "worker-process_namespace", "worker-container", "worker-microvm",
