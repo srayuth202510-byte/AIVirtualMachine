@@ -15,6 +15,8 @@ const FIXED: &str = "int add(int a, int b) { return a + b; }\nint main(void) { r
 mod repair_benchmark;
 #[path = "support/repair_controller.rs"]
 mod repair_controller;
+#[path = "support/repair_trace.rs"]
+mod repair_trace;
 struct Script(Mutex<VecDeque<String>>);
 impl Model for Script {
     fn reason(&self, _: &str) -> Result<String, ModelError> {
