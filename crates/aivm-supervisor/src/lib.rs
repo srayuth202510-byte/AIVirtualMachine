@@ -197,6 +197,7 @@ impl Supervisor {
 
     /// Agent loop เต็มรอบ (Phase 5) — โมเดลคิดเป็น intent แล้วผ่าน gateway
     /// ถ้า `workspace` ให้มา จะสร้าง RAG index และผสม context ลง prompt (Phase 6)
+    /// ถือ lease ตลอด repair controller และเก็บรายงาน private แยกต่อ task แม้งานจะ stalled
     pub fn run_agent(
         &mut self,
         name: &str,
@@ -218,6 +219,13 @@ impl Supervisor {
             .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
         rt.persist()
             .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
+        let report = serde_json::to_string_pretty(&run)
+            .map_err(|error| SupervisorError::Runtime(error.to_string()))?;
+        aivm_tools::state_store::write_private(
+            &dir.join(format!("agent-run-{}.json", run.task_contract.task_id)),
+            &report,
+        )
+        .map_err(|error| SupervisorError::Runtime(error.to_string()))?;
         Ok(run)
     }
 
@@ -391,6 +399,41 @@ mod tests {
         std::fs::remove_file(journal).unwrap();
         drop(lease);
         assert!(supervisor.inspect("vm").unwrap().contains("INIT"));
+        aivm_audit::clear_flags(&root);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_reports_are_private_per_task_and_survive_new_supervisor_instances() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = root("agent-report");
+        let mut supervisor = Supervisor::new(root.clone());
+        supervisor
+            .create("vm", VmConfig::from_yaml("name: report").unwrap())
+            .unwrap();
+        // zero-step run ทำให้หยุดตาม budget โดยไม่พึ่ง backend model แต่ยังต้องเก็บผล
+        let run = supervisor
+            .run_agent("vm", "fix code and run tests", 0, None)
+            .unwrap();
+        let report = root
+            .join("vm")
+            .join(format!("agent-run-{}.json", run.task_contract.task_id));
+        assert_eq!(
+            std::fs::metadata(&report).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+        assert_eq!(saved["task_contract"]["task_id"], run.task_contract.task_id);
+        assert_eq!(saved["repair_state"]["task_id"], run.task_contract.task_id);
+        assert_eq!(saved["outcome"]["execution"], "budget_exhausted");
+        assert!(!root
+            .join("vm/workspace")
+            .join(report.file_name().unwrap())
+            .exists());
+        drop(supervisor);
+        assert!(Supervisor::new(root.clone()).status("vm").is_some());
+        assert!(report.exists());
         aivm_audit::clear_flags(&root);
         std::fs::remove_dir_all(root).unwrap();
     }

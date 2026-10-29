@@ -11,6 +11,7 @@
 //! policy → execute → audit) เท่านั้น การ parse ไม่ผ่าน = DENY + audit
 //! (I-7) ไม่มีทางที่ข้อความจากโมเดลจะกลายเป็นการ execute โดยตรง
 
+use crate::repair::{FailureStatus, RepairPolicy, RepairState};
 use crate::RuntimeError;
 use aivm_cube::rag;
 use aivm_cube::Cube;
@@ -19,7 +20,7 @@ use aivm_model::Model;
 use aivm_tools::{ExecContent, ToolGateway, ToolRequest};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// สร้าง RAG ผ่าน gateway: ไม่มี API ให้เลือก root ที่ข้าม policy
 pub fn build_workspace_index(
@@ -174,6 +175,128 @@ pub struct AgentRun {
     /// หลักฐานจาก gateway เท่านั้น; summary ของ model ไม่ใช่ผลยืนยัน
     pub verification_status: aivm_tools::verification::VerificationStatus,
     pub verification: Option<aivm_tools::verification::VerificationRecord>,
+    /// Ledger ของ host แยกจาก observations และจากข้อความอ้างผลสำเร็จของโมเดล
+    pub repair_state: RepairState,
+}
+
+#[derive(Clone)]
+enum OperatorStage {
+    Prepare,
+    Counterexample(String),
+    Full,
+}
+
+#[derive(Clone)]
+struct OperatorAction {
+    request: ToolRequest,
+    stage: OperatorStage,
+}
+
+fn operator_actions(
+    plan: &[ToolRequest],
+    gateway: &ToolGateway,
+    state: &RepairState,
+) -> VecDeque<OperatorAction> {
+    let mut queue = VecDeque::new();
+    if let Some((full, prepare)) = plan.split_last() {
+        queue.extend(prepare.iter().cloned().map(|request| OperatorAction {
+            request,
+            stage: OperatorStage::Prepare,
+        }));
+        if let Some(check) = gateway
+            .verifier
+            .as_ref()
+            .and_then(|verifier| verifier.counterexample.as_ref())
+        {
+            for failure in state
+                .verification_failures
+                .iter()
+                .filter(|failure| failure.status == FailureStatus::Unresolved)
+            {
+                if let Some(case) = &failure.counterexample {
+                    let mut argv = check.argv.clone();
+                    // input เป็น argv literal ของโปรแกรม operator ไม่ใช่คำสั่งหรือ executable จากโมเดล
+                    argv.push(case.input.to_string());
+                    queue.push_back(OperatorAction {
+                        request: ToolRequest {
+                            tool: "process.exec".into(),
+                            path: check.executable.clone(),
+                            content: Some(serde_json::json!({"argv":argv}).to_string()),
+                        },
+                        stage: OperatorStage::Counterexample(failure.id.clone()),
+                    });
+                }
+            }
+        }
+        queue.push_back(OperatorAction {
+            request: full.clone(),
+            stage: OperatorStage::Full,
+        });
+    }
+    queue
+}
+
+fn audit_repair(
+    gateway: &mut ToolGateway,
+    cube: &mut Cube,
+    task: &aivm_tools::contracts::TaskContract,
+    state: &RepairState,
+) -> Result<(), RuntimeError> {
+    if state.verification_failures.is_empty() && state.tool_errors.is_empty() {
+        return Ok(());
+    }
+    let serialized =
+        serde_json::to_string(state).map_err(|error| RuntimeError::Io(error.to_string()))?;
+    gateway
+        .audit_repair_state(cube, task, &serialized)
+        .map_err(|error| RuntimeError::Io(error.to_string()))
+}
+
+fn planned_write(
+    gateway: &mut ToolGateway,
+    cube: &mut Cube,
+    state: &RepairState,
+) -> Result<ToolRequest, String> {
+    let plan = state.plan.as_ref().ok_or("missing repair plan")?;
+    let digest = gateway
+        .workspace_digest()
+        .map_err(|error| error.to_string())?;
+    if Some(&digest) != state.plan_workspace_digest.as_ref() {
+        return Err("workspace changed while planning; inspect and propose again".into());
+    }
+    gateway.clear_read_cache();
+    // การใช้ patch ต้องอ่านผ่านสิทธิ์เดิมเช่นเดียวกับโมเดล ไม่อ่านไฟล์โดยข้าม gateway
+    let read = gateway
+        .read(cube, &plan.path)
+        .map_err(|error| error.to_string())?;
+    if !read.ok {
+        return Err("source read failed".into());
+    }
+    let first = read
+        .output
+        .find(&plan.old_text)
+        .ok_or("old_text is absent from current source")?;
+    let next = first
+        + read.output[first..]
+            .chars()
+            .next()
+            .expect("nonempty match")
+            .len_utf8();
+    if read.output[next..].contains(&plan.old_text) {
+        return Err("old_text is ambiguous; include more source context".into());
+    }
+    if gateway
+        .workspace_digest()
+        .map_err(|error| error.to_string())?
+        != digest
+    {
+        return Err("workspace changed while preparing patch".into());
+    }
+    Ok(ToolRequest {
+        tool: "filesystem.write".into(),
+        path: plan.path.clone(),
+        content: Some(read.output.replacen(&plan.old_text, &plan.new_text, 1)),
+    })
 }
 
 /// parse intent จากข้อความโมเดลแบบ fail-closed
@@ -482,6 +605,27 @@ pub fn run_loop(
     max_steps: usize,
     rag_index: Option<&aivm_cube::rag::RagIndex>,
 ) -> Result<AgentRun, RuntimeError> {
+    run_loop_with_policy(
+        model,
+        gateway,
+        cube,
+        task,
+        max_steps,
+        rag_index,
+        &RepairPolicy::default(),
+    )
+}
+
+pub fn run_loop_with_policy(
+    model: &dyn Model,
+    gateway: &mut ToolGateway,
+    cube: &mut Cube,
+    task: &str,
+    max_steps: usize,
+    rag_index: Option<&aivm_cube::rag::RagIndex>,
+    repair_policy: &RepairPolicy,
+) -> Result<AgentRun, RuntimeError> {
+    repair_policy.validate().map_err(RuntimeError::Config)?;
     let task_contract = gateway
         .begin_task(cube, task)
         .map_err(|error| RuntimeError::Io(error.to_string()))?;
@@ -497,6 +641,7 @@ pub fn run_loop(
     let mut last_successful_request: Option<ToolRequest> = None;
     let mut last_successful_write: Option<ToolRequest> = None;
     let mut verification = None;
+    let mut repair = RepairState::new(&task_contract);
     let operator_plan = gateway
         .verifier
         .as_ref()
@@ -504,26 +649,40 @@ pub fn run_loop(
         .transpose()
         .map_err(|error| RuntimeError::Config(error.to_string()))?
         .unwrap_or_default();
-    let mut operator_next: Option<usize> = None;
+    let mut operator_queue: VecDeque<OperatorAction> = VecDeque::new();
     let mut last_guarded_action: Option<String> = None;
     let mut guarded_action_streak = 0usize;
     let mut live_rag = rag_index.map(WorkspaceRag::new);
     let mut latest_diagnostic: Option<String> = None;
 
     for index in 0..max_steps {
-        let operator_request = operator_next
-            .and_then(|step| operator_plan.get(step))
-            .cloned();
-        let origin = if operator_request.is_some() {
-            "operator_verifier"
-        } else {
-            "model"
+        let operator_action = operator_queue.front().cloned();
+        let operator_request = operator_action
+            .as_ref()
+            .map(|action| action.request.clone());
+        let origin = match operator_action.as_ref().map(|action| &action.stage) {
+            Some(OperatorStage::Counterexample(_)) => "operator_counterexample",
+            Some(_) => "operator_verifier",
+            None => "model",
         };
+        let retained_diagnostic = repair
+            .verification_failures
+            .iter()
+            .rev()
+            .find(|failure| failure.status == FailureStatus::Unresolved)
+            .map(|failure| serde_json::to_string(failure).expect("failure serializes"));
+        let planning = operator_request.is_none() && repair.needs_plan(repair_policy);
+        let mut source_progress = false;
         // ตรวจ snapshot ใหม่ก่อน model inference; operator plan ไม่ต้องใช้ model context
         let context_hint =
             if let Some(live) = live_rag.as_mut().filter(|_| operator_request.is_none()) {
                 live.refresh(gateway, cube)?;
-                let query = live.query(task, latest_diagnostic.as_deref());
+                let query = live.query(
+                    task,
+                    retained_diagnostic
+                        .as_deref()
+                        .or(latest_diagnostic.as_deref()),
+                );
                 let retriever = rag::Retriever {
                     top_k: 3,
                     current_state: cube.current_state() as u32,
@@ -547,21 +706,33 @@ pub fn run_loop(
             (None, Some(notes)) => Some(format!("Build/test notes:\n{notes}")),
             (None, None) => None,
         };
-        let prompt = build_prompt(
+        let mut prompt = build_prompt(
             &phase_task(task, subtask),
             subtask,
             &observations,
             phase_context.as_deref(),
         );
+        if repair.unresolved() || !repair.tool_errors.is_empty() {
+            prompt.push_str(&repair.prompt());
+        }
+        let base_system = if operator_plan.is_empty() {
+            SYSTEM_PROMPT.to_string()
+        } else {
+            SYSTEM_PROMPT.replace("After a successful edit, compile and run the requested tests;",
+                "After a successful edit, the operator runtime compiles and runs the requested tests;")
+        };
         let system_prompt = subtask
             .map(|phase| {
+                let contract = if !operator_plan.is_empty() && matches!(phase, CodingSubtask::Verify | CodingSubtask::Repair) {
+                    "Read source and make a different targeted source edit. The operator runs builds and tests automatically; do not invoke a compiler or test runner yourself."
+                } else { phase.system_contract() };
                 format!(
-                    "{SYSTEM_PROMPT}\nPreferred tools for this subtask: {}. {}",
-                    phase.preferred_tools(),
-                    phase.system_contract()
+                    "{base_system}\nPreferred tools for this subtask: {}. {}",
+                    if !operator_plan.is_empty() { "filesystem.read, filesystem.write, code.search" } else { phase.preferred_tools() },
+                    contract
                 )
             })
-            .unwrap_or_else(|| SYSTEM_PROMPT.to_string());
+            .unwrap_or(base_system);
         // Known-output profile ไม่เปิดพื้นที่ temp: บอกข้อจำกัดก่อนให้โมเดลเลือก compiler flags
         let system_prompt = if gateway.build.enabled && operator_plan.is_empty() {
             format!("{system_prompt}\nBuild profile: only declared output slots under .aivm-build are writable. Temporary files in /tmp and arbitrary new files are denied. For GCC, compile each source separately using -pipe -c SOURCE -o .aivm-build/NAME.o and declare NAME.o in outputs. Link the objects using the operator's ld command and declared output slots; do not use the GCC driver to link or invent startup-object paths. Follow the project's build/test instructions, then execute the configured verifier. A successful compile alone does not verify completion.")
@@ -580,8 +751,22 @@ pub fn run_loop(
         } else {
             format!("{system_prompt}\nAfter your source edit, the runtime will compile and run the operator verifier through the gateway. Read and edit the source; do not compile or repeat a successful edit yourself. If the operator build or verifier fails, repair the source using the diagnostics.")
         };
+        let planning_digest = if planning {
+            Some(
+                gateway
+                    .workspace_digest()
+                    .map_err(|error| RuntimeError::Io(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         let generated = if let Some(request) = operator_request {
             Ok(serde_json::to_string(&request).expect("operator request serializes"))
+        } else if planning {
+            model.reason_with_system_mode(
+                "Return one JSON object with exactly failure_ids (array of unresolved host failure IDs), path (relative source filename), change (one concise explanation addressing the counterexample), old_text (unique exact source fragment), new_text (its different replacement). The host applies this bounded patch through the gateway and runs tests. Use a small exact replacement. No tool calls or reasoning transcript. Do not claim tests passed.",
+                &prompt, aivm_model::OutputMode::Json,
+            )
         } else {
             model.reason_with_system_mode(
                 &system_prompt,
@@ -589,9 +774,13 @@ pub fn run_loop(
                 aivm_model::OutputMode::AgentIntent,
             )
         };
-        let (raw, intent) = match generated {
+        let (raw, mut intent) = match generated {
             Ok(raw) => {
-                let intent = parse_intent(&raw);
+                let intent = if planning {
+                    Err(String::new())
+                } else {
+                    parse_intent(&raw)
+                };
                 (raw, intent)
             }
             // schema ที่ปฏิเสธยังเข้าทาง audit invalid-intent; ไม่สร้างข้อความปลอมแทน output
@@ -606,6 +795,50 @@ pub fn run_loop(
                 break;
             }
         };
+
+        if planning {
+            let digest = planning_digest.expect("planning captures a workspace digest");
+            let result = if raw.is_empty() {
+                Err(intent
+                    .as_ref()
+                    .err()
+                    .cloned()
+                    .unwrap_or_else(|| "empty repair plan".into()))
+            } else {
+                repair.accept_plan(&raw, digest)
+            };
+            let request = result.and_then(|()| planned_write(gateway, cube, &repair));
+            match request {
+                Ok(request) => {
+                    audit_repair(gateway, cube, &task_contract, &repair)?;
+                    intent = Ok(Intent::Tool(request));
+                }
+                Err(reason) => {
+                    gateway
+                        .audit_agent_guard_deny(cube, "repair.plan", &reason)
+                        .map_err(|error| RuntimeError::Io(error.to_string()))?;
+                    repair.tool_error("repair.plan", &reason);
+                    repair.consume_plan();
+                    let outcome = format!("DENY repair.plan :: {reason}");
+                    observations.clear();
+                    observations.push(outcome.clone());
+                    steps.push(AgentStep {
+                        index,
+                        origin: "model".into(),
+                        subtask: "repair".into(),
+                        action: "repair.plan".into(),
+                        outcome,
+                    });
+                    let stalled = repair.model_step(false, repair_policy);
+                    audit_repair(gateway, cube, &task_contract, &repair)?;
+                    if stalled {
+                        stopped = "stalled".into();
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
 
         match intent {
             Ok(Intent::Finish(s)) => {
@@ -645,12 +878,25 @@ pub fn run_loop(
                         || (req.tool == "filesystem.write"
                             && last_successful_write.as_ref().is_some_and(is_same_request)));
                 let action_subtask = subtask.map(CodingSubtask::name).unwrap_or("general");
+                let invalid_plan = origin == "model"
+                    && req.tool == "filesystem.write"
+                    && repair.plan.as_ref().is_some_and(|plan| {
+                        plan.path != req.path
+                            || gateway.workspace_digest().ok().as_ref()
+                                != repair.plan_workspace_digest.as_ref()
+                    });
                 let disallowed_for_phase = subtask.is_some_and(|phase| !phase.allows(&req.tool));
                 // Every non-guarded intent passes the gateway; repeated or
                 // out-of-phase intents receive an audit entry without execution.
-                let outcome = if repeated || disallowed_for_phase {
+                let outcome = if repeated || disallowed_for_phase || invalid_plan {
                     let reason = if repeated {
-                        "repeated an identical successful action; advance to the next subtask"
+                        if operator_plan.is_empty() {
+                            "repeated an identical successful action; advance to the next subtask"
+                        } else {
+                            "repeated an identical successful action; change the patch or stop; the previous verifier failure remains unresolved"
+                        }
+                    } else if invalid_plan {
+                        "source write does not match the host-bound repair plan; propose a new plan"
                     } else {
                         "tool is outside the current coding subtask; choose an allowed next action"
                     };
@@ -658,18 +904,71 @@ pub fn run_loop(
                         .audit_agent_guard_deny(cube, &req.path, reason)
                         .map_err(|e| RuntimeError::Io(e.to_string()))?;
                     if req.tool == "filesystem.write" {
-                        subtask = Some(CodingSubtask::Verify);
+                        subtask = Some(if operator_plan.is_empty() {
+                            CodingSubtask::Verify
+                        } else {
+                            CodingSubtask::Repair
+                        });
+                        repair.consume_plan();
                     }
+                    repair.tool_error(&format!("{} {}", req.tool, req.path), reason);
                     format!("DENY {} {} :: {reason}", req.tool, req.path)
                 } else {
+                    let before_write = (req.tool == "filesystem.write")
+                        .then(|| gateway.workspace_digest().ok())
+                        .flatten();
                     match gateway.dispatch(cube, &req) {
                         Ok(res) => {
+                            if let Some(OperatorStage::Counterexample(id)) =
+                                operator_action.as_ref().map(|action| &action.stage)
+                            {
+                                let digest = gateway
+                                    .workspace_digest()
+                                    .map_err(|error| RuntimeError::Io(error.to_string()))?;
+                                repair.record_probe(
+                                    id,
+                                    digest,
+                                    gateway.audit.tip().to_string(),
+                                    res.ok,
+                                    &res.output,
+                                    repair_policy,
+                                );
+                            }
+                            let full_stage = operator_action
+                                .as_ref()
+                                .is_none_or(|action| matches!(action.stage, OperatorStage::Full));
+                            let failed_receipt = full_stage && res.verification.as_ref().is_some_and(|record|
+                                record.status != aivm_tools::verification::VerificationStatus::Verified);
                             if req.tool == "process.exec" {
-                                latest_diagnostic = (!res.ok).then(|| clip(&res.output, 1000));
+                                latest_diagnostic =
+                                    (!res.ok || failed_receipt).then(|| clip(&res.output, 1000));
+                            }
+                            if failed_receipt {
+                                let receipt =
+                                    res.verification.as_ref().expect("failed receipt exists");
+                                let diagnostic = format!("{}\n{}", res.output, receipt.reason);
+                                if let Err(reason) =
+                                    repair.record_failure(&diagnostic, receipt, repair_policy)
+                                {
+                                    stopped = "stalled".into();
+                                    repair.halt_reason = Some(reason);
+                                }
+                            } else if !res.ok
+                                && !matches!(
+                                    operator_action.as_ref().map(|action| &action.stage),
+                                    Some(OperatorStage::Counterexample(_))
+                                )
+                            {
+                                repair
+                                    .tool_error(&format!("{} {}", req.tool, req.path), &res.output);
                             }
                             let outcome = format!(
                                 "{} {} {} :: {}",
-                                if res.ok { "OK" } else { "FAIL" },
+                                if res.ok && !failed_receipt {
+                                    "OK"
+                                } else {
+                                    "FAIL"
+                                },
                                 req.tool,
                                 req.path,
                                 clip(&res.output, MAX_OBS_CHARS)
@@ -683,19 +982,36 @@ pub fn run_loop(
                             } else {
                                 outcome
                             };
-                            if res.ok {
-                                if origin == "operator_verifier" {
-                                    operator_next = operator_next
-                                        .map(|step| step + 1)
-                                        .filter(|step| *step < operator_plan.len());
+                            if res.ok && !failed_receipt {
+                                if origin != "model" {
+                                    operator_queue.pop_front();
+                                    if let Some(OperatorStage::Counterexample(_)) =
+                                        operator_action.as_ref().map(|action| &action.stage)
+                                    {
+                                        repair.no_progress_steps = 0;
+                                    }
                                 } else if req.tool == "filesystem.write"
                                     && !operator_plan.is_empty()
                                 {
-                                    operator_next = Some(0);
+                                    let after = gateway
+                                        .workspace_digest()
+                                        .map_err(|error| RuntimeError::Io(error.to_string()))?;
+                                    source_progress = before_write.as_ref() != Some(&after)
+                                        && repair.new_workspace(after);
+                                    if source_progress {
+                                        operator_queue =
+                                            operator_actions(&operator_plan, gateway, &repair);
+                                    } else {
+                                        repair.tool_error("filesystem.write", "no new source candidate; operator verification was not repeated");
+                                    }
                                 }
                                 last_successful_request = Some(req.clone());
                                 if req.tool == "filesystem.write" {
                                     last_successful_write = Some(req.clone());
+                                    if repair.plan.is_some() {
+                                        repair.last_plan_applied = true;
+                                    }
+                                    repair.consume_plan();
                                 }
                                 if let Some(current) = subtask {
                                     match req.tool.as_str() {
@@ -705,7 +1021,15 @@ pub fn run_loop(
                                             subtask = Some(CodingSubtask::Implement);
                                         }
                                         "filesystem.write" => {
-                                            subtask = Some(CodingSubtask::Verify);
+                                            subtask = Some(
+                                                if !operator_plan.is_empty()
+                                                    && operator_queue.is_empty()
+                                                {
+                                                    CodingSubtask::Repair
+                                                } else {
+                                                    CodingSubtask::Verify
+                                                },
+                                            );
                                         }
                                         _ => {}
                                     }
@@ -723,7 +1047,7 @@ pub fn run_loop(
                                         inspection_notes.remove(0);
                                     }
                                 }
-                                if let Some(record) = res.verification {
+                                if let Some(record) = res.verification.filter(|_| full_stage) {
                                     let verified = matches!(
                                         record.status,
                                         aivm_tools::verification::VerificationStatus::Verified
@@ -746,8 +1070,8 @@ pub fn run_loop(
                                     }
                                 }
                             } else {
-                                operator_next = None;
-                                if res.verification.is_some() {
+                                operator_queue.clear();
+                                if full_stage && res.verification.is_some() {
                                     verification = res.verification;
                                 }
                                 last_successful_request = None;
@@ -758,10 +1082,15 @@ pub fn run_loop(
                             outcome
                         }
                         Err(e) => {
+                            if req.tool == "filesystem.write" {
+                                repair.consume_plan();
+                            }
+                            repair
+                                .tool_error(&format!("{} {}", req.tool, req.path), &e.to_string());
                             if req.tool == "process.exec" {
                                 latest_diagnostic = Some(clip(&e.to_string(), 1000));
                             }
-                            operator_next = None;
+                            operator_queue.clear();
                             last_successful_request = None;
                             if req.tool == "process.exec" && subtask.is_some() {
                                 subtask = Some(CodingSubtask::Repair);
@@ -770,7 +1099,7 @@ pub fn run_loop(
                         }
                     }
                 };
-                if repeated || disallowed_for_phase {
+                if repeated || disallowed_for_phase || invalid_plan {
                     let key = format!("{}:{}", req.tool, req.path);
                     if last_guarded_action.as_deref() == Some(key.as_str()) {
                         guarded_action_streak += 1;
@@ -782,7 +1111,7 @@ pub fn run_loop(
                     last_guarded_action = None;
                     guarded_action_streak = 0;
                 }
-                if repeated || disallowed_for_phase || phase_at_start != subtask {
+                if repeated || disallowed_for_phase || invalid_plan || phase_at_start != subtask {
                     observations.clear();
                 }
                 observations.push(outcome.clone());
@@ -799,6 +1128,7 @@ pub fn run_loop(
                 }
             }
             Err(reason) => {
+                repair.tool_error("invalid-intent", &reason);
                 // fail-closed: ไม่รันอะไร และต้องมี audit (I-7)
                 gateway
                     .audit_intent_deny(cube, &reason, &clip(&raw, MAX_RAW_CHARS))
@@ -816,6 +1146,12 @@ pub fn run_loop(
                     outcome,
                 });
             }
+        }
+        let no_progress = origin == "model" && repair.model_step(source_progress, repair_policy);
+        audit_repair(gateway, cube, &task_contract, &repair)?;
+        if no_progress || repair.halt_reason.is_some() {
+            stopped = "stalled".into();
+            break;
         }
     }
 
@@ -841,6 +1177,8 @@ pub fn run_loop(
             verification.as_ref(),
         )
         .map_err(|error| RuntimeError::Io(error.to_string()))?;
+    repair.resolve_verified(&outcome);
+    audit_repair(gateway, cube, &task_contract, &repair)?;
     Ok(AgentRun {
         verification_status: outcome.legacy_status(),
         task_contract,
@@ -852,6 +1190,7 @@ pub fn run_loop(
         stopped,
         error: run_error,
         verification,
+        repair_state: repair,
     })
 }
 

@@ -22,6 +22,43 @@ RUNNER_SPEC.loader.exec_module(RUNNER)
 
 
 class SourceIdentityTests(unittest.TestCase):
+    def test_interpretation_selection_uses_validated_failed_unchanged_sources(self):
+        corpus = evidence.load(evidence.PROJECT / "examples/repair-benchmark.json")["cases"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = {"source_identity":{},"model_config_sha256":"a"*64,
+                "cases":[{"task_success":i > 1} for i, _ in enumerate(corpus)]}
+            path = root / "report.json"
+            path.write_text(json.dumps(baseline))
+            for i, case in enumerate(corpus):
+                directory = root / case["id"]; directory.mkdir()
+                (directory / "source.c").write_text(case["reference"] if i == 1 else case["buggy"].rstrip("\n"))
+            with mock.patch.object(evidence, "validate_benchmark") as validate:
+                _, selected = RUNNER.interpretation_cases(path)
+                self.assertEqual(selected, [corpus[0]["id"]])
+                validate.assert_called_once_with(path, {}, "a"*64)
+            with mock.patch.object(evidence, "validate_benchmark", side_effect=ValueError("changed audit")):
+                with self.assertRaisesRegex(ValueError, "changed audit"):
+                    RUNNER.interpretation_cases(path)
+
+    def test_interpretation_transcript_must_match_input_schema_and_repair_task(self):
+        case = {"description":"Return zero for zero.","buggy":"int signum(int x){return x>=0?1:-1;}"}
+        parsed = {"expected_behavior":"Zero returns zero.","suspected_bug":"Zero returns one.","planned_change":"Handle zero."}
+        trace = {"system":"Describe the task briefly.","prompt":json.dumps({"bug_report":case["description"],"source":case["buggy"]}),
+            "raw":json.dumps(parsed),"parsed":parsed,"error":None,"advisory_only":True}
+        suffix = "\nYour preliminary task interpretation (untrusted model proposal; verify it against the source and test results): "
+        task = "Fix the source." + suffix + json.dumps(parsed)
+        evidence.validate_interpretation(trace, case, task)
+        changes = [("raw", '{"done":true}'), ("prompt", '{}'), ("advisory_only", False),
+            ("parsed", {**parsed,"expected_behavior":""}), ("error", "model failure"),
+            ("raw", json.dumps(parsed)[:-1]+',"planned_change":"Handle zero."}')]
+        for field, value in changes:
+            with self.assertRaises((ValueError, TypeError), msg=field):
+                evidence.validate_interpretation({**trace,field:value},case,task)
+        with self.assertRaisesRegex(ValueError, "not supplied"):
+            evidence.validate_interpretation(trace, case, "Fix the source.")
+        evidence.validate_interpretation({**trace,"raw":None,"parsed":None,"error":"invalid output"},case,"Fix the source.")
+
     def test_benchmark_timeout_stops_its_child_process_group(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); pid_file = root / "child.pid"
@@ -154,6 +191,16 @@ class RepairEvidenceTests(unittest.TestCase):
         self.path.write_text(json.dumps(self.report))
         with self.assertRaisesRegex(ValueError,"release profile"):
             evidence.validate_benchmark(self.path,self.source,None)
+
+    def test_interpretation_experiments_are_rejected_by_normal_release_validation(self):
+        self.report.update(schema=3,mode="interpretation_experiment",build_profile="release")
+        self.path.write_text(json.dumps(self.report))
+        for allow_control in (False, True):
+            with self.assertRaisesRegex(ValueError,"identity, mode"):
+                evidence.validate_benchmark(self.path,self.source,None,allow_control=allow_control)
+        for ids in ([], ["missing"], ["add", "add"]):
+            with self.assertRaisesRegex(ValueError,"selection"):
+                evidence.validate_benchmark(self.path,self.source,None,experiment_case_ids=ids)
 
     def test_canonical_outcome_task_revision_and_receipt_tampering_is_rejected(self):
         for field, value in [("task_id","another-task"),("task_revision",99),("solution_origin","model_repair"),

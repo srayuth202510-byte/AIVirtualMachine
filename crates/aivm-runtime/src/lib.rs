@@ -20,6 +20,7 @@ use thiserror::Error;
 
 pub mod agent;
 pub mod demo;
+pub mod repair;
 pub mod semantic;
 mod transaction;
 
@@ -64,6 +65,8 @@ pub struct VmConfig {
     /// สัญญาตรวจผลที่ operator เลือก; ไม่เพิ่มสิทธิ์ execute
     #[serde(default)]
     pub verification: Option<aivm_tools::verification::VerifierConfig>,
+    #[serde(default)]
+    pub repair: repair::RepairPolicy,
     #[serde(default)]
     pub filesystem: FilesystemBlock,
     #[serde(default)]
@@ -368,6 +371,7 @@ impl Runtime {
     /// init แบบ fail-closed: config/policy เสียได้ Err VM ปฏิเสธสตาร์ต
     pub fn init(config: VmConfig, base_dir: PathBuf) -> Result<Self, RuntimeError> {
         validate_model_security(&config)?;
+        config.repair.validate().map_err(RuntimeError::Config)?;
         let workspace = base_dir.join("workspace");
         std::fs::create_dir_all(&workspace).map_err(|e| RuntimeError::Io(e.to_string()))?;
         // ทำ workspace ให้เป็น absolute เพื่อให้ scope ของ capability
@@ -834,13 +838,14 @@ impl Runtime {
         // RAG อ่านจาก gateway workspace ที่ runtime เป็นเจ้าของเท่านั้น
         // loop สร้างและตรวจ snapshot ผ่าน gateway ก่อน inference แต่ละรอบ
         let rag_index = workspace.map(|_| aivm_cube::rag::RagIndex::default());
-        let result = agent::run_loop(
+        let result = agent::run_loop_with_policy(
             &*self.model,
             &mut self.gateway,
             &mut self.cube,
             task,
             max_steps,
             rag_index.as_ref(),
+            &self.config.repair,
         );
         match &result {
             Ok(_) => self.audit_op("inference", &model_name, "completed", "agent")?,

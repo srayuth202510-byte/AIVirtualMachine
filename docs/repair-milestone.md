@@ -70,6 +70,10 @@ mode `reference_control` ใช้ `operator_patch`; release gate รับเ�
 ไม่มี semantic solver/reference fallback ใน model repair benchmark
 นี่ไม่ใช่ benchmark แก้ production repositories หรือการรับรอง general coding success rate
 
+มี [โหมดทดลองสรุปความเข้าใจโจทย์ก่อนแก้](repair-interpretation-experiment.md)
+สำหรับงานที่เคยส่ง source เดิมกลับมา เก็บคำอธิบายสามช่องก่อน agent ลงมือ
+ผลเป็น subset/schema แยก และใช้แทน full-corpus release evidence ไม่ได้
+
 ```sh
 # ไม่ใช้โมเดล; output directory ต้องเป็น directory ใหม่
 python3 scripts/run-repair-benchmark.py --mode reference_control \

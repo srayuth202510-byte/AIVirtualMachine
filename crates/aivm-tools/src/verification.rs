@@ -19,6 +19,17 @@ pub struct VerifierConfig {
     /// คำสั่ง build จาก operator; runtime ส่งผ่าน gateway หลังโมเดลแก้ source
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prepare: Vec<VerifierStep>,
+    /// โปรแกรมของ operator รับ JSON ของ counterexample เป็น argv ตัวสุดท้าย
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counterexample: Option<CounterexampleCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CounterexampleCheck {
+    pub executable: String,
+    #[serde(default)]
+    pub argv: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +43,27 @@ pub struct VerifierStep {
 
 impl VerifierConfig {
     pub fn validate(&self) -> Result<(), ToolError> {
+        if let Some(check) = &self.counterexample {
+            if self.prepare.is_empty() {
+                return Err(denied(
+                    "counterexample checks require an operator-managed build",
+                ));
+            }
+            let name = check
+                .executable
+                .strip_prefix("build:")
+                .ok_or_else(|| denied("counterexample check requires a declared build artifact"))?;
+            build::validate_name(name)?;
+            if check.argv.len() > 254
+                || check
+                    .argv
+                    .iter()
+                    .any(|arg| arg.len() > 4096 || arg.contains('\0'))
+                || (check.executable == self.executable && check.argv.len() + 1 == self.argv.len())
+            {
+                return Err(denied("invalid or ambiguous counterexample invocation"));
+            }
+        }
         if self.prepare.len() > 16 {
             return Err(denied("too many verifier preparation steps"));
         }
@@ -303,6 +335,7 @@ mod tests {
                 executable_sha256: None,
                 stdout_contains: Some("2 tests passed".into()),
                 prepare: Vec::new(),
+                counterexample: None,
             }
         }
         fn prepare(&self) -> PreparedVerification {
@@ -320,6 +353,9 @@ mod tests {
         let fixture = Fixture::new();
         let mut config = fixture.config();
         assert!(!serde_json::to_string(&config).unwrap().contains("prepare"));
+        assert!(!serde_json::to_string(&config)
+            .unwrap()
+            .contains("counterexample"));
         assert!(config.execution_plan().unwrap().is_empty());
         config.prepare = vec![VerifierStep {
             executable: "/usr/bin/cc".into(),
@@ -336,6 +372,30 @@ mod tests {
         invalid = config.clone();
         invalid.prepare = vec![config.prepare[0].clone(); 17];
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn counterexample_checks_require_declared_builds_and_cannot_mint_full_receipts() {
+        let fixture = Fixture::new();
+        let mut config = fixture.config();
+        config.counterexample = Some(CounterexampleCheck {
+            executable: "build:tests".into(),
+            argv: vec!["--case".into()],
+        });
+        assert!(config.validate().is_err());
+        config.prepare = vec![VerifierStep {
+            executable: "/usr/bin/cc".into(),
+            argv: vec![],
+            outputs: vec!["tests".into()],
+        }];
+        assert!(config.validate().is_ok());
+        for path in ["/bin/true", "build:../tests"] {
+            let mut invalid = config.clone();
+            invalid.counterexample.as_mut().unwrap().executable = path.into();
+            assert!(invalid.validate().is_err());
+        }
+        config.argv = vec!["one".into(), "two".into()];
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -157,6 +157,7 @@ crates/
 - [`docs/model-validation-runner.md`](./docs/model-validation-runner.md) — เตรียม KVM runner และเปิด recurring real-model CI
 
 - [`docs/verification-and-transactions.md`](./docs/verification-and-transactions.md) — operator verifier contracts, completion receipts และ crash recovery ของ state/audit
+- [`docs/repair-controller.md`](./docs/repair-controller.md) — รักษา unresolved counterexamples, แยก tool errors, ผูกคำอธิบายกับ patch และหยุดเมื่อไม่คืบหน้า
 
 - [`docs/workspace-recovery.md`](./docs/workspace-recovery.md) — snapshot workspace, integrity verification และ operator restore ลง VM ใหม่
 - [`docs/offsite-backup.md`](./docs/offsite-backup.md) — ชุดตั้งค่า S3 Object Lock, แยกสิทธิ์ upload/restore และขั้นตอนทดลองกู้จากนอกเครื่อง (ยังไม่ผ่าน AWS host validation)

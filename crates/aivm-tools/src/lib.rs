@@ -1891,6 +1891,47 @@ impl ToolGateway {
     ) -> Result<(), ToolError> {
         self.audit_decision(cube, "agent", resource, "deny", "agent-guard", reason)
     }
+
+    /// ใช้โดย controller เท่านั้น ไม่เปิดเป็น tool และไม่สร้างสิทธิ์อ่านเนื้อหาไฟล์ให้โมเดล
+    pub fn workspace_digest(&self) -> Result<String, ToolError> {
+        verification::workspace_digest(&self.workspace).map(|hash| format!("sha256:{hash}"))
+    }
+
+    /// เก็บ ledger ที่ผูกกับ task จริงใน audit; payload ไม่ใช่ verification authority
+    pub fn audit_repair_state(
+        &mut self,
+        cube: &mut Cube,
+        task: &contracts::TaskContract,
+        state: &str,
+    ) -> Result<(), ToolError> {
+        let known_task = self.active_task.as_ref() == Some(task)
+            || self
+                .last_outcome
+                .as_ref()
+                .is_some_and(|(issued, _)| issued == task);
+        if !known_task || state.len() > 65536 {
+            return Err(ToolError::Denied(
+                "repair state requires the active task and bounded data".into(),
+            ));
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(state).map_err(|error| ToolError::Denied(error.to_string()))?;
+        if value.get("task_id").and_then(|value| value.as_str()) != Some(task.task_id.as_str())
+            || value.get("schema").and_then(|value| value.as_u64()) != Some(1)
+        {
+            return Err(ToolError::Denied(
+                "repair ledger task/schema mismatch".into(),
+            ));
+        }
+        self.audit_decision(
+            cube,
+            "repair-state",
+            &task.task_id,
+            "allow",
+            "host-repair-state",
+            state,
+        )
+    }
 }
 
 /// normalize แบบ lexical (ไม่แตะ I/O): ตัด `.` กับ `..` ออก
@@ -2470,6 +2511,37 @@ network: {{allow: [], deny: ['10.0.0.0/8']}}
         (gw, cube, dir)
     }
 
+    #[test]
+    fn repair_audit_requires_issued_task_identity_and_never_creates_verification() {
+        let (mut gateway, mut cube, dir) = harness();
+        let task = gateway.begin_task(&mut cube, "repair audit").unwrap();
+        assert!(gateway
+            .audit_repair_state(&mut cube, &task, r#"{"schema":1,"task_id":"another-task"}"#)
+            .is_err());
+        let mut forged = task.clone();
+        forged.revision += 1;
+        let body =
+            serde_json::json!({"schema":1,"task_id":task.task_id,"verification_failures":[]})
+                .to_string();
+        assert!(gateway
+            .audit_repair_state(&mut cube, &forged, &body)
+            .is_err());
+        gateway.audit_repair_state(&mut cube, &task, &body).unwrap();
+        let outcome = gateway
+            .finalize_task(
+                &mut cube,
+                &task,
+                contracts::Execution::Completed,
+                contracts::SolutionOrigin::Model,
+                None,
+            )
+            .unwrap();
+        assert!(!outcome.is_verified());
+        assert!(outcome.receipt_ids.is_empty());
+        aivm_audit::clear_flags(&dir);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     // harness สำหรับ secrets: broker + นโยบาย allow แคบ + secret ค่าปลอม
     // (+ execute cap สำหรับ /usr/bin/printenv ไว้พิสูจน์ injection —
     // `env` ตรง ๆ โดน interpreter denylist ถูกต้องแล้ว)
@@ -2549,6 +2621,7 @@ network: {{allow: [], deny: ['10.0.0.0/8']}}
                 executable_sha256: Some(verification::digest(&std::fs::read(&executable).unwrap())),
                 stdout_contains: None,
                 prepare: vec![],
+                counterexample: None,
             });
             let mut task = gateway.begin_task(&mut cube, "repair bug").unwrap();
             let mut receipt = gateway
@@ -2611,6 +2684,7 @@ network: {{allow: [], deny: ['10.0.0.0/8']}}
             executable_sha256: Some(verification::digest(&std::fs::read(&exe).unwrap())),
             stdout_contains: None,
             prepare: Vec::new(),
+            counterexample: None,
         });
         let result = gateway.exec(&mut cube, &exe, &args).unwrap();
         let record = result.verification.unwrap();

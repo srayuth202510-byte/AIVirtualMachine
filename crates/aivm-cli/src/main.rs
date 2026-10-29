@@ -374,6 +374,9 @@ fn main() -> Result<(), AnyErr> {
                 Some(s) => println!("summary: {s}"),
                 None => println!("(stopped: {})", run.stopped),
             }
+            if let Some(reason) = &run.repair_state.halt_reason {
+                println!("repair stopped: {reason}");
+            }
         }
         Cmd::SemanticSource { task } => {
             print!(

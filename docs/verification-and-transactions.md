@@ -4,6 +4,10 @@
 verification, solution origin และ tested/current workspace digest ฟิลด์สถานะเดิมเป็น mirrors
 ดู [Repair milestone และ release gate](repair-milestone.md)
 
+ดู [Repair controller](repair-controller.md) สำหรับ unresolved counterexamples ที่คงข้าม retry,
+การแยก tool errors, host-applied source hunks, counterexample-first checks และ no-progress guards
+Supervisor เก็บรายงานแต่ละ task แบบ private แม้งานหยุดโดยยังไม่ผ่าน
+
 `inspect`, `state` และ `capabilities` ถือ exclusive VM lease ก่อนเปิด runtime
 เพราะการเปิดอาจกู้ transaction และเขียน state/audit หากมี operation ทำงานอยู่
 คำสั่งจะคืน `VM already has an active operation` ให้เรียกใหม่หลัง operation จบ

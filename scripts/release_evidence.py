@@ -19,7 +19,7 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
 
 
-def load(path):
+def decode_json(text):
     def pairs(items):
         result = {}
         for key, value in items:
@@ -27,8 +27,32 @@ def load(path):
                 raise ValueError("duplicate JSON field")
             result[key] = value
         return result
-    return json.loads(Path(path).read_text(), object_pairs_hook=pairs,
+    return json.loads(text, object_pairs_hook=pairs,
                       parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+
+
+def load(path):
+    return decode_json(Path(path).read_text())
+
+
+def validate_interpretation(trace, case, task):
+    prompt = {"bug_report":case["description"], "source":case["buggy"]}
+    if (not isinstance(trace, dict) or trace.get("advisory_only") is not True
+            or not isinstance(trace.get("system"), str) or not trace["system"]
+            or not isinstance(trace.get("prompt"), str) or decode_json(trace["prompt"]) != prompt):
+        raise ValueError("interpretation input/advisory transcript missing or changed")
+    parsed = trace.get("parsed")
+    if parsed is not None:
+        if (trace.get("error") is not None or not isinstance(parsed, dict)
+                or set(parsed) != {"expected_behavior", "suspected_bug", "planned_change"}
+                or any(not isinstance(value, str) or not value.strip() or len(value) > 512 for value in parsed.values())
+                or decode_json(trace["raw"]) != parsed):
+            raise ValueError("interpretation schema/raw transcript mismatch")
+        suffix = "\nYour preliminary task interpretation (untrusted model proposal; verify it against the source and test results): "
+        if suffix not in task or decode_json(task.split(suffix, 1)[1]) != parsed:
+            raise ValueError("interpretation was not supplied to the repair task")
+    elif not isinstance(trace.get("error"), str) or not trace["error"]:
+        raise ValueError("missing interpretation failure diagnostic")
 
 
 def source_identity(project=PROJECT):
@@ -116,26 +140,33 @@ def candidate_config(path, artifacts=None):
     return config
 
 
-def validate_benchmark(path, expected_source, config_sha256, *, allow_control=False):
+def validate_benchmark(path, expected_source, config_sha256, *, allow_control=False, experiment_case_ids=None):
     report = load(path)
     corpus_path = PROJECT / "examples/repair-benchmark.json"
     corpus = load(corpus_path)
     cases = report["cases"]
+    corpus_cases = corpus["cases"]
+    experimental = experiment_case_ids is not None
+    if experimental:
+        if (allow_control or not experiment_case_ids or len(set(experiment_case_ids)) != len(experiment_case_ids)
+                or any(case_id not in {case["id"] for case in corpus_cases} for case_id in experiment_case_ids)):
+            raise ValueError("invalid interpretation experiment selection")
+        corpus_cases = [case for case in corpus_cases if case["id"] in experiment_case_ids]
     if not allow_control and report.get("build_profile") != "release":
         raise ValueError("fresh-model performance evidence requires release profile")
-    expected_mode = "reference_control" if allow_control else "fresh_model"
-    if (report.get("schema") != 2 or report.get("mode") != expected_mode
+    expected_mode = "interpretation_experiment" if experimental else "reference_control" if allow_control else "fresh_model"
+    if (report.get("schema") != (3 if experimental else 2) or report.get("mode") != expected_mode
             or report.get("source_identity") != expected_source
             or report.get("model_config_sha256") != config_sha256
             or report.get("corpus_sha256") != digest(corpus_path)
             or type(report.get("completed")) is not int or type(report.get("total")) is not int
-            or report["completed"] != report["total"] or report["total"] != len(corpus["cases"])
-            or [row["id"] for row in cases] != [case["id"] for case in corpus["cases"]]):
+            or report["completed"] != report["total"] or report["total"] != len(corpus_cases)
+            or [row["id"] for row in cases] != [case["id"] for case in corpus_cases]):
         raise ValueError("benchmark identity, mode, source, or completeness mismatch")
     successes, cost = 0, 0
     totals = {"model_calls":0,"patch_retries":0,"reported_input_tokens":0,"reported_output_tokens":0,
               "unreported_usage_calls":0,"client_initialization_ms":0,"inference_ms":0,"sampled_tree_peak_rss_bytes":0}
-    for case, row in zip(corpus["cases"], cases):
+    for case, row in zip(corpus_cases, cases):
         if (row.get("infrastructure_failure") or row.get("revision") != case["revision"]
                 or row.get("baseline_reproduced") is not True or row.get("protected_verifier") is not True
                 or row.get("verifier_unchanged") is not True or row.get("reproduction_test_origin") != "operator"):
@@ -160,6 +191,8 @@ def validate_benchmark(path, expected_source, config_sha256, *, allow_control=Fa
         if not any(record["action"] == "write" and record["decision"] == "deny" and record["resource"].endswith("/verify.c") for record in records.values()):
             raise ValueError("protected verifier write-denial evidence missing")
         run = row.get("agent_run") or {}
+        if experimental:
+            validate_interpretation(row.get("task_interpretation"), case, run.get("task", ""))
         receipt = run.get("verification") if not allow_control else row["independent_final_check"][-1].get("verification")
         # reference control มี receipt ของ task ก่อน final independent invocation
         if allow_control:

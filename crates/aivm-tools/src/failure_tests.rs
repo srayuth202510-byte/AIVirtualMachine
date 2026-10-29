@@ -71,6 +71,7 @@ fn crash_child() {
                 executable_sha256: Some(verification::digest(&std::fs::read(&executable).unwrap())),
                 stdout_contains: None,
                 prepare: vec![],
+                counterexample: None,
             };
             let prepared =
                 verification::PreparedVerification::new(config, &gateway.workspace, &executable)

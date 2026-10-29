@@ -13,6 +13,8 @@ const BROKEN: &str = "int add(int a, int b) { return a - b; }\nint main(void) { 
 const FIXED: &str = "int add(int a, int b) { return a + b; }\nint main(void) { return add(2, 3) == 5 && add(-1, 1) == 0 ? 0 : 1; }\n";
 #[path = "support/repair_benchmark.rs"]
 mod repair_benchmark;
+#[path = "support/repair_controller.rs"]
+mod repair_controller;
 struct Script(Mutex<VecDeque<String>>);
 impl Model for Script {
     fn reason(&self, _: &str) -> Result<String, ModelError> {
@@ -310,8 +312,10 @@ fn operator_verifier_builds_after_edit_and_repairs_a_failed_test_without_model_b
     let mut fixture = Fixture::new(true);
     fixture.modify();
     fixture.prepare_verifier(&fixture.build_steps()[..2]);
+    // candidate ต้องต่างจาก source เริ่มต้นจริง จึงควรเรียก verifier แล้วเข้าสู่ repair
+    let wrong_patch = BROKEN.replace("a - b", "a + b + 1");
     let run = fixture.execute(vec![
-        json!({"tool":"filesystem.write","path":"src/main.c","content":BROKEN}).to_string(),
+        json!({"tool":"filesystem.write","path":"src/main.c","content":wrong_patch}).to_string(),
         json!({"tool":"filesystem.write","path":"src/main.c","content":FIXED}).to_string(),
     ]);
     assert_eq!(run.steps.len(), 8);
