@@ -16,10 +16,11 @@ runner ใช้ operator-only ignored test ใน coding_workflow เพื่�
 ผ่าน gateway, sandbox, build slots และ audit เดิม ไม่มี model tool หรือ capability ใหม่
 ไม่ได้เรียก debugger, shell หรือ Python จากโมเดลเพื่อรัน target
 
-ขอบเขตแรกคือหนึ่ง standalone function ที่คืน int, มี named int parameters ไม่เกินแปดตัว
-และ initialized int locals รองรับ if/for/while/do, arithmetic, assignments และ ++/--
+ขอบเขตแรกคือหนึ่ง standalone function ที่คืน int หรือ unsigned int, มี named int/unsigned parameters ไม่เกินแปดตัว
+และ initialized int/unsigned locals รองรับ if/for/while/do, arithmetic, bitwise (&, |, ^, <<, >>, ~),
+assignments, ++/-- และ explicit casts (CStyleCastExpr)
 ยังไม่รองรับ headers/macros, globals, function calls/recursion, pointers, arrays,
-storage qualifiers และชนิดตัวเลขอื่น สิ่งที่ไม่รองรับจะปฏิเสธก่อน native execution
+storage qualifiers และชนิด float/double สิ่งที่ไม่รองรับจะปฏิเสธก่อน native execution
 ใช้กับ C ที่มี defined integer behavior; ไม่ได้พิสูจน์ absence of undefined behavior
 
 สำเนา instrumented ต้องคืนค่าเท่ากับ source เดิมใน input ที่เลือกจึงออก `trace.json`

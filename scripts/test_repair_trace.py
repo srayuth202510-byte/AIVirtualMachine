@@ -42,6 +42,17 @@ class InstrumentationTests(unittest.TestCase):
             "choose", {"n": 3})
         self.check_c(traced)
 
+    def test_unsigned_parameters_and_c_style_casts_compile(self):
+        source = "int popcount(unsigned x){int n=0;while(x){n+=(int)(x&1u);x>>=1;}return n;}"
+        bundle, original, traced = trace.prepare(source.encode(), "popcount", {"x": 7})
+        self.assertEqual(bundle["function"], "popcount")
+        self.check_c(original)
+        self.check_c(traced)
+        with self.assertRaises(ValueError):
+            trace.prepare(source.encode(), "popcount", {"x": -1})
+        with self.assertRaises(ValueError):
+            trace.prepare(source.encode(), "popcount", {"x": 2 ** 32})
+
     def test_input_keys_types_and_ranges_are_checked(self):
         for inputs in ({"b": -3}, {"b": True, "e": 1}, {"b": 2 ** 31, "e": 1}, {"b": "system()", "e": 1}):
             with self.subTest(inputs=inputs), self.assertRaises(ValueError):

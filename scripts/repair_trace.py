@@ -13,8 +13,9 @@ ALLOWED = {
     "IfStmt", "ForStmt", "WhileStmt", "DoStmt", "ReturnStmt", "NullStmt",
     "BreakStmt", "ContinueStmt", "BinaryOperator", "CompoundAssignOperator",
     "UnaryOperator", "IntegerLiteral", "ImplicitCastExpr", "ParenExpr",
-    "DeclRefExpr", "ConditionalOperator",
+    "DeclRefExpr", "ConditionalOperator", "CStyleCastExpr",
 }
+SUPPORTED_INTEGER_TYPES = {"int", "unsigned int", "unsigned", "_Bool"}
 
 
 def digest(data):
@@ -43,7 +44,9 @@ def target_name(node):
     return identifier(node["referencedDecl"]["name"])
 
 
-def c_integer(value):
+def c_integer(value, ptype="int"):
+    if ptype in ("unsigned int", "unsigned"):
+        return f"{value}u"
     return "(-2147483647 - 1)" if value == -(2 ** 31) else str(value)
 
 
@@ -58,8 +61,8 @@ def prepare(source, function, inputs, max_events=32, compiler=None, argument_ord
         raise ValueError("preprocessor directives, escapes and reserved trace names are unsupported")
     if type(max_events) is not int or not 4 <= max_events <= 64:
         raise ValueError("max_events must be 4..64")
-    if not isinstance(inputs, dict) or any(type(v) is not int or not -(2 ** 31) <= v < 2 ** 31 for v in inputs.values()):
-        raise ValueError("inputs must map parameter names to signed 32-bit integers")
+    if not isinstance(inputs, dict) or any(type(v) is not int or not -(2 ** 31) <= v < 2 ** 32 for v in inputs.values()):
+        raise ValueError("inputs must map parameter names to 32-bit integers")
     compiler = compiler or shutil.which("clang")
     if compiler is None:
         raise ValueError("clang is required to prepare source locations")
@@ -80,9 +83,15 @@ def prepare(source, function, inputs, max_events=32, compiler=None, argument_ord
         function = identifier(target.get("name"))
     if target.get("name") != function or function == "main":
         raise ValueError("source must contain exactly the selected non-main function")
-    if not target["type"]["qualType"].startswith("int (") or target.get("variadic"):
-        raise ValueError("only functions returning int are supported")
-    parameters = [identifier(n.get("name")) for n in target.get("inner", []) if n["kind"] == "ParmVarDecl"]
+    ret_type = target["type"]["qualType"].split("(")[0].strip()
+    if ret_type not in ("int", "unsigned int", "unsigned") or target.get("variadic"):
+        raise ValueError("only functions returning int or unsigned int are supported")
+    param_nodes = [n for n in target.get("inner", []) if n["kind"] == "ParmVarDecl"]
+    parameters = [identifier(n.get("name")) for n in param_nodes]
+    param_types = {n.get("name"): n.get("type", {}).get("qualType", "int") for n in param_nodes}
+    for name, ptype in param_types.items():
+        if ptype not in SUPPORTED_INTEGER_TYPES:
+            raise ValueError(f"parameter {name} has unsupported type {ptype}")
     logical_input = dict(inputs)
     if argument_order:
         if len(argument_order) != len(parameters) or len(set(argument_order)) != len(argument_order) or set(argument_order) != set(inputs):
@@ -90,6 +99,15 @@ def prepare(source, function, inputs, max_events=32, compiler=None, argument_ord
         inputs = dict(zip(parameters, (inputs[key] for key in argument_order)))
     if len(parameters) > 8 or set(inputs) != set(parameters):
         raise ValueError("input keys must match the function's named int parameters (at most eight)")
+    for name in parameters:
+        val = inputs[name]
+        ptype = param_types[name]
+        if ptype in ("unsigned int", "unsigned"):
+            if not 0 <= val < (2 ** 32):
+                raise ValueError(f"parameter {name} requires an unsigned 32-bit integer")
+        else:
+            if not -(2 ** 31) <= val < (2 ** 31):
+                raise ValueError(f"parameter {name} requires a signed 32-bit integer")
     if not any(n["kind"] == "CompoundStmt" for n in target.get("inner", [])):
         raise ValueError("function body is missing")
     sites, wrappers, replacements = [], [], {}
@@ -116,8 +134,8 @@ def prepare(source, function, inputs, max_events=32, compiler=None, argument_ord
             return
         if kind not in ALLOWED:
             raise ValueError(f"unsupported C construct: {kind}")
-        if kind != "FunctionDecl" and node.get("type", {}).get("qualType", "int") != "int":
-            raise ValueError("only plain int expressions and variables are supported")
+        if kind != "FunctionDecl" and node.get("type", {}).get("qualType", "int") not in SUPPORTED_INTEGER_TYPES:
+            raise ValueError("only plain int and unsigned integer expressions and variables are supported")
         if kind in ("FunctionDecl", "ParmVarDecl", "VarDecl"):
             identifier(node.get("name"))
             if node.get("storageClass") or node.get("tls"):
@@ -169,25 +187,45 @@ def prepare(source, function, inputs, max_events=32, compiler=None, argument_ord
         else:
             rewritten.append(source[position:position + 1])
             position += 1
-    arguments = ",".join(c_integer(inputs[name]) for name in parameters)
-    main = f'\nint main(void){{int value={function}({arguments});printf("AIVM_RESULT %d\\n",value);return 0;}}\n'
+    arguments = ",".join(c_integer(inputs[name], param_types[name]) for name in parameters)
+    main = f'\nint main(void){{int value=(int){function}({arguments});printf("AIVM_RESULT %d\\n",value);return 0;}}\n'
     original = b"#include <stdio.h>\n" + source + main.encode()
     # helper รับ expression value เพียงครั้งเดียว; postfix update คืนค่าเดิมตาม C semantics
     helper = f'''#include <stdio.h>
 #include <stdlib.h>
 static unsigned aivm_trace_count;
-static int aivm_trace_value(int site,int value){{
+static int aivm_trace_value_i(int site, int value){{
     if(aivm_trace_count++ >= {max_events}){{puts("AIVM_TRACE_TRUNCATED");fflush(stdout);_Exit(75);}}
     printf("AIVM_TRACE {{\\"site\\":%d,\\"value\\":%d}}\\n",site,value);
     return value;
 }}
-static int aivm_trace_update(int site,int *value,int delta,int postfix){{
+static unsigned aivm_trace_value_u(int site, unsigned value){{
+    if(aivm_trace_count++ >= {max_events}){{puts("AIVM_TRACE_TRUNCATED");fflush(stdout);_Exit(75);}}
+    printf("AIVM_TRACE {{\\"site\\":%d,\\"value\\":%u}}\\n",site,value);
+    return value;
+}}
+#define aivm_trace_value(site, val) \\
+    _Generic((val), \\
+        unsigned int: aivm_trace_value_u, \\
+        default: aivm_trace_value_i \\
+    )((site), (val))
+static int aivm_trace_update_i(int site, int *value, int delta, int postfix){{
     int previous=*value; *value+=delta;
     aivm_trace_value(site,*value);
     return postfix ? previous : *value;
 }}
+static unsigned aivm_trace_update_u(int site, unsigned *value, int delta, int postfix){{
+    unsigned previous=*value; *value+=delta;
+    aivm_trace_value(site,(int)*value);
+    return postfix ? previous : *value;
+}}
+#define aivm_trace_update(site, ptr, delta, postfix) \\
+    _Generic((ptr), \\
+        int*: aivm_trace_update_i, \\
+        unsigned int*: aivm_trace_update_u \\
+    )((site), (ptr), (delta), (postfix))
 '''
-    entry = "".join(f"aivm_trace_value({number},{c_integer(inputs[name])});" for number, name in zip(parameter_sites, parameters))
+    entry = "".join(f"aivm_trace_value({number},{c_integer(inputs[name], param_types[name])});" for number, name in zip(parameter_sites, parameters))
     traced_main = main.replace("{int value=", "{" + entry + "int value=", 1)
     traced = helper.encode() + b"".join(rewritten) + traced_main.encode()
     manifest = {"schema": 1, "kind": "native_integer_function_trace", "function": function,
