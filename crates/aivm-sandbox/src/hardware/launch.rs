@@ -706,7 +706,7 @@ fn launch_and_run_inner(
             break;
         }
         if let Some(st) = child.try_wait().map_err(|e| spawn_err("wait", e))? {
-            let tail = read_tail(&serial_log, 2000);
+            let tail = exit_diagnostic(&serial_log, &err_log);
             return Err((
                 SandboxError::Spawn(format!(
                     "hardware VM exited before completion ({st}): {tail}"
@@ -849,6 +849,15 @@ fn read_tail(path: &Path, n: usize) -> String {
     let text = read_capped(path, MAX_SERIAL_BYTES);
     let start = text.len().saturating_sub(n);
     text[start..].replace('\n', " | ")
+}
+
+/// อ่านหลักฐานท้าย serial.log; ถ้าว่างให้ fallback ไปอ่าน stderr.log ของ QEMU (เช่น kernel format ผิดก่อนเข้า guest)
+fn exit_diagnostic(serial_log: &Path, err_log: &Path) -> String {
+    let serial = read_tail(serial_log, 2000);
+    if !serial.trim().is_empty() {
+        return serial;
+    }
+    read_tail(err_log, 500)
 }
 
 /// ข้อความระหว่าง marker คู่สุดท้ายที่เจอ (payload อาจมีบรรทัดอื่นปนได้
@@ -1092,5 +1101,24 @@ mod tests {
         assert_eq!(sh_escape("a'b"), "'a'\\''b'");
         assert_eq!(sh_escape("$(id)"), "'$(id)'");
         assert_eq!(sh_escape("a;reboot"), "'a;reboot'");
+    }
+
+    #[test]
+    fn exit_diagnostic_falls_back_to_qemu_stderr_when_serial_is_empty() {
+        // เมื่อ QEMU ล้มก่อนเข้า guest (serial.log ว่าง) ต้องดึงข้อความจาก stderr.log มาแสดง
+        let dir = std::env::temp_dir().join(format!("aivm-hw-diag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let serial = dir.join("serial.log");
+        let stderr = dir.join("stderr.log");
+        std::fs::write(&serial, b"").unwrap();
+        std::fs::write(
+            &stderr,
+            b"qemu-system-x86_64: Error loading uncompressed kernel\n",
+        )
+        .unwrap();
+        assert!(exit_diagnostic(&serial, &stderr).contains("Error loading uncompressed kernel"));
+        std::fs::write(&serial, b"guest serial panic\n").unwrap();
+        assert!(exit_diagnostic(&serial, &stderr).contains("guest serial panic"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

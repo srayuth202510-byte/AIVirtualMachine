@@ -61,6 +61,7 @@ fi
 # exit 0 ที่เลือก 0 test หรือ skip ไม่ใช่หลักฐานว่า boundary ผ่าน
 python3 - "$SCRIPT_DIR/validate-model-host.py" "$LOG" <<'PY'
 import pathlib,runpy,sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]).resolve().parent))
 validator=runpy.run_path(sys.argv[1])
 if not validator['exact_test_passed'](pathlib.Path(sys.argv[2]).read_text()):
     raise SystemExit('container boundary test did not execute exactly once without skips')
