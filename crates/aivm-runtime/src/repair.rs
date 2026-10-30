@@ -120,6 +120,8 @@ pub struct RepairState {
     pub last_plan_applied: bool,
     pub resolved_by: Option<String>,
     pub trace_history: Vec<crate::trace::TraceObservation>,
+    /// จำนวนครั้งที่โมเดลส่งฟังก์ชันเดิมกลับมาโดยไม่แก้ (ใช้ตัดสินใจ scrap-and-rewrite)
+    pub unchanged_plan_responses: usize,
     #[serde(skip)]
     seen_workspaces: BTreeSet<String>,
     #[serde(skip)]
@@ -155,6 +157,7 @@ impl RepairState {
             last_plan_applied: false,
             resolved_by: None,
             trace_history: Vec::new(),
+            unchanged_plan_responses: 0,
             seen_workspaces: task.base_workspace_digest.clone().into_iter().collect(),
             failed_workspaces: BTreeSet::new(),
             passed_cases: BTreeSet::new(),

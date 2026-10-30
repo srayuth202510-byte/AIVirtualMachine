@@ -251,6 +251,7 @@ fn real_isolated_worker_failure_recovery() {
         stream: true,
         max_output_tokens: 4,
         timeout_ms: limits.timeout_ms,
+        temperature: None,
     };
     let mut evidence = Vec::new();
     for case in ["timeout", "memory"] {

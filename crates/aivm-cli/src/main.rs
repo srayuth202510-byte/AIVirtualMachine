@@ -677,6 +677,7 @@ fn main() -> Result<(), AnyErr> {
                         stream: false,
                         max_output_tokens: local.max_tokens,
                         timeout_ms: 120_000,
+                        temperature: None,
                     };
                     let limits = model_config.worker_limits.clone().unwrap_or_default();
                     let client = aivm_model::worker::WorkerClient::from_config(&model_config)

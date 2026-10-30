@@ -241,6 +241,13 @@ pub struct TraceObservation {
     pub observation: Option<NativeTrace>,
 }
 
+/// คำตอบ repair.plan ที่คืนฟังก์ชันเดิม (เทียบแบบไม่สนช่องว่าง) ถูกปฏิเสธด้วยข้อความนี้
+pub const UNCHANGED_FUNCTION: &str = "function is unchanged; return a corrected implementation";
+/// เมื่อโมเดลส่งโค้ดเดิมซ้ำครบจำนวนนี้ ตัดโค้ดเดิมออกจาก prompt แล้วให้เขียนใหม่จาก signature
+pub const SCRAP_AFTER_UNCHANGED: usize = 2;
+/// อุณหภูมิสำหรับ stage 2/3 ให้โมเดลหลุดจากคำตอบ greedy เดิมเล็กน้อย
+pub const RETRY_TEMPERATURE: f32 = 0.2;
+
 pub struct FunctionRepair {
     source: String,
     path: String,
@@ -286,6 +293,16 @@ impl FunctionRepair {
         }
     }
 
+    // Adaptive temperature: stage 0/1 ใช้ค่าจาก config (deterministic), stage 2/3 ใช้ RETRY_TEMPERATURE
+    pub fn temperature(&self, state: &crate::repair::RepairState) -> Option<f32> {
+        (self.retry_stage(state) >= 2).then_some(RETRY_TEMPERATURE)
+    }
+
+    // Scrap-and-rewrite: โมเดลวนส่งโค้ดเดิมซ้ำ จึงไม่แสดงโค้ดเดิมอีกและให้เขียนใหม่จาก signature
+    fn scrap(state: &crate::repair::RepairState) -> bool {
+        state.unchanged_plan_responses >= SCRAP_AFTER_UNCHANGED
+    }
+
     // เลือก counterexample ที่ตรงกับ input ของ trace ปัจจุบันก่อน เพื่อให้ค่าที่อ้างใน prompt มาจากการรันเดียวกัน
     fn current_case<'a>(
         &self,
@@ -304,6 +321,12 @@ impl FunctionRepair {
     }
 
     pub fn system(&self, state: &crate::repair::RepairState) -> String {
+        if Self::scrap(state) {
+            return format!(
+                "You write C functions from scratch. Read the task and the required tests. Write a new implementation of `{}` from an empty body; do not reuse any earlier implementation. Return only the C function (no #include, no main).",
+                self.signature()
+            );
+        }
         match self.retry_stage(state) {
             0 => format!(
                 "You repair C functions. Read the task, current code, and failing tests. Return only the complete corrected {} function as C source code.",
@@ -326,6 +349,9 @@ impl FunctionRepair {
             .next()
             .unwrap_or(task);
         let stage = self.retry_stage(state);
+        if Self::scrap(state) {
+            return self.rewrite_prompt(task, state);
+        }
         if stage == 0 {
             let mut prompt = format!(
                 "Task:\n{task}\n\nCurrent code:\n{}\n",
@@ -469,6 +495,37 @@ impl FunctionRepair {
         }
         prompt
     }
+    // prompt แบบ scrap-and-rewrite: ไม่ใส่ source/trace ของโค้ดเดิม เหลือเพียง task, signature ว่าง และ test ที่ต้องผ่าน
+    fn rewrite_prompt(&self, task: &str, state: &crate::repair::RepairState) -> String {
+        let sig = self.signature();
+        let mut prompt = format!(
+            "Task:\n{task}\n\nThe previous {} responses returned the original implementation unchanged, so it has been removed.\nWrite the function from scratch starting from this empty signature:\n{sig} {{\n}}\n",
+            state.unchanged_plan_responses
+        );
+        for failure in state
+            .verification_failures
+            .iter()
+            .filter(|f| f.status == crate::repair::FailureStatus::Unresolved)
+        {
+            match &failure.counterexample {
+                Some(case) => prompt.push_str(&format!(
+                    "\nRequired test:\nInput: {}\nRequired result: {}\n",
+                    case.input, case.expected
+                )),
+                // ไม่มี counterexample ให้ใช้ diagnostic แทนเพื่อไม่ให้โมเดลไม่มีข้อมูลเลย
+                None if !failure.diagnostic.is_empty() => prompt.push_str(&format!(
+                    "\nUnresolved diagnostic:\n{}\n",
+                    failure.diagnostic
+                )),
+                None => {}
+            }
+        }
+        prompt.push_str(&format!(
+            "\nYour response:\nReturn only the complete new `{sig}` function implemented from scratch (no #include, no main).\n"
+        ));
+        prompt
+    }
+
     pub fn plan(&self, raw: &str, state: &crate::repair::RepairState) -> Result<String, String> {
         let mut code = raw.trim();
         if code.starts_with("```") {
@@ -483,10 +540,11 @@ impl FunctionRepair {
         }
         code = strip_leading_includes(code);
         let original = &self.source[self.trace.function_start..self.trace.function_end];
-        if code.len() > 2048 || compact_c(code) == compact_c(original) {
-            return Err(
-                "function is too large or unchanged; return a corrected implementation".into(),
-            );
+        if code.len() > 2048 {
+            return Err("function is too large; return a corrected implementation".into());
+        }
+        if compact_c(code) == compact_c(original) {
+            return Err(UNCHANGED_FUNCTION.into());
         }
         let open = code.find('{').ok_or("missing function body")?;
         let signature = compact_c(&code[..open]);
@@ -1486,9 +1544,9 @@ mod tests {
         state.trace_history.push(extra);
         assert_eq!(function.retry_stage(&state), 1);
         assert!(function.prompt("t", &state).contains("Diagnosis:"));
-        state.tool_error("repair.plan", "function is too large or unchanged");
+        state.tool_error("repair.plan", UNCHANGED_FUNCTION);
         assert_eq!(function.retry_stage(&state), 1);
-        state.tool_error("repair.plan", "function is too large or unchanged");
+        state.tool_error("repair.plan", UNCHANGED_FUNCTION);
         assert_eq!(function.retry_stage(&state), 3);
 
         let looping = vec![
@@ -1501,9 +1559,51 @@ mod tests {
         ];
         let (function, mut state) = staged_repair(looping);
         for _ in 0..3 {
-            state.tool_error("repair.plan", "function is too large or unchanged");
+            state.tool_error("repair.plan", UNCHANGED_FUNCTION);
         }
         let prompt = function.prompt("t", &state);
         assert!(prompt.contains("a loop condition was true 1 time, `a` changed from 0 to 1"));
+    }
+
+    #[test]
+    fn retry_stages_two_and_three_lower_temperature() {
+        let returns = vec![event("parameter", "n", 0), event("return", "return", 7)];
+        let (function, mut state) = staged_repair(returns);
+        assert_eq!(function.temperature(&state), None);
+        state.tool_error("repair.plan", "expected the same function signature");
+        assert_eq!(function.temperature(&state), None);
+        state.tool_error("repair.plan", "expected the same function signature");
+        assert_eq!(function.retry_stage(&state), 2);
+        assert_eq!(function.temperature(&state), Some(RETRY_TEMPERATURE));
+        state.tool_error("repair.plan", "expected the same function signature");
+        assert_eq!(function.retry_stage(&state), 3);
+        assert_eq!(function.temperature(&state), Some(0.2));
+    }
+
+    #[test]
+    fn repeated_unchanged_code_scraps_original_from_prompt() {
+        let returns = vec![event("parameter", "n", 0), event("return", "return", 7)];
+        let (function, mut state) = staged_repair(returns);
+        assert_eq!(
+            function
+                .plan("int f(int n){ return n; }", &state)
+                .unwrap_err(),
+            UNCHANGED_FUNCTION
+        );
+        state.tool_error("repair.plan", UNCHANGED_FUNCTION);
+        state.unchanged_plan_responses += 1;
+        // ส่งซ้ำครั้งเดียวยังแสดงโค้ดเดิม
+        assert!(function.prompt("t", &state).contains("return n;"));
+
+        state.tool_error("repair.plan", UNCHANGED_FUNCTION);
+        state.unchanged_plan_responses += 1;
+        let prompt = function.prompt("t", &state);
+        let system = function.system(&state);
+        assert!(!prompt.contains("return n;"));
+        assert!(!prompt.contains("Observed execution"));
+        assert!(prompt.contains("int f(int n) {\n}"));
+        assert!(prompt.contains("Input: {\"n\":0}\nRequired result: 3"));
+        assert!(prompt.contains("from scratch"));
+        assert!(system.contains("from scratch") && system.contains("`int f(int n)`"));
     }
 }

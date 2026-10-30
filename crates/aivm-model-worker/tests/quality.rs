@@ -176,6 +176,7 @@ fn real_model_quality_and_latency() {
             stream: false,
             max_output_tokens: local.max_tokens,
             timeout_ms: limits.timeout_ms,
+            temperature: None,
         };
         let request_prompt = request.prompt.clone();
         let started = Instant::now();

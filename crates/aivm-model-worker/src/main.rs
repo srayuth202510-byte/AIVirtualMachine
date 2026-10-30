@@ -101,16 +101,17 @@ fn run() -> Result<(), WorkerError> {
         }
         let started = Instant::now();
         let generation = if request.stream {
-            model.reason_stream_with_mode(&request.prompt, request.max_output_tokens, request.output_mode, &mut |delta| {
+            model.reason_stream_with_mode_temperature(&request.prompt, request.max_output_tokens, request.output_mode, request.temperature, &mut |delta| {
                 let event = serde_json::json!({"protocol_version": request.protocol_version, "request_id": request_id, "delta": delta});
                 serde_json::to_writer(&mut stdout, &event).map_err(|e| aivm_model::ModelError::InferenceFailed(e.to_string()))?;
                 stdout.write_all(b"\n").and_then(|_| stdout.flush()).map_err(|e| aivm_model::ModelError::InferenceFailed(e.to_string()))
             })
         } else {
-            model.reason_with_mode(
+            model.reason_with_mode_temperature(
                 &request.prompt,
                 request.max_output_tokens,
                 request.output_mode,
+                request.temperature,
             )
         };
         let output = match generation {

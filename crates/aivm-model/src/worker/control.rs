@@ -261,6 +261,7 @@ mod tests {
             stream: true,
             max_output_tokens: 16,
             timeout_ms: 2000,
+            temperature: None,
         };
         let mut streamed = String::new();
         let mut callbacks = 0;

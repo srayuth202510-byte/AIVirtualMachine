@@ -132,6 +132,9 @@ pub struct InferenceRequest {
     pub stream: bool,
     pub max_output_tokens: usize,
     pub timeout_ms: u64,
+    /// อุณหภูมิแซมเพิลต่อ request (None = ใช้ค่าจาก config ที่ pin ไว้)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
 }
 
 impl InferenceRequest {
@@ -175,6 +178,14 @@ impl InferenceRequest {
         }
         if self.timeout_ms == 0 || self.timeout_ms > limits.timeout_ms {
             return Err(WorkerError::LimitExceeded("timeout".into()));
+        }
+        if self
+            .temperature
+            .is_some_and(|t| !t.is_finite() || !(0.0..=2.0).contains(&t))
+        {
+            return Err(WorkerError::InvalidRequest(
+                "temperature must be within 0.0..=2.0".into(),
+            ));
         }
         Ok(())
     }
@@ -1329,6 +1340,7 @@ mod tests {
             stream: false,
             max_output_tokens: 16,
             timeout_ms: 1_000,
+            temperature: None,
         }
     }
 
@@ -1341,6 +1353,20 @@ mod tests {
             ..InferenceLimits::default()
         };
         assert!(request().validate(&limits, 4).is_ok());
+    }
+
+    #[test]
+    fn request_temperature_override_is_bounded_and_optional_on_wire() {
+        let limits = InferenceLimits::default();
+        let mut req = request();
+        // None ไม่ปรากฏใน JSON เพื่อให้ request เดิมเหมือนเดิมทุกไบต์
+        assert!(!serde_json::to_string(&req).unwrap().contains("temperature"));
+        req.temperature = Some(0.2);
+        assert!(req.validate(&limits, 4).is_ok());
+        for bad in [-0.1, 2.5, f32::NAN] {
+            req.temperature = Some(bad);
+            assert!(req.validate(&limits, 4).is_err());
+        }
     }
 
     #[test]

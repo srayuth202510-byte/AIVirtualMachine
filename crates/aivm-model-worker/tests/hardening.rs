@@ -59,6 +59,7 @@ fn request() -> InferenceRequest {
         stream: true,
         max_output_tokens: 16,
         timeout_ms: 2000,
+        temperature: None,
     }
 }
 const RESPONSE: &str = r#"{"protocol_version":1,"request_id":"req-1","output":"ok","usage":{"input_tokens":1,"output_tokens":1,"elapsed_ms":0},"termination":"completed","artifact_verified":false,"applied_limits":[],"audit_id":null}"#;

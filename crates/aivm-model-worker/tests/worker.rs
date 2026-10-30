@@ -18,6 +18,7 @@ fn request() -> InferenceRequest {
         stream: false,
         max_output_tokens: 16,
         timeout_ms: 2000,
+        temperature: None,
     }
 }
 fn worker() -> WorkerClient {

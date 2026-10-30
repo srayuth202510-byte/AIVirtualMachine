@@ -190,6 +190,11 @@ fn default_top_k() -> i32 {
 fn default_max_tokens() -> usize {
     2048
 }
+/// ขอบเขตการแซมเพิลเมื่อ request ขอ temperature > 0 (ค่ามาตรฐานของ llama.cpp)
+#[cfg(feature = "llama")]
+const OVERRIDE_TOP_K: i32 = 40;
+#[cfg(feature = "llama")]
+const OVERRIDE_TOP_P: f32 = 0.95;
 fn default_true() -> bool {
     true
 }
@@ -318,6 +323,36 @@ pub trait Model: Send + Sync {
         mode.validate(&output)?;
         Ok(output)
     }
+    /// เหมือน reason_with_system_mode แต่ขอ override อุณหภูมิต่อ request
+    /// backend ที่ไม่รองรับใช้ค่าเดิมจาก config (temperature เป็นคำแนะนำ ไม่ใช่ policy)
+    fn reason_with_system_mode_temperature(
+        &self,
+        system: &str,
+        context: &str,
+        mode: OutputMode,
+        _temperature: Option<f32>,
+    ) -> Result<String, ModelError> {
+        self.reason_with_system_mode(system, context, mode)
+    }
+    fn reason_with_mode_temperature(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+        mode: OutputMode,
+        _temperature: Option<f32>,
+    ) -> Result<String, ModelError> {
+        self.reason_with_mode(context, max_output_tokens, mode)
+    }
+    fn reason_stream_with_mode_temperature(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+        mode: OutputMode,
+        _temperature: Option<f32>,
+        on_delta: &mut dyn FnMut(&str) -> Result<(), ModelError>,
+    ) -> Result<String, ModelError> {
+        self.reason_stream_with_mode(context, max_output_tokens, mode, on_delta)
+    }
     fn token_count(&self, text: &str) -> usize;
     /// Telemetry ของ request ล่าสุด ไม่ใช้เป็นหลักฐาน verification; None เมื่อ backend ไม่รายงาน
     fn last_usage(&self) -> Option<worker::InferenceUsage> {
@@ -376,6 +411,16 @@ impl Model for WorkerModel {
         max_output_tokens: usize,
         mode: OutputMode,
     ) -> Result<String, ModelError> {
+        self.reason_with_mode_temperature(context, max_output_tokens, mode, None)
+    }
+
+    fn reason_with_mode_temperature(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+        mode: OutputMode,
+        temperature: Option<f32>,
+    ) -> Result<String, ModelError> {
         *self.last_usage.lock().unwrap() = None;
         let request = worker::InferenceRequest {
             protocol_version: mode.protocol_version(),
@@ -386,6 +431,7 @@ impl Model for WorkerModel {
             stream: false,
             max_output_tokens: max_output_tokens.min(self.limits.max_output_tokens),
             timeout_ms: self.limits.timeout_ms,
+            temperature,
         };
         let response = self
             .client
@@ -413,6 +459,17 @@ impl Model for WorkerModel {
         mode: OutputMode,
         on_delta: &mut dyn FnMut(&str) -> Result<(), ModelError>,
     ) -> Result<String, ModelError> {
+        self.reason_stream_with_mode_temperature(context, max_output_tokens, mode, None, on_delta)
+    }
+
+    fn reason_stream_with_mode_temperature(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+        mode: OutputMode,
+        temperature: Option<f32>,
+        on_delta: &mut dyn FnMut(&str) -> Result<(), ModelError>,
+    ) -> Result<String, ModelError> {
         *self.last_usage.lock().unwrap() = None;
         let request = worker::InferenceRequest {
             protocol_version: mode.protocol_version(),
@@ -423,6 +480,7 @@ impl Model for WorkerModel {
             stream: true,
             max_output_tokens: max_output_tokens.min(self.limits.max_output_tokens),
             timeout_ms: self.limits.timeout_ms,
+            temperature,
         };
         let response = self
             .client
@@ -446,6 +504,21 @@ impl Model for WorkerModel {
             &format!("{system}\n\n{context}"),
             self.limits.max_output_tokens,
             mode,
+        )
+    }
+
+    fn reason_with_system_mode_temperature(
+        &self,
+        system: &str,
+        context: &str,
+        mode: OutputMode,
+        temperature: Option<f32>,
+    ) -> Result<String, ModelError> {
+        self.reason_with_mode_temperature(
+            &format!("{system}\n\n{context}"),
+            self.limits.max_output_tokens,
+            mode,
+            temperature,
         )
     }
 
@@ -568,7 +641,7 @@ impl LocalLlamaModel {
         messages: &[(&str, &str)],
         max_output_tokens: usize,
     ) -> Result<String, ModelError> {
-        self.reason_with_messages_mode(messages, max_output_tokens, OutputMode::Text)
+        self.reason_with_messages_mode(messages, max_output_tokens, OutputMode::Text, None)
     }
 
     fn reason_with_messages_mode(
@@ -576,6 +649,7 @@ impl LocalLlamaModel {
         messages: &[(&str, &str)],
         max_output_tokens: usize,
         mode: OutputMode,
+        temperature: Option<f32>,
     ) -> Result<String, ModelError> {
         let prompt = if let Some(template) = &self.chat_template {
             let messages = messages
@@ -602,6 +676,7 @@ impl LocalLlamaModel {
             &prompt,
             max_output_tokens.min(self.config.max_tokens),
             mode,
+            temperature,
             &mut |_| Ok(()),
         )
     }
@@ -611,6 +686,7 @@ impl LocalLlamaModel {
         prompt: &str,
         max_output_tokens: usize,
         mode: OutputMode,
+        temperature: Option<f32>,
         on_delta: &mut dyn FnMut(&str) -> Result<(), ModelError>,
     ) -> Result<String, ModelError> {
         let n_ctx = self.config.ctx_size as u32;
@@ -652,10 +728,25 @@ impl LocalLlamaModel {
                 })?,
             );
         }
+        // override อุณหภูมิต่อ request ต้องผ่อน top_k/top_p ด้วย ไม่งั้น top_k=1 (ค่า pin ปกติ)
+        // จะเลือก token เดียวเสมอและ temperature ไม่มีผล; seed เดิมยังทำให้ผลทำซ้ำได้
+        let (temp, top_k, top_p) = match temperature {
+            Some(t) if t > 0.0 => (
+                t,
+                self.config.top_k.max(OVERRIDE_TOP_K),
+                self.config.top_p.max(OVERRIDE_TOP_P),
+            ),
+            Some(t) => (t, self.config.top_k, self.config.top_p),
+            None => (
+                self.config.temperature,
+                self.config.top_k,
+                self.config.top_p,
+            ),
+        };
         samplers.extend([
-            LlamaSampler::temp(self.config.temperature),
-            LlamaSampler::top_k(self.config.top_k),
-            LlamaSampler::top_p(self.config.top_p, 1),
+            LlamaSampler::temp(temp),
+            LlamaSampler::top_k(top_k),
+            LlamaSampler::top_p(top_p, 1),
             LlamaSampler::dist(self.config.seed),
         ]);
         let mut sampler = LlamaSampler::chain_simple(samplers);
@@ -734,6 +825,30 @@ impl Model for LocalLlamaModel {
         max_output_tokens: usize,
         on_delta: &mut dyn FnMut(&str) -> Result<(), ModelError>,
     ) -> Result<String, ModelError> {
+        self.reason_stream_with_mode_temperature(
+            context,
+            max_output_tokens,
+            OutputMode::Text,
+            None,
+            on_delta,
+        )
+    }
+
+    fn reason_stream_with_mode_temperature(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+        mode: OutputMode,
+        temperature: Option<f32>,
+        on_delta: &mut dyn FnMut(&str) -> Result<(), ModelError>,
+    ) -> Result<String, ModelError> {
+        if !mode.is_text() {
+            // structured stream ไม่ส่งผลบางส่วนก่อน schema ผ่าน
+            let output =
+                self.reason_with_mode_temperature(context, max_output_tokens, mode, temperature)?;
+            on_delta(&output)?;
+            return Ok(output);
+        }
         let prompt = if let Some(template) = &self.chat_template {
             let message = llama_cpp_2::model::LlamaChatMessage::new("user".into(), context.into())
                 .map_err(|e| ModelError::Tokenizer(e.to_string()))?;
@@ -747,6 +862,7 @@ impl Model for LocalLlamaModel {
             &prompt,
             max_output_tokens.min(self.config.max_tokens),
             OutputMode::Text,
+            temperature,
             on_delta,
         )
     }
@@ -761,7 +877,17 @@ impl Model for LocalLlamaModel {
         max_output_tokens: usize,
         mode: OutputMode,
     ) -> Result<String, ModelError> {
-        self.reason_with_messages_mode(&[("user", context)], max_output_tokens, mode)
+        self.reason_with_messages_mode(&[("user", context)], max_output_tokens, mode, None)
+    }
+
+    fn reason_with_mode_temperature(
+        &self,
+        context: &str,
+        max_output_tokens: usize,
+        mode: OutputMode,
+        temperature: Option<f32>,
+    ) -> Result<String, ModelError> {
+        self.reason_with_messages_mode(&[("user", context)], max_output_tokens, mode, temperature)
     }
 
     fn reason_with_system_mode(
@@ -770,10 +896,21 @@ impl Model for LocalLlamaModel {
         context: &str,
         mode: OutputMode,
     ) -> Result<String, ModelError> {
+        self.reason_with_system_mode_temperature(system, context, mode, None)
+    }
+
+    fn reason_with_system_mode_temperature(
+        &self,
+        system: &str,
+        context: &str,
+        mode: OutputMode,
+        temperature: Option<f32>,
+    ) -> Result<String, ModelError> {
         self.reason_with_messages_mode(
             &[("system", system), ("user", context)],
             self.config.max_tokens,
             mode,
+            temperature,
         )
     }
 

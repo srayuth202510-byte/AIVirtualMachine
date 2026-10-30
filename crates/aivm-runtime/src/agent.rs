@@ -809,10 +809,11 @@ pub fn run_loop_with_trace_collector(
         let generated = if let Some(request) = operator_request {
             Ok(serde_json::to_string(&request).expect("operator request serializes"))
         } else if let Some(function) = &function_repair {
-            model.reason_with_system_mode(
+            model.reason_with_system_mode_temperature(
                 &function.system(&repair),
                 &function.prompt(task, &repair),
                 aivm_model::OutputMode::Text,
+                function.temperature(&repair),
             )
         } else if planning {
             model.reason_with_system_mode(
@@ -874,6 +875,9 @@ pub fn run_loop_with_trace_collector(
                         .audit_agent_guard_deny(cube, "repair.plan", &reason)
                         .map_err(|error| RuntimeError::Io(error.to_string()))?;
                     repair.tool_error("repair.plan", &reason);
+                    if reason == crate::trace::UNCHANGED_FUNCTION {
+                        repair.unchanged_plan_responses += 1;
+                    }
                     repair.consume_plan();
                     let outcome = format!("DENY repair.plan :: {reason}");
                     observations.clear();
