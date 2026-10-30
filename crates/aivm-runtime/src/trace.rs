@@ -258,20 +258,49 @@ impl FunctionRepair {
             .to_string()
     }
 
-    // แบ่งระดับคำแนะนำตามจำนวนครั้งที่ซ้ำหรือเมื่อเปลี่ยน source แล้วยังไม่ผ่าน เพื่อให้โมเดลไม่วนตอบโค้ดเดิม
+    // จำนวนคำตอบ repair.plan ที่ถูกปฏิเสธ (รวมรายการที่ถูกย่อออกจาก context ซึ่งอาจนับ tool error ชนิดอื่นเกินมาบ้าง)
+    fn plan_rejections(state: &crate::repair::RepairState) -> usize {
+        state
+            .tool_errors
+            .iter()
+            .filter(|e| e.action == "repair.plan")
+            .count()
+            + state.tool_errors_omitted
+    }
+
+    // จำนวน source/input ใหม่ที่ยังล้มหลังเก็บ trace ชุดแรก (แต่ละ candidate ที่ล้มจะเก็บ trace ใหม่หนึ่งชุด)
+    fn failed_candidates(state: &crate::repair::RepairState) -> usize {
+        state.trace_history.len().saturating_sub(1)
+    }
+
+    // แบ่งระดับคำแนะนำตามจำนวนครั้งที่ลองแล้วไม่ผ่านรวมกัน เพื่อให้ prompt เปลี่ยนต่อเนื่องและไม่ค้างที่ระดับเดียว
+    // 0: prompt ตั้งต้น (และการปฏิเสธครั้งแรกบน source เดิม), 1: มี candidate ใหม่ที่ยังล้ม,
+    // 2: ถูกปฏิเสธสองครั้งบน source เดิม, 3: ลองแล้วไม่ผ่านตั้งแต่สามครั้งขึ้นไป
     fn retry_stage(&self, state: &crate::repair::RepairState) -> u8 {
-        let multi_observation = state.trace_history.len() > 1
-            || state.verification_failures.iter().any(|f| {
-                f.status == crate::repair::FailureStatus::Unresolved && f.observations > 1
-            });
-        if multi_observation {
-            return 1;
-        }
-        match state.tool_errors.len() + state.tool_errors_omitted {
-            0 | 1 => 0,
-            2 => 2,
+        let candidates = Self::failed_candidates(state);
+        match (Self::plan_rejections(state) + candidates, candidates) {
+            (0, _) | (1, 0) => 0,
+            (1..=2, c) if c > 0 => 1,
+            (2, _) => 2,
             _ => 3,
         }
+    }
+
+    // เลือก counterexample ที่ตรงกับ input ของ trace ปัจจุบันก่อน เพื่อให้ค่าที่อ้างใน prompt มาจากการรันเดียวกัน
+    fn current_case<'a>(
+        &self,
+        state: &'a crate::repair::RepairState,
+    ) -> Option<&'a crate::repair::Counterexample> {
+        let unresolved = || {
+            state
+                .verification_failures
+                .iter()
+                .filter(|f| f.status == crate::repair::FailureStatus::Unresolved)
+                .filter_map(|f| f.counterexample.as_ref())
+        };
+        unresolved()
+            .find(|case| case.input == self.trace.input)
+            .or_else(|| unresolved().next_back())
     }
 
     pub fn system(&self, state: &crate::repair::RepairState) -> String {
@@ -341,7 +370,6 @@ impl FunctionRepair {
             "Task:\n{task}\n\n{header}\n{}\n",
             display_source(&self.source)
         );
-        let mut last_case = None;
         for failure in state
             .verification_failures
             .iter()
@@ -352,7 +380,6 @@ impl FunctionRepair {
                     "\nFailing test (unresolved):\nInput: {}\nRequired result: {}\nRecorded failing result: {}\n",
                     case.input, case.expected, case.actual
                 ));
-                last_case = Some(case);
             }
             if !failure.diagnostic.is_empty() {
                 prompt.push_str(&format!(
@@ -362,87 +389,82 @@ impl FunctionRepair {
             }
         }
         prompt.push_str(&format!("\n{}\n", self.trace.context()));
-        if stage == 1 {
-            if let Some(case) = last_case {
-                prompt.push_str(&format!(
-                    "Diagnosis:\nFor input {}, the buggy `{sig}` function returned {}, but the required result is {}.\nYour response:\nWrite the corrected `{sig}` function in C so that it returns {} for {} and satisfies the task. Return only the C function (no #include, no main).\n",
-                    case.input, case.actual, case.expected, case.expected, case.input
-                ));
-            } else {
-                prompt.push_str(&format!(
-                    "Your response:\nReturn only the complete corrected `{sig}` function (no #include, no main).\n"
-                ));
-            }
-        } else if stage == 2 {
-            if let Some(case) = last_case {
-                prompt.push_str(&format!(
-                    "Previous response was rejected:\nYour previous response did not fix the bug or included extra code. Look closely at every operator (`>=`, `<=`, `<`, `>`, `+`, `-`, `i=0`, `i<n`) in `{}`: for Input {}, it returned {} instead of {}.\n\nYour response:\nReturn only the complete corrected `{sig}` function with the bug fixed (do not include #include or main).\n",
-                    self.trace.function, case.input, case.actual, case.expected
-                ));
-            } else {
-                prompt.push_str(&format!(
-                    "Your response:\nReturn only the complete corrected `{sig}` function with the bug fixed (do not include #include or main).\n"
-                ));
-            }
-        } else {
-            let params = self
-                .trace
-                .events
-                .iter()
-                .filter(|e| e.kind == "parameter")
-                .map(|e| format!("{} = {}", e.name, e.value))
-                .collect::<Vec<_>>();
-            let param_vals = self
-                .trace
-                .events
-                .iter()
-                .filter(|e| e.kind == "parameter")
-                .map(|e| e.value.to_string())
-                .collect::<Vec<_>>();
-            let loop_iters = self
-                .trace
-                .events
-                .iter()
-                .filter(|e| {
-                    e.kind == "condition"
-                        && (e.name == "ForStmt" || e.name == "WhileStmt")
-                        && e.value == 1
-                })
-                .count();
-            let mut change_detail = String::new();
-            for init in self.trace.events.iter().filter(|e| e.kind == "initialize") {
-                if let Some(updated) = self.trace.events.iter().find(|e| {
-                    (e.kind == "assign" || e.kind == "update")
-                        && e.name == init.name
-                        && e.value != init.value
-                }) {
-                    change_detail = format!(
-                        " (changing `{}` from {} to {})",
-                        init.name, init.value, updated.value
-                    );
-                    break;
+        let response = format!(
+            "Your response:\nReturn only the complete corrected `{sig}` function with the bug fixed (do not include #include or main).\n"
+        );
+        let Some(case) = self.current_case(state) else {
+            prompt.push_str(&response);
+            return prompt;
+        };
+        // ใช้ input/ค่าคืนจาก trace ของ source ปัจจุบัน ไม่อ้างข้อเท็จจริงที่ host ไม่ได้สังเกตจริง
+        let input = &self.trace.input;
+        let actual = self.trace.actual;
+        let last_reason = state
+            .tool_errors
+            .iter()
+            .rev()
+            .find(|e| e.action == "repair.plan")
+            .map(|e| e.diagnostic.as_str());
+        match stage {
+            1 => prompt.push_str(&format!(
+                "Diagnosis:\nFor input {input}, the buggy `{sig}` function returned {actual}, but the required result is {}.\nYour response:\nWrite the corrected `{sig}` function in C so that it returns {} for {input} and satisfies the task. Return only the C function (no #include, no main).\n",
+                case.expected, case.expected
+            )),
+            2 => {
+                prompt.push_str("Previous responses were rejected");
+                if let Some(reason) = last_reason {
+                    prompt.push_str(&format!(" (last reason: {reason})"));
                 }
+                prompt.push_str(&format!(
+                    ".\nLook closely at every operator (`>=`, `<=`, `<`, `>`, `+`, `-`, `i=0`, `i<n`) in `{}`: for input {input}, it returned {actual} instead of {}.\n\n{response}",
+                    self.trace.function, case.expected
+                ));
             }
-            if let Some(case) = last_case {
-                let when_clause = if params.is_empty() {
-                    format!("for {}", case.input)
-                } else {
-                    format!("when {}", params.join(", "))
-                };
-                let call_expr = if param_vals.is_empty() {
-                    self.trace.function.clone()
-                } else {
-                    format!("{}({})", self.trace.function, param_vals.join(", "))
-                };
-                let iter_word = if loop_iters == 1 { "time" } else { "times" };
+            _ => {
+                let attempts = Self::plan_rejections(state) + Self::failed_candidates(state);
                 prompt.push_str(&format!(
-                    "Previous response was rejected (attempt 2):\nYou returned the exact same unchanged function! In the trace above, the loop executed {loop_iters} {iter_word} {when_clause}{change_detail} because of the loop condition. Fix the loop condition or return statement so that `{call_expr}` returns {}.\n\nYour response:\nReturn only the complete corrected `{sig}` function with the bug fixed (do not include #include or main).\n",
-                    case.expected
+                    "Previous attempts did not pass ({attempts} attempts so far)."
                 ));
-            } else {
-                prompt.push_str(&format!(
-                    "Your response:\nReturn only the complete corrected `{sig}` function with the bug fixed (do not include #include or main).\n"
-                ));
+                if let Some(reason) = last_reason {
+                    prompt.push_str(&format!(" Last rejection reason: {reason}."));
+                }
+                let loop_iters = self
+                    .trace
+                    .events
+                    .iter()
+                    .filter(|e| {
+                        e.kind == "condition"
+                            && matches!(e.name.as_str(), "ForStmt" | "WhileStmt" | "DoStmt")
+                    })
+                    .map(|e| usize::from(e.value != 0))
+                    .collect::<Vec<_>>();
+                let mut change_detail = String::new();
+                for init in self.trace.events.iter().filter(|e| e.kind == "initialize") {
+                    if let Some(updated) = self.trace.events.iter().find(|e| {
+                        (e.kind == "assign" || e.kind == "update")
+                            && e.name == init.name
+                            && e.value != init.value
+                    }) {
+                        change_detail = format!(
+                            ", `{}` changed from {} to {}",
+                            init.name, init.value, updated.value
+                        );
+                        break;
+                    }
+                }
+                if loop_iters.is_empty() {
+                    prompt.push_str(&format!(
+                        "\nIn the trace above, for input {input}{change_detail}, the function returned {actual}. Change the logic so that it returns {} for this input.\n\n{response}",
+                        case.expected
+                    ));
+                } else {
+                    let taken: usize = loop_iters.iter().sum();
+                    let word = if taken == 1 { "time" } else { "times" };
+                    prompt.push_str(&format!(
+                        "\nIn the trace above, for input {input}, a loop condition was true {taken} {word}{change_detail}, and the function returned {actual}. Check the loop bounds and the return expression so that it returns {} for this input.\n\n{response}",
+                        case.expected
+                    ));
+                }
             }
         }
         prompt
@@ -1355,5 +1377,133 @@ mod tests {
             .validate(source, &input, &cfg, &root)
             .is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn staged_repair(events: Vec<TraceEvent>) -> (FunctionRepair, crate::repair::RepairState) {
+        let source = "int f(int n){return n;}";
+        let input = json!({"n":0});
+        let trace = NativeTrace {
+            source_sha256: format!("{:x}", Sha256::digest(source)),
+            input: input.clone(),
+            function: "f".into(),
+            function_start: 0,
+            function_end: source.len(),
+            parameters: vec!["n".into()],
+            actual: 7,
+            events,
+            artifact_dir: PathBuf::from("/nonexistent"),
+            evidence_sha256: "0".repeat(64),
+            extra_gateway_execs: 6,
+        };
+        let mut state = crate::repair::RepairState::new(&TaskContract {
+            schema: 1,
+            task_id: "test".into(),
+            revision: 1,
+            task_digest: "d".into(),
+            base_workspace_digest: None,
+            audit_id: "a".into(),
+        });
+        state
+            .verification_failures
+            .push(crate::repair::VerificationFailure {
+                id: "failure:x".into(),
+                counterexample: Some(crate::repair::Counterexample {
+                    input,
+                    expected: json!(3),
+                    actual: json!(7),
+                }),
+                diagnostic: String::new(),
+                status: crate::repair::FailureStatus::Unresolved,
+                contract_sha256: "c".into(),
+                receipt_id: "r".into(),
+                workspace_sha256: "w".into(),
+                observations: 1,
+            });
+        let observation = TraceObservation {
+            source_sha256: trace.source_sha256.clone(),
+            input_sha256: "i".into(),
+            elapsed_ms: 1,
+            artifact_dir: None,
+            diagnostic: None,
+            observation: Some(trace.clone()),
+        };
+        state.trace_history.push(observation);
+        let function = FunctionRepair {
+            source: source.into(),
+            path: "src/main.c".into(),
+            trace,
+        };
+        (function, state)
+    }
+
+    fn event(kind: &str, name: &str, value: i32) -> TraceEvent {
+        TraceEvent {
+            line: 1,
+            kind: kind.into(),
+            name: name.into(),
+            value,
+        }
+    }
+
+    #[test]
+    fn retry_prompts_escalate_and_only_state_observed_facts() {
+        let returns = vec![event("parameter", "n", 0), event("return", "return", 7)];
+        let (function, mut state) = staged_repair(returns.clone());
+        assert_eq!(function.retry_stage(&state), 0);
+        assert!(function.prompt("t", &state).contains("Current code:"));
+
+        state.tool_error("repair.plan", "expected the same function signature");
+        assert_eq!(function.retry_stage(&state), 0);
+        assert!(function
+            .prompt("t", &state)
+            .contains("Previous response was rejected:\nexpected the same function signature"));
+
+        // tool error ชนิดอื่นไม่ยกระดับ prompt ซ่อมฟังก์ชัน
+        state.tool_error("process.exec", "denied");
+        assert_eq!(function.retry_stage(&state), 0);
+
+        state.tool_error("repair.plan", "expected the same function signature");
+        assert_eq!(function.retry_stage(&state), 2);
+        let second = function.prompt("t", &state);
+        assert!(second.contains("last reason: expected the same function signature"));
+        assert!(!second.contains("did not fix the bug"));
+
+        state.tool_error("repair.plan", "expected the same function signature");
+        assert_eq!(function.retry_stage(&state), 3);
+        let third = function.prompt("t", &state);
+        // ไม่อ้างว่าคืนโค้ดเดิม ไม่ใส่เลข attempt ผิด และไม่พูดถึงลูปเมื่อ trace ไม่มีลูป
+        assert!(!third.contains("unchanged"));
+        assert!(!third.contains("attempt 2"));
+        assert!(!third.to_lowercase().contains("loop"));
+        assert!(third.contains("3 attempts so far"));
+        assert!(third.contains("for input {\"n\":0}"));
+        assert!(third.contains("returned 7"));
+        assert!(third.contains("returns 3 for this input"));
+
+        // candidate ใหม่ที่ยังล้มเข้า stage 1 แล้วยกระดับต่อเมื่อยังไม่ผ่าน ไม่ค้างที่ stage 1
+        let (function, mut state) = staged_repair(returns);
+        let extra = state.trace_history[0].clone();
+        state.trace_history.push(extra);
+        assert_eq!(function.retry_stage(&state), 1);
+        assert!(function.prompt("t", &state).contains("Diagnosis:"));
+        state.tool_error("repair.plan", "function is too large or unchanged");
+        assert_eq!(function.retry_stage(&state), 1);
+        state.tool_error("repair.plan", "function is too large or unchanged");
+        assert_eq!(function.retry_stage(&state), 3);
+
+        let looping = vec![
+            event("parameter", "n", 0),
+            event("initialize", "a", 0),
+            event("condition", "ForStmt", 1),
+            event("assign", "a", 1),
+            event("condition", "ForStmt", 0),
+            event("return", "return", 7),
+        ];
+        let (function, mut state) = staged_repair(looping);
+        for _ in 0..3 {
+            state.tool_error("repair.plan", "function is too large or unchanged");
+        }
+        let prompt = function.prompt("t", &state);
+        assert!(prompt.contains("a loop condition was true 1 time, `a` changed from 0 to 1"));
     }
 }

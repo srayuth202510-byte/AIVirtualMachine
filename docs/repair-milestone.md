@@ -119,16 +119,33 @@ RAM เป็นผลรวม RSS ของ process/descendants ที่ samp
 `qwen2.5-coder-1.5b-instruct-q4_k_m.gguf` (SHA-256: `cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046`,
 CPU inference, `threads: 2`, `temperature: 0.0`, `process_namespace` worker launcher):
 
-| รอบการวัด | Commit / โหมด | Successes | เวลารวม (s) | Cost / Success (ms) | Model Calls รวม | Native Traces |
+| รอบการวัด | Source ที่รันจริง | Successes | เวลารวม (s) | Cost / Success (ms) | Model Calls รวม | งานที่ได้ Native Trace |
 |---|---|---:|---:|---:|---:|---:|
-| 1. Baseline (ไม่มี `--trace-config`) | `f47141c` (`fresh_model`) | 10 / 24 (41.7%) | ~1,980.0 | ~198,000.0 | 127 | 0 / 24 |
-| 2. เปิด `--trace-config` (Scalar Int Trace) | `c4fb3be` (`fresh_model` + trace) | 13 / 24 (54.2%) | 2,666.7 | 205,051.2 | 125 | 13 / 24 |
-| 3. ขยาย Array/String/Void Trace + Pre-seed Baseline | `3e81a0b` (`fresh_model` + trace) | 17 / 24 (70.8%) | 582.4 | 34,199.5 | 61 | 24 / 24 |
-| 4. Staged Trace Diagnostics + Strip Single-Function `#include` | `9af3493` (`fresh_model` + trace) | **24 / 24 (100.0%)** | **400.8** | **16,293.6** | **40** (1.67/งาน) | **24 / 24** |
+| 1. Baseline (ไม่มี `--trace-config`) | `f47141c` (clean) | 10 / 24 (41.7%) | 2,673.1 | 267,212.3 | 162 | 0 / 24 |
+| 2. เปิด `--trace-config` (scalar int trace) | `c4fb3be` (clean) | 13 / 24 (54.2%) | 2,666.7 | 205,051.2 | 125 | 5 / 24 |
+| 3. ขยาย array/string/void trace + pre-seed baseline | `3e81a0b` (clean) | 17 / 24 (70.8%) | 582.4 | 34,199.5 | 61 | 24 / 24 |
+| 4. Staged trace diagnostics + ตัด `#include` นำหน้า | `3e81a0b` + working tree (ดูหมายเหตุ) | 24 / 24 | 400.8 | 16,293.6 | 40 | 24 / 24 |
 
-รายละเอียดเพิ่มเติมของรอบที่ 4 (`9af3493`):
+ตัวเลขทุกแถวมาจาก `runner.json` / `report.json` ของแต่ละรอบใน `target/`
+(`repair-release-f47141c/model-benchmark`, `repair-benchmark-trace-c4fb3be`,
+`repair-benchmark-trace-3e81a0b`, `repair-benchmark-trace-v3`)
+"งานที่ได้ Native Trace" นับงานที่มี `trace_history` พร้อม observation อย่างน้อยหนึ่งรายการ
+
+> [!WARNING]
+> ข้อจำกัดของรอบที่ 4 ต้องอ่านก่อนใช้ตัวเลขนี้:
+> - **จูนบนชุดข้อสอบเดิม:** ข้อความ prompt แบบยกระดับ (stage 1–3) ใน `FunctionRepair` ถูกปรับโดยลองซ้ำกับ
+>   7 งานที่ตกในรอบที่ 3 ด้วยโมเดลเดียวกันที่ `temperature: 0.0` ไม่มี hard-code คำตอบ แต่ยังไม่มี held-out corpus
+>   จึง **ไม่ใช่หลักฐานว่าวิธีนี้ทำงานได้ทั่วไป** ต้องวัดกับชุดงานใหม่ที่ไม่ได้ใช้ระหว่างปรับ prompt
+> - **ไม่ใช่ clean commit:** runner บันทึก `commit: 3e81a0b`, `clean: false` ไฟล์ทั้ง 231 รายการใน source manifest
+>   มี SHA-256 ตรงกับ `9af3493` (commit หลังรันเสร็จ) แต่ตามเกณฑ์ release gate ยังไม่นับเป็น release evidence
+> - **collector/worker ที่ pin เป็นของ `3e81a0b`:** ขั้นคัดลอก binary ใหม่ล้มด้วย permission error
+>   `trace_config_sha256` จึงเท่ากับรอบที่ 3 ส่วนโค้ด `FunctionRepair` ถูก compile ใหม่ใน test harness
+>   และโค้ดเก็บ trace ไม่เปลี่ยนระหว่างสอง commit
+> - **ผลจาก run เดียว** ที่ sampling แบบ deterministic ยังไม่ได้วัดความแปรปรวนข้าม seed/temperature
+
+รายละเอียดเพิ่มเติมของรอบที่ 4:
 - `reported_input_tokens`: 15,512 (เฉลี่ย 646.3 tokens/งาน), `reported_output_tokens`: 1,778 (เฉลี่ย 74.1 tokens/งาน), `unreported_usage_calls`: 0
-- `sampled_tree_peak_rss_bytes`: 2,138,939,392 bytes (~2.04 GiB)
+- `sampled_tree_peak_rss_bytes`: 2,138,939,392 bytes (~2.0 GiB)
 - ผลนี้วัดบน bounded synthetic C benchmark 24 งานภายใต้ operator verifier/trace config เท่านั้น ไม่ใช่คำรับรองอัตราความสำเร็จบนโค้ดเบสทั่วไปในโลกจริง
 
 ## Failure injection และ recovery

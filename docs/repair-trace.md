@@ -16,7 +16,9 @@ runner ใช้ operator-only ignored test ใน coding_workflow เพื่�
 ผ่าน gateway, sandbox, build slots และ audit เดิม ไม่มี model tool หรือ capability ใหม่
 ไม่ได้เรียก debugger, shell หรือ Python จากโมเดลเพื่อรัน target
 
-ขอบเขตปัจจุบันคือหนึ่ง standalone function ที่คืน `int`, `unsigned int` หรือ `void` (สำหรับฟังก์ชันที่แก้ไข array in-place แล้วเก็บผลตรวจจาก checksum ของ array), มี named parameters ไม่เกินแปดตัว (`int`, `unsigned`, `const int *`, `int *`, `const char *`, `char *`) และ initialized scalar locals รองรับ `if`/`for`/`while`/`do`, ternary (`?:`), arithmetic, bitwise (`&`, `|`, `^`, `<<`, `>>`, `~`), array subscript (`a[i]`), assignments, `++/--` และ explicit casts (`CStyleCastExpr`)
+ขอบเขตปัจจุบันคือหนึ่ง standalone function ที่คืน `int`, `unsigned int` หรือ `void`, มี named parameters ไม่เกินแปดตัว (`int`, `unsigned`, `const int *`, `int *`, `const char *`, `char *`) และ initialized scalar locals รองรับ `if`/`for`/`while`/`do`, ternary (`?:`), arithmetic, bitwise (`&`, `|`, `^`, `<<`, `>>`, `~`), array subscript (`a[i]`), assignments, `++/--` และ explicit casts (`CStyleCastExpr`)
+ฟังก์ชัน `void` ต้องมี parameter ชนิด `int *` และ input ต้องมี key `index` ที่อยู่ในขอบเขต array
+ค่าที่สังเกตคือสมาชิก `a[index]` ของ `int *` ตัวแรกหลังเรียกฟังก์ชัน (ค่าเดียว ไม่ใช่ทั้ง array)
 ยังไม่รองรับ headers/macros ใน source ที่เก็บ trace, globals, function calls/recursion, struct/union, pointer arithmetic นอกเหนือจาก subscript และชนิด `float`/`double` สิ่งที่ไม่รองรับจะปฏิเสธก่อน native execution
 ใช้กับ C ที่มี defined behavior; ไม่ได้พิสูจน์ absence of undefined behavior
 
