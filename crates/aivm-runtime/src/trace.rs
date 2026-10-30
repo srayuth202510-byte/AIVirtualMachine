@@ -248,22 +248,111 @@ pub struct FunctionRepair {
 }
 
 impl FunctionRepair {
-    pub fn system(&self) -> String {
-        format!("You repair C functions. Read the task, current code, and failing tests. Return only the complete corrected {} function as C source code.",self.trace.function)
+    fn signature(&self) -> String {
+        let original = &self.source[self.trace.function_start..self.trace.function_end];
+        original
+            .split('{')
+            .next()
+            .unwrap_or(&self.trace.function)
+            .trim()
+            .to_string()
     }
+
+    // แบ่งระดับคำแนะนำตามจำนวนครั้งที่ซ้ำหรือเมื่อเปลี่ยน source แล้วยังไม่ผ่าน เพื่อให้โมเดลไม่วนตอบโค้ดเดิม
+    fn retry_stage(&self, state: &crate::repair::RepairState) -> u8 {
+        let multi_observation = state.trace_history.len() > 1
+            || state.verification_failures.iter().any(|f| {
+                f.status == crate::repair::FailureStatus::Unresolved && f.observations > 1
+            });
+        if multi_observation {
+            return 1;
+        }
+        match state.tool_errors.len() + state.tool_errors_omitted {
+            0 | 1 => 0,
+            2 => 2,
+            _ => 3,
+        }
+    }
+
+    pub fn system(&self, state: &crate::repair::RepairState) -> String {
+        match self.retry_stage(state) {
+            0 => format!(
+                "You repair C functions. Read the task, current code, and failing tests. Return only the complete corrected {} function as C source code.",
+                self.trace.function
+            ),
+            1 => format!(
+                "You repair buggy C functions. Read the task, buggy code, failing test, and execution trace. Return only the complete corrected {} function as C source code without #include or main.",
+                self.trace.function
+            ),
+            _ => format!(
+                "You repair buggy C functions. Read the task, the buggy code, and the failing test. You MUST modify the buggy operator, condition, or loop bound so the function passes all tests. Return only the corrected `{}` function as C source code (no #include, no main).",
+                self.signature()
+            ),
+        }
+    }
+
     pub fn prompt(&self, task: &str, state: &crate::repair::RepairState) -> String {
-        let task=task.split("\nYour preliminary task interpretation (untrusted model proposal; verify it against the source and test results): ").next().unwrap_or(task);
+        let task = task
+            .split("\nYour preliminary task interpretation (untrusted model proposal; verify it against the source and test results): ")
+            .next()
+            .unwrap_or(task);
+        let stage = self.retry_stage(state);
+        if stage == 0 {
+            let mut prompt = format!(
+                "Task:\n{task}\n\nCurrent code:\n{}\n",
+                display_source(&self.source)
+            );
+            for failure in state
+                .verification_failures
+                .iter()
+                .filter(|f| f.status == crate::repair::FailureStatus::Unresolved)
+            {
+                if let Some(case) = &failure.counterexample {
+                    prompt.push_str(&format!("\nFailing test (unresolved):\nInput: {}\nRequired result: {}\nRecorded failing result: {}\n",case.input,case.expected,case.actual));
+                }
+                if !failure.diagnostic.is_empty() {
+                    prompt.push_str(&format!(
+                        "\nUnresolved diagnostic:\n{}\n",
+                        failure.diagnostic
+                    ));
+                }
+            }
+            if let Some(error) = state.tool_errors.last() {
+                prompt.push_str(&format!(
+                    "\nPrevious response was rejected:\n{}\n",
+                    error.diagnostic
+                ));
+            }
+            prompt.push_str(&format!(
+                "\n{}\nYour response:\nReturn only the complete corrected {} function.\n",
+                self.trace.context(),
+                self.trace.function
+            ));
+            return prompt;
+        }
+
+        let sig = self.signature();
+        let header = if stage == 1 {
+            "Buggy code (contains a bug that must be fixed):"
+        } else {
+            "Buggy code (fails the test below; you must change the implementation):"
+        };
         let mut prompt = format!(
-            "Task:\n{task}\n\nCurrent code:\n{}\n",
+            "Task:\n{task}\n\n{header}\n{}\n",
             display_source(&self.source)
         );
+        let mut last_case = None;
         for failure in state
             .verification_failures
             .iter()
             .filter(|f| f.status == crate::repair::FailureStatus::Unresolved)
         {
             if let Some(case) = &failure.counterexample {
-                prompt.push_str(&format!("\nFailing test (unresolved):\nInput: {}\nRequired result: {}\nRecorded failing result: {}\n",case.input,case.expected,case.actual));
+                prompt.push_str(&format!(
+                    "\nFailing test (unresolved):\nInput: {}\nRequired result: {}\nRecorded failing result: {}\n",
+                    case.input, case.expected, case.actual
+                ));
+                last_case = Some(case);
             }
             if !failure.diagnostic.is_empty() {
                 prompt.push_str(&format!(
@@ -272,17 +361,90 @@ impl FunctionRepair {
                 ));
             }
         }
-        if let Some(error) = state.tool_errors.last() {
-            prompt.push_str(&format!(
-                "\nPrevious response was rejected:\n{}\n",
-                error.diagnostic
-            ));
+        prompt.push_str(&format!("\n{}\n", self.trace.context()));
+        if stage == 1 {
+            if let Some(case) = last_case {
+                prompt.push_str(&format!(
+                    "Diagnosis:\nFor input {}, the buggy `{sig}` function returned {}, but the required result is {}.\nYour response:\nWrite the corrected `{sig}` function in C so that it returns {} for {} and satisfies the task. Return only the C function (no #include, no main).\n",
+                    case.input, case.actual, case.expected, case.expected, case.input
+                ));
+            } else {
+                prompt.push_str(&format!(
+                    "Your response:\nReturn only the complete corrected `{sig}` function (no #include, no main).\n"
+                ));
+            }
+        } else if stage == 2 {
+            if let Some(case) = last_case {
+                prompt.push_str(&format!(
+                    "Previous response was rejected:\nYour previous response did not fix the bug or included extra code. Look closely at every operator (`>=`, `<=`, `<`, `>`, `+`, `-`, `i=0`, `i<n`) in `{}`: for Input {}, it returned {} instead of {}.\n\nYour response:\nReturn only the complete corrected `{sig}` function with the bug fixed (do not include #include or main).\n",
+                    self.trace.function, case.input, case.actual, case.expected
+                ));
+            } else {
+                prompt.push_str(&format!(
+                    "Your response:\nReturn only the complete corrected `{sig}` function with the bug fixed (do not include #include or main).\n"
+                ));
+            }
+        } else {
+            let params = self
+                .trace
+                .events
+                .iter()
+                .filter(|e| e.kind == "parameter")
+                .map(|e| format!("{} = {}", e.name, e.value))
+                .collect::<Vec<_>>();
+            let param_vals = self
+                .trace
+                .events
+                .iter()
+                .filter(|e| e.kind == "parameter")
+                .map(|e| e.value.to_string())
+                .collect::<Vec<_>>();
+            let loop_iters = self
+                .trace
+                .events
+                .iter()
+                .filter(|e| {
+                    e.kind == "condition"
+                        && (e.name == "ForStmt" || e.name == "WhileStmt")
+                        && e.value == 1
+                })
+                .count();
+            let mut change_detail = String::new();
+            for init in self.trace.events.iter().filter(|e| e.kind == "initialize") {
+                if let Some(updated) = self.trace.events.iter().find(|e| {
+                    (e.kind == "assign" || e.kind == "update")
+                        && e.name == init.name
+                        && e.value != init.value
+                }) {
+                    change_detail = format!(
+                        " (changing `{}` from {} to {})",
+                        init.name, init.value, updated.value
+                    );
+                    break;
+                }
+            }
+            if let Some(case) = last_case {
+                let when_clause = if params.is_empty() {
+                    format!("for {}", case.input)
+                } else {
+                    format!("when {}", params.join(", "))
+                };
+                let call_expr = if param_vals.is_empty() {
+                    self.trace.function.clone()
+                } else {
+                    format!("{}({})", self.trace.function, param_vals.join(", "))
+                };
+                let iter_word = if loop_iters == 1 { "time" } else { "times" };
+                prompt.push_str(&format!(
+                    "Previous response was rejected (attempt 2):\nYou returned the exact same unchanged function! In the trace above, the loop executed {loop_iters} {iter_word} {when_clause}{change_detail} because of the loop condition. Fix the loop condition or return statement so that `{call_expr}` returns {}.\n\nYour response:\nReturn only the complete corrected `{sig}` function with the bug fixed (do not include #include or main).\n",
+                    case.expected
+                ));
+            } else {
+                prompt.push_str(&format!(
+                    "Your response:\nReturn only the complete corrected `{sig}` function with the bug fixed (do not include #include or main).\n"
+                ));
+            }
         }
-        prompt.push_str(&format!(
-            "\n{}\nYour response:\nReturn only the complete corrected {} function.\n",
-            self.trace.context(),
-            self.trace.function
-        ));
         prompt
     }
     pub fn plan(&self, raw: &str, state: &crate::repair::RepairState) -> Result<String, String> {
@@ -297,6 +459,7 @@ impl FunctionRepair {
                 .ok_or("unclosed C code fence")?
                 .trim();
         }
+        code = strip_leading_includes(code);
         let original = &self.source[self.trace.function_start..self.trace.function_end];
         if code.len() > 2048 || compact_c(code) == compact_c(original) {
             return Err(
@@ -376,6 +539,46 @@ impl FunctionRepair {
             .collect::<Vec<_>>();
         Ok(json!({"failure_ids":ids,"path":self.path,"change":"Replace the function with the model-proposed implementation to address unresolved test failures.","old_text":original,"new_text":code}).to_string())
     }
+}
+
+// ตัดบรรทัด #include นำหน้าเฉพาะกรณีที่โค้ดส่วนที่เหลือเป็นฟังก์ชันเดียวจบพอดี
+fn strip_leading_includes(code: &str) -> &str {
+    let mut rest = code.trim_start();
+    if !rest.starts_with("#include") {
+        return code;
+    }
+    while rest.starts_with("#include") {
+        match rest.find('\n') {
+            Some(nl) => rest = rest[nl + 1..].trim_start(),
+            None => return code,
+        }
+    }
+    if let Some(open) = rest.find('{') {
+        let mut depth = 0usize;
+        let mut closed = false;
+        for ch in rest[open..].chars() {
+            if closed && !ch.is_whitespace() {
+                return code;
+            }
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    let Some(next) = depth.checked_sub(1) else {
+                        return code;
+                    };
+                    depth = next;
+                    if depth == 0 {
+                        closed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if closed && depth == 0 {
+            return rest;
+        }
+    }
+    code
 }
 
 fn compact_c(text: &str) -> String {
@@ -1111,6 +1314,18 @@ mod tests {
         assert!(function
             .plan("int f(unsigned int n){return (int)(n+1u);}", &state)
             .is_ok());
+        assert!(function
+            .plan(
+                "```c\n#include <stdio.h>\n\nint f(int n){\n    return n + 1;\n}\n```",
+                &state
+            )
+            .is_ok());
+        assert!(function
+            .plan(
+                "#include <stdio.h>\nint f(int n){return n+1;}\nint main(void){return 0;}",
+                &state
+            )
+            .is_err());
         let wrapped = format!("/* keep license */\n{source}\n/* keep footer */\n");
         let mut preserved = FunctionRepair {
             source: wrapped.clone(),

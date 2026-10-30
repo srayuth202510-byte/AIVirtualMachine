@@ -810,7 +810,7 @@ pub fn run_loop_with_trace_collector(
             Ok(serde_json::to_string(&request).expect("operator request serializes"))
         } else if let Some(function) = &function_repair {
             model.reason_with_system_mode(
-                &function.system(),
+                &function.system(&repair),
                 &function.prompt(task, &repair),
                 aivm_model::OutputMode::Text,
             )
