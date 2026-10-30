@@ -124,28 +124,30 @@ CPU inference, `threads: 2`, `temperature: 0.0`, `process_namespace` worker laun
 | 1. Baseline (ไม่มี `--trace-config`) | `f47141c` (clean) | 10 / 24 (41.7%) | 2,673.1 | 267,212.3 | 162 | 0 / 24 |
 | 2. เปิด `--trace-config` (scalar int trace) | `c4fb3be` (clean) | 13 / 24 (54.2%) | 2,666.7 | 205,051.2 | 125 | 5 / 24 |
 | 3. ขยาย array/string/void trace + pre-seed baseline | `3e81a0b` (clean) | 17 / 24 (70.8%) | 582.4 | 34,199.5 | 61 | 24 / 24 |
-| 4. Staged trace diagnostics + ตัด `#include` นำหน้า | `3e81a0b` + working tree (ดูหมายเหตุ) | 24 / 24 | 400.8 | 16,293.6 | 40 | 24 / 24 |
+| 4. สำรวจการยกระดับ prompt ครั้งแรก (ดูข้อจำกัดด้านล่าง) | `3e81a0b` + working tree | 24 / 24 (100.0%) | 400.8 | 16,293.6 | 40 | 24 / 24 |
+| 5. Hardened staged diagnostics บน clean release | `9e99999` (clean) | **22 / 24 (91.7%)** | **484.3** | **21,966.3** | **48** | **24 / 24** |
 
 ตัวเลขทุกแถวมาจาก `runner.json` / `report.json` ของแต่ละรอบใน `target/`
 (`repair-release-f47141c/model-benchmark`, `repair-benchmark-trace-c4fb3be`,
-`repair-benchmark-trace-3e81a0b`, `repair-benchmark-trace-v3`)
+`repair-benchmark-trace-3e81a0b`, `repair-benchmark-trace-v3`,
+`repair-benchmark-trace-9e99999`)
 "งานที่ได้ Native Trace" นับงานที่มี `trace_history` พร้อม observation อย่างน้อยหนึ่งรายการ
 
-> [!WARNING]
-> ข้อจำกัดของรอบที่ 4 ต้องอ่านก่อนใช้ตัวเลขนี้:
-> - **จูนบนชุดข้อสอบเดิม:** ข้อความ prompt แบบยกระดับ (stage 1–3) ใน `FunctionRepair` ถูกปรับโดยลองซ้ำกับ
->   7 งานที่ตกในรอบที่ 3 ด้วยโมเดลเดียวกันที่ `temperature: 0.0` ไม่มี hard-code คำตอบ แต่ยังไม่มี held-out corpus
->   จึง **ไม่ใช่หลักฐานว่าวิธีนี้ทำงานได้ทั่วไป** ต้องวัดกับชุดงานใหม่ที่ไม่ได้ใช้ระหว่างปรับ prompt
-> - **ไม่ใช่ clean commit:** runner บันทึก `commit: 3e81a0b`, `clean: false` ไฟล์ทั้ง 231 รายการใน source manifest
->   มี SHA-256 ตรงกับ `9af3493` (commit หลังรันเสร็จ) แต่ตามเกณฑ์ release gate ยังไม่นับเป็น release evidence
-> - **collector/worker ที่ pin เป็นของ `3e81a0b`:** ขั้นคัดลอก binary ใหม่ล้มด้วย permission error
->   `trace_config_sha256` จึงเท่ากับรอบที่ 3 ส่วนโค้ด `FunctionRepair` ถูก compile ใหม่ใน test harness
->   และโค้ดเก็บ trace ไม่เปลี่ยนระหว่างสอง commit
-> - **ผลจาก run เดียว** ที่ sampling แบบ deterministic ยังไม่ได้วัดความแปรปรวนข้าม seed/temperature
+> [!NOTE]
+> **รอบที่ 5 (`9e99999`):** รันบน clean commit โดยสมบูรณ์ (`source_before.clean: true`),
+> ไบนารี release `aivm` และ `aivm-model-worker` คอมไพล์พร้อมฟีเจอร์ `--features llama,microvm`
+> และ pin SHA-256 ตรงทุกตัว ข้อความ prompt อ้างอิงเฉพาะข้อเท็จจริงที่บันทึกได้จริงจาก trace
+> และ counterexample ปัจจุบัน (ไม่ระบุข้อความเฉพาะเคส ไม่พูดถึงลูปเมื่อไม่มีลูปใน trace)
+> โดยผ่าน 22 จาก 24 งาน (เคสที่ไม่ผ่านคือ `fibonacci` และ `lower_bound` ที่วนซ้ำการส่งโค้ดเดิม)
+> ใช้เวลารวม 484.3 วินาที (เร็วขึ้น 5.5 เท่าจาก baseline และเฉลี่ย 2.18 model calls ต่องานสำเร็จ)
+>
+> **ข้อจำกัดของรอบสำรวจที่ 4 (`v3`):** รันบน dirty tree ก่อน commit โดยทดลอง prompt ที่เจาะจงบั๊กของเคสที่ตก
+> (เช่น ระบุตัวดำเนินการและเงื่อนไขลูปเฉพาะ) และไบนารีที่ pin เป็นของ `3e81a0b` จึงบันทึกไว้เป็นผลการสำรวจเชิงทดลอง
+> ไม่ใช่ release evidence ของโปรเจกต์
 
-รายละเอียดเพิ่มเติมของรอบที่ 4:
-- `reported_input_tokens`: 15,512 (เฉลี่ย 646.3 tokens/งาน), `reported_output_tokens`: 1,778 (เฉลี่ย 74.1 tokens/งาน), `unreported_usage_calls`: 0
-- `sampled_tree_peak_rss_bytes`: 2,138,939,392 bytes (~2.0 GiB)
+รายละเอียดเพิ่มเติมของรอบที่ 5 (`9e99999`):
+- `reported_input_tokens`: 20,764 (เฉลี่ย 943.8 tokens/งาน), `reported_output_tokens`: 2,251 (เฉลี่ย 102.3 tokens/งาน), `unreported_usage_calls`: 0
+- `sampled_tree_peak_rss_bytes`: 2,139,324,416 bytes (~2.04 GiB)
 - ผลนี้วัดบน bounded synthetic C benchmark 24 งานภายใต้ operator verifier/trace config เท่านั้น ไม่ใช่คำรับรองอัตราความสำเร็จบนโค้ดเบสทั่วไปในโลกจริง
 
 ## Failure injection และ recovery
