@@ -22,6 +22,7 @@ pub mod agent;
 pub mod demo;
 pub mod repair;
 pub mod semantic;
+pub mod trace;
 mod transaction;
 
 /// เกณฑ์ confidence สำหรับ ANALYZE -> MODIFY (ตัวอย่างในสเปก §15)

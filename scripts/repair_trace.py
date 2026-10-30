@@ -47,9 +47,10 @@ def c_integer(value):
     return "(-2147483647 - 1)" if value == -(2 ** 31) else str(value)
 
 
-def prepare(source, function, inputs, max_events=32):
+def prepare(source, function, inputs, max_events=32, compiler=None, argument_order=None):
     """ใช้ Clang AST ระบุตำแหน่ง แล้วให้ native C เป็นผู้คำนวณค่าจริง."""
-    identifier(function)
+    if function is not None:
+        identifier(function)
     if function == "main" or not isinstance(source, bytes) or not 1 <= len(source) <= MAX_SOURCE:
         raise ValueError("expected one non-main C function, at most 8192 source bytes")
     text = source.decode("utf-8")
@@ -59,7 +60,7 @@ def prepare(source, function, inputs, max_events=32):
         raise ValueError("max_events must be 4..64")
     if not isinstance(inputs, dict) or any(type(v) is not int or not -(2 ** 31) <= v < 2 ** 31 for v in inputs.values()):
         raise ValueError("inputs must map parameter names to signed 32-bit integers")
-    compiler = shutil.which("clang")
+    compiler = compiler or shutil.which("clang")
     if compiler is None:
         raise ValueError("clang is required to prepare source locations")
     compiler = str(Path(compiler).resolve())
@@ -72,12 +73,21 @@ def prepare(source, function, inputs, max_events=32):
         raise ValueError("unsupported or invalid C source: " + parsed.stderr.decode(errors="replace")[:1500])
     tree = json.loads(parsed.stdout)
     declarations = [n for n in tree.get("inner", []) if not n.get("isImplicit")]
-    if len(declarations) != 1 or declarations[0]["kind"] != "FunctionDecl" or declarations[0].get("name") != function:
+    if len(declarations) != 1 or declarations[0]["kind"] != "FunctionDecl":
         raise ValueError("source must contain exactly the selected function and no global declarations")
     target = declarations[0]
+    if function is None:
+        function = identifier(target.get("name"))
+    if target.get("name") != function or function == "main":
+        raise ValueError("source must contain exactly the selected non-main function")
     if not target["type"]["qualType"].startswith("int (") or target.get("variadic"):
         raise ValueError("only functions returning int are supported")
     parameters = [identifier(n.get("name")) for n in target.get("inner", []) if n["kind"] == "ParmVarDecl"]
+    logical_input = dict(inputs)
+    if argument_order:
+        if len(argument_order) != len(parameters) or len(set(argument_order)) != len(argument_order) or set(argument_order) != set(inputs):
+            raise ValueError("argument_order must name each input key exactly once")
+        inputs = dict(zip(parameters, (inputs[key] for key in argument_order)))
     if len(parameters) > 8 or set(inputs) != set(parameters):
         raise ValueError("input keys must match the function's named int parameters (at most eight)")
     if not any(n["kind"] == "CompoundStmt" for n in target.get("inner", [])):
@@ -181,7 +191,8 @@ static int aivm_trace_update(int site,int *value,int delta,int postfix){{
     traced_main = main.replace("{int value=", "{" + entry + "int value=", 1)
     traced = helper.encode() + b"".join(rewritten) + traced_main.encode()
     manifest = {"schema": 1, "kind": "native_integer_function_trace", "function": function,
-                "input": inputs, "parameters": parameters, "max_events": max_events,
+                "function_range": list(span(target)),
+                "input": inputs, "logical_input": logical_input, "parameters": parameters, "max_events": max_events,
                 "source_sha256": digest(source), "original_sha256": digest(original),
                 "traced_sha256": digest(traced), "sites": sites,
                 "parser": {"path": compiler, "sha256": compiler_hash, "argv": command[1:]},

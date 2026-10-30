@@ -47,6 +47,16 @@ class InstrumentationTests(unittest.TestCase):
             with self.subTest(inputs=inputs), self.assertRaises(ValueError):
                 self.prepare("int power(int b,int e){return b;}", inputs=inputs)
 
+    def test_worker_auto_detection_and_explicit_argument_mapping(self):
+        source=b"int renamed(int base,int exponent){int r=base;for(int n=0;n<exponent;n++)r*=base;return r;}"
+        bundle,_,unit=trace.prepare(source,None,{"b":-3,"e":1},argument_order=["b","e"])
+        self.assertEqual(bundle["function"],"renamed")
+        self.assertEqual(bundle["input"],{"base":-3,"exponent":1})
+        self.assertEqual(bundle["logical_input"],{"b":-3,"e":1})
+        self.check_c(unit)
+        with self.assertRaises(ValueError):
+            trace.prepare(source,None,{"b":-3,"e":1})
+
     def test_unsupported_constructs_and_reserved_symbols_are_rejected(self):
         sources = [
             "int global;int power(int b,int e){return global;}",

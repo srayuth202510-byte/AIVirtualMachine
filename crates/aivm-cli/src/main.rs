@@ -87,6 +87,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Operator: pin the native trace collector and parser into a new config file.
+    EnableRepairTrace {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value = "/usr/bin/python3")]
+        python: PathBuf,
+        #[arg(long, default_value = "/usr/bin/clang")]
+        clang: PathBuf,
+        #[arg(long, default_value = "src/main.c")]
+        source_path: String,
+        #[arg(long, value_delimiter = ',')]
+        argument_order: Vec<String>,
+    },
+    #[command(hide = true)]
+    TraceWorker,
     /// สร้าง VM จากไฟล์ config aivm.yaml
     Create {
         name: String,
@@ -282,6 +299,36 @@ fn main() -> Result<(), AnyErr> {
     let root = cli.root.clone();
     let mut sup = Supervisor::new(cli.root);
     match cli.cmd {
+        Cmd::TraceWorker => {
+            aivm_runtime::trace::worker_main().map_err(err)?;
+        }
+        Cmd::EnableRepairTrace {
+            config,
+            output,
+            python,
+            clang,
+            source_path,
+            argument_order,
+        } => {
+            use std::io::Write;
+            let mut config = VmConfig::from_file(&config).map_err(err)?;
+            let mut trace = aivm_runtime::trace::TraceConfig::pinned(
+                &std::env::current_exe()?,
+                &python,
+                &clang,
+            )
+            .map_err(err)?;
+            trace.source_path = source_path;
+            trace.argument_order = argument_order;
+            trace.validate().map_err(err)?;
+            config.repair.trace = Some(trace);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&output)?;
+            file.write_all(serde_json::to_string_pretty(&config)?.as_bytes())?;
+            println!("trace enabled in {}", output.display());
+        }
         Cmd::Create { name, config } => {
             let cfg = VmConfig::from_file(&config).map_err(err)?;
             // ลงทะเบียนเข้า root ของ supervisor เอง (create จะ validate การบูต)

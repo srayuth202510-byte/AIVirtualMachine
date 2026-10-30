@@ -45,6 +45,55 @@ Output directory ต้องใหม่เพื่อรักษาหลั
 measurement driver ที่ exit 0 ไม่ได้เป็น verifier ของโจทย์ ต้องตรวจ patch ด้วย protected verifier เดิม
 หลัง source เปลี่ยน trace เดิมเป็นข้อมูล historical และต้องเก็บใหม่เพื่อใช้อธิบาย candidate ปัจจุบัน
 
-helper นี้ยังเป็น operator workflow แยกจาก automatic retry loop
-การแนบ `context.txt` ควรรักษา unresolved input/expected/actual จาก repair ledger เดิมครบ
-ทดสอบผลกับโมเดลโดยคง plain-language request เดิม แล้วเพิ่มเฉพาะ trace เป็นการทดลองถัดไป
+## เปิด automatic repair trace
+
+ตัวช่วย standalone ด้านบนยังใช้ตรวจทีละเคสได้ ส่วน runtime รองรับ automatic trace
+แบบ opt-in สำหรับ operator โดยไม่ต้องเรียก cargo/test harness ระหว่าง agent ทำงาน:
+
+```sh
+cargo build --release -p aivm-cli
+target/release/aivm enable-repair-trace \
+  --config examples/build-c.yaml --output target/build-c-with-trace.json
+target/release/aivm create coding-trace --config target/build-c-with-trace.json
+```
+
+คำสั่งนี้ pin SHA256 ของ collector CLI ปัจจุบัน, Python และ Clang ลง `repair.trace`
+โปรแกรมต้องอยู่ภายนอก model workspace และเป็น native executables ที่ pin ตรง
+เมื่อ rebuild collector ให้สร้าง config ใหม่ ไฟล์ output ต้องยังไม่มีอยู่
+config JSON ที่ได้ใช้กับ CLI/Supervisor เหมือน YAML เดิม
+
+ต้องมี protected verifier/prepare plan ที่รายงาน `AIVM_CASE_FAILURE` พร้อม input JSON
+และ `repair.require_plan: true` เมื่อ verifier fail runtime จะ:
+
+1. อ่าน `source_path` ผ่าน gateway เดิม และเลือก structured counterexample ล่าสุด
+2. เรียก worker ของ operator ด้วย source/input เป็น JSON ใน stdin มี deadline,
+   process group และ output/resource bounds ไม่มี command หรือ script จากโมเดล
+3. worker ใช้ Python ที่ pin ไว้กับ preparer code ที่ฝังใน collector binary
+   เพื่อหา AST จาก Clang แล้ว compile/run original และ instrumented copy ผ่าน gateway
+   ใน private runtime แยกสองชุด ตรวจค่าคืนตรงกันและผูก output snapshots กับ audit
+4. แนบ trace ที่ตรงกับ source SHA256/input ปัจจุบัน พร้อมทุก unresolved failure
+   ให้โมเดลตอบ complete C function Host ผูก path/failure IDs/old fragment เอง
+   เก็บ comments/เนื้อหานอก function span เดิม และใช้ patch ผ่าน gateway
+5. ให้ counterexample/full verifier ของ parent task ตัดสินผลตามเดิม
+
+การเก็บ trace ไม่เปลี่ยนสถานะ failure และไม่รีเซ็ต no-progress counter
+source เดิม/input เดิมใช้ cache ภายใน task; source เปลี่ยนจะไม่แนบ trace เก่า
+ประวัติและ artifact paths อยู่ใน `AgentRun.repair_state.trace_history` และ private report
+worker artifacts อยู่ภายนอก model workspace ข้อมูล historical ไม่กลับเข้า model prompt
+
+ค่าปริยายเมื่อเปิดใช้: source `src/main.c`, ไม่เกิน 3 collections/task, 32 events,
+deadline 20 วินาที/collection การเก็บ native trace เพิ่มได้ 6 gateway execs/collection
+นอกงบ agent steps และบันทึกเวลาใน trace history ให้ประเมินต้นทุนเพิ่มได้
+worker มี CPU/memory bounds ของ operator; native targets ใช้ sandbox และ quota แยก
+
+automatic whole-function repair จำกัด source 2048 bytes ถ้าไม่รองรับ, pin ผิด,
+worker timeout, trace truncated/เกินขนาด หรือหมด collection budget จะใช้ JSON hunk
+repair เดิม โดยคง counterexample ทุกข้อไว้ ไม่มี fallback ไปรัน target นอก sandbox
+หาก source/workspace เปลี่ยนระหว่าง collection จะปฏิเสธ trace/patch ที่ผูกกับ snapshot เก่า
+
+`argument_order` เป็น optional list ของชื่อ input keys ตามลำดับ parameters เช่น
+`--argument-order b,e` สำหรับ verifier ที่ใช้ keys b/e แม้ implementation เปลี่ยนชื่อ parameter
+หากไม่ตั้งจะต้องตรงกับชื่อ parameters ที่ Clang ตรวจพบ ไม่เดาการจับคู่ให้เอง
+
+ปิด automatic trace ด้วยการไม่ตั้ง `repair.trace` จึงคงพฤติกรรม config เก่าได้
+การเปิดผ่าน config ยังจำกัดตามขอบเขต C int ข้างต้น ผลการซ่อมต้องวัดแยกจาก trace availability

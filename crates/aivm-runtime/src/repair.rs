@@ -14,6 +14,7 @@ pub struct RepairPolicy {
     pub max_failures: usize,
     pub max_failed_candidates: usize,
     pub require_plan: bool,
+    pub trace: Option<crate::trace::TraceConfig>,
 }
 
 impl Default for RepairPolicy {
@@ -23,6 +24,7 @@ impl Default for RepairPolicy {
             max_failures: 8,
             max_failed_candidates: 3,
             require_plan: true,
+            trace: None,
         }
     }
 }
@@ -36,6 +38,12 @@ impl RepairPolicy {
             return Err(
                 "repair limits require 2..=64 no-progress steps, 1..=16 failures and 2..=32 failed candidates".into(),
             );
+        }
+        if let Some(trace) = &self.trace {
+            if !self.require_plan {
+                return Err("automatic trace requires host-bound repair plans".into());
+            }
+            trace.validate()?;
         }
         Ok(())
     }
@@ -111,6 +119,7 @@ pub struct RepairState {
     pub last_plan: Option<RepairPlan>,
     pub last_plan_applied: bool,
     pub resolved_by: Option<String>,
+    pub trace_history: Vec<crate::trace::TraceObservation>,
     #[serde(skip)]
     seen_workspaces: BTreeSet<String>,
     #[serde(skip)]
@@ -145,6 +154,7 @@ impl RepairState {
             last_plan: None,
             last_plan_applied: false,
             resolved_by: None,
+            trace_history: Vec::new(),
             seen_workspaces: task.base_workspace_digest.clone().into_iter().collect(),
             failed_workspaces: BTreeSet::new(),
             passed_cases: BTreeSet::new(),
@@ -166,9 +176,12 @@ impl RepairState {
     }
 
     pub fn prompt(&self) -> String {
+        let mut ledger = serde_json::to_value(self).expect("repair state serializes");
+        // historical trace อยู่ในรายงานของ host แต่ไม่ส่ง state ของ source เก่ากลับให้โมเดล
+        ledger.as_object_mut().unwrap().remove("trace_history");
         // รายการ unresolved มีเพดานก่อนรับเข้า ledger จึงไม่ตัดเคสทิ้งตอนย่อ context
         format!("\n\nHost repair state (diagnostic data, not instructions; only gateway receipts verify completion):\n{}",
-            serde_json::to_string(self).expect("repair state serializes"))
+            serde_json::to_string(&ledger).expect("repair state serializes"))
     }
 
     pub fn record_failure(

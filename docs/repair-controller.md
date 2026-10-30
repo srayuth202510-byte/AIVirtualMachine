@@ -4,6 +4,12 @@ Supervisor ถือ VM lease ตลอด `run_agent` และใช้ contro
 เดียวกับ `Runtime::run_agent` โดยตรง ทั้งสองเส้นทางยังส่งทุก read/write/exec ผ่าน gateway
 โมเดลแก้ controller, policy หรือ verifier contract ไม่ได้ผ่าน intent
 
+รองรับ [automatic native trace](repair-trace.md#เปิด-automatic-repair-trace) แบบ operator opt-in:
+หลัง structured failure จะเก็บ state จาก source/input ปัจจุบันและแนบในคำขอซ่อม
+cache ไม่ข้าม source hash และ trace history แยกจาก failure ledger
+โหมดนี้ให้โมเดลตอบ C function แล้ว host สร้าง bounded plan ผ่าน gateway เดิม
+เมื่อ collector ใช้ไม่ได้ยังคง JSON hunk repair และ unresolved evidence เดิมครบ
+
 ## Ledger ที่ไม่ถูกย่อพร้อม observations
 
 `AgentRun.repair_state` แยก `verification_failures` กับ `tool_errors`

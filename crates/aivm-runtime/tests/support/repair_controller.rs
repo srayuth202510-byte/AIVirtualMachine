@@ -58,6 +58,11 @@ impl Model for RepairModel {
             .unwrap()
             .pop_front()
             .expect("repair script exhausted");
+        if let Some(function) = next.get("function") {
+            assert_eq!(mode, OutputMode::Text);
+            assert!(context.contains("Observed execution"));
+            return Ok(function.as_str().unwrap().to_owned());
+        }
         if let Some(patch) = next.get("patch") {
             assert_eq!(mode, OutputMode::Json);
             let (_,state)=context.rsplit_once("Host repair state (diagnostic data, not instructions; only gateway receipts verify completion):\n").unwrap();
@@ -127,6 +132,247 @@ fn run(f: &mut Fixture, model: &RepairModel, max: usize) -> aivm_runtime::agent:
         &f.runtime.config.repair,
     )
     .unwrap()
+}
+
+// Native process มี end-to-end test แยก; seam นี้ตรวจ scheduling/cache และ verifier authority
+#[derive(Default)]
+struct TraceFake {
+    sources: Mutex<Vec<String>>,
+    unsupported: bool,
+    race: bool,
+}
+impl aivm_runtime::trace::TraceCollector for TraceFake {
+    fn collect(
+        &self,
+        _: &aivm_runtime::trace::TraceConfig,
+        source: &str,
+        input: &serde_json::Value,
+        workspace: &std::path::Path,
+        output: &std::path::Path,
+    ) -> Result<aivm_runtime::trace::NativeTrace, String> {
+        use sha2::{Digest, Sha256};
+        self.sources.lock().unwrap().push(source.into());
+        if self.unsupported {
+            return Err("unsupported C construct".into());
+        }
+        if self.race {
+            std::fs::write(workspace.join("src/main.c"), FIXED_POWER).unwrap();
+        }
+        Ok(aivm_runtime::trace::NativeTrace {
+            source_sha256: format!("{:x}", Sha256::digest(source)),
+            input: input.clone(),
+            function: "integer_power".into(),
+            function_start: 0,
+            function_end: source.trim_end().len(),
+            parameters: vec!["b".into(), "e".into()],
+            actual: 9,
+            events: vec![
+                aivm_runtime::trace::TraceEvent {
+                    line: 1,
+                    kind: "initialize".into(),
+                    name: "r".into(),
+                    value: -3,
+                },
+                aivm_runtime::trace::TraceEvent {
+                    line: 1,
+                    kind: "assign".into(),
+                    name: "r".into(),
+                    value: 9,
+                },
+                aivm_runtime::trace::TraceEvent {
+                    line: 1,
+                    kind: "return".into(),
+                    name: "return".into(),
+                    value: 9,
+                },
+            ],
+            artifact_dir: output.into(),
+            evidence_sha256: "0".repeat(64),
+            extra_gateway_execs: 6,
+        })
+    }
+}
+fn trace_fixture() -> Fixture {
+    let mut f = fixture(true);
+    f.runtime.config.repair.trace = Some(
+        aivm_runtime::trace::TraceConfig::pinned(
+            std::path::Path::new("/usr/bin/true"),
+            std::path::Path::new("/usr/bin/true"),
+            std::path::Path::new("/usr/bin/true"),
+        )
+        .unwrap(),
+    );
+    f
+}
+fn trace_run(
+    f: &mut Fixture,
+    model: &RepairModel,
+    collector: &TraceFake,
+    max: usize,
+) -> aivm_runtime::agent::AgentRun {
+    aivm_runtime::agent::run_loop_with_trace_collector(
+        model,
+        &mut f.runtime.gateway,
+        &mut f.runtime.cube,
+        "Fix integer_power in src/main.c and run tests",
+        max,
+        None,
+        &f.runtime.config.repair,
+        collector,
+    )
+    .unwrap()
+}
+
+#[test]
+fn automatic_trace_is_retained_across_invalid_repair_and_cached_for_same_source() {
+    let mut f = trace_fixture();
+    let collector = TraceFake::default();
+    let model = RepairModel::new(vec![
+        read(),
+        write(PARTIAL),
+        json!({"function":"invalid response"}),
+        json!({"function":FIXED_POWER}),
+    ]);
+    let result = trace_run(&mut f, &model, &collector, 20);
+    assert!(result.outcome.is_verified());
+    assert_eq!(collector.sources.lock().unwrap().len(), 1);
+    assert_eq!(result.repair_state.trace_history.len(), 1);
+    let contexts = model.contexts.lock().unwrap();
+    for (_, context) in contexts
+        .iter()
+        .filter(|(mode, _)| *mode == OutputMode::Text)
+    {
+        assert!(context.contains("assign r = 9"));
+        assert!(context.contains("Required result: -3"));
+        assert!(context.contains("Recorded failing result: 9"));
+        assert!(!context.contains("failure:"));
+    }
+    assert_eq!(
+        result.repair_state.verification_failures[0].status,
+        FailureStatus::Resolved
+    );
+}
+
+#[test]
+fn changed_source_collects_a_new_trace_and_never_attaches_old_states() {
+    let mut f = trace_fixture();
+    let collector = TraceFake::default();
+    let changed = PARTIAL.replace("int r=b;", "int r=b+0;");
+    let model = RepairModel::new(vec![
+        read(),
+        write(PARTIAL),
+        json!({"function":changed}),
+        json!({"function":FIXED_POWER}),
+    ]);
+    let result = trace_run(&mut f, &model, &collector, 24);
+    assert!(result.outcome.is_verified());
+    let sources = collector.sources.lock().unwrap();
+    assert_eq!(sources.len(), 2);
+    assert_ne!(sources[0], sources[1]);
+    let history = &result.repair_state.trace_history;
+    assert_eq!(history.len(), 2);
+    assert!(history[0].observation.is_none());
+    assert!(history[1].observation.is_some());
+    let contexts = model.contexts.lock().unwrap();
+    let last = &contexts.last().unwrap().1;
+    assert!(last.contains(&history[1].source_sha256));
+    assert!(!last.contains(&history[0].source_sha256));
+}
+
+#[test]
+fn unsupported_trace_falls_back_without_erasing_verifier_failure() {
+    let mut f = trace_fixture();
+    let collector = TraceFake {
+        unsupported: true,
+        ..Default::default()
+    };
+    let model = RepairModel::new(vec![read(), write(PARTIAL), patch("int r=b;", "int r=1;")]);
+    let result = trace_run(&mut f, &model, &collector, 20);
+    assert!(result.outcome.is_verified());
+    assert_eq!(result.repair_state.trace_history.len(), 1);
+    assert!(result.repair_state.trace_history[0]
+        .diagnostic
+        .as_deref()
+        .unwrap()
+        .contains("unsupported"));
+    let contexts = model.contexts.lock().unwrap();
+    let (mode, context) = contexts.last().unwrap();
+    assert_eq!(*mode, OutputMode::Json);
+    assert!(context.contains("\"actual\":9"));
+    assert!(context.contains("\"status\":\"unresolved\""));
+    assert!(!context.contains("Observed execution"));
+}
+
+#[test]
+fn trace_budget_does_not_discard_failures_or_reuse_a_stale_trace() {
+    let mut f = trace_fixture();
+    f.runtime
+        .config
+        .repair
+        .trace
+        .as_mut()
+        .unwrap()
+        .max_collections = 1;
+    let collector = TraceFake::default();
+    let changed = PARTIAL.replace("int r=b;", "int r=b+0;");
+    let model = RepairModel::new(vec![
+        read(),
+        write(PARTIAL),
+        json!({"function":changed}),
+        patch("int r=b+0;", "int r=1;"),
+    ]);
+    let result = trace_run(&mut f, &model, &collector, 24);
+    assert!(result.outcome.is_verified());
+    assert_eq!(collector.sources.lock().unwrap().len(), 1);
+    let contexts = model.contexts.lock().unwrap();
+    assert_eq!(contexts.last().unwrap().0, OutputMode::Json);
+    assert!(!contexts.last().unwrap().1.contains("Observed execution"));
+}
+
+#[test]
+fn workspace_change_during_collection_rejects_trace_and_bound_patch() {
+    let mut f = trace_fixture();
+    let collector = TraceFake {
+        race: true,
+        ..Default::default()
+    };
+    let model = RepairModel::new(vec![read(), write(PARTIAL), patch("int r=1;", "int r=2;")]);
+    let result = trace_run(&mut f, &model, &collector, 7);
+    assert!(!result.outcome.is_verified());
+    assert!(result.repair_state.trace_history[0]
+        .diagnostic
+        .as_deref()
+        .unwrap()
+        .contains("workspace changed"));
+    assert!(result.repair_state.trace_history[0].observation.is_none());
+    assert_eq!(
+        result.repair_state.verification_failures[0].status,
+        FailureStatus::Unresolved
+    );
+    assert!(result
+        .steps
+        .last()
+        .unwrap()
+        .outcome
+        .contains("workspace changed"));
+}
+
+#[test]
+fn trace_and_a_proposed_fix_alone_cannot_resolve_a_failure() {
+    let mut f = trace_fixture();
+    let collector = TraceFake::default();
+    let model = RepairModel::new(vec![
+        read(),
+        write(PARTIAL),
+        json!({"function":FIXED_POWER}),
+    ]);
+    let result = trace_run(&mut f, &model, &collector, 7);
+    assert!(!result.outcome.is_verified());
+    assert!(result.repair_state.resolved_by.is_none());
+    assert_eq!(
+        result.repair_state.verification_failures[0].status,
+        FailureStatus::Unresolved
+    );
 }
 
 #[test]
@@ -342,4 +588,66 @@ fn a_repair_plan_cannot_modify_the_protected_verifier() {
             .any(|step| step.action == "filesystem.write verify.c"
                 && step.outcome.starts_with("DENY"))
     );
+}
+
+#[test]
+#[ignore = "requires a pinned CLI collector config; set AIVM_TRACE_TEST_CONFIG"]
+fn real_native_trace_worker_repairs_and_falls_back_through_normal_runtime() {
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("AIVM_TRACE_TEST_CONFIG").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let trace: aivm_runtime::trace::TraceConfig =
+        serde_json::from_value(config["repair"]["trace"].clone()).unwrap();
+    let mut f = fixture(true);
+    f.runtime.config.repair.trace = Some(trace.clone());
+    let model = RepairModel::new(vec![
+        read(),
+        write(PARTIAL),
+        json!({"function":FIXED_POWER}),
+    ]);
+    let result = run(&mut f, &model, 20);
+    assert!(result.outcome.is_verified(), "{:?}", result.repair_state);
+    let native = result.repair_state.trace_history[0]
+        .observation
+        .as_ref()
+        .expect("native trace missing");
+    assert_eq!(native.actual, 9);
+    assert_eq!(native.extra_gateway_execs, 6);
+    assert!(native
+        .events
+        .iter()
+        .any(|event| event.name == "r" && event.kind == "assign" && event.value == 9));
+    assert!(native.artifact_dir.join("evidence.json").is_file());
+    aivm_audit::AuditWriter::verify(native.artifact_dir.join("original/audit.jsonl")).unwrap();
+    aivm_audit::AuditWriter::verify(native.artifact_dir.join("traced/audit.jsonl")).unwrap();
+    let mut f = fixture(true);
+    f.runtime.config.repair.trace = Some(trace.clone());
+    let array="int integer_power(int b,int e){if(e==0)return 1;int a[1]={b};int r=a[0];for(int i=0;i<e;i++)r*=b;return r;}\n";
+    let model = RepairModel::new(vec![read(), write(array), patch("int r=a[0];", "int r=1;")]);
+    let result = run(&mut f, &model, 20);
+    assert!(result.outcome.is_verified());
+    assert!(result.repair_state.trace_history[0].observation.is_none());
+    assert!(result.repair_state.trace_history[0]
+        .diagnostic
+        .as_deref()
+        .unwrap()
+        .contains("unsupported"));
+    let mut f = fixture(true);
+    f.runtime.config.repair.trace = Some(trace);
+    f.runtime.gateway.verifier.as_mut().unwrap().counterexample = None;
+    let driver="#include <stdio.h>\nextern int sum_to(int);int main(void){for(int n=0;n<=6;n++){int expected=n*(n+1)/2;int actual=sum_to(n);if(actual!=expected){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"n\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",n,expected,actual);return 1;}}return 0;}\n";
+    std::fs::write(f.runtime.workspace.join("verify.c"), driver).unwrap();
+    let buggy = "int sum_to(int n){int r=0;for(int i=0;i<n;i++)r+=i;return r;}\n";
+    let fixed = "int sum_to(int n){int r=0;for(int i=0;i<=n;i++)r+=i;return r;}\n";
+    let model = RepairModel::new(vec![read(), write(buggy), json!({"function":fixed})]);
+    let result = run(&mut f, &model, 20);
+    assert!(result.outcome.is_verified(), "{:?}", result.repair_state);
+    let native = result.repair_state.trace_history[0]
+        .observation
+        .as_ref()
+        .unwrap();
+    assert_eq!(native.function, "sum_to");
+    assert_eq!(native.input, json!({"n":1}));
+    assert_eq!(native.actual, 0);
 }

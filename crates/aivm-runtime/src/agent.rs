@@ -625,6 +625,30 @@ pub fn run_loop_with_policy(
     rag_index: Option<&aivm_cube::rag::RagIndex>,
     repair_policy: &RepairPolicy,
 ) -> Result<AgentRun, RuntimeError> {
+    run_loop_with_trace_collector(
+        model,
+        gateway,
+        cube,
+        task,
+        max_steps,
+        rag_index,
+        repair_policy,
+        &crate::trace::ProcessTraceCollector,
+    )
+}
+
+/// Operator injection point; collector ไม่มีสิทธิ์สร้าง verifier receipt ให้ parent task
+#[allow(clippy::too_many_arguments)]
+pub fn run_loop_with_trace_collector(
+    model: &dyn Model,
+    gateway: &mut ToolGateway,
+    cube: &mut Cube,
+    task: &str,
+    max_steps: usize,
+    rag_index: Option<&aivm_cube::rag::RagIndex>,
+    repair_policy: &RepairPolicy,
+    collector: &dyn crate::trace::TraceCollector,
+) -> Result<AgentRun, RuntimeError> {
     repair_policy.validate().map_err(RuntimeError::Config)?;
     let task_contract = gateway
         .begin_task(cube, task)
@@ -760,8 +784,24 @@ pub fn run_loop_with_policy(
         } else {
             None
         };
+        let function_repair = if planning {
+            repair_policy.trace.as_ref().and_then(|config| {
+                crate::trace::prepare_repair(config, collector, gateway, cube, &mut repair)
+            })
+        } else {
+            None
+        };
+        if planning && repair_policy.trace.is_some() {
+            audit_repair(gateway, cube, &task_contract, &repair)?;
+        }
         let generated = if let Some(request) = operator_request {
             Ok(serde_json::to_string(&request).expect("operator request serializes"))
+        } else if let Some(function) = &function_repair {
+            model.reason_with_system_mode(
+                &function.system(),
+                &function.prompt(task, &repair),
+                aivm_model::OutputMode::Text,
+            )
         } else if planning {
             model.reason_with_system_mode(
                 "Return one JSON object with exactly failure_ids (array of unresolved host failure IDs), path (relative source filename), change (one concise explanation addressing the counterexample), old_text (unique exact source fragment), new_text (its different replacement). The host applies this bounded patch through the gateway and runs tests. Use a small exact replacement. No tool calls or reasoning transcript. Do not claim tests passed.",
@@ -805,7 +845,11 @@ pub fn run_loop_with_policy(
                     .cloned()
                     .unwrap_or_else(|| "empty repair plan".into()))
             } else {
-                repair.accept_plan(&raw, digest)
+                let bounded_plan = match &function_repair {
+                    Some(function) => function.plan(&raw, &repair),
+                    None => Ok(raw.clone()),
+                };
+                bounded_plan.and_then(|plan| repair.accept_plan(&plan, digest))
             };
             let request = result.and_then(|()| planned_write(gateway, cube, &repair));
             match request {
