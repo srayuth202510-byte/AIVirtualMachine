@@ -16,12 +16,9 @@ runner ใช้ operator-only ignored test ใน coding_workflow เพื่�
 ผ่าน gateway, sandbox, build slots และ audit เดิม ไม่มี model tool หรือ capability ใหม่
 ไม่ได้เรียก debugger, shell หรือ Python จากโมเดลเพื่อรัน target
 
-ขอบเขตแรกคือหนึ่ง standalone function ที่คืน int หรือ unsigned int, มี named int/unsigned parameters ไม่เกินแปดตัว
-และ initialized int/unsigned locals รองรับ if/for/while/do, arithmetic, bitwise (&, |, ^, <<, >>, ~),
-assignments, ++/-- และ explicit casts (CStyleCastExpr)
-ยังไม่รองรับ headers/macros, globals, function calls/recursion, pointers, arrays,
-storage qualifiers และชนิด float/double สิ่งที่ไม่รองรับจะปฏิเสธก่อน native execution
-ใช้กับ C ที่มี defined integer behavior; ไม่ได้พิสูจน์ absence of undefined behavior
+ขอบเขตปัจจุบันคือหนึ่ง standalone function ที่คืน `int`, `unsigned int` หรือ `void` (สำหรับฟังก์ชันที่แก้ไข array in-place แล้วเก็บผลตรวจจาก checksum ของ array), มี named parameters ไม่เกินแปดตัว (`int`, `unsigned`, `const int *`, `int *`, `const char *`, `char *`) และ initialized scalar locals รองรับ `if`/`for`/`while`/`do`, ternary (`?:`), arithmetic, bitwise (`&`, `|`, `^`, `<<`, `>>`, `~`), array subscript (`a[i]`), assignments, `++/--` และ explicit casts (`CStyleCastExpr`)
+ยังไม่รองรับ headers/macros ใน source ที่เก็บ trace, globals, function calls/recursion, struct/union, pointer arithmetic นอกเหนือจาก subscript และชนิด `float`/`double` สิ่งที่ไม่รองรับจะปฏิเสธก่อน native execution
+ใช้กับ C ที่มี defined behavior; ไม่ได้พิสูจน์ absence of undefined behavior
 
 สำเนา instrumented ต้องคืนค่าเท่ากับ source เดิมใน input ที่เลือกจึงออก `trace.json`
 ความเท่ากันนี้เป็นเพียงการตรวจหนึ่ง input ไม่ใช่การพิสูจน์ว่า instrumentation
@@ -96,5 +93,11 @@ repair เดิม โดยคง counterexample ทุกข้อไว้ �
 `--argument-order b,e` สำหรับ verifier ที่ใช้ keys b/e แม้ implementation เปลี่ยนชื่อ parameter
 หากไม่ตั้งจะต้องตรงกับชื่อ parameters ที่ Clang ตรวจพบ ไม่เดาการจับคู่ให้เอง
 
+หากตั้ง `preseed_baseline: true` ใน `repair.trace` (ใช้ในโหมด benchmark ที่ทราบว่า source ตั้งต้นล้มเหลว)
+controller จะรัน operator verifier plan ตั้งต้นตั้งแต่ต้น task เพื่อบันทึก structured counterexample
+และเก็บ native trace ก่อนเรียกโมเดลครั้งแรก จึงเข้าสู่ whole-function repair ได้ตั้งแต่ model call แรก
+เมื่อโมเดลส่งคำตอบที่ซ้ำหรือถูกปฏิเสธซ้ำ `FunctionRepair` จะยกระดับคำแนะนำจาก counterexample
+และสรุปพฤติกรรมลูป/การเปลี่ยนค่าตัวแปรจาก `NativeTrace.events` โดยอัตโนมัติ
+
 ปิด automatic trace ด้วยการไม่ตั้ง `repair.trace` จึงคงพฤติกรรม config เก่าได้
-การเปิดผ่าน config ยังจำกัดตามขอบเขต C int ข้างต้น ผลการซ่อมต้องวัดแยกจาก trace availability
+การเปิดผ่าน config ยังจำกัดตามขอบเขต C ข้างต้น ผลการซ่อมต้องวัดแยกจาก trace availability

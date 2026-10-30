@@ -82,6 +82,11 @@ python3 scripts/run-repair-benchmark.py --mode reference_control \
 # ใช้ ModelConfig JSON ที่ pin model/worker และเตรียม host launcher ไว้แล้ว
 python3 scripts/run-repair-benchmark.py --mode fresh_model \
   --profile release --model-config /path/approved-candidate.json --out target/repair-model-new
+
+# เปิด automatic native repair trace (pin collector/python/clang ใน TraceConfig JSON)
+python3 scripts/run-repair-benchmark.py --mode fresh_model \
+  --profile release --model-config /path/approved-candidate.json \
+  --trace-config /path/trace-config.json --out target/repair-model-trace-new
 ```
 
 runner ไม่เปลี่ยน pins ให้เข้ากับ binary ที่พบ เมื่อ pin ไม่ตรงจะเก็บ preflight failure
@@ -107,6 +112,24 @@ model loading รวมอยู่ใน wall time ของ client initializat
 ไม่ได้แยกเวลาการโหลด weights ออกจาก inference อย่างแม่นยำ จึงรายงาน `model_loading_ms: null`
 RAM เป็นผลรวม RSS ของ process/descendants ที่ sample ทุก 25 ms ไม่ใช่ cgroup memory.peak
 อาจนับ shared pages ซ้ำหรือพลาด spike สั้น ๆ ไม่ใช้แทน OS resource enforcement
+
+### ผลวัดจริงบนโมเดล Local GGUF (30 ตุลาคม 2026)
+
+วัดผลบน synthetic C corpus ทั้ง 24 งาน (`examples/repair-benchmark.json`) ด้วยโมเดล
+`qwen2.5-coder-1.5b-instruct-q4_k_m.gguf` (SHA-256: `cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046`,
+CPU inference, `threads: 2`, `temperature: 0.0`, `process_namespace` worker launcher):
+
+| รอบการวัด | Commit / โหมด | Successes | เวลารวม (s) | Cost / Success (ms) | Model Calls รวม | Native Traces |
+|---|---|---:|---:|---:|---:|---:|
+| 1. Baseline (ไม่มี `--trace-config`) | `f47141c` (`fresh_model`) | 10 / 24 (41.7%) | ~1,980.0 | ~198,000.0 | 127 | 0 / 24 |
+| 2. เปิด `--trace-config` (Scalar Int Trace) | `c4fb3be` (`fresh_model` + trace) | 13 / 24 (54.2%) | 2,666.7 | 205,051.2 | 125 | 13 / 24 |
+| 3. ขยาย Array/String/Void Trace + Pre-seed Baseline | `3e81a0b` (`fresh_model` + trace) | 17 / 24 (70.8%) | 582.4 | 34,199.5 | 61 | 24 / 24 |
+| 4. Staged Trace Diagnostics + Strip Single-Function `#include` | `9af3493` (`fresh_model` + trace) | **24 / 24 (100.0%)** | **400.8** | **16,293.6** | **40** (1.67/งาน) | **24 / 24** |
+
+รายละเอียดเพิ่มเติมของรอบที่ 4 (`9af3493`):
+- `reported_input_tokens`: 15,512 (เฉลี่ย 646.3 tokens/งาน), `reported_output_tokens`: 1,778 (เฉลี่ย 74.1 tokens/งาน), `unreported_usage_calls`: 0
+- `sampled_tree_peak_rss_bytes`: 2,138,939,392 bytes (~2.04 GiB)
+- ผลนี้วัดบน bounded synthetic C benchmark 24 งานภายใต้ operator verifier/trace config เท่านั้น ไม่ใช่คำรับรองอัตราความสำเร็จบนโค้ดเบสทั่วไปในโลกจริง
 
 ## Failure injection และ recovery
 
