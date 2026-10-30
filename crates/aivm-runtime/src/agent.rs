@@ -673,7 +673,19 @@ pub fn run_loop_with_trace_collector(
         .transpose()
         .map_err(|error| RuntimeError::Config(error.to_string()))?
         .unwrap_or_default();
-    let mut operator_queue: VecDeque<OperatorAction> = VecDeque::new();
+    let mut operator_queue: VecDeque<OperatorAction> = if !operator_plan.is_empty()
+        && repair_policy
+            .trace
+            .as_ref()
+            .is_some_and(|trace| trace.preseed_baseline)
+    {
+        if subtask.is_some() {
+            subtask = Some(CodingSubtask::Verify);
+        }
+        operator_actions(&operator_plan, gateway, &repair)
+    } else {
+        VecDeque::new()
+    };
     let mut last_guarded_action: Option<String> = None;
     let mut guarded_action_streak = 0usize;
     let mut live_rag = rag_index.map(WorkspaceRag::new);
@@ -961,6 +973,9 @@ pub fn run_loop_with_trace_collector(
                     let before_write = (req.tool == "filesystem.write")
                         .then(|| gateway.workspace_digest().ok())
                         .flatten();
+                    let before_text = (req.tool == "filesystem.write" && !operator_plan.is_empty())
+                        .then(|| std::fs::read_to_string(gateway.workspace.join(&req.path)).ok())
+                        .flatten();
                     match gateway.dispatch(cube, &req) {
                         Ok(res) => {
                             if let Some(OperatorStage::Counterexample(id)) =
@@ -1037,10 +1052,27 @@ pub fn run_loop_with_trace_collector(
                                 } else if req.tool == "filesystem.write"
                                     && !operator_plan.is_empty()
                                 {
+                                    let whitespace_only =
+                                        before_text.as_deref().is_some_and(|old| {
+                                            req.content.as_deref().is_some_and(|new| {
+                                                old.chars()
+                                                    .filter(|c| !c.is_whitespace())
+                                                    .eq(new.chars().filter(|c| !c.is_whitespace()))
+                                            })
+                                        });
+                                    if whitespace_only {
+                                        if let Some(old) = &before_text {
+                                            let _ = std::fs::write(
+                                                gateway.workspace.join(&req.path),
+                                                old,
+                                            );
+                                        }
+                                    }
                                     let after = gateway
                                         .workspace_digest()
                                         .map_err(|error| RuntimeError::Io(error.to_string()))?;
                                     source_progress = before_write.as_ref() != Some(&after)
+                                        && !whitespace_only
                                         && repair.new_workspace(after);
                                     if source_progress {
                                         operator_queue =

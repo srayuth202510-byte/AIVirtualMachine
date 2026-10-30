@@ -44,6 +44,8 @@ pub struct TraceConfig {
     pub max_events: usize,
     #[serde(default = "default_collections")]
     pub max_collections: usize,
+    #[serde(default)]
+    pub preseed_baseline: bool,
 }
 
 impl TraceConfig {
@@ -93,6 +95,7 @@ impl TraceConfig {
             timeout_ms: default_timeout(),
             max_events: default_events(),
             max_collections: default_collections(),
+            preseed_baseline: false,
         })
     }
 
@@ -295,30 +298,49 @@ impl FunctionRepair {
                 .trim();
         }
         let original = &self.source[self.trace.function_start..self.trace.function_end];
-        if code.len() > 2048 || code == original.trim() {
+        if code.len() > 2048 || compact_c(code) == compact_c(original) {
             return Err(
                 "function is too large or unchanged; return a corrected implementation".into(),
             );
         }
         let open = code.find('{').ok_or("missing function body")?;
-        let signature = code[..open]
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>();
-        let prefix = format!("int{}(", self.trace.function);
-        let args = signature
-            .strip_prefix(&prefix)
-            .and_then(|s| s.strip_suffix(')'))
-            .ok_or("expected the same int function signature")?;
+        let signature = compact_c(&code[..open]);
+        let args = [
+            format!("int{}(", self.trace.function),
+            format!("void{}(", self.trace.function),
+            format!("unsignedint{}(", self.trace.function),
+            format!("unsigned{}(", self.trace.function),
+        ]
+        .iter()
+        .find_map(|prefix| signature.strip_prefix(prefix))
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or("expected the same function signature")?;
         let valid = if self.trace.parameters.is_empty() {
             args.is_empty() || args == "void"
         } else {
             let parts = args.split(',').collect::<Vec<_>>();
             parts.len() == self.trace.parameters.len()
                 && parts.iter().all(|p| {
-                    ["unsignedint", "intunsigned", "unsigned", "int"]
-                        .iter()
-                        .any(|prefix| p.strip_prefix(prefix).is_some_and(identifier))
+                    let base = p.strip_suffix("[]").unwrap_or(p);
+                    [
+                        "constint*",
+                        "intconst*",
+                        "constchar*",
+                        "charconst*",
+                        "int*",
+                        "char*",
+                        "constint",
+                        "intconst",
+                        "constchar",
+                        "charconst",
+                        "unsignedint",
+                        "intunsigned",
+                        "unsigned",
+                        "int",
+                        "char",
+                    ]
+                    .iter()
+                    .any(|prefix| base.strip_prefix(prefix).is_some_and(identifier))
                 })
         };
         if !valid {
@@ -354,6 +376,10 @@ impl FunctionRepair {
             .collect::<Vec<_>>();
         Ok(json!({"failure_ids":ids,"path":self.path,"change":"Replace the function with the model-proposed implementation to address unresolved test failures.","old_text":original,"new_text":code}).to_string())
     }
+}
+
+fn compact_c(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 fn display_source(source: &str) -> String {

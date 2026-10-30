@@ -254,6 +254,28 @@ fn automatic_trace_is_retained_across_invalid_repair_and_cached_for_same_source(
 }
 
 #[test]
+fn preseed_baseline_traces_initial_source_and_rejects_whitespace_only_reformat() {
+    let mut f = trace_fixture();
+    f.runtime
+        .config
+        .repair
+        .trace
+        .as_mut()
+        .unwrap()
+        .preseed_baseline = true;
+    let collector = TraceFake::default();
+    let reformat = "int integer_power(int b, int e) {\n    int r = b;\n    for (int i = 0; i < e; i++)\n        r *= b;\n    return r;\n}";
+    let model = RepairModel::new(vec![
+        json!({"function":reformat}),
+        json!({"function":FIXED_POWER}),
+    ]);
+    let result = trace_run(&mut f, &model, &collector, 20);
+    assert!(result.outcome.is_verified());
+    assert_eq!(collector.sources.lock().unwrap().len(), 1);
+    assert_eq!(model.contexts.lock().unwrap().len(), 2);
+}
+
+#[test]
 fn changed_source_collects_a_new_trace_and_never_attaches_old_states() {
     let mut f = trace_fixture();
     let collector = TraceFake::default();

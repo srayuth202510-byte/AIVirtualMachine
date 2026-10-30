@@ -12,10 +12,15 @@ ALLOWED = {
     "FunctionDecl", "ParmVarDecl", "CompoundStmt", "DeclStmt", "VarDecl",
     "IfStmt", "ForStmt", "WhileStmt", "DoStmt", "ReturnStmt", "NullStmt",
     "BreakStmt", "ContinueStmt", "BinaryOperator", "CompoundAssignOperator",
-    "UnaryOperator", "IntegerLiteral", "ImplicitCastExpr", "ParenExpr",
-    "DeclRefExpr", "ConditionalOperator", "CStyleCastExpr",
+    "UnaryOperator", "IntegerLiteral", "CharacterLiteral", "ImplicitCastExpr",
+    "ParenExpr", "DeclRefExpr", "ConditionalOperator", "CStyleCastExpr",
+    "ArraySubscriptExpr",
 }
-SUPPORTED_INTEGER_TYPES = {"int", "unsigned int", "unsigned", "_Bool"}
+SUPPORTED_INTEGER_TYPES = {
+    "int", "unsigned int", "unsigned", "_Bool",
+    "const int", "char", "const char", "signed char", "unsigned char",
+}
+SUPPORTED_POINTER_TYPES = {"const int *", "int *", "const char *", "char *"}
 
 
 def digest(data):
@@ -36,9 +41,11 @@ def span(node):
     return first["offset"], last["offset"] + last["tokLen"]
 
 
-def target_name(node):
-    while node["kind"] == "ParenExpr":
+def target_name(node, allow_subscript=False):
+    while node["kind"] in ("ParenExpr", "ImplicitCastExpr"):
         node = node["inner"][0]
+    if allow_subscript and node["kind"] == "ArraySubscriptExpr":
+        return target_name(node["inner"][0], False)
     if node["kind"] != "DeclRefExpr" or node["referencedDecl"]["kind"] not in ("VarDecl", "ParmVarDecl"):
         raise ValueError("only updates to plain local integer variables are supported")
     return identifier(node["referencedDecl"]["name"])
@@ -48,6 +55,21 @@ def c_integer(value, ptype="int"):
     if ptype in ("unsigned int", "unsigned"):
         return f"{value}u"
     return "(-2147483647 - 1)" if value == -(2 ** 31) else str(value)
+
+
+def c_string(value):
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def valid_input_value(value):
+    if type(value) is int:
+        return -(2 ** 31) <= value < 2 ** 32
+    if isinstance(value, list):
+        return len(value) <= 32 and all(type(x) is int and -(2 ** 31) <= x < 2 ** 31 for x in value)
+    if isinstance(value, str):
+        return len(value) <= 64 and all(32 <= ord(ch) <= 126 for ch in value)
+    return False
 
 
 def prepare(source, function, inputs, max_events=32, compiler=None, argument_order=None):
@@ -61,8 +83,8 @@ def prepare(source, function, inputs, max_events=32, compiler=None, argument_ord
         raise ValueError("preprocessor directives, escapes and reserved trace names are unsupported")
     if type(max_events) is not int or not 4 <= max_events <= 64:
         raise ValueError("max_events must be 4..64")
-    if not isinstance(inputs, dict) or any(type(v) is not int or not -(2 ** 31) <= v < 2 ** 32 for v in inputs.values()):
-        raise ValueError("inputs must map parameter names to 32-bit integers")
+    if not isinstance(inputs, dict) or any(not valid_input_value(v) for v in inputs.values()):
+        raise ValueError("inputs must map parameter names to bounded integers, int arrays, or ASCII strings")
     compiler = compiler or shutil.which("clang")
     if compiler is None:
         raise ValueError("clang is required to prepare source locations")
@@ -84,30 +106,47 @@ def prepare(source, function, inputs, max_events=32, compiler=None, argument_ord
     if target.get("name") != function or function == "main":
         raise ValueError("source must contain exactly the selected non-main function")
     ret_type = target["type"]["qualType"].split("(")[0].strip()
-    if ret_type not in ("int", "unsigned int", "unsigned") or target.get("variadic"):
-        raise ValueError("only functions returning int or unsigned int are supported")
+    if ret_type not in ("int", "unsigned int", "unsigned", "void") or target.get("variadic"):
+        raise ValueError("only functions returning int, unsigned int, or void are supported")
     param_nodes = [n for n in target.get("inner", []) if n["kind"] == "ParmVarDecl"]
     parameters = [identifier(n.get("name")) for n in param_nodes]
     param_types = {n.get("name"): n.get("type", {}).get("qualType", "int") for n in param_nodes}
     for name, ptype in param_types.items():
-        if ptype not in SUPPORTED_INTEGER_TYPES:
+        if ptype not in (SUPPORTED_INTEGER_TYPES | SUPPORTED_POINTER_TYPES):
             raise ValueError(f"parameter {name} has unsupported type {ptype}")
     logical_input = dict(inputs)
+    extra_keys = {"index"} if ret_type == "void" and "index" in inputs else set()
     if argument_order:
-        if len(argument_order) != len(parameters) or len(set(argument_order)) != len(argument_order) or set(argument_order) != set(inputs):
+        if len(argument_order) != len(parameters) or len(set(argument_order)) != len(argument_order) or set(argument_order) != (set(inputs) - extra_keys):
             raise ValueError("argument_order must name each input key exactly once")
-        inputs = dict(zip(parameters, (inputs[key] for key in argument_order)))
-    if len(parameters) > 8 or set(inputs) != set(parameters):
-        raise ValueError("input keys must match the function's named int parameters (at most eight)")
+        remapped = {param: inputs[key] for param, key in zip(parameters, argument_order)}
+        for k in extra_keys:
+            remapped[k] = inputs[k]
+        inputs = remapped
+    if len(parameters) > 8 or (set(inputs) - extra_keys) != set(parameters):
+        raise ValueError("input keys must match the function's named parameters (at most eight)")
+    void_array_param = None
     for name in parameters:
         val = inputs[name]
         ptype = param_types[name]
         if ptype in ("unsigned int", "unsigned"):
-            if not 0 <= val < (2 ** 32):
+            if type(val) is not int or not 0 <= val < (2 ** 32):
                 raise ValueError(f"parameter {name} requires an unsigned 32-bit integer")
-        else:
-            if not -(2 ** 31) <= val < (2 ** 31):
+        elif ptype in SUPPORTED_INTEGER_TYPES:
+            if type(val) is not int or not -(2 ** 31) <= val < (2 ** 31):
                 raise ValueError(f"parameter {name} requires a signed 32-bit integer")
+        elif ptype in ("const int *", "int *"):
+            if not isinstance(val, list) or not all(type(x) is int and -(2 ** 31) <= x < (2 ** 31) for x in val):
+                raise ValueError(f"parameter {name} requires a bounded list of signed 32-bit integers")
+            if ptype == "int *" and void_array_param is None:
+                void_array_param = name
+        elif ptype in ("const char *", "char *"):
+            if not isinstance(val, str):
+                raise ValueError(f"parameter {name} requires an ASCII string")
+    if ret_type == "void":
+        idx = inputs.get("index")
+        if void_array_param is None or type(idx) is not int or not 0 <= idx < len(inputs[void_array_param]):
+            raise ValueError("void functions require a mutable int* parameter and a valid index")
     if not any(n["kind"] == "CompoundStmt" for n in target.get("inner", [])):
         raise ValueError("function body is missing")
     sites, wrappers, replacements = [], [], {}
@@ -134,8 +173,12 @@ def prepare(source, function, inputs, max_events=32, compiler=None, argument_ord
             return
         if kind not in ALLOWED:
             raise ValueError(f"unsupported C construct: {kind}")
-        if kind != "FunctionDecl" and node.get("type", {}).get("qualType", "int") not in SUPPORTED_INTEGER_TYPES:
-            raise ValueError("only plain int and unsigned integer expressions and variables are supported")
+        ntype = node.get("type", {}).get("qualType", "int")
+        if kind == "VarDecl":
+            if ntype not in SUPPORTED_INTEGER_TYPES:
+                raise ValueError("only plain integer local variables are supported")
+        elif kind != "FunctionDecl" and ntype not in (SUPPORTED_INTEGER_TYPES | SUPPORTED_POINTER_TYPES):
+            raise ValueError("only plain integer and parameter pointer expressions are supported")
         if kind in ("FunctionDecl", "ParmVarDecl", "VarDecl"):
             identifier(node.get("name"))
             if node.get("storageClass") or node.get("tls"):
@@ -146,31 +189,46 @@ def prepare(source, function, inputs, max_events=32, compiler=None, argument_ord
                 raise ValueError("local variables must have an initializer")
             wrap(children[0], "initialize", node["name"])
         elif kind == "ReturnStmt":
-            if len(children) != 1:
-                raise ValueError("return must have an int value")
-            wrap(children[0], "return", "return")
+            if ret_type == "void":
+                if len(children) != 0:
+                    raise ValueError("void return must not have a value")
+            else:
+                if len(children) != 1:
+                    raise ValueError("return must have an int value")
+                wrap(children[0], "return", "return")
         elif kind in ("IfStmt", "WhileStmt", "DoStmt", "ForStmt"):
             condition = children[2] if kind == "ForStmt" else children[-1] if kind == "DoStmt" else children[0]
             if not condition.get("kind"):
                 raise ValueError("loops must have an explicit condition")
             wrap(condition, "condition", kind)
         elif kind == "CompoundAssignOperator" or (kind == "BinaryOperator" and node.get("opcode") == "="):
-            wrap(node, "assign", target_name(children[0]))
+            if ntype in SUPPORTED_INTEGER_TYPES:
+                wrap(node, "assign", target_name(children[0], allow_subscript=True))
         elif kind == "UnaryOperator":
             operation = node["opcode"]
             if operation in ("++", "--"):
-                name = target_name(children[0])
-                number = site(node, "update", name)
-                start, end = span(node)
-                delta = 1 if operation == "++" else -1
-                replacements[start] = (end, f"aivm_trace_update({number}, &{name}, {delta}, {int(node.get('isPostfix', False))})".encode())
+                operand_type = children[0].get("type", {}).get("qualType", "")
+                if operand_type in ("int", "unsigned int", "unsigned"):
+                    name = target_name(children[0])
+                    number = site(node, "update", name)
+                    start, end = span(node)
+                    delta = 1 if operation == "++" else -1
+                    replacements[start] = (end, f"aivm_trace_update({number}, &{name}, {delta}, {int(node.get('isPostfix', False))})".encode())
+                elif operand_type not in SUPPORTED_POINTER_TYPES:
+                    raise ValueError("unsupported increment target")
+            elif operation == "*":
+                operand_type = children[0].get("type", {}).get("qualType", "")
+                if operand_type not in SUPPORTED_POINTER_TYPES:
+                    raise ValueError("dereference requires a supported pointer parameter")
             elif operation not in ("+", "-", "!", "~"):
                 raise ValueError(f"unsupported unary operator: {operation}")
         for child in children:
             visit(child)
 
-    parameter_sites = [site(n, "parameter", n["name"]) for n in target["inner"] if n["kind"] == "ParmVarDecl"]
+    scalar_params = [n for n in param_nodes if param_types[n["name"]] in SUPPORTED_INTEGER_TYPES]
+    parameter_sites = [site(n, "parameter", n["name"]) for n in scalar_params]
     visit(target)
+    void_return_site = site(target, "return", "return") if ret_type == "void" else None
     opens, closes = {}, {}
     for start, end, order, prefix, suffix in wrappers:
         opens.setdefault(start, []).append((-end, order, prefix))
@@ -187,8 +245,30 @@ def prepare(source, function, inputs, max_events=32, compiler=None, argument_ord
         else:
             rewritten.append(source[position:position + 1])
             position += 1
-    arguments = ",".join(c_integer(inputs[name], param_types[name]) for name in parameters)
-    main = f'\nint main(void){{int value=(int){function}({arguments});printf("AIVM_RESULT %d\\n",value);return 0;}}\n'
+    setup_parts, arg_exprs = [], []
+    for name in parameters:
+        ptype = param_types[name]
+        val = inputs[name]
+        if ptype in ("const int *", "int *"):
+            elems = ",".join(c_integer(x) for x in val) if val else "0"
+            size = len(val) if val else 1
+            setup_parts.append(f"int aivm_arg_{name}[{size}]={{{elems}}};")
+            arg_exprs.append(f"aivm_arg_{name}")
+        elif ptype in ("const char *", "char *"):
+            setup_parts.append(f"char aivm_arg_{name}[]={c_string(val)};")
+            arg_exprs.append(f"aivm_arg_{name}")
+        else:
+            arg_exprs.append(c_integer(val, ptype))
+    setup = "".join(setup_parts)
+    arguments = ",".join(arg_exprs)
+    entry = "".join(f"aivm_trace_value({number},{c_integer(inputs[n['name']], param_types[n['name']])});" for number, n in zip(parameter_sites, scalar_params))
+    if ret_type == "void":
+        idx = inputs["index"]
+        main = f'\nint main(void){{{setup}{function}({arguments});int value=aivm_arg_{void_array_param}[{idx}];printf("AIVM_RESULT %d\\n",value);return 0;}}\n'
+        traced_main = f'\nint main(void){{{setup}{entry}{function}({arguments});int value=aivm_trace_value({void_return_site},aivm_arg_{void_array_param}[{idx}]);printf("AIVM_RESULT %d\\n",value);return 0;}}\n'
+    else:
+        main = f'\nint main(void){{{setup}int value=(int){function}({arguments});printf("AIVM_RESULT %d\\n",value);return 0;}}\n'
+        traced_main = f'\nint main(void){{{setup}{entry}int value=(int){function}({arguments});printf("AIVM_RESULT %d\\n",value);return 0;}}\n'
     original = b"#include <stdio.h>\n" + source + main.encode()
     # helper รับ expression value เพียงครั้งเดียว; postfix update คืนค่าเดิมตาม C semantics
     helper = f'''#include <stdio.h>
@@ -225,8 +305,6 @@ static unsigned aivm_trace_update_u(int site, unsigned *value, int delta, int po
         unsigned int*: aivm_trace_update_u \\
     )((site), (ptr), (delta), (postfix))
 '''
-    entry = "".join(f"aivm_trace_value({number},{c_integer(inputs[name], param_types[name])});" for number, name in zip(parameter_sites, parameters))
-    traced_main = main.replace("{int value=", "{" + entry + "int value=", 1)
     traced = helper.encode() + b"".join(rewritten) + traced_main.encode()
     manifest = {"schema": 1, "kind": "native_integer_function_trace", "function": function,
                 "function_range": list(span(target)),

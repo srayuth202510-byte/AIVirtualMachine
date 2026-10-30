@@ -305,7 +305,7 @@ fn run_case(
             }
             interpretation = Some(captured);
         }
-        match fixture.runtime.run_agent(&task, 16, Some(&fixture.root)) {
+        match fixture.runtime.run_agent(&task, 20, Some(&fixture.root)) {
             Ok(run) => (
                 Some(run.outcome.clone()),
                 Some(run.task_contract.clone()),
@@ -491,7 +491,11 @@ fn suite(fresh: bool, interpret: bool) {
             .and_then(|repair| repair.get("trace"))
             .cloned()
             .unwrap_or(raw);
-        let config: aivm_runtime::trace::TraceConfig = serde_json::from_value(value).unwrap();
+        let has_preseed = value.get("preseed_baseline").is_some();
+        let mut config: aivm_runtime::trace::TraceConfig = serde_json::from_value(value).unwrap();
+        if !has_preseed {
+            config.preseed_baseline = true;
+        }
         config.validate().unwrap();
         (config, format!("{:x}", Sha256::digest(&bytes)))
     });

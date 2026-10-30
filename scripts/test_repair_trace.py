@@ -53,6 +53,20 @@ class InstrumentationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             trace.prepare(source.encode(), "popcount", {"x": 2 ** 32})
 
+    def test_array_string_and_void_parameters_compile(self):
+        arr_src = "int positive_count(const int*a,int n){int c=0;for(int i=0;i<n;i++)c+=a[i]>0;return c;}"
+        _, orig, traced = trace.prepare(arr_src.encode(), None, {"a": [0, -1, 2], "n": 3})
+        self.check_c(orig)
+        self.check_c(traced)
+        str_src = "int string_equal(const char*a,const char*b){while(*a&&*b){if(*a++!=*b++)return 0;}return *a==*b;}"
+        _, orig, traced = trace.prepare(str_src.encode(), None, {"a": "a", "b": "ab"})
+        self.check_c(orig)
+        self.check_c(traced)
+        void_src = "void reverse_array(int*a,int n){for(int i=0;i<n/2;i++){int t=a[i];a[i]=a[n-i-1];a[n-i-1]=t;}}"
+        _, orig, traced = trace.prepare(void_src.encode(), None, {"a": [1, 2, 3], "n": 2, "index": 0})
+        self.check_c(orig)
+        self.check_c(traced)
+
     def test_input_keys_types_and_ranges_are_checked(self):
         for inputs in ({"b": -3}, {"b": True, "e": 1}, {"b": 2 ** 31, "e": 1}, {"b": "system()", "e": 1}):
             with self.subTest(inputs=inputs), self.assertRaises(ValueError):
