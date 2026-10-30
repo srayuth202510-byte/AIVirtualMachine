@@ -315,12 +315,14 @@ impl FunctionRepair {
         } else {
             let parts = args.split(',').collect::<Vec<_>>();
             parts.len() == self.trace.parameters.len()
-                && parts
-                    .iter()
-                    .all(|p| p.strip_prefix("int").is_some_and(identifier))
+                && parts.iter().all(|p| {
+                    ["unsignedint", "intunsigned", "unsigned", "int"]
+                        .iter()
+                        .any(|prefix| p.strip_prefix(prefix).is_some_and(identifier))
+                })
         };
         if !valid {
-            return Err("expected the same number of int parameters".into());
+            return Err("expected the same number of integer parameters".into());
         }
         let mut depth = 0usize;
         let mut closed = false;
@@ -1077,6 +1079,12 @@ mod tests {
             trace,
         };
         assert!(function.plan("int f(int n){return n+1;}", &state).is_ok());
+        assert!(function
+            .plan("int f(unsigned n){return (int)(n+1u);}", &state)
+            .is_ok());
+        assert!(function
+            .plan("int f(unsigned int n){return (int)(n+1u);}", &state)
+            .is_ok());
         let wrapped = format!("/* keep license */\n{source}\n/* keep footer */\n");
         let mut preserved = FunctionRepair {
             source: wrapped.clone(),

@@ -109,6 +109,18 @@ class SourceIdentityTests(unittest.TestCase):
             worker.write_bytes(b"changed worker")
             with self.assertRaisesRegex(ValueError, "pin mismatch"):
                 evidence.candidate_config(config)
+            exe, py, clang, trace_cfg = root / "aivm", root / "python3", root / "clang", root / "trace.json"
+            exe.write_bytes(b"aivm"); py.write_bytes(b"py"); clang.write_bytes(b"clang")
+            trace_obj = {"executable":str(exe),"sha256":evidence.digest(exe),
+                "python":str(py),"python_sha256":evidence.digest(py),
+                "clang":str(clang),"clang_sha256":evidence.digest(clang)}
+            trace_cfg.write_text(json.dumps(trace_obj))
+            evidence.trace_config(trace_cfg)
+            trace_cfg.write_text(json.dumps({"repair":{"trace":trace_obj}}))
+            evidence.trace_config(trace_cfg)
+            clang.write_bytes(b"tampered clang")
+            with self.assertRaisesRegex(ValueError, "trace pin mismatch"):
+                evidence.trace_config(trace_cfg)
             config.write_text('{"status":"passed","status":"failed"}')
             with self.assertRaises(ValueError): evidence.load(config)
 
@@ -228,6 +240,25 @@ class RepairEvidenceTests(unittest.TestCase):
         for report in mutations:
             self.path.write_text(json.dumps(report))
             with self.assertRaises(ValueError): self.validate()
+
+    def test_trace_config_binding_is_enforced_in_benchmark_validation(self):
+        trace_hash = "d" * 64
+        with self.assertRaisesRegex(ValueError, "identity, mode"):
+            evidence.validate_benchmark(self.path, self.source, None, allow_control=True, trace_config_sha256=trace_hash)
+        report = copy.deepcopy(self.report)
+        report["trace_config_sha256"] = trace_hash
+        self.path.write_text(json.dumps(report))
+        with self.assertRaisesRegex(ValueError, "incomplete reproduction"):
+            evidence.validate_benchmark(self.path, self.source, None, allow_control=True, trace_config_sha256=trace_hash)
+        for row in report["cases"]:
+            row["effective_config"]["repair"]["trace"] = {"executable":"/usr/bin/true"}
+        self.path.write_text(json.dumps(report))
+        self.assertEqual(
+            evidence.validate_benchmark(self.path, self.source, None, allow_control=True, trace_config_sha256=trace_hash)["successes"],
+            24,
+        )
+        with self.assertRaisesRegex(ValueError, "identity, mode"):
+            self.validate()
 
 
 if __name__ == "__main__": unittest.main()

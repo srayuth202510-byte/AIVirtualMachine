@@ -140,7 +140,28 @@ def candidate_config(path, artifacts=None):
     return config
 
 
-def validate_benchmark(path, expected_source, config_sha256, *, allow_control=False, experiment_case_ids=None):
+def trace_config(path):
+    """ตรวจสอบ pin ของ native trace collector (executable, python, clang) แบบ fail-closed."""
+    raw = load(path)
+    if not isinstance(raw, dict):
+        raise ValueError("trace config must be a JSON object")
+    trace = raw.get("repair", {}).get("trace") if isinstance(raw.get("repair"), dict) else raw
+    if not isinstance(trace, dict):
+        raise ValueError("trace config missing trace block")
+    entries = {
+        "executable": (trace.get("executable"), trace.get("sha256")),
+        "python": (trace.get("python"), trace.get("python_sha256")),
+        "clang": (trace.get("clang"), trace.get("clang_sha256")),
+    }
+    for name, (file, pin) in entries.items():
+        if (not isinstance(file, str) or not Path(file).is_absolute()
+                or not isinstance(pin, str) or not re.fullmatch(r"[0-9a-f]{64}", pin)
+                or digest(file) != pin):
+            raise ValueError(f"{name}: trace pin mismatch")
+    return trace
+
+
+def validate_benchmark(path, expected_source, config_sha256, *, allow_control=False, experiment_case_ids=None, trace_config_sha256=None):
     report = load(path)
     corpus_path = PROJECT / "examples/repair-benchmark.json"
     corpus = load(corpus_path)
@@ -158,6 +179,7 @@ def validate_benchmark(path, expected_source, config_sha256, *, allow_control=Fa
     if (report.get("schema") != (3 if experimental else 2) or report.get("mode") != expected_mode
             or report.get("source_identity") != expected_source
             or report.get("model_config_sha256") != config_sha256
+            or report.get("trace_config_sha256") != trace_config_sha256
             or report.get("corpus_sha256") != digest(corpus_path)
             or type(report.get("completed")) is not int or type(report.get("total")) is not int
             or report["completed"] != report["total"] or report["total"] != len(corpus_cases)
@@ -169,7 +191,8 @@ def validate_benchmark(path, expected_source, config_sha256, *, allow_control=Fa
     for case, row in zip(corpus_cases, cases):
         if (row.get("infrastructure_failure") or row.get("revision") != case["revision"]
                 or row.get("baseline_reproduced") is not True or row.get("protected_verifier") is not True
-                or row.get("verifier_unchanged") is not True or row.get("reproduction_test_origin") != "operator"):
+                or row.get("verifier_unchanged") is not True or row.get("reproduction_test_origin") != "operator"
+                or (trace_config_sha256 is not None) != isinstance(row.get("effective_config", {}).get("repair", {}).get("trace"), dict)):
             raise ValueError("benchmark case has incomplete reproduction/protection evidence")
         root = Path(path).parent / row["id"]
         if digest(root / "audit.jsonl") != row["audit_sha256"]:

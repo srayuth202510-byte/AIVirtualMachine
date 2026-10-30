@@ -9,7 +9,7 @@
       "description": "Return the sum of two integers.",
       "buggy": "int add(int a,int b){return a-b;}\n",
       "reference": "int add(int a,int b){return a+b;}\n",
-      "verifier": "extern int add(int,int); int main(void){for(int a=-8;a<=8;a++)for(int b=-8;b<=8;b++)if(add(a,b)!=a+b)return 1;return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int add(int,int); int main(void){for(int a=-8;a<=8;a++)for(int b=-8;b<=8;b++){int actual=add(a,b),expected=a+b;if(actual!=expected){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"a\\\":%d,\\\"b\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",a,b,expected,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "maximum",
@@ -18,7 +18,7 @@
       "description": "Return the larger argument, including negative values.",
       "buggy": "int maximum(int a,int b){return a<b?a:b;}\n",
       "reference": "int maximum(int a,int b){return a>b?a:b;}\n",
-      "verifier": "extern int maximum(int,int);int main(void){for(int a=-9;a<=9;a++)for(int b=-9;b<=9;b++)if(maximum(a,b)!=(a>b?a:b))return 1;return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int maximum(int,int);int main(void){for(int a=-9;a<=9;a++)for(int b=-9;b<=9;b++){int actual=maximum(a,b),expected=a>b?a:b;if(actual!=expected){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"a\\\":%d,\\\"b\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",a,b,expected,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "minimum",
@@ -27,7 +27,7 @@
       "description": "Return the smaller argument.",
       "buggy": "int minimum(int a,int b){return a>b?a:b;}\n",
       "reference": "int minimum(int a,int b){return a<b?a:b;}\n",
-      "verifier": "extern int minimum(int,int);int main(void){for(int a=-9;a<=9;a++)for(int b=-9;b<=9;b++)if(minimum(a,b)!=(a<b?a:b))return 1;return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int minimum(int,int);int main(void){for(int a=-9;a<=9;a++)for(int b=-9;b<=9;b++){int actual=minimum(a,b),expected=a<b?a:b;if(actual!=expected){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"a\\\":%d,\\\"b\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",a,b,expected,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "absolute",
@@ -36,7 +36,7 @@
       "description": "Return absolute value for inputs from -1000 through 1000.",
       "buggy": "int absolute(int x){return x<0?x:-x;}\n",
       "reference": "int absolute(int x){return x<0?-x:x;}\n",
-      "verifier": "extern int absolute(int);int main(void){for(int i=-1000;i<=1000;i++)if(absolute(i)!=(i<0?-i:i))return 1;return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int absolute(int);int main(void){for(int i=-1000;i<=1000;i++){int actual=absolute(i),expected=i<0?-i:i;if(actual!=expected){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"x\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",i,expected,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "clamp",
@@ -45,7 +45,7 @@
       "description": "Clamp x to inclusive [lo,hi], where lo<=hi.",
       "buggy": "int clamp(int x,int lo,int hi){if(x<lo)return hi;if(x>hi)return lo;return x;}\n",
       "reference": "int clamp(int x,int lo,int hi){if(x<lo)return lo;if(x>hi)return hi;return x;}\n",
-      "verifier": "extern int clamp(int,int,int);int main(void){for(int l=-3;l<=3;l++)for(int h=l;h<=4;h++)for(int x=-6;x<=7;x++)if(clamp(x,l,h)!=(x<l?l:x>h?h:x))return 1;return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int clamp(int,int,int);int main(void){for(int l=-3;l<=3;l++)for(int h=l;h<=4;h++)for(int x=-6;x<=7;x++){int actual=clamp(x,l,h),expected=x<l?l:x>h?h:x;if(actual!=expected){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"x\\\":%d,\\\"lo\\\":%d,\\\"hi\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",x,l,h,expected,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "signum",
@@ -54,7 +54,7 @@
       "description": "Return -1, 0, or 1 for a negative, zero, or positive integer.",
       "buggy": "int signum(int x){return x>=0?1:-1;}\n",
       "reference": "int signum(int x){return (x>0)-(x<0);}\n",
-      "verifier": "extern int signum(int);int main(void){for(int x=-100;x<=100;x++)if(signum(x)!=((x>0)-(x<0)))return 1;return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int signum(int);int main(void){for(int x=-100;x<=100;x++){int actual=signum(x),expected=(x>0)-(x<0);if(actual!=expected){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"x\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",x,expected,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "even",
@@ -63,7 +63,7 @@
       "description": "Return 1 for an even integer, otherwise 0, including negative inputs.",
       "buggy": "int even(int x){return x%2==1;}\n",
       "reference": "int even(int x){return x%2==0;}\n",
-      "verifier": "extern int even(int);int main(void){for(int x=-100;x<=100;x++)if(even(x)!=(x%2==0))return 1;return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int even(int);int main(void){for(int x=-100;x<=100;x++){int actual=even(x),expected=x%2==0;if(actual!=expected){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"x\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",x,expected,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "factorial",
@@ -72,7 +72,7 @@
       "description": "Return n! for n in [0,10], with 0!=1.",
       "buggy": "int factorial(int n){int r=0;for(int i=1;i<=n;i++)r*=i;return r;}\n",
       "reference": "int factorial(int n){int r=1;for(int i=1;i<=n;i++)r*=i;return r;}\n",
-      "verifier": "extern int factorial(int);int main(void){int r=1;for(int n=0;n<=10;n++){if(n)r*=n;if(factorial(n)!=r)return 1;}return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int factorial(int);int main(void){int r=1;for(int n=0;n<=10;n++){if(n)r*=n;int actual=factorial(n);if(actual!=r){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"n\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",n,r,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "gcd",
@@ -81,7 +81,7 @@
       "description": "Compute the nonnegative greatest common divisor of a,b in [0,100], with gcd(0,0)=0.",
       "buggy": "int gcd(int a,int b){while(b){int t=a%b;a=t;b=0;}return a;}\n",
       "reference": "int gcd(int a,int b){while(b){int t=a%b;a=b;b=t;}return a;}\n",
-      "verifier": "extern int gcd(int,int);int main(void){for(int a=0;a<=40;a++)for(int b=0;b<=40;b++){int g=0;for(int d=1;d<=a||d<=b;d++)if(a%d==0&&b%d==0)g=d;if(gcd(a,b)!=g)return 1;}return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int gcd(int,int);int main(void){for(int a=0;a<=40;a++)for(int b=0;b<=40;b++){int g=0;for(int d=1;d<=a||d<=b;d++)if(a%d==0&&b%d==0)g=d;int actual=gcd(a,b);if(actual!=g){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"a\\\":%d,\\\"b\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",a,b,g,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "triangular",
@@ -90,7 +90,7 @@
       "description": "Sum integers 1 through n inclusive, n in [0,100].",
       "buggy": "int triangular(int n){int s=0;for(int i=1;i<n;i++)s+=i;return s;}\n",
       "reference": "int triangular(int n){int s=0;for(int i=1;i<=n;i++)s+=i;return s;}\n",
-      "verifier": "extern int triangular(int);int main(void){for(int n=0;n<=100;n++)if(triangular(n)!=n*(n+1)/2)return 1;return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int triangular(int);int main(void){for(int n=0;n<=100;n++){int actual=triangular(n),expected=n*(n+1)/2;if(actual!=expected){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"n\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",n,expected,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "positive_count",
@@ -99,7 +99,7 @@
       "description": "Count strictly positive entries; zero must not count, n may be 0.",
       "buggy": "int positive_count(const int*a,int n){int c=0;for(int i=0;i<n;i++)c+=a[i]>=0;return c;}\n",
       "reference": "int positive_count(const int*a,int n){int c=0;for(int i=0;i<n;i++)c+=a[i]>0;return c;}\n",
-      "verifier": "extern int positive_count(const int*,int);int main(void){int a[]={0,-1,2,0,3,-4,5};for(int n=0;n<=7;n++){int c=0;for(int i=0;i<n;i++)c+=a[i]>0;if(positive_count(a,n)!=c)return 1;}return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int positive_count(const int*,int);int main(void){int a[]={0,-1,2,0,3,-4,5};for(int n=0;n<=7;n++){int c=0;for(int i=0;i<n;i++)c+=a[i]>0;int actual=positive_count(a,n);if(actual!=c){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"a\\\":[0,-1,2,0,3,-4,5],\\\"n\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",n,c,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "array_sum",
@@ -108,7 +108,7 @@
       "description": "Sum exactly n array entries, including the last entry; n may be 0.",
       "buggy": "int array_sum(const int*a,int n){int s=0;for(int i=0;i<n-1;i++)s+=a[i];return s;}\n",
       "reference": "int array_sum(const int*a,int n){int s=0;for(int i=0;i<n;i++)s+=a[i];return s;}\n",
-      "verifier": "extern int array_sum(const int*,int);int main(void){int a[]={4,-1,0,7,-9,2};for(int n=0;n<=6;n++){int s=0;for(int i=0;i<n;i++)s+=a[i];if(array_sum(a,n)!=s)return 1;}return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int array_sum(const int*,int);int main(void){int a[]={4,-1,0,7,-9,2};for(int n=0;n<=6;n++){int s=0;for(int i=0;i<n;i++)s+=a[i];int actual=array_sum(a,n);if(actual!=s){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"a\\\":[4,-1,0,7,-9,2],\\\"n\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",n,s,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "find_first",
@@ -117,7 +117,7 @@
       "description": "Return the first matching index, or -1 when absent.",
       "buggy": "int find_first(const int*a,int n,int v){for(int i=n-1;i>=0;i--)if(a[i]==v)return i;return -1;}\n",
       "reference": "int find_first(const int*a,int n,int v){for(int i=0;i<n;i++)if(a[i]==v)return i;return -1;}\n",
-      "verifier": "extern int find_first(const int*,int,int);int main(void){int a[]={2,1,2,3,1};for(int n=0;n<=5;n++)for(int v=0;v<=4;v++){int e=-1;for(int i=0;i<n;i++)if(a[i]==v){e=i;break;}if(find_first(a,n,v)!=e)return 1;}return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int find_first(const int*,int,int);int main(void){int a[]={2,1,2,3,1};for(int n=0;n<=5;n++)for(int v=0;v<=4;v++){int e=-1;for(int i=0;i<n;i++)if(a[i]==v){e=i;break;}int actual=find_first(a,n,v);if(actual!=e){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"a\\\":[2,1,2,3,1],\\\"n\\\":%d,\\\"v\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",n,v,e,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "count_value",
@@ -126,7 +126,7 @@
       "description": "Count entries equal to v, not entries different from v.",
       "buggy": "int count_value(const int*a,int n,int v){int c=0;for(int i=0;i<n;i++)c+=a[i]!=v;return c;}\n",
       "reference": "int count_value(const int*a,int n,int v){int c=0;for(int i=0;i<n;i++)c+=a[i]==v;return c;}\n",
-      "verifier": "extern int count_value(const int*,int,int);int main(void){int a[]={1,2,1,3,1};for(int n=0;n<=5;n++)for(int v=0;v<=4;v++){int e=0;for(int i=0;i<n;i++)e+=a[i]==v;if(count_value(a,n,v)!=e)return 1;}return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int count_value(const int*,int,int);int main(void){int a[]={1,2,1,3,1};for(int n=0;n<=5;n++)for(int v=0;v<=4;v++){int e=0;for(int i=0;i<n;i++)e+=a[i]==v;int actual=count_value(a,n,v);if(actual!=e){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"a\\\":[1,2,1,3,1],\\\"n\\\":%d,\\\"v\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",n,v,e,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "reverse_array",
@@ -135,7 +135,7 @@
       "description": "Reverse n entries in place; preserve the unused suffix.",
       "buggy": "void reverse_array(int*a,int n){for(int i=0;i<n/2;i++){int t=a[i];a[i]=a[n-i-2];a[n-i-2]=t;}}\n",
       "reference": "void reverse_array(int*a,int n){for(int i=0;i<n/2;i++){int t=a[i];a[i]=a[n-i-1];a[n-i-1]=t;}}\n",
-      "verifier": "extern void reverse_array(int*,int);int main(void){for(int n=0;n<=7;n++){int a[]={1,2,3,4,5,6,7};reverse_array(a,n);for(int i=0;i<7;i++)if(a[i]!=(i<n?n-i:i+1))return 1;}return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern void reverse_array(int*,int);int main(void){for(int n=0;n<=7;n++){int a[]={1,2,3,4,5,6,7};reverse_array(a,n);for(int i=0;i<7;i++){int expected=i<n?n-i:i+1;if(a[i]!=expected){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"a\\\":[1,2,3,4,5,6,7],\\\"n\\\":%d,\\\"index\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",n,i,expected,a[i]);return 1;}}}return 0;}\n"
     },
     {
       "id": "is_sorted",
@@ -144,7 +144,7 @@
       "description": "Return 1 for a nondecreasing array, including equal neighbors and empty arrays.",
       "buggy": "int is_sorted(const int*a,int n){for(int i=1;i<n;i++)if(a[i-1]>=a[i])return 0;return 1;}\n",
       "reference": "int is_sorted(const int*a,int n){for(int i=1;i<n;i++)if(a[i-1]>a[i])return 0;return 1;}\n",
-      "verifier": "extern int is_sorted(const int*,int);int main(void){int a[]={1,1,2,3},b[]={1,3,2};if(!is_sorted(a,0)||!is_sorted(a,4)||is_sorted(b,3))return 1;return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int is_sorted(const int*,int);int main(void){int a[]={1,1,2,3},b[]={1,3,2};int r0=is_sorted(a,0);if(r0!=1){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"a\\\":[1,1,2,3],\\\"n\\\":0},\\\"expected\\\":1,\\\"actual\\\":%d}\\n\",r0);return 1;}int r1=is_sorted(a,4);if(r1!=1){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"a\\\":[1,1,2,3],\\\"n\\\":4},\\\"expected\\\":1,\\\"actual\\\":%d}\\n\",r1);return 1;}int r2=is_sorted(b,3);if(r2!=0){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"a\\\":[1,3,2],\\\"n\\\":3},\\\"expected\\\":0,\\\"actual\\\":%d}\\n\",r2);return 1;}return 0;}\n"
     },
     {
       "id": "binary_search",
@@ -153,7 +153,7 @@
       "description": "On a strictly increasing array return the index of v or -1.",
       "buggy": "int binary_search(const int*a,int n,int v){int l=0,h=n-1;while(l<=h){int m=l+(h-l)/2;if(a[m]==v)return m;if(a[m]<v)h=m-1;else l=m+1;}return -1;}\n",
       "reference": "int binary_search(const int*a,int n,int v){int l=0,h=n-1;while(l<=h){int m=l+(h-l)/2;if(a[m]==v)return m;if(a[m]<v)l=m+1;else h=m-1;}return -1;}\n",
-      "verifier": "extern int binary_search(const int*,int,int);int main(void){int a[]={-5,-1,0,3,8,12};for(int n=0;n<=6;n++)for(int v=-7;v<=14;v++){int e=-1;for(int i=0;i<n;i++)if(a[i]==v)e=i;if(binary_search(a,n,v)!=e)return 1;}return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int binary_search(const int*,int,int);int main(void){int a[]={-5,-1,0,3,8,12};for(int n=0;n<=6;n++)for(int v=-7;v<=14;v++){int e=-1;for(int i=0;i<n;i++)if(a[i]==v)e=i;int actual=binary_search(a,n,v);if(actual!=e){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"a\\\":[-5,-1,0,3,8,12],\\\"n\\\":%d,\\\"v\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",n,v,e,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "string_length",
@@ -162,7 +162,7 @@
       "description": "Return the number of bytes before NUL, with empty string length 0.",
       "buggy": "int string_length(const char*s){int n=0;while(s[n])n++;return n+1;}\n",
       "reference": "int string_length(const char*s){int n=0;while(s[n])n++;return n;}\n",
-      "verifier": "extern int string_length(const char*);int main(void){if(string_length(\"\")!=0||string_length(\"a\")!=1||string_length(\"abcdef\")!=6)return 1;return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int string_length(const char*);int main(void){const char*s[]={\"\",\"a\",\"abcdef\"};int e[]={0,1,6};for(int i=0;i<3;i++){int actual=string_length(s[i]);if(actual!=e[i]){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"s\\\":\\\"%s\\\"},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",s[i],e[i],actual);return 1;}}return 0;}\n"
     },
     {
       "id": "string_equal",
@@ -171,7 +171,7 @@
       "description": "Return 1 only when both NUL-terminated strings have identical content and length.",
       "buggy": "int string_equal(const char*a,const char*b){while(*a&&*b){if(*a++!=*b++)return 0;}return 1;}\n",
       "reference": "int string_equal(const char*a,const char*b){while(*a&&*b){if(*a++!=*b++)return 0;}return *a==*b;}\n",
-      "verifier": "extern int string_equal(const char*,const char*);int main(void){if(!string_equal(\"\",\"\")||!string_equal(\"abc\",\"abc\")||string_equal(\"a\",\"ab\")||string_equal(\"ab\",\"a\")||string_equal(\"abc\",\"abd\"))return 1;return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int string_equal(const char*,const char*);int main(void){const char*a[]={\"\",\"abc\",\"a\",\"ab\",\"abc\"};const char*b[]={\"\",\"abc\",\"ab\",\"a\",\"abd\"};int e[]={1,1,0,0,0};for(int i=0;i<5;i++){int actual=string_equal(a[i],b[i]);if(actual!=e[i]){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"a\\\":\\\"%s\\\",\\\"b\\\":\\\"%s\\\"},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",a[i],b[i],e[i],actual);return 1;}}return 0;}\n"
     },
     {
       "id": "palindrome",
@@ -180,7 +180,7 @@
       "description": "Return 1 if a byte string is a palindrome; empty string is a palindrome.",
       "buggy": "int palindrome(const char*s){int n=0;while(s[n])n++;for(int i=0;i<n/2;i++)if(s[i]!=s[n-i])return 0;return 1;}\n",
       "reference": "int palindrome(const char*s){int n=0;while(s[n])n++;for(int i=0;i<n/2;i++)if(s[i]!=s[n-i-1])return 0;return 1;}\n",
-      "verifier": "extern int palindrome(const char*);int main(void){if(!palindrome(\"\")||!palindrome(\"x\")||!palindrome(\"abba\")||!palindrome(\"aba\")||palindrome(\"ab\")||palindrome(\"abca\"))return 1;return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int palindrome(const char*);int main(void){const char*s[]={\"\",\"x\",\"abba\",\"aba\",\"ab\",\"abca\"};int e[]={1,1,1,1,0,0};for(int i=0;i<6;i++){int actual=palindrome(s[i]);if(actual!=e[i]){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"s\\\":\\\"%s\\\"},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",s[i],e[i],actual);return 1;}}return 0;}\n"
     },
     {
       "id": "popcount",
@@ -189,7 +189,7 @@
       "description": "Count set bits in an unsigned integer.",
       "buggy": "int popcount(unsigned x){int n=0;while(x){n++;x>>=1;}return n;}\n",
       "reference": "int popcount(unsigned x){int n=0;while(x){n+=(int)(x&1u);x>>=1;}return n;}\n",
-      "verifier": "extern int popcount(unsigned);int main(void){for(unsigned x=0;x<1024;x++){int n=0;for(unsigned y=x;y;y&=y-1)n++;if(popcount(x)!=n)return 1;}return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int popcount(unsigned);int main(void){for(unsigned x=0;x<1024;x++){int n=0;for(unsigned y=x;y;y&=y-1)n++;int actual=popcount(x);if(actual!=n){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"x\\\":%u},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",x,n,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "integer_power",
@@ -198,7 +198,7 @@
       "description": "Return b^e for b in [-3,3], e in [0,6], including b^0=1.",
       "buggy": "int integer_power(int b,int e){int r=b;for(int i=0;i<e;i++)r*=b;return r;}\n",
       "reference": "int integer_power(int b,int e){int r=1;for(int i=0;i<e;i++)r*=b;return r;}\n",
-      "verifier": "extern int integer_power(int,int);int main(void){for(int b=-3;b<=3;b++)for(int e=0;e<=6;e++){int r=1;for(int i=0;i<e;i++)r*=b;if(integer_power(b,e)!=r)return 1;}return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int integer_power(int,int);int main(void){for(int b=-3;b<=3;b++)for(int e=0;e<=6;e++){int r=1;for(int i=0;i<e;i++)r*=b;int actual=integer_power(b,e);if(actual!=r){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"b\\\":%d,\\\"e\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",b,e,r,actual);return 1;}}return 0;}\n"
     },
     {
       "id": "fibonacci",
@@ -207,7 +207,7 @@
       "description": "Return F(n) for n in [0,20], where F(0)=0,F(1)=1.",
       "buggy": "int fibonacci(int n){int a=0,b=1;for(int i=0;i<=n;i++){int t=a+b;a=b;b=t;}return a;}\n",
       "reference": "int fibonacci(int n){int a=0,b=1;for(int i=0;i<n;i++){int t=a+b;a=b;b=t;}return a;}\n",
-      "verifier": "extern int fibonacci(int);int main(void){int a=0,b=1;for(int n=0;n<=20;n++){if(fibonacci(n)!=a)return 1;int t=a+b;a=b;b=t;}return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int fibonacci(int);int main(void){int a=0,b=1;for(int n=0;n<=20;n++){int actual=fibonacci(n);if(actual!=a){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"n\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",n,a,actual);return 1;}int t=a+b;a=b;b=t;}return 0;}\n"
     },
     {
       "id": "lower_bound",
@@ -216,7 +216,7 @@
       "description": "Return the first index whose value is >= v, or n if none, on a nondecreasing array.",
       "buggy": "int lower_bound(const int*a,int n,int v){int l=0,h=n;while(l<h){int m=l+(h-l)/2;if(a[m]<=v)l=m+1;else h=m;}return l;}\n",
       "reference": "int lower_bound(const int*a,int n,int v){int l=0,h=n;while(l<h){int m=l+(h-l)/2;if(a[m]<v)l=m+1;else h=m;}return l;}\n",
-      "verifier": "extern int lower_bound(const int*,int,int);int main(void){int a[]={-2,0,0,0,4,9};for(int n=0;n<=6;n++)for(int v=-4;v<=11;v++){int e=0;while(e<n&&a[e]<v)e++;if(lower_bound(a,n,v)!=e)return 1;}return 0;}\n"
+      "verifier": "#include <stdio.h>\nextern int lower_bound(const int*,int,int);int main(void){int a[]={-2,0,0,0,4,9};for(int n=0;n<=6;n++)for(int v=-4;v<=11;v++){int e=0;while(e<n&&a[e]<v)e++;int actual=lower_bound(a,n,v);if(actual!=e){printf(\"AIVM_CASE_FAILURE {\\\"input\\\":{\\\"a\\\":[-2,0,0,0,4,9],\\\"n\\\":%d,\\\"v\\\":%d},\\\"expected\\\":%d,\\\"actual\\\":%d}\\n\",n,v,e,actual);return 1;}}return 0;}\n"
     }
   ]
 }

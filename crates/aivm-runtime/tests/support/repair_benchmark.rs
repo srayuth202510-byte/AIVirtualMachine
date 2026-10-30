@@ -229,6 +229,7 @@ fn verify(fixture: &mut Fixture, plan: &[String]) -> Vec<serde_json::Value> {
 fn run_case(
     case: &Case,
     model: Option<aivm_runtime::ModelBlock>,
+    trace: Option<aivm_runtime::trace::TraceConfig>,
     out: &std::path::Path,
     interpret: bool,
 ) -> serde_json::Value {
@@ -248,6 +249,7 @@ fn run_case(
     .unwrap();
     // task นี้แก้ไฟล์เดียว เพื่อให้ diff ครบกับ source ที่ verifier ตรวจ
     fixture.runtime.config.filesystem.write = vec!["./workspace/src/main.c".into()];
+    fixture.runtime.config.repair.trace = trace;
     fixture.runtime.gateway.policy.filesystem.write = vec![fixture
         .runtime
         .workspace
@@ -263,10 +265,20 @@ fn run_case(
         .write(&mut fixture.runtime.cube, "verify.c", "tampered")
         .is_err();
     let baseline = verify(&mut fixture, &plan);
+    let counterexample = baseline
+        .get(3)
+        .and_then(|row| row["output"].as_str())
+        .and_then(|out| {
+            out.lines()
+                .find_map(|line| line.strip_prefix("AIVM_CASE_FAILURE "))
+        })
+        .and_then(|json| serde_json::from_str::<aivm_runtime::repair::Counterexample>(json).ok())
+        .is_some_and(|cx| cx.expected != cx.actual);
     let reproduced = baseline.len() == 4
         && baseline[..3].iter().all(|row| row["ok"] == true)
         && baseline[3]["ok"] == false
-        && baseline[3]["verification"]["exit_code"] == 1;
+        && baseline[3]["verification"]["exit_code"] == 1
+        && counterexample;
     assert!(
         reproduced && protected,
         "{}: baseline must compile and fail the protected oracle: {baseline:?}",
@@ -471,6 +483,18 @@ fn suite(fresh: bool, interpret: bool) {
     } else {
         None
     };
+    let trace = std::env::var("AIVM_REPAIR_TRACE_CONFIG").ok().map(|path| {
+        let bytes = std::fs::read(path).expect("approved pinned trace config required");
+        let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let value = raw
+            .get("repair")
+            .and_then(|repair| repair.get("trace"))
+            .cloned()
+            .unwrap_or(raw);
+        let config: aivm_runtime::trace::TraceConfig = serde_json::from_value(value).unwrap();
+        config.validate().unwrap();
+        (config, format!("{:x}", Sha256::digest(&bytes)))
+    });
     let out = std::env::var("AIVM_REPAIR_BENCHMARK_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -489,6 +513,7 @@ fn suite(fresh: bool, interpret: bool) {
             run_case(
                 case,
                 model.as_ref().map(|entry| entry.0.clone()),
+                trace.as_ref().map(|entry| entry.0.clone()),
                 &out,
                 interpret,
             )
@@ -505,6 +530,7 @@ fn suite(fresh: bool, interpret: bool) {
         let report = json!({"schema":if interpret {3} else {2},"mode":if interpret {"interpretation_experiment"} else if fresh {"fresh_model"} else {"reference_control"},"scope":corpus.scope,
             "build_profile":if cfg!(debug_assertions) {"debug"} else {"release"},
             "corpus_sha256":format!("{:x}",Sha256::digest(CORPUS.as_bytes())),"model_config_sha256":model.as_ref().map(|entry| &entry.1),
+            "trace_config_sha256":trace.as_ref().map(|entry| &entry.1),
             "source_identity":std::env::var("AIVM_SOURCE_IDENTITY").ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok()),
             "completed":rows.len(),"total":selected_cases.len(),"task_successes":success,"elapsed_ms":started.elapsed().as_millis(),
             "cost_per_success_ms":if success>0 {Some(total_cost as f64/success as f64)} else {None},"cases":rows});

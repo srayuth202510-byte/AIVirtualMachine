@@ -30,7 +30,15 @@ def run_group(command, env, log, timeout):
 
 def interpretation_cases(baseline_path):
     baseline = evidence.load(baseline_path)
-    evidence.validate_benchmark(baseline_path, baseline["source_identity"], baseline["model_config_sha256"])
+    if baseline.get("trace_config_sha256") is not None:
+        evidence.validate_benchmark(
+            baseline_path,
+            baseline["source_identity"],
+            baseline["model_config_sha256"],
+            trace_config_sha256=baseline["trace_config_sha256"],
+        )
+    else:
+        evidence.validate_benchmark(baseline_path, baseline["source_identity"], baseline["model_config_sha256"])
     corpus = evidence.load(evidence.PROJECT / "examples/repair-benchmark.json")
     selected = []
     for case, row in zip(corpus["cases"], baseline["cases"]):
@@ -48,6 +56,7 @@ def main():
     parser.add_argument("--mode", choices=("fresh_model", "reference_control", "interpretation_experiment"), default="fresh_model")
     parser.add_argument("--baseline-report", type=Path, help="Validated original report; required for interpretation experiment")
     parser.add_argument("--model-config", type=Path)
+    parser.add_argument("--trace-config", type=Path, help="Pinned native trace collector config")
     parser.add_argument("--profile", choices=("release", "debug"), default="release")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=7200)
@@ -59,6 +68,7 @@ def main():
     started = time.monotonic()
     source = evidence.source_identity()
     config_hash = None
+    trace_hash = None
     selected = None
     baseline_hash = None
     experimental = args.mode == "interpretation_experiment"
@@ -69,6 +79,14 @@ def main():
         baseline_hash = evidence.digest(args.baseline_report)
     elif args.baseline_report is not None:
         raise ValueError("--baseline-report is only valid for interpretation_experiment")
+    if args.trace_config is not None:
+        try:
+            evidence.trace_config(args.trace_config)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            (out / "preflight.json").write_text(json.dumps({"passed": False, "error": str(error), "source_identity": source}, indent=2) + "\n")
+            print(f"preflight failed: {error}")
+            return 1
+        trace_hash = evidence.digest(args.trace_config)
     command = ["cargo", "test", "--locked", "-p", "aivm-runtime", "--test", "coding_workflow"]
     if args.profile == "release":
         command.append("--release")
@@ -91,18 +109,22 @@ def main():
     env = dict(os.environ, AIVM_REPAIR_BENCHMARK_OUT=str(out), AIVM_SOURCE_IDENTITY=json.dumps(source))
     if args.model_config:
         env["AIVM_WORKER_HOST_CONFIG"] = str(args.model_config.resolve())
+    if args.trace_config:
+        env["AIVM_REPAIR_TRACE_CONFIG"] = str(args.trace_config.resolve())
     if selected is not None:
         env["AIVM_REPAIR_INTERPRETATION_CASES"] = json.dumps(selected)
     with (out / "run.log").open("w") as log:
         code = run_group(command, env, log, args.timeout_seconds)
     result = {"schema": 1, "returncode": code, "command": command, "build_profile":args.profile,"elapsed_seconds": time.monotonic() - started,
               "source_before": source, "source_after": evidence.source_identity(), "passed": False,
-              "baseline_sha256":baseline_hash,"experiment_case_ids":selected}
+              "baseline_sha256":baseline_hash,"experiment_case_ids":selected,"trace_config_sha256":trace_hash}
     try:
         result["score"] = evidence.validate_benchmark(out / "report.json", source, config_hash,
-                                                    allow_control=args.mode == "reference_control", experiment_case_ids=selected)
+                                                    allow_control=args.mode == "reference_control", experiment_case_ids=selected,
+                                                    trace_config_sha256=trace_hash)
         result["passed"] = (code == 0 and result["source_before"] == result["source_after"]
-                            and (args.model_config is None or evidence.digest(args.model_config) == config_hash))
+                            and (args.model_config is None or evidence.digest(args.model_config) == config_hash)
+                            and (args.trace_config is None or evidence.digest(args.trace_config) == trace_hash))
         if experimental:
             result["passed"] = result["passed"] and evidence.digest(args.baseline_report) == baseline_hash
             report = evidence.load(out / "report.json")
