@@ -16,10 +16,13 @@ fi
 PROMPT="${2:-Once upon a time}"
 
 WORKER="${AIVM_MODEL_WORKER:-}"
+WORKER_TIER="${AIVM_WORKER_TIER:-process_namespace}"
 WORKER_YAML=""
 if [ -n "$WORKER" ]; then
     [ -x "$WORKER" ] || { echo "FAIL: worker not executable: $WORKER"; exit 2; }
-    WORKER_YAML="    worker_path: $WORKER"
+    WORKER_YAML="    worker_path: $WORKER
+    worker_launcher:
+      tier: $WORKER_TIER"
 fi
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/aivm-llama-XXXXXX")"

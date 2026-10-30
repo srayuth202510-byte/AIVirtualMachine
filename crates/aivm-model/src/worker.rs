@@ -849,6 +849,12 @@ impl WorkerClient {
                     }
                     if network_namespace {
                         aivm_sandbox::enter_worker_network_namespace()?;
+                    } else {
+                        #[cfg(target_os = "linux")]
+                        {
+                            // แยกตัวนับ RLIMIT_NPROC ออกจากโปรเซสของ host UID แบบ best-effort
+                            let _ = aivm_sandbox::enter_worker_user_namespace();
+                        }
                     }
                     if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                         return Err(std::io::Error::last_os_error());

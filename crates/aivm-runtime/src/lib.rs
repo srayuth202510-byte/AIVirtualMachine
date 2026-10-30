@@ -190,6 +190,8 @@ pub struct ResourceBlock {
     pub memory: String,
     #[serde(default = "default_storage")]
     pub storage: String,
+    #[serde(default = "default_pids_max")]
+    pub pids_max: u64,
 }
 impl Default for ResourceBlock {
     fn default() -> Self {
@@ -197,6 +199,7 @@ impl Default for ResourceBlock {
             cpu: default_cpu(),
             memory: default_mem(),
             storage: default_storage(),
+            pids_max: default_pids_max(),
         }
     }
 }
@@ -208,6 +211,9 @@ fn default_mem() -> String {
 }
 fn default_storage() -> String {
     "5GB".into()
+}
+fn default_pids_max() -> u64 {
+    64
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -965,12 +971,15 @@ fn resource_limits(resources: &ResourceBlock) -> Result<ResourceLimits, RuntimeE
     if resources.cpu == 0 {
         return Err(RuntimeError::Config("CPU must be positive".into()));
     }
+    if resources.pids_max == 0 {
+        return Err(RuntimeError::Config("pids_max must be positive".into()));
+    }
     let memory_mb = megabytes(&resources.memory)?;
     let storage_mb = megabytes(&resources.storage)?;
     Ok(ResourceLimits {
         cpu: resources.cpu,
         memory_mb,
-        pids_max: 64,
+        pids_max: resources.pids_max,
         storage_mb,
     })
 }
@@ -2640,5 +2649,36 @@ secrets:
             aivm_audit::clear_flags(&base);
             std::fs::remove_dir_all(base).unwrap();
         }
+    }
+
+    #[test]
+    fn resource_block_configures_and_validates_pids_max() {
+        // ค่าเริ่มต้นของ pids_max คือ 64, กำหนดเองได้ และต้องปฏิเสธ 0 แบบ fail-closed
+        let default_cfg = VmConfig::from_yaml("name: t\n").unwrap();
+        assert_eq!(default_cfg.resources.pids_max, 64);
+        assert_eq!(
+            resource_limits(&default_cfg.resources).unwrap().pids_max,
+            64
+        );
+
+        let custom_cfg = VmConfig::from_yaml(
+            "name: t\nresources:\n  cpu: 2\n  memory: 1GB\n  storage: 5GB\n  pids_max: 128\n",
+        )
+        .unwrap();
+        assert_eq!(custom_cfg.resources.pids_max, 128);
+        assert_eq!(
+            resource_limits(&custom_cfg.resources).unwrap().pids_max,
+            128
+        );
+
+        let zero_cfg = VmConfig::from_yaml(
+            "name: t\nresources:\n  cpu: 2\n  memory: 1GB\n  storage: 5GB\n  pids_max: 0\n",
+        )
+        .unwrap();
+        let err = resource_limits(&zero_cfg.resources).unwrap_err();
+        assert!(
+            err.to_string().contains("pids_max must be positive"),
+            "{err}"
+        );
     }
 }

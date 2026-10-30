@@ -755,6 +755,16 @@ pub fn install_worker_network_seccomp() -> std::io::Result<()> {
     }
 }
 
+/// เข้า user namespace แบบไม่บังคับ network namespace เพื่อแยกตัวนับ RLIMIT_NPROC
+/// ของ worker ออกจากจำนวนโปรเซสรวมของ UID บน host
+#[cfg(target_os = "linux")]
+pub fn enter_worker_user_namespace() -> std::io::Result<()> {
+    unsafe {
+        enter_user_ns()?;
+        drop_capabilities()
+    }
+}
+
 /// Enter an empty network namespace; failure is fatal to a requested namespace tier.
 #[cfg(target_os = "linux")]
 pub fn enter_worker_network_namespace() -> std::io::Result<()> {

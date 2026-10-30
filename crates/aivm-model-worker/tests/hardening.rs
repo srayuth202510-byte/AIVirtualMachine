@@ -351,3 +351,20 @@ print(json.dumps({'protocol_version':1,'request_id':request['request_id'],'outpu
     let response = client.infer(&fixture.config, req, &limits).unwrap();
     assert_eq!(response.output.as_deref(), Some("approved model"));
 }
+
+#[test]
+fn process_tier_worker_spawns_threads_under_default_pids_max() {
+    // tier process ต้องแยกตัวนับ RLIMIT_NPROC ด้วย userns best-effort เพื่อไม่ให้เธรดของ host UID ขวาง pids_max=64
+    let fixture = Fixture::new(&format!(
+        "read request\n( : ) &\nwait\nprintf '%s\\n' '{RESPONSE}'"
+    ));
+    let mut limits = fixture.limits(2000);
+    limits.pids_max = 64;
+    let mut req = request();
+    req.stream = false;
+    let response = fixture
+        .client()
+        .infer(&fixture.config, req, &limits)
+        .unwrap();
+    assert_eq!(response.output.as_deref(), Some("ok"));
+}
