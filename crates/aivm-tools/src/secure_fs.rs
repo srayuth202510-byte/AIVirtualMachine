@@ -111,7 +111,8 @@ pub fn replace_with_hook(
 ) -> Result<(), ToolError> {
     use std::io::Write;
     let (dir, last) = parent(workspace, path, true)?;
-    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // เคลียร์ทุกไบต์รวมถึง padding ของ C struct ก่อนส่งให้ syscall
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::zeroed();
     let exists = unsafe {
         libc::fstatat(
             dir.as_raw_fd(),

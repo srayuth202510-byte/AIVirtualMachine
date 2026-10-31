@@ -244,6 +244,7 @@ const DANGEROUS_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_rt_sigqueueinfo,
     libc::SYS_pidfd_open,
     libc::SYS_pidfd_send_signal,
+    libc::SYS_pidfd_getfd,
     libc::SYS_setpgid,
     libc::SYS_setsid,
     libc::SYS_ptrace,
@@ -695,6 +696,19 @@ pub fn install_worker_network_seccomp() -> std::io::Result<()> {
         libc::SYS_process_vm_readv,
         libc::SYS_process_vm_writev,
         libc::SYS_bpf,
+        // ป้องกันการอ่านตำแหน่งหน่วยความจำข้ามโปรเซส การปิด ASLR และ primitive สำหรับ exploit
+        libc::SYS_kcmp,
+        libc::SYS_process_madvise,
+        libc::SYS_pidfd_open,
+        libc::SYS_pidfd_send_signal,
+        libc::SYS_pidfd_getfd,
+        libc::SYS_personality,
+        libc::SYS_userfaultfd,
+        libc::SYS_perf_event_open,
+        libc::SYS_add_key,
+        libc::SYS_keyctl,
+        libc::SYS_request_key,
+        libc::SYS_memfd_secret,
     ];
     let kill = libc::sock_filter {
         code: 0x06,
@@ -748,10 +762,37 @@ pub fn install_worker_network_seccomp() -> std::io::Result<()> {
     filter.push(allow);
     filter.push(kill);
     unsafe {
+        // ปิดการสร้าง core dump ของ worker เพื่อไม่ให้ตำแหน่งหน่วยความจำหรือข้อมูลโมเดลรั่วลงดิสก์เมื่อ crash
+        let no_core = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::setrlimit(libc::RLIMIT_CORE, &no_core) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             return Err(std::io::Error::last_os_error());
         }
         install_dangerous_filter(&filter)
+    }
+}
+
+/// ปิด dumpable flag หลังโหลดไฟล์ผ่าน `/proc/self/fd` เสร็จแล้ว เพื่อล็อก `/proc/<pid>/mem`,
+/// `/proc/<pid>/maps` และ `/proc/<pid>/auxv` ไม่ให้โปรเซสอื่นใน UID เดียวกันอ่านตำแหน่ง ASLR หรือหน่วยความจำได้
+#[cfg(target_os = "linux")]
+pub fn disable_process_dumpable() -> std::io::Result<()> {
+    unsafe {
+        let no_core = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::setrlimit(libc::RLIMIT_CORE, &no_core) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
@@ -1430,6 +1471,7 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
             };
             cap(libc::RLIMIT_AS, mem_bytes as libc::rlim_t)?;
             cap(libc::RLIMIT_CPU, SANDBOX_CPU_SECS as libc::rlim_t)?;
+            cap(libc::RLIMIT_CORE, 0)?;
             cap(
                 libc::RLIMIT_FSIZE,
                 filesystem_fsize_limit.min(SANDBOX_FS_MB * 1024 * 1024) as libc::rlim_t,
@@ -1543,6 +1585,7 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
         "pdeathsig-sigkill".into(),
         format!("rlimit-as={mem_bytes}"),
         format!("rlimit-cpu={SANDBOX_CPU_SECS}s"),
+        "rlimit-core=0".into(),
         format!(
             "rlimit-fsize={}bytes",
             filesystem_fsize_limit.min(SANDBOX_FS_MB * 1024 * 1024)

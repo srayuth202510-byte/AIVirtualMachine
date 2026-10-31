@@ -1002,6 +1002,62 @@ fn semantic_quality_replay() {
 }
 
 #[test]
+fn stack_protector_and_zero_core_limit_contain_pointer_overwrite_and_memory_dumps() {
+    let mut fixture = Fixture::new(true);
+    fixture.modify();
+    let source = r#"
+#include <sys/resource.h>
+#include <string.h>
+__attribute__((noinline)) static int smash(const char *input, size_t len) {
+    volatile char buf[16];
+    for (size_t i = 0; i < len; i++) {
+        buf[i] = input[i];
+    }
+    return (unsigned char)buf[0];
+}
+int main(void) {
+    struct rlimit core;
+    if (getrlimit(RLIMIT_CORE, &core) != 0 || core.rlim_cur != 0 || core.rlim_max != 0) {
+        return 2;
+    }
+    char payload[64];
+    memset(payload, 'A', sizeof(payload));
+    return smash(payload, sizeof(payload));
+}
+"#;
+    std::fs::write(fixture.runtime.workspace.join("src/main.c"), source).unwrap();
+    let steps = vec![
+        intent(
+            &fixture.cc,
+            &json!({
+                "argv": ["-pipe", "-fstack-protector-strong", "-O1", "-c", "src/main.c", "-o", ".aivm-build/main.o"],
+                "outputs": ["main.o"]
+            })
+            .to_string(),
+        ),
+        fixture.build_steps().remove(1),
+        intent(&fixture.artifact(), "[]"),
+        done(),
+    ];
+    let run = fixture.execute(steps);
+    assert!(run.steps[0].outcome.starts_with("OK"), "{:?}", run.steps);
+    assert!(run.steps[1].outcome.starts_with("OK"), "{:?}", run.steps);
+    assert!(run.steps[2].outcome.starts_with("FAIL"), "{:?}", run.steps);
+    assert!(!fixture.runtime.cube.tests_passed());
+    for dir in [
+        fixture.runtime.workspace.clone(),
+        fixture.runtime.workspace.join(".aivm-build"),
+    ] {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.starts_with("core"), "unexpected core dump: {name}");
+        }
+    }
+    assert!(AuditWriter::verify(fixture.root.join("audit.jsonl")).is_ok());
+}
+
+#[test]
 #[ignore = "requires pinned GGUF worker; keep fresh model scores separate from replay/probe evidence"]
 fn real_model_semantic_quality() {
     evaluate_semantic_corpus(true);

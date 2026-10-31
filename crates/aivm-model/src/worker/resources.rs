@@ -51,8 +51,9 @@ fn staging_capacity() -> Result<(bool, u64), WorkerError> {
         use std::os::fd::AsRawFd;
         let file = std::fs::File::open(std::env::temp_dir())
             .map_err(|_| WorkerError::Resources("inspect staging filesystem".into()))?;
-        let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
-        let mut space = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // เคลียร์ทุกไบต์รวมถึง padding ของ C struct ก่อนส่งให้ syscall
+        let mut fs = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+        let mut space = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
         // SAFETY: fd มีเจ้าของ และอ่าน struct เฉพาะเมื่อ syscall สำเร็จ
         if unsafe { libc::fstatfs(file.as_raw_fd(), fs.as_mut_ptr()) } != 0
             || unsafe { libc::fstatvfs(file.as_raw_fd(), space.as_mut_ptr()) } != 0

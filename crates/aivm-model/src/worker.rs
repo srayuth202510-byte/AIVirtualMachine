@@ -879,6 +879,7 @@ impl WorkerClient {
                     set_limit(libc::RLIMIT_CPU, cpu_seconds, cpu_seconds)?;
                     set_limit(libc::RLIMIT_AS, memory_bytes, memory_bytes)?;
                     set_limit(libc::RLIMIT_NPROC, pids_max, pids_max)?;
+                    set_limit(libc::RLIMIT_CORE, 0, 0)?;
                     Ok(())
                 });
             }

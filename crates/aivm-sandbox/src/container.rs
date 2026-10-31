@@ -282,6 +282,14 @@ mod linux {
         if unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limit) } != 0 {
             return Err(spawn_error(std::io::Error::last_os_error()));
         }
+        // ปิดการสร้าง core dump ใน container เพื่อไม่ให้หน่วยความจำรั่วลง workspace
+        let no_core = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) } != 0 {
+            return Err(spawn_error(std::io::Error::last_os_error()));
+        }
         // Trusted prefix is emitted only after Landlock and file limits succeed.
         // The target cannot run (or spoof readiness) before these gates complete.
         std::io::stdout()

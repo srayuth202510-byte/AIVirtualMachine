@@ -41,6 +41,10 @@ fn run() -> Result<(), WorkerError> {
         local.worker_path = None;
     }
     let model = create_model(&config).map_err(|e| WorkerError::Failed(e.to_string()))?;
+    // ล็อก dumpable หลังเปิดไฟล์ผ่าน /proc/self/fd เสร็จแล้ว เพื่อป้องกันการอ่านหน่วยความจำและตำแหน่ง ASLR
+    #[cfg(target_os = "linux")]
+    aivm_sandbox::disable_process_dumpable()
+        .map_err(|e| WorkerError::Failed(format!("disable worker dumpable: {e}")))?;
     let limits = config.worker_limits.clone().unwrap_or_default();
     let mut input: Box<dyn BufRead> = if let Some(path) = argument("--request") {
         Box::new(io::BufReader::new(std::fs::File::open(path).map_err(

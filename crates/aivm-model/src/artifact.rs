@@ -97,7 +97,8 @@ impl PreparedModelFile {
             return Err(failed("bad model hash (must be 64 hex chars)"));
         }
         let mut source = open_regular(path)?;
-        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // เคลียร์ทุกไบต์รวมถึง padding ของ C struct เพื่อไม่ให้มีค่าค้างในหน่วยความจำบน stack
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
         // SAFETY: fd มีเจ้าของ และอ่าน struct เฉพาะเมื่อ syscall สำเร็จ
         if unsafe { libc::fstatvfs(source.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
             return Err(failed("cannot inspect model mount"));
@@ -150,7 +151,7 @@ impl PreparedModelFile {
             let mut output = output?;
             unlink.map_err(|e| failed(format!("unlink model snapshot: {e}")))?;
             cleanup.map_err(|e| failed(format!("remove model staging directory: {e}")))?;
-            let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
             // SAFETY: output fd ยังมีเจ้าของ; อ่าน statfs เฉพาะเมื่อ syscall สำเร็จ
             if unsafe { libc::fstatfs(output.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
                 return Err(failed("cannot inspect snapshot filesystem"));
