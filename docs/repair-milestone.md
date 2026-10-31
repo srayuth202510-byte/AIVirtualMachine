@@ -126,16 +126,21 @@ CPU inference, `threads: 2`, `temperature: 0.0`, `process_namespace` worker laun
 | 3. ขยาย array/string/void trace + pre-seed baseline | `3e81a0b` (clean) | 17 / 24 (70.8%) | 582.4 | 34,199.5 | 61 | 24 / 24 |
 | 4. สำรวจการยกระดับ prompt ครั้งแรก (ดูข้อจำกัดด้านล่าง) | `3e81a0b` + working tree | 24 / 24 (100.0%) | 400.8 | 16,293.6 | 40 | 24 / 24 |
 | 5. Hardened staged diagnostics บน clean release | `9e99999` (clean) | 22 / 24 (91.7%) | 484.3 | 21,966.3 | 48 | 24 / 24 |
-| 6. Adaptive temperature (0.2) + scrap-and-rewrite | `9db169c` + working tree | **24 / 24 (100.0%)** | **358.9** | **14,467.5** | **38** | **24 / 24** |
+| 6. Adaptive temperature (0.2) + scrap-and-rewrite (สำรวจ) | `9db169c` + working tree | 24 / 24 (100.0%) | 358.9 | 14,467.5 | 38 | 24 / 24 |
+| 7. Adaptive temperature + hardened worker/sandbox บน clean release | `0d1d072` (clean) | **24 / 24 (100.0%)** | **376.1** | **15,121.3** | **38** | **24 / 24** |
 
 ตัวเลขทุกแถวมาจาก `runner.json` / `report.json` ของแต่ละรอบใน `target/`
 (`repair-release-f47141c/model-benchmark`, `repair-benchmark-trace-c4fb3be`,
 `repair-benchmark-trace-3e81a0b`, `repair-benchmark-trace-v3`,
-`repair-benchmark-trace-9e99999`, `repair-benchmark-trace-adaptive`)
+`repair-benchmark-trace-9e99999`, `repair-benchmark-trace-adaptive`,
+`repair-benchmark-trace-0d1d072`)
 "งานที่ได้ Native Trace" นับงานที่มี `trace_history` พร้อม observation อย่างน้อยหนึ่งรายการ
 
 > [!NOTE]
-> **รอบที่ 6 (`repair-benchmark-trace-adaptive`):** เมื่อเข้าสู่ Stage 2/3 ปรับ `temperature` เป็น `0.2` (พร้อมขยายขอบเขต sampling `top_k >= 40`, `top_p >= 0.95` เฉพาะเมื่อขอ temperature > 0) และเมื่อตรวจพบการส่งฟังก์ชันเดิมซ้ำครบ 2 ครั้ง (`unchanged_plan_responses >= 2`) จะเข้าสู่โหมด **Scrap-and-Rewrite** ตัด source/trace เดิมออกจาก prompt แล้วให้เขียนใหม่จาก signature ว่าง
+> **รอบที่ 7 (`0d1d072`, `repair-benchmark-trace-0d1d072`):** รันบน clean commit โดยสมบูรณ์ (`source_before.clean: true`), ไบนารี release `aivm` (`0fcaf09bc5fa...`) และ `aivm-model-worker` (`dd9212533229...`) คอมไพล์พร้อมฟีเจอร์ `--features llama,microvm` และ pin SHA-256 ตรงทุกตัว รวมการปรับปรุง Adaptive Temperature (`0.2` ใน Stage 2/3), โหมด **Scrap-and-Rewrite** เมื่อส่งฟังก์ชันเดิมซ้ำครบ 2 ครั้ง และการเพิ่มความแข็งแกร่งของ Worker/Sandbox (`RLIMIT_CORE=0`, `PR_SET_DUMPABLE=0`, seccomp memory-inspection filter)
+> ผลคือผ่านครบ **24 / 24 งาน (100.0%)** บน clean release (รวม 38 model calls, เฉลี่ย 1.58 calls/งาน, เวลารวม 376.1 วินาที, `cost_per_success_ms`: 15,121.3 ms, `reported_input_tokens`: 12,992, `reported_output_tokens`: 1,756, `unreported_usage_calls`: 0, `sampled_tree_peak_rss_bytes`: 2,133,458,944 bytes)
+>
+> **รอบที่ 6 (`repair-benchmark-trace-adaptive`):** รอบสำรวจก่อน commit `3c96c1a` เมื่อเข้าสู่ Stage 2/3 ปรับ `temperature` เป็น `0.2` (พร้อมขยายขอบเขต sampling `top_k >= 40`, `top_p >= 0.95` เฉพาะเมื่อขอ temperature > 0) และเมื่อตรวจพบการส่งฟังก์ชันเดิมซ้ำครบ 2 ครั้ง (`unchanged_plan_responses >= 2`) จะเข้าสู่โหมด **Scrap-and-Rewrite** ตัด source/trace เดิมออกจาก prompt แล้วให้เขียนใหม่จาก signature ว่าง
 > ผลคือผ่านครบ **24 / 24 งาน (100%)** โดยทั้ง `fibonacci` และ `lower_bound` ผ่านใน call ที่ 3 (รวม 38 model calls, เฉลี่ย 1.58 calls/งาน, เวลารวม 358.9 วินาที, `reported_input_tokens`: 12,992, `reported_output_tokens`: 1,756, `sampled_tree_peak_rss_bytes`: 2,131,755,008 bytes)
 >
 > **รอบที่ 5 (`9e99999`):** รันบน clean commit โดยสมบูรณ์ (`source_before.clean: true`),
