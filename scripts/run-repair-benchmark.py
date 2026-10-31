@@ -57,6 +57,7 @@ def main():
     parser.add_argument("--baseline-report", type=Path, help="Validated original report; required for interpretation experiment")
     parser.add_argument("--model-config", type=Path)
     parser.add_argument("--trace-config", type=Path, help="Pinned native trace collector config")
+    parser.add_argument("--corpus", type=Path, help="Optional alternate repair corpus JSON (default: examples/repair-benchmark.json)")
     parser.add_argument("--profile", choices=("release", "debug"), default="release")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=7200)
@@ -107,6 +108,9 @@ def main():
     else:
         command += ["repair_benchmark::repair_corpus_baselines_and_reference_controls", "--", "--exact", "--nocapture"]
     env = dict(os.environ, AIVM_REPAIR_BENCHMARK_OUT=str(out), AIVM_SOURCE_IDENTITY=json.dumps(source))
+    corpus_path = args.corpus.resolve(strict=True) if args.corpus is not None else None
+    if corpus_path is not None:
+        env["AIVM_REPAIR_CORPUS_PATH"] = str(corpus_path)
     if args.model_config:
         env["AIVM_WORKER_HOST_CONFIG"] = str(args.model_config.resolve())
     if args.trace_config:
@@ -118,10 +122,12 @@ def main():
     result = {"schema": 1, "returncode": code, "command": command, "build_profile":args.profile,"elapsed_seconds": time.monotonic() - started,
               "source_before": source, "source_after": evidence.source_identity(), "passed": False,
               "baseline_sha256":baseline_hash,"experiment_case_ids":selected,"trace_config_sha256":trace_hash}
+    if corpus_path is not None:
+        result["corpus_path"] = str(corpus_path)
     try:
         result["score"] = evidence.validate_benchmark(out / "report.json", source, config_hash,
                                                     allow_control=args.mode == "reference_control", experiment_case_ids=selected,
-                                                    trace_config_sha256=trace_hash)
+                                                    trace_config_sha256=trace_hash, corpus_path=corpus_path)
         result["passed"] = (code == 0 and result["source_before"] == result["source_after"]
                             and (args.model_config is None or evidence.digest(args.model_config) == config_hash)
                             and (args.trace_config is None or evidence.digest(args.trace_config) == trace_hash))

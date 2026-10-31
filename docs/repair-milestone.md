@@ -159,6 +159,22 @@ CPU inference, `threads: 2`, `temperature: 0.0`, `process_namespace` worker laun
 - `sampled_tree_peak_rss_bytes`: 2,139,324,416 bytes (~2.04 GiB)
 - ผลนี้วัดบน bounded synthetic C benchmark 24 งานภายใต้ operator verifier/trace config เท่านั้น ไม่ใช่คำรับรองอัตราความสำเร็จบนโค้ดเบสทั่วไปในโลกจริง
 
+### Memory-Safety Holdout Corpus (6 งานซ่อมช่องโหว่ขอบเขตหน่วยความจำ)
+
+เพื่อพิสูจน์ว่ากลไก Native Trace + Staged Diagnostics ไม่ได้ overfit กับโจทย์ 24 ข้อเดิม จึงแยกชุดทดสอบ **Memory-Safety Holdout** ไว้ใน `examples/repair-memory-safety-holdout.json` (6 งานที่ไม่เคยใช้ระหว่างปรับแต่ง prompt/temperature) พร้อมบังคับใช้ Compiler Hardening Flags (`-fstack-protector-strong -Wformat -Werror=format-security`) ในทุกขั้นคอมไพล์ C:
+
+1. `bounded_read_sum` (`bounds_read`) — ป้องกันการอ่านเกินความจุบัฟเฟอร์ (`cap`) เมื่อผู้เรียกส่ง `req > cap`
+2. `packet_payload_checksum` (`bounds_read`) — ปฏิเสธ `declared_len` ที่หลอกขนาดเกิน `actual_len` (รูปแบบเดียวกับ Heartbleed)
+3. `bounded_strnlen` (`bounds_read`) — หยุดอ่านสตริงที่ `max_len` แม้ไม่มี NUL-terminator ภายในขอบเขต
+4. `ring_buffer_index` (`bounds_read`) — บังคับ modulo wrap `(head + offset) % cap` ไม่ให้อ่านทะลุท้าย ring buffer
+5. `safe_write_at` (`bounds_write`) — แก้บั๊ก off-by-one (`pos <= cap` → `pos < cap`) ที่เขียนทับ guard/pointer slot
+6. `safe_slice_copy` (`bounds_write`) — จำกัดการคัดลอกข้อมูลเข้า `dst` ไม่ให้เกิน `dst_cap`
+
+ผลการรันด้วยโมเดล `qwen2.5-coder-1.5b-instruct-q4_k_m.gguf` (`target/repair-memory-safety-holdout-run`):
+- **Successes:** **6 / 6 งาน (100.0%)** (`passed: true`)
+- **Model Calls รวม:** 9 ครั้ง (เฉลี่ย **1.50 ครั้ง/งาน**, เวลารวม **111.3 วินาที**, `cost_per_success_ms`: **16,860.7 ms**)
+- **Tokens:** `reported_input_tokens`: 4,388, `reported_output_tokens`: 419, `unreported_usage_calls`: 0 (`sampled_tree_peak_rss_bytes`: 2,135,244,800 bytes)
+
 ## Failure injection และ recovery
 
 มี SIGKILL จริง 20 boundaries: quota temporary write/fsync/rename, ก่อนเขียน source,

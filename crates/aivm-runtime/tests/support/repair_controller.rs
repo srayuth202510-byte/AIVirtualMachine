@@ -106,8 +106,8 @@ fn fixture(probe: bool) -> Fixture {
     std::fs::write(f.runtime.workspace.join("src/main.c"), BUGGY).unwrap();
     std::fs::write(f.runtime.workspace.join("verify.c"), DRIVER).unwrap();
     let commands=vec![
-        intent(&f.cc,&json!({"argv":["-pipe","-std=c11","-c","src/main.c","-o",".aivm-build/main.o"],"outputs":["main.o"]}).to_string()),
-        intent(&f.cc,&json!({"argv":["-pipe","-std=c11","-c","verify.c","-o",".aivm-build/verify.o"],"outputs":["verify.o"]}).to_string()),
+        intent(&f.cc,&json!({"argv":["-pipe","-fstack-protector-strong","-Wformat","-Werror=format-security","-std=c11","-c","src/main.c","-o",".aivm-build/main.o"],"outputs":["main.o"]}).to_string()),
+        intent(&f.cc,&json!({"argv":["-pipe","-fstack-protector-strong","-Wformat","-Werror=format-security","-std=c11","-c","verify.c","-o",".aivm-build/verify.o"],"outputs":["verify.o"]}).to_string()),
         intent(&f.ld,&json!({"argv":["-o",".aivm-build/tests","--dynamic-linker","/lib64/ld-linux-x86-64.so.2",f.crt[0],f.crt[1],".aivm-build/main.o",".aivm-build/verify.o","-lc",f.crt[2]],"outputs":["tests"]}).to_string()),
     ];
     f.prepare_verifier(&commands);

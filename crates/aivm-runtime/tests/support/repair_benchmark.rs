@@ -12,6 +12,8 @@ use std::{
 };
 
 const CORPUS: &str = include_str!("../../../../examples/repair-benchmark.json");
+const MEMORY_SAFETY_HOLDOUT_CORPUS: &str =
+    include_str!("../../../../examples/repair-memory-safety-holdout.json");
 #[derive(Deserialize)]
 struct Corpus {
     schema: u8,
@@ -199,8 +201,8 @@ impl Drop for MemorySample {
 
 fn commands(fixture: &Fixture) -> Vec<String> {
     vec![
-        intent(&fixture.cc, &json!({"argv":["-pipe","-std=c11","-c","src/main.c","-o",".aivm-build/main.o"],"outputs":["main.o"]}).to_string()),
-        intent(&fixture.cc, &json!({"argv":["-pipe","-std=c11","-c","verify.c","-o",".aivm-build/verify.o"],"outputs":["verify.o"]}).to_string()),
+        intent(&fixture.cc, &json!({"argv":["-pipe","-fstack-protector-strong","-Wformat","-Werror=format-security","-std=c11","-c","src/main.c","-o",".aivm-build/main.o"],"outputs":["main.o"]}).to_string()),
+        intent(&fixture.cc, &json!({"argv":["-pipe","-fstack-protector-strong","-Wformat","-Werror=format-security","-std=c11","-c","verify.c","-o",".aivm-build/verify.o"],"outputs":["verify.o"]}).to_string()),
         intent(&fixture.ld, &json!({"argv":["-o",".aivm-build/tests","--dynamic-linker","/lib64/ld-linux-x86-64.so.2",fixture.crt[0],fixture.crt[1],".aivm-build/main.o",".aivm-build/verify.o","-lc",fixture.crt[2]],"outputs":["tests"]}).to_string()),
         intent("build:tests", "[]"),
     ]
@@ -422,9 +424,17 @@ fn run_case(
 }
 
 fn suite(fresh: bool, interpret: bool) {
-    let corpus: Corpus = serde_json::from_str(CORPUS).unwrap();
+    let corpus_text = std::env::var("AIVM_REPAIR_CORPUS_PATH")
+        .ok()
+        .map(|path| std::fs::read_to_string(path).expect("explicit repair corpus path readable"))
+        .unwrap_or_else(|| CORPUS.to_string());
+    suite_with_corpus(&corpus_text, fresh, interpret);
+}
+
+fn suite_with_corpus(corpus_text: &str, fresh: bool, interpret: bool) {
+    let corpus: Corpus = serde_json::from_str(corpus_text).unwrap();
     assert_eq!(corpus.schema, 1);
-    assert!((20..=30).contains(&corpus.cases.len()));
+    assert!((6..=30).contains(&corpus.cases.len()));
     let selected = interpret.then(|| {
         assert!(fresh, "interpretation requires a real model");
         let ids: Vec<String> = serde_json::from_str(
@@ -533,7 +543,7 @@ fn suite(fresh: bool, interpret: bool) {
             .sum();
         let report = json!({"schema":if interpret {3} else {2},"mode":if interpret {"interpretation_experiment"} else if fresh {"fresh_model"} else {"reference_control"},"scope":corpus.scope,
             "build_profile":if cfg!(debug_assertions) {"debug"} else {"release"},
-            "corpus_sha256":format!("{:x}",Sha256::digest(CORPUS.as_bytes())),"model_config_sha256":model.as_ref().map(|entry| &entry.1),
+            "corpus_sha256":format!("{:x}",Sha256::digest(corpus_text.as_bytes())),"model_config_sha256":model.as_ref().map(|entry| &entry.1),
             "trace_config_sha256":trace.as_ref().map(|entry| &entry.1),
             "source_identity":std::env::var("AIVM_SOURCE_IDENTITY").ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok()),
             "completed":rows.len(),"total":selected_cases.len(),"task_successes":success,"elapsed_ms":started.elapsed().as_millis(),
@@ -569,6 +579,11 @@ fn suite(fresh: bool, interpret: bool) {
 #[test]
 fn repair_corpus_baselines_and_reference_controls() {
     suite(false, false);
+}
+
+#[test]
+fn memory_safety_holdout_baselines_and_reference_controls() {
+    suite_with_corpus(MEMORY_SAFETY_HOLDOUT_CORPUS, false, false);
 }
 
 #[test]

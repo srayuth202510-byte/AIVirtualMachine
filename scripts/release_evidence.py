@@ -161,9 +161,9 @@ def trace_config(path):
     return trace
 
 
-def validate_benchmark(path, expected_source, config_sha256, *, allow_control=False, experiment_case_ids=None, trace_config_sha256=None):
+def validate_benchmark(path, expected_source, config_sha256, *, allow_control=False, experiment_case_ids=None, trace_config_sha256=None, corpus_path=None):
     report = load(path)
-    corpus_path = PROJECT / "examples/repair-benchmark.json"
+    corpus_path = Path(corpus_path) if corpus_path is not None else PROJECT / "examples/repair-benchmark.json"
     corpus = load(corpus_path)
     cases = report["cases"]
     corpus_cases = corpus["cases"]

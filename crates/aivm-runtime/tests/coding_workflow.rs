@@ -63,7 +63,7 @@ impl Fixture {
         contract.executable = "build:tests".into();
         // semantic helper มี main ของตัวเองและอยู่เหนือ src ที่ model เขียนได้
         let steps = vec![
-            intent(&fixture.cc, &json!({"argv":["-pipe","-std=c11","-c","semantic.c","-o",".aivm-build/main.o"],"outputs":["main.o"]}).to_string()),
+            intent(&fixture.cc, &json!({"argv":["-pipe","-fstack-protector-strong","-Wformat","-Werror=format-security","-std=c11","-c","semantic.c","-o",".aivm-build/main.o"],"outputs":["main.o"]}).to_string()),
             intent(&fixture.ld, &json!({"argv":["-o",".aivm-build/tests","--dynamic-linker","/lib64/ld-linux-x86-64.so.2",fixture.crt[0],fixture.crt[1],".aivm-build/main.o","-lc",fixture.crt[2]],"outputs":["tests"]}).to_string()),
         ];
         fixture.prepare_verifier(&steps);
@@ -168,7 +168,7 @@ tools: {{allow: [cc, as, ld, "build:tests"]}}
     }
     fn build_steps(&self) -> Vec<String> {
         vec![
-            intent(&self.cc, &json!({"argv":["-pipe", "-c", "src/main.c", "-o", ".aivm-build/main.o"],"outputs":["main.o"]}).to_string()),
+            intent(&self.cc, &json!({"argv":["-pipe", "-fstack-protector-strong", "-Wformat", "-Werror=format-security", "-c", "src/main.c", "-o", ".aivm-build/main.o"],"outputs":["main.o"]}).to_string()),
             intent(&self.ld, &json!({"argv":["-o", ".aivm-build/tests", "--dynamic-linker", "/lib64/ld-linux-x86-64.so.2", self.crt[0], self.crt[1], ".aivm-build/main.o", "-lc", self.crt[2]],"outputs":["tests"]}).to_string()),
             intent(&self.artifact(), "[]"),
         ]

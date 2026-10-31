@@ -1032,6 +1032,9 @@ fn measure(source: &str, root: &Path, label: &str) -> Result<(i32, String, Value
             executable: cc.display().to_string(),
             argv: vec![
                 "-pipe".into(),
+                "-fstack-protector-strong".into(),
+                "-Wformat".into(),
+                "-Werror=format-security".into(),
                 "-std=c11".into(),
                 "-c".into(),
                 "src/main.c".into(),
