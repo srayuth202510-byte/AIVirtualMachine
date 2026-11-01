@@ -157,6 +157,11 @@ pub struct ModelBlock {
     pub openai: Option<aivm_model::providers::OpenAIConfig>,
     #[serde(default)]
     pub anthropic: Option<aivm_model::providers::AnthropicConfig>,
+    /// I-1: provider cloud (openai/anthropic) เป็นการส่ง context ออกนอก
+    /// policy โดยตรง — deny-by-default หากไม่ตั้งค่าชัดเจนว่า
+    /// operator ยอมรับความเสี่ยงนี้แล้ว
+    #[serde(default)]
+    pub cloud_allowed: bool,
 }
 
 // default ต้องตรงกับ serde default (echo) ไม่ใช่ค่าว่าง เพื่อให้ผู้ที่สร้าง
@@ -171,6 +176,7 @@ impl Default for ModelBlock {
             local: None,
             openai: None,
             anthropic: None,
+            cloud_allowed: false,
         }
     }
 }
@@ -299,6 +305,7 @@ impl VmConfig {
             local: self.model.local.clone(),
             openai: self.model.openai.clone(),
             anthropic: self.model.anthropic.clone(),
+            cloud_allowed: self.model.cloud_allowed,
             worker_limits: self.model.local.as_ref().map(|local| {
                 aivm_model::worker::InferenceLimits {
                     max_context_tokens: local.ctx_size,
@@ -1324,6 +1331,26 @@ fn validate_model_security(config: &VmConfig) -> Result<(), RuntimeError> {
         }
     }
     if config.model.provider != "local" {
+        // I-1: provider cloud ส่ง context ออก HTTPS ตรง ๆ นอก policy/audit
+        // — deny-by-default และบูตไม่ผ่านโปรไฟล์ production (ไม่มีทาง
+        // ผูกชื่อ backend แบบ pin sha256 ได้จริง)
+        if config.model.provider == "openai" || config.model.provider == "anthropic" {
+            if !config.model.cloud_allowed {
+                return Err(RuntimeError::Config(
+                    "cloud provider denied by default: set model.cloud_allowed=true \
+                     to accept external HTTPS egress for the full workspace context"
+                        .into(),
+                ));
+            }
+            if config.security.profile == "production" {
+                return Err(RuntimeError::Config(
+                    "security.profile=production requires a pinned local model; \
+                     use cloud_allowed only outside production"
+                        .into(),
+                ));
+            }
+            return Ok(());
+        }
         return Ok(());
     }
     let local = config.model.local.as_ref().ok_or_else(|| {
@@ -1586,6 +1613,23 @@ capabilities:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // regression I-1: provider cloud ต้องเปิดอย่างชัดเจน และห้ามใช้กับ
+    // โปรไฟล์ production (จ่ายหัวโพดยากกว starttime ที่ตั้งจาก)
+    #[test]
+    fn cloud_provider_gated_by_default_and_production_denies_cloud() {
+        let yaml_open = "name: cloud\nmodel:\n  provider: openai\n  openai:\n    api_key_env: MISSING_KEY_FOR_TEST\n";
+        let cfg = VmConfig::from_yaml(yaml_open).unwrap();
+        assert!(validate_model_security(&cfg).is_err());
+        let mut cfg2 = VmConfig::from_yaml(yaml_open).unwrap();
+        cfg2.model.cloud_allowed = true;
+        assert!(validate_model_security(&cfg2).is_ok());
+        // production + cloud = ปฏิเสธ แม้จะตั้ง cloud_allowed แล้ว
+        cfg2.security.profile = "production".into();
+        assert!(validate_model_security(&cfg2).is_err());
+        // แปะ demo (`aivm run` มี yaml ทุกตัว) — deny-by-default ยังคงผ่าน validate
+        // (deny จีบอยู่ที่ create_model และ model worker ตามเส้นทางการรัน)
+    }
+
     #[test]
     fn total_inference_budget_is_forwarded_and_cannot_be_silently_ignored() {
         // รับ config จาก YAML จริงและห้ามรับ budget เมื่อ backend ไม่มี worker บังคับใช้
@@ -1634,8 +1678,10 @@ capabilities:
             ("anthropic", "AIVM_RUNTIME_TEST_ANTHROPIC_CONFIG_KEY"),
         ] {
             std::env::set_var(key, "test-only");
+            // cloud = egress นอก policy ⇒ ต้อง opt-in ตาม I-1 (deny-by-default
+            // คือค่า default ของ field เมื่อไม่ระบุ)
             let config = VmConfig::from_yaml(&format!(
-                "name: cloud\nmodel:\n  provider: {provider}\n  {provider}:\n    api_key_env: {key}\n    model: selected-model\n"
+                "name: cloud\nmodel:\n  provider: {provider}\n  {provider}:\n    api_key_env: {key}\n    model: selected-model\n  cloud_allowed: true\n"
             )).unwrap();
             let (rt, base) = test_runtime(provider);
             drop(rt);

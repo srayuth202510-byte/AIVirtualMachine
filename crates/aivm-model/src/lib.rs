@@ -61,6 +61,11 @@ pub struct ModelConfig {
     pub anthropic: Option<providers::AnthropicConfig>,
     #[serde(default)]
     pub worker_limits: Option<worker::InferenceLimits>,
+    /// I-1 (เน็ตผ่านเกตเดียว): backend cloud ส่ง context ทั้งหมดออก HTTPS
+    /// ตรง ๆ นอก policy/audit จึง deny-by-default ไว้ก่อน — operator
+    /// ต้องตั้ง `true` อย่างชัดเจนเพื่อรับข้อจำกัดด้าน privacy ของเส้นทางนี้
+    #[serde(default)]
+    pub cloud_allowed: bool,
 }
 
 impl Default for ModelConfig {
@@ -72,6 +77,7 @@ impl Default for ModelConfig {
             openai: None,
             anthropic: None,
             worker_limits: None,
+            cloud_allowed: false,
         }
     }
 }
@@ -946,12 +952,26 @@ pub fn create_model(config: &ModelConfig) -> Result<Box<dyn Model>, ModelError> 
                 create_local_model(config)
             }
         }
-        "openai" => Ok(Box::new(providers::OpenAIProvider::new(
-            config.openai_config(),
-        )?)),
-        "anthropic" => Ok(Box::new(providers::AnthropicProvider::new(
-            config.anthropic_config(),
-        )?)),
+        "openai" | "anthropic" => {
+            // gate ระดับ factory: provider cloud ต้องถูกเปิดอย่างชัดเจน
+            // (worker ปฏิเสธ cloud อีกชั้นเมื่อ run ใน sandbox)
+            if !config.cloud_allowed {
+                return Err(ModelError::Backend(format!(
+                    "provider {} denied by default: set cloud_allowed=true to accept \
+                     that the full workspace context is sent to an external HTTPS backend",
+                    config.provider
+                )));
+            }
+            if config.provider == "openai" {
+                Ok(Box::new(providers::OpenAIProvider::new(
+                    config.openai_config(),
+                )?))
+            } else {
+                Ok(Box::new(providers::AnthropicProvider::new(
+                    config.anthropic_config(),
+                )?))
+            }
+        }
         other => Err(ModelError::Backend(format!("unknown provider: {other}"))),
     }
 }
@@ -1041,6 +1061,7 @@ mod tests {
             openai: None,
             anthropic: None,
             worker_limits: None,
+            cloud_allowed: false,
         };
         assert!(create_model(&cfg).is_err());
     }
@@ -1054,6 +1075,7 @@ mod tests {
             openai: None,
             anthropic: None,
             worker_limits: None,
+            cloud_allowed: false,
         };
         assert!(create_model(&cfg).is_err());
 
@@ -1064,8 +1086,33 @@ mod tests {
             openai: None,
             anthropic: None,
             worker_limits: None,
+            cloud_allowed: false,
         };
         assert!(create_model(&cfg_empty_path).is_err());
+    }
+
+    #[test]
+    fn cloud_provider_denies_by_default_without_explicit_opt_in() {
+        // regression I-1: provider cloud = ส่ง context ทั้งหมดของ workspace
+        // ออก HTTPS ตรง ๆ นอก policy/audit — ต้อง deny จนกว่า operator
+        // ตั้ง cloud_allowed=true อย่างชัดเจน
+        for provider in ["openai", "anthropic"] {
+            let cfg = ModelConfig {
+                provider: provider.into(),
+                name: provider.into(),
+                ..Default::default()
+            };
+            let error = match create_model(&cfg) {
+                Err(error) => error.to_string(),
+                Ok(_) => {
+                    panic!("cloud provider {provider} must fail closed without explicit opt-in")
+                }
+            };
+            assert!(
+                error.contains("cloud_allowed"),
+                "cloud gate missing for {provider}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1083,6 +1130,8 @@ mod tests {
             }),
             anthropic: None,
             worker_limits: None,
+            // เปิด gate ผ่านเพื่อทดสอบเงื่อนไขถัดไป (env ไม่มี key)
+            cloud_allowed: true,
         };
         assert!(create_model(&cfg).is_err());
     }
@@ -1101,6 +1150,8 @@ mod tests {
                 model: "claude-sonnet-4-20250514".into(),
             }),
             worker_limits: None,
+            // เปิด gate ผ่านเพื่อทดสอบเงื่อนไขถัดไป (env ไม่มี key)
+            cloud_allowed: true,
         };
         assert!(create_model(&cfg).is_err());
     }

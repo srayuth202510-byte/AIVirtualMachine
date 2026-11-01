@@ -31,6 +31,7 @@ fn run() -> Result<(), WorkerError> {
         .map_err(|e| WorkerError::Failed(format!("read model config: {e}")))?;
     let config: ModelConfig = serde_json::from_str(&config_text)
         .map_err(|e| WorkerError::Failed(format!("parse model config JSON: {e}")))?;
+    ensure_worker_supported_provider(&config)?;
     #[cfg(target_os = "linux")]
     aivm_sandbox::install_worker_network_seccomp()
         .map_err(|e| WorkerError::Failed(format!("install worker network filter: {e}")))?;
@@ -189,6 +190,26 @@ fn run() -> Result<(), WorkerError> {
     Ok(())
 }
 
+/// บังคับให้ worker รับ provider `local`/`echo` เท่านั้น
+///
+/// เหตุผล: worker ติดตั้ง seccomp ที่ KILL ทุก socket อยู่แล้ว ถ้า config
+/// เป็น provider cloud (`openai`/`anthropic`) แล้วพาต่อผ่านมาได้ จะเป็นการ
+/// การันตี inconsistency กับเกตของ control-plane และ infer แรกจะโดน
+/// SIGSYS กลาง loop โดยไม่มีข้อความบอกสาเหตุ — จึงปฏิเสธตั้งแต่ต้น
+/// (fail-closed) พร้อมข้อความบอก operator ที่ชัดเจน
+const WORKER_PROVIDERS: [&str; 2] = ["local", "echo"];
+fn ensure_worker_supported_provider(config: &ModelConfig) -> Result<(), WorkerError> {
+    if WORKER_PROVIDERS.contains(&config.provider.as_str()) {
+        return Ok(());
+    }
+    Err(WorkerError::Failed(format!(
+        "worker supports only provider {} (got \"{}\"): cloud backends must run \
+         in the control plane; the worker network seccomp filter kills sockets",
+        WORKER_PROVIDERS.join("/"),
+        config.provider
+    )))
+}
+
 fn config_path() -> Result<PathBuf, WorkerError> {
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
@@ -231,4 +252,34 @@ fn argument(name: &str) -> Option<PathBuf> {
     args.windows(2)
         .find(|pair| pair[0] == name)
         .map(|pair| PathBuf::from(&pair[1]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // regression ของจุดที่เคยโง่: ถ้ายอม provider cloud ผ่านมา
+    // จะตายด้วย SIGSYS ตอน infer แรก แทนที่จะปฏิเสธตั้งแต่ startup
+    #[test]
+    fn worker_refuses_cloud_providers_at_startup() {
+        for provider in ["openai", "anthropic"] {
+            let config = ModelConfig {
+                provider: provider.into(),
+                ..Default::default()
+            };
+            let error = ensure_worker_supported_provider(&config).unwrap_err();
+            assert!(error.to_string().contains("control plane"));
+        }
+    }
+
+    #[test]
+    fn worker_accepts_local_and_echo() {
+        for provider in ["local", "echo"] {
+            let config = ModelConfig {
+                provider: provider.into(),
+                ..Default::default()
+            };
+            assert!(ensure_worker_supported_provider(&config).is_ok());
+        }
+    }
 }

@@ -12,6 +12,13 @@ const EXECUTE: u64 = 1;
 const WRITE_FILE: u64 = 1 << 1;
 const READ_FILE: u64 = 1 << 2;
 const READ_DIR: u64 = 1 << 3;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
 #[repr(C)]
 struct Ruleset {
     handled: u64,
@@ -49,12 +56,6 @@ fn add(rules: &PreparedRules, path: &Path, access: u64) -> Result<(), SandboxErr
     // SAFETY: CString มีอายุครอบคลุม syscall และ fd ทุกตัวมีเจ้าของ
     let raw = if let Some((workspace, root)) = &rules.workspace {
         if let Ok(relative) = path.strip_prefix(workspace) {
-            #[repr(C)]
-            struct OpenHow {
-                flags: u64,
-                mode: u64,
-                resolve: u64,
-            }
             let relative = if relative.as_os_str().is_empty() {
                 Path::new(".")
             } else {
@@ -65,8 +66,10 @@ fn add(rules: &PreparedRules, path: &Path, access: u64) -> Result<(), SandboxErr
             let how = OpenHow {
                 flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
                 mode: 0,
+                // BENEATH | NO_SYMLINKS | NO_XDEV: resolve จบใต้ root fd ที่
+                // ตรึงไว้แล้ว ไม่เดิน symlink ชั้นกลาง ปิด symlink-swap TOCTOU
                 resolve: 0x08 | 0x04 | 0x01,
-            }; // BENEATH | NO_SYMLINKS | NO_XDEV
+            };
             unsafe {
                 libc::syscall(
                     libc::SYS_openat2,
@@ -77,12 +80,25 @@ fn add(rules: &PreparedRules, path: &Path, access: u64) -> Result<(), SandboxErr
                 ) as i32
             }
         } else {
-            unsafe { libc::open(name.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) }
+            // SAFETY: เหมือนด้านบน — name มีอายุครอบฉัน
+            open_no_symlink_follow(&name)
         }
     } else {
-        unsafe { libc::open(name.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) }
+        // SAFETY: เหมือนด้านบน — name มีอายุครอบฉัน
+        open_no_symlink_follow(&name)
     };
     if raw < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            // พาธจุดตายมี symlink ตามโครง host เปลี่ยนระหว่างตรวจกับเปิด
+            // (หรือ operator ชี้ allow-list ไปที่ symlink) — fail-closed
+            // ห้ามตาม symlink เพราะจะ grant ไฟล์ที่ไม่ใช่รายการที่ policy อนุญาต
+            return Err(SandboxError::Invalid(format!(
+                "Landlock grant refused: {} resolves through a symlink; \
+                 use a canonical path",
+                path.display()
+            )));
+        }
         return Err(error());
     }
     let file = unsafe { File::from_raw_fd(raw) };
@@ -149,7 +165,11 @@ fn prepare_inner(
     collect_mounts: bool,
 ) -> Result<(File, u64, Vec<MountGrant>), SandboxError> {
     let mut rules = new_rules(collect_mounts)?;
-    if collect_mounts {
+    {
+        // ตรึง root fd ของ workspace ทั้งสองโหมด (container + process-level)
+        // เพื่อให้ grant ใต้ workspace เดินผ่าน openat2 BENEATH เสมอ — เดิม
+        // process prepare ไม่มี fd ตรึง ทำให้ไฟล์ใน workspace เปิดผ่าน
+        // symlink ตัวพ่นช้าตอนเดินรายการ
         let name = CString::new(workspace.as_os_str().as_bytes())
             .map_err(|_| SandboxError::Invalid("NUL in workspace".into()))?;
         let fd = unsafe {
@@ -174,8 +194,14 @@ fn prepare_inner(
         "/dev/urandom",
     ] {
         let path = Path::new(path);
-        if path.exists() {
-            add(&rules, path, READ_FILE | READ_DIR | EXECUTE)?;
+        // ระบบ merged-usr มักมี /lib,/lib64 เป็น symlink ไปที่ /usr/lib —
+        // ข้าม grant นั้น (grant ลดลง = fail-closed) ไม่ตาม symlink แบบเดิม
+        // เพราะ grant ไปถึงไฟล์ที่อยู่นอกตาราง policy
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if !meta.file_type().is_symlink() => {
+                add(&rules, path, READ_FILE | READ_DIR | EXECUTE)?;
+            }
+            _ => continue,
         }
     }
     // binary ที่ operator อนุญาตเป็นข้อยกเว้นเฉพาะไฟล์ ไม่ใช่ parent directory
@@ -413,6 +439,27 @@ fn new_rules(collect_mounts: bool) -> Result<PreparedRules, SandboxError> {
     })
 }
 
+/// เปิด absolute path โดยไม่เดิน symlink แม้แต่ชั้นเดียว (openat2
+/// `RESOLVE_NO_SYMLINKS`) เพื่อปิดหน้าต่าง TOCTOU: ตรวจด้วย `symlink_metadata`
+/// แล้วมีคนแทน symlink ก่อน `open` — kernel เก่ากว่า 5.6 (ENOSYS) จะ
+/// fail-closed เป็น error เอง
+fn open_no_symlink_follow(name: &std::ffi::CStr) -> i32 {
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_NO_SYMLINKS,
+    };
+    unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            name.as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        ) as i32
+    }
+}
+
 pub(crate) fn restrict_mounts(grants: &[(PathBuf, u64)]) -> Result<(), SandboxError> {
     let rules = new_rules(false)?;
     for (path, access) in grants {
@@ -424,4 +471,81 @@ pub(crate) fn restrict_mounts(grants: &[(PathBuf, u64)]) -> Result<(), SandboxEr
         return Err(error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_ws(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aivm-landlock-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn clean(ws: &Path) {
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    fn policy() -> Policy {
+        Policy::from_yaml(
+            "name: t\nfilesystem:\n  deny: ['**/.env*']\nprocess:\n  allow: []\n  deny: [/bin/sh]\nnetwork:\n  allow: []\n  deny: ['10.0.0.0/8']\n",
+        )
+        .unwrap()
+    }
+
+    // regression F1: การ grant ห้ามตาม symlink ทั้งจุดตายและชั้นกลาง
+    // เดิม prepare() ของ process-level เปิดด้วย libc::open (ตาม symlink)
+    // หลังตรวจด้วย symlink_metadata — เปิดหน้าต่าง TOCTOU symlink swap
+    #[test]
+    fn symlinked_exe_outside_workspace_is_refused_not_followed() {
+        let ws = temp_ws("relex");
+        let link_ws = temp_ws("relsm");
+        let link = link_ws.join("diag-true");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/usr/bin/true", &link).unwrap();
+        let error = prepare(&ws, &link, &policy(), 1 << 20, None).err().unwrap();
+        let message = match error {
+            SandboxError::Invalid(message) => message,
+            _ => panic!("unexpected error kind"),
+        };
+        assert!(message.contains("symlink"));
+        clean(&ws);
+        clean(&link_ws);
+    }
+
+    #[test]
+    fn symlinked_exe_inside_workspace_is_refused_not_followed() {
+        let ws = temp_ws("relin");
+        let _ = std::fs::remove_file(ws.join("prog"));
+        std::os::unix::fs::symlink("/usr/bin/true", ws.join("prog")).unwrap();
+        let error = prepare(&ws, &ws.join("prog"), &policy(), 1 << 20, None)
+            .err()
+            .unwrap();
+        let message = match error {
+            SandboxError::Invalid(message) => message,
+            _ => panic!("unexpected error kind"),
+        };
+        assert!(message.contains("symlink"));
+        clean(&ws);
+    }
+
+    // happy path: ไฟล์จริงใน workspace เปิดผ่าน openat2-beneath แล้วยัง
+    // grant ได้ปกติ (กันแก้โค้ดนี้แสล้มหันให้ deny ทุกอย่าง)
+    #[test]
+    fn real_workspace_file_is_still_granted() {
+        let ws = temp_ws("relreal");
+        let exe = ws.join("prog");
+        std::fs::copy("/usr/bin/true", &exe).unwrap();
+        let (_file, budget) = prepare(&ws, &exe, &policy(), 1 << 20, None).unwrap();
+        assert!(budget >= 1);
+        clean(&ws);
+    }
 }

@@ -94,6 +94,22 @@ deadline) — serial log ของ guest ใช้สืบย้อนเท่
 
 - **out of scope ชัดเจน** (ดู §4)
 
+### A7 — ข้อมูลออกผ่าน backend โมเดล cloud (exfil ทาง provider)
+
+- ตาม I-1 เน็ตจะผ่าน gateway เดียว แต่ provider cloud (`openai`/`anthropic`)
+  เรียก HTTPS ตรงออกนอก policy — เมื่อเปิดใช้งาน context ของ workspace
+  จะถูกส่งออกทั้งก้อน จึงกำหนด **deny-by-default** (I-1/I-6):
+  ต้องตั้ง `model.cloud_allowed: true` อย่างชัดเจนจึงใช้ได้
+- จำกัดเป็นชั้น ๆ: `security.profile: production` ปฏิเสธ cloud เด็ดขาด,
+  factory `create_model` ปฏิเสธ config ที่ขาด opt-in (เทสต์
+  `cloud_provider_denies_by_default_without_explicit_opt_in`),
+  worker process (`aivm-model-worker`) ปฏิเสธ provider cloud ตั้งแต่ startup
+  เพราะใต้ seccomp KILL-on-socket (เทสต์ `worker_refuses_cloud_providers_at_startup`)
+- เมื่อเปิดใช้จริง: เส้นทางนี้ไม่มี audit — ข้อจำกัด  นี้คือสิ่งที่ operator
+  ยอมรับอย่างชัดเจนผ่าน config ไม่ใช่ช่องที่เสียมันออกไปเอง หากต้องใช้ใน
+  การผลิตจริง ควรเพิ่มชั้น mediated egress (policy + audit) สำหรับเส้นทาง
+  โมเดลก่อน
+
 ## 3. Instance DNA — สุ่มอะไรได้บ้าง (กัน A3 + A4)
 
 สุ่มได้โดย contract ไม่พัง: nonce marker/scheme ต่อบูต (มีแล้ว), vcpu/mem

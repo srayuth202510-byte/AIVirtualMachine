@@ -978,7 +978,22 @@ pub fn run_loop_with_trace_collector(
                         .then(|| gateway.workspace_digest().ok())
                         .flatten();
                     let before_text = (req.tool == "filesystem.write" && !operator_plan.is_empty())
-                        .then(|| std::fs::read_to_string(gateway.workspace.join(&req.path)).ok())
+                        .then(|| {
+                            // I-7 + I-1: snapshot ก่อน write ต้องอ่านผ่าน
+                            // gateway (canonicalize/policy/checkpoint/audit ครบ)
+                            // ไม่อ่าน raw ออกหน้ากลาง
+                            gateway
+                                .dispatch(
+                                    cube,
+                                    &ToolRequest {
+                                        tool: "filesystem.read".into(),
+                                        path: req.path.clone(),
+                                        content: None,
+                                    },
+                                )
+                                .ok()
+                                .map(|snapshot| snapshot.output)
+                        })
                         .flatten();
                     match gateway.dispatch(cube, &req) {
                         Ok(res) => {
@@ -1066,10 +1081,17 @@ pub fn run_loop_with_trace_collector(
                                         });
                                     if whitespace_only {
                                         if let Some(old) = &before_text {
-                                            let _ = std::fs::write(
-                                                gateway.workspace.join(&req.path),
-                                                old,
-                                            );
+                                            // restore = การเขียนจริงที่มี effect
+                                            // ต้องผ่าน gateway ครบเส้นทาง
+                                            // (policy + I-7 audit) ถ้า DENY
+                                            // เช่น budget หมด ก็ไม่ restore —
+                                            // ไม่มีการเขียนลับนอกเกต (fail-closed)
+                                            let restore = ToolRequest {
+                                                tool: "filesystem.write".into(),
+                                                path: req.path.clone(),
+                                                content: Some(old.clone()),
+                                            };
+                                            let _ = gateway.dispatch(cube, &restore);
                                         }
                                     }
                                     let after = gateway

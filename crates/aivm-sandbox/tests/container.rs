@@ -242,8 +242,14 @@ fn init_enforces_file_reads_and_execution_without_namespace_privileges() {
         "/lib64",
         "/etc/ld.so.cache",
     ] {
-        if std::path::Path::new(path).exists() {
-            grants.push((PathBuf::from(path), 13));
+        // merged-usr ทำ /lib,/lib64 เป็น symlink — grant ต้องเป็น canonical
+        // path เท่านั้น (openat2 NO_SYMLINKS ปฏิเสธ symlink เพื่อปิด TOCTOU)
+        let path = std::path::Path::new(path);
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if !meta.file_type().is_symlink() => {
+                grants.push((path.to_path_buf(), 13));
+            }
+            _ => {}
         }
     }
     let plan_path = ws.join("plan.json");

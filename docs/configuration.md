@@ -169,12 +169,25 @@ variable ของ API key แยกตาม provider ได้ เช่น:
 model:
   provider: openai
   name: your-openai-model
+  # I-1: backend cloud ส่ง context ทั้งหมดออกนอก policy/audit — จึง deny-by-default
+  # ต้องตั้งอย่างชัดเจน และห้ามใช้ร่วมกับ security.profile: production
+  cloud_allowed: true
   openai:
     api_key_env: AIVM_OPENAI_KEY
 ```
 
 สำหรับ Anthropic ใช้ `provider: anthropic` และบล็อก `anthropic.api_key_env`
 ค่า API key อยู่ใน environment เท่านั้น ไม่ใส่ใน YAML
+
+ข้อควรทราบ (บังคับตัวตั้งของระบบ):
+
+- `model.cloud_allowed` default เป็น `false` — runtime จะปฏิเสธ config provider
+  cloud ตั้งแต่ตอน boot ถ้าไม่มี opt-in ด้วยค่า `true`
+- worker process (`aivm-model-worker`) รับเฉพาะ provider `local`/`echo`
+  เส้นทาง cloud รันใน control-plane เท่านั้น
+- โปรไฟล์ `production` ไม่รับ provider cloud
+- การเรียก backend cloud ไม่ผ่าน policy/audit (ไม่ใช่ tool call) — เปิด
+  `cloud_allowed` แปลว่า operator ยอมรับข้อจำกัดนี้อย่างชัดเจน
 
 ลำดับเลือกชื่อคือ `model.name` ที่ระบุเอง → `model.openai.model` หรือ
 `model.anthropic.model` → default ของ provider ค่า name ว่าง, `echo` หรือชื่อ

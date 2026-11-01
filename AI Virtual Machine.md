@@ -1189,6 +1189,13 @@ capabilities:
 policy:  
   require\_test\_before\_network: true
 
+Cloud providers (openai / anthropic) — กติกาตาม I-1
+
+\* Backend cloud คือเส้นทางเดียวที่ context ของ workspace ออกไปยัง external HTTPS โดยไม่ผ่าน policy/audit จึง **denied โดยปริยาย**: ต้องตั้ง `model.cloud_allowed: true` อย่างชัดเจนจึงใช้ได้
+\* `security.profile: production` ห้าม provider cloud เด็ดขาด (ไม่มีทาง pin backend ด้วย hash ได้จริง)
+\* `aivm-model-worker` รับเฉพาะ provider `local`/`echo` — ปฏิเสธ config cloud ตั้งแต่ startup (worker อยู่ใต้ seccomp ที่ KILL ทุก socket)
+\* API key อยู่ใน environment เท่านั้น (ผ่าน `api\_key\_env`) ห้ามลง YAML และห้ามลง Audit
+
 \---
 
 29\. CLI
