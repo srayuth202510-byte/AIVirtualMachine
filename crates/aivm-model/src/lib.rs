@@ -602,9 +602,15 @@ impl LocalLlamaModel {
 
         let backend = LlamaBackend::init().map_err(|e| ModelError::Backend(e.to_string()))?;
 
-        // gpu_layers เป็น i32 (ติดลบ = ไม่ยกไป GPU) แต่ API รับ u32
+        // gpu_layers เป็น i32 (ติดลบ = "ทั้งหมด" ตามเอกสาร แต่ API รับ u32)
+        let n_gpu = if config.gpu_layers < 0 {
+            // -1 หมายถึง "ทั้งหมด" ตามเอกสาร ให้ใช้ค่าสูงสุด
+            u32::MAX
+        } else {
+            config.gpu_layers as u32
+        };
         let model_params = LlamaModelParams::default()
-            .with_n_gpu_layers(config.gpu_layers.max(0) as u32)
+            .with_n_gpu_layers(n_gpu)
             .with_use_mmap(config.use_mmap)
             .with_use_mlock(config.use_mlock)
             .with_vocab_only(config.embedding);
@@ -949,6 +955,10 @@ pub fn create_model(config: &ModelConfig) -> Result<Box<dyn Model>, ModelError> 
             {
                 Ok(Box::new(WorkerModel::new(config.clone(), worker_path)?))
             } else {
+                #[allow(clippy::unnecessary_map_or)]
+                if config.local.as_ref().map_or(false, |l| l.ctx_size == 0) {
+                    return Err(ModelError::Backend("ctx_size cannot be 0".into()));
+                }
                 create_local_model(config)
             }
         }

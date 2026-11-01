@@ -364,8 +364,15 @@ impl ToolGateway {
         hook: &mut impl FnMut(&str) -> std::io::Result<()>,
     ) -> Result<(), ToolError> {
         if let Some(path) = &self.state_path {
+            // เส้นทาง serialize ค่าลับทางเดียว: ผ่าน LeaseState ลง state
+            // file 0600 เท่านั้น (SecretLease ไม่มี serde derive — regression #30)
+            let leases_state: Vec<aivm_secrets::LeaseState> = self
+                .live_secret_leases()
+                .iter()
+                .map(aivm_secrets::LeaseState::from_lease)
+                .collect();
             let text = serde_json::to_string(&serde_json::json!({
-                "cube": cube, "caps": self.caps, "leases": self.live_secret_leases()
+                "cube": cube, "caps": self.caps, "leases": leases_state
             }))
             .map_err(|e| ToolError::Io(e.to_string()))?;
             state_store::write_private_with_hook(path, &text, &mut |stage| {
@@ -612,6 +619,10 @@ impl ToolGateway {
                 Ok((canon, cap_index))
             }
             Decision::Deny => {
+                // ยกเลิกค่าใช้จ่าย capability ที่ชาร์จไปแล้ว เพราะ policy ปฏิเสธ
+                // (budget ไม่ควรถูกหักเมื่อ insurance ปฏิเสธ)
+                self.caps.caps[cap_index].used_count =
+                    self.caps.caps[cap_index].used_count.saturating_sub(1);
                 self.audit_decision(
                     cube,
                     action,

@@ -350,8 +350,10 @@ struct PersistedState {
     caps: CapabilitySet,
     /// leases ค้าง (G4b): รวม values (ไฟล์ 0600 อยู่แล้ว — ระดับเดียวกับ
     /// secrets.yaml) ฟื้นเฉพาะที่ยังใช้ได้ ที่เหลือทิ้ง (fail-closed ข้าม restart)
+    /// serialize ค่าลับได้ทางเดียวผ่าน LeaseState — SecretLease ไม่มี derive
+    /// serde อีกต่อไป (regression #30)
     #[serde(default)]
-    leases: Vec<aivm_secrets::SecretLease>,
+    leases: Vec<aivm_secrets::LeaseState>,
 }
 
 /// Restore usage and the original deadline for identical grant identities.
@@ -473,6 +475,9 @@ impl Runtime {
         // G4 §26: secret broker (patterns จาก yaml + values จาก secrets.yaml
         // ของ operator) — ไม่มีไฟล์ = broker ว่าง = deny หมด (fail-closed)
         let mut broker = aivm_secrets::SecretBroker::new(config.secrets.clone(), None);
+        broker
+            .validate_patterns()
+            .map_err(|e| RuntimeError::Secret(e.to_string()))?;
         load_secrets_file(&base_dir.join(SECRETS_FILE), &mut broker)?;
         gateway = gateway.with_secret_broker(broker);
         let mut cube = Cube::new(&format!("task_{}", config.name));
@@ -498,7 +503,13 @@ impl Runtime {
                 }
                 restore_cap_usage(&mut gateway.caps, &saved.caps);
                 // G4b: ฟื้น leases ที่ยังใช้ได้ (หมดอายุ/หมดโควต้า/จบแล้วทิ้ง)
-                gateway.restore_secret_leases(&cube, saved.leases);
+                // LeaseState → SecretLease ที่ช่องเข้าเดียวของค่าลับ
+                let leases: Vec<aivm_secrets::SecretLease> = saved
+                    .leases
+                    .iter()
+                    .map(aivm_secrets::LeaseState::into_lease)
+                    .collect();
+                gateway.restore_secret_leases(&cube, leases);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // A dangling symlink is not a fresh state file.
@@ -693,7 +704,13 @@ impl Runtime {
         PersistedState {
             cube: self.cube.clone(),
             caps: self.gateway.caps.clone(),
-            leases: self.gateway.live_secret_leases(),
+            // เส้นทาง serialize ค่าลับทางเดียว ผ่าน LeaseState (regression #30)
+            leases: self
+                .gateway
+                .live_secret_leases()
+                .iter()
+                .map(aivm_secrets::LeaseState::from_lease)
+                .collect(),
         }
     }
 

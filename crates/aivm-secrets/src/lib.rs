@@ -54,16 +54,18 @@ fn default_ttl_seconds() -> u64 {
 ///
 /// ไม่ derive `Debug` — `value` ต้องไม่มีทางหลุดเข้า log/panic message
 /// (ใช้ `impl Debug` ที่ redact ด้านล่างแทน)
-#[derive(Clone, Serialize, Deserialize)]
+/// ไม่ derive `Serialize`/`Deserialize` — ค่าลับ serialize ได้ทางเดียวคือ
+/// ผ่าน [`LeaseState`] (persist ลง state file 0600 เท่านั้น) กันการ serialize
+/// ทั้ง struct หลุดผ่านช่อง serde อื่นโดยพลการ (API/summary/audit ใช้
+/// `LeaseSummary` หรือ field เลือกเองเสมอ — regression #30)
+#[derive(Clone)]
 pub struct SecretLease {
     /// Unique lease ID
     pub id: String,
     /// Secret request ที่เกี่ยวข้อง
     pub request: SecretRequest,
-    /// Secret value (จะถูก zeroize หลังใช้งาน)
-    /// หมายเหตุ: serialize ได้ (ต้องใช้ตอน persist ข้าม restart — ไฟล์
-    /// 0600 ระดับเดียวกับ secrets.yaml) ห้าม serialize ผ่านช่องอื่น
-    /// (API/summary/audit ใช้ LeaseSummary หรือ field เลือกเองเสมอ)
+    /// Secret value (จะถูก zeroize หลังใช้งาน) — ตัว struct นี้ไม่มี
+    /// serde derive จึงไม่มีทาง serialize โดยตรง ต้องผ่าน [`LeaseState`]
     pub value: String,
     /// สถานะ
     pub status: LeaseStatus,
@@ -101,6 +103,74 @@ impl std::fmt::Debug for SecretLease {
             .field("hitl_approved", &self.hitl_approved)
             .field("approved_by", &self.approved_by)
             .finish()
+    }
+}
+
+/// รูป serialize ของ lease สำหรับ persist ข้าม restart — ช่องเดียวที่
+/// อนุญาตให้ค่าลับลงดิสก์ (state file 0600 เท่านั้น ระดับเดียวกับ
+/// secrets.yaml) `SecretLease` ไม่มี serde derive อีกต่อไปจึงไม่มีช่อง
+/// serde อื่นพาค่าลับออกนอกไฟล์นี้ได้ (regression #30)
+#[derive(Clone, Serialize, Deserialize)]
+pub struct LeaseState {
+    pub id: String,
+    pub request: SecretRequest,
+    pub value: String,
+    pub status: LeaseStatus,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub uses: u32,
+    pub hitl_approved: bool,
+    pub approved_by: Option<String>,
+}
+
+/// Debug ที่ redact `value` ของ state copy เสมอ (เท่ากับ lease จริง)
+impl std::fmt::Debug for LeaseState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeaseState")
+            .field("id", &self.id)
+            .field("request", &self.request)
+            .field("value", &"<redacted>")
+            .field("status", &self.status)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("uses", &self.uses)
+            .field("hitl_approved", &self.hitl_approved)
+            .field("approved_by", &self.approved_by)
+            .finish()
+    }
+}
+
+impl LeaseState {
+    /// คัดลอก lease ออกมา persist — live value ยังเป็นของ lease ตัวเดิม
+    /// (zeroize ตอน drop ตามเดิม); ตัว state เป็นสำเนาเฉพาะไฟล์ 0600
+    pub fn from_lease(lease: &SecretLease) -> Self {
+        Self {
+            id: lease.id.clone(),
+            request: lease.request.clone(),
+            value: lease.value.clone(),
+            status: lease.status,
+            created_at: lease.created_at,
+            expires_at: lease.expires_at,
+            uses: lease.uses,
+            hitl_approved: lease.hitl_approved,
+            approved_by: lease.approved_by.clone(),
+        }
+    }
+
+    /// ฟื้น lease จาก state file 0600 (G4b) — lease ที่ได้จะเป็นเจ้าของ
+    /// value และ zeroize เมื่อจบอายุตามปกติ
+    pub fn into_lease(&self) -> SecretLease {
+        SecretLease {
+            id: self.id.clone(),
+            request: self.request.clone(),
+            value: self.value.clone(),
+            status: self.status,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            uses: self.uses,
+            hitl_approved: self.hitl_approved,
+            approved_by: self.approved_by.clone(),
+        }
     }
 }
 
@@ -234,6 +304,35 @@ impl SecretBroker {
         }
     }
 
+    /// ตรวจ glob ใน policy ทุกตัว (allow/deny/low_risk_allow) — config พังต้อง
+    /// error ตอนบูต ไม่ fallback เทียบตรงตัว (allow fallback = ปฏิเสธบนช่อง
+    /// ตามกว้าง, deny fallback = fail-open) เว้น pure-glob (`*`-ล้วน) และ
+    /// `prefix*` ซึ่ง match_pattern ตัดสินเองได้โดยไม่ต้อง compile
+    pub fn validate_patterns(&self) -> Result<(), SecretError> {
+        for pattern in self
+            .policy
+            .allow
+            .iter()
+            .chain(self.policy.deny.iter())
+            .chain(self.policy.low_risk_allow.iter())
+        {
+            let pure_glob = !pattern.is_empty() && pattern.chars().all(|c| c == '*');
+            let prefix_glob = pattern
+                .strip_suffix('*')
+                .is_some_and(|p| !p.contains(['*', '?', '[']));
+            if pure_glob || prefix_glob {
+                continue;
+            }
+            if glob::Pattern::new(pattern).is_err() {
+                return Err(SecretError::PolicyDenied(format!(
+                    "invalid glob pattern in secret policy: {}",
+                    pattern
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Register a secret with the broker (operator-only operation)
     pub fn register_secret(&mut self, resource: String, value: String) {
         if self.secrets.get(&resource).is_some_and(|old| old != &value) {
@@ -272,6 +371,9 @@ impl SecretBroker {
     ) -> Result<SecretLease, SecretError> {
         self.cleanup();
         self.check_request_limits(&request)?;
+        // fail-closed: deny-fallback เดิม (pattern พัง เทียบตรงตัว) = fail-open
+        // ปิดทางไม่ให้ตัดสินด้วย config ที่พังเลย
+        self.validate_patterns()?;
         // 1. Capability check
         let scope = format!("{}:{}", request.resource, request.scope);
         caps.authorize("use", "secret", &scope)
@@ -616,7 +718,8 @@ impl SecretBroker {
         // แล้วไม่เคยตรงกับ scope ไหนเลย = deny list ไม่มีผล (fail-open)
         match glob::Pattern::new(pattern) {
             Ok(p) => p.matches(scope),
-            // pattern ไม่ถูกต้อง: เทียบตรงตัว — allow = fail-closed เสมอ
+            // pattern ไม่ถูกต้อง: เทียบตรงตัว — allow = fail-closed เสมอ;
+            // deny ไม่มีทางเข้า branch นี้เพราะ validate_patterns() บังคับก่อน
             Err(_) => pattern == scope,
         }
     }
@@ -1020,6 +1123,80 @@ mod tests {
         // panic/Result ที่ถือ lease ผ่าน {:?} ก็ต้องไม่หลุดเหมือนกัน
         let err = format!("{:?}", Ok::<SecretLease, ()>(lease));
         assert!(!err.contains("ghp_super_secret_value"));
+    }
+
+    // regression #30: ค่าลับ serialize ได้ทางเดียวผ่าน LeaseState — state copy
+    // ต้องรอดราบรื่น (ไฟล์ 0600 เท่านั้น) และ Debug ต้อง redact เท่ากับ lease
+    #[test]
+    fn lease_state_roundtrip_keeps_value_and_redacts_debug() {
+        let lease = test_lease("ghp_state_roundtrip");
+        let state = LeaseState::from_lease(&lease);
+        let back = state.into_lease();
+        assert_eq!(back.value, "ghp_state_roundtrip");
+        assert_eq!(back.status, LeaseStatus::Active);
+        assert_eq!(back.uses, 0);
+
+        // Debug ของ state copy ห้ามพิมพ์ค่าจริงเหมือนตอนแรก
+        let dbg = format!("{:?}", state);
+        assert!(
+            !dbg.contains("ghp_state_roundtrip"),
+            "LeaseState Debug leaked secret: {}",
+            dbg
+        );
+        assert!(dbg.contains("<redacted>"));
+
+        // persist/restore ของ state file ต้องทำงานเต็มรอบ
+        let json = serde_json::to_string(&state).expect("persist");
+        let restored: LeaseState = serde_json::from_str(&json).expect("restore");
+        assert_eq!(restored.value, "ghp_state_roundtrip");
+    }
+
+    // regression #30: deny glob พัง = fail-closed (ไม่ fallback เทียบตรงตัว
+    // แล้วหลุดหมดรายการ)
+    #[test]
+    fn invalid_glob_in_deny_list_fails_closed() {
+        let mut broker = SecretBroker::new(
+            SecretPolicy {
+                allow: vec!["*".into()],
+                deny: vec!["[broken".into()],
+                ..Default::default()
+            },
+            None,
+        );
+        broker.register_secret("github_token".into(), "ghp_x".into());
+        assert!(broker.validate_patterns().is_err());
+        let mut caps = CapabilitySet::new(vec![aivm_capability::Capability::new(
+            "use",
+            "secret",
+            "github_token:read",
+        )]);
+        let request = SecretRequest {
+            tool: "git.push".into(),
+            resource: "github_token".into(),
+            scope: "read".into(),
+            purpose: "read".into(),
+            max_uses: 1,
+            ttl_seconds: 300,
+            risk: RiskLevel::High,
+        };
+        assert!(matches!(
+            broker.request_lease(request, &Cube::new("t"), &mut caps, true, Some("op".into())),
+            Err(SecretError::PolicyDenied(_))
+        ));
+    }
+
+    // ฟอร์ม glob เดิม (*-ล้วน, prefix*) และ glob ตัวจริงที่ compile ผ่าน
+    // ต้องยัง validate ผ่านเหมือนเดิม
+    #[test]
+    fn valid_glob_forms_still_pass_validation() {
+        let policy = SecretPolicy {
+            allow: vec!["*".into(), "github_token:*".into()],
+            deny: vec!["*admin*".into()],
+            low_risk_allow: vec!["credential:*".into()],
+            ..Default::default()
+        };
+        let broker = SecretBroker::new(policy, None);
+        assert!(broker.validate_patterns().is_ok());
     }
 
     // regression #27: deny pattern ขึ้นต้น wildcard ต้องยิงจริง (fail-closed)
