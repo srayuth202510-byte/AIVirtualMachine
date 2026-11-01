@@ -12,24 +12,17 @@ build: ## คอมไพล์ทั้ง workspace
 check: ## ตรวจ type เร็ว ไม่สร้างโค้ด
 	cargo check --workspace --all-targets
 
-test: ## เทสต์ unit + integration ทั้งหมด
+PYTHON_TEST_PATTERNS := test_qwen_*.py test_supervisor.py test_detection.py test_immunity.py test_pins.py test_security_court.py test_fuzz_seeded.py test_llama_replay.py test_model_host_validation.py test_model_quality.py test_semantic_quality.py test_release_gate.py test_repair_trace.py test_dashboard.py test_model_validation_setup.py
+
+test: test-scripts ## เทสต์ unit + integration ทั้งหมด
 	cargo test --workspace
-	python3 -m unittest discover -s scripts -p 'test_qwen_*.py'
-	python3 -m unittest discover -s scripts -p 'test_supervisor.py'
-	python3 -m unittest discover -s scripts -p 'test_detection.py'
-	python3 -m unittest discover -s scripts -p 'test_immunity.py'
-	python3 -m unittest discover -s scripts -p 'test_pins.py'
-	python3 -m unittest discover -s scripts -p 'test_security_court.py'
-	python3 -m unittest discover -s scripts -p 'test_fuzz_seeded.py'
-	python3 -m unittest discover -s scripts -p 'test_llama_replay.py'
-	python3 -m unittest discover -s scripts -p 'test_model_host_validation.py'
-	python3 -m unittest discover -s scripts -p 'test_model_quality.py'
-	python3 -m unittest discover -s scripts -p 'test_semantic_quality.py'
-	python3 -m unittest discover -s scripts -p 'test_release_gate.py'
-	python3 -m unittest discover -s scripts -p 'test_repair_trace.py'
+
+test-scripts: ## รันสคริปต์ Python ทั้งหมด (รายการอยู่ที่เดียว ลดการซ้ำ)
+	set -e; \
+	for pattern in $(PYTHON_TEST_PATTERNS); do \
+		python3 -m unittest discover -s scripts -p "$$pattern"; \
+	done
 	python3 scripts/smoke-semantic.py
-	python3 -m unittest discover -s scripts -p 'test_dashboard.py'
-	python3 -m unittest discover -s scripts -p 'test_model_validation_setup.py'
 	python3 scripts/eval-qwen-audit.py
 	python3 scripts/smoke-qwen-watch.py
 

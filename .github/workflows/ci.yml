@@ -33,24 +33,7 @@ jobs:
         run: cargo test --workspace
 
       - name: ทดสอบตัวตรวจคำตอบและ audit reviewer (ไม่ต้องใช้โมเดล)
-        run: |
-          python3 -m unittest discover -s scripts -p 'test_qwen_*.py'
-          python3 -m unittest discover -s scripts -p 'test_supervisor.py'
-          python3 -m unittest discover -s scripts -p 'test_detection.py'
-          python3 -m unittest discover -s scripts -p 'test_immunity.py'
-          python3 -m unittest discover -s scripts -p 'test_pins.py'
-          python3 -m unittest discover -s scripts -p 'test_security_court.py'
-          python3 -m unittest discover -s scripts -p 'test_fuzz_seeded.py'
-          python3 -m unittest discover -s scripts -p 'test_llama_replay.py'
-          python3 -m unittest discover -s scripts -p 'test_model_host_validation.py'
-          python3 -m unittest discover -s scripts -p 'test_model_quality.py'
-          python3 -m unittest discover -s scripts -p 'test_semantic_quality.py'
-          python3 -m unittest discover -s scripts -p 'test_release_gate.py'
-          python3 -m unittest discover -s scripts -p 'test_repair_trace.py'
-          python3 -m unittest discover -s scripts -p 'test_dashboard.py'
-          python3 -m unittest discover -s scripts -p 'test_model_validation_setup.py'
-          python3 scripts/eval-qwen-audit.py
-          python3 scripts/smoke-qwen-watch.py
+        run: make test-scripts
 
       - name: ทดสอบ dashboard HTTP จริง (DB lock, slow client, concurrency และ graph cache)
         run: make test-dashboard-http

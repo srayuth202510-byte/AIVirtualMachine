@@ -9,7 +9,7 @@ PROJECT = Path(__file__).resolve().parent.parent
 
 
 def fail(msg):
-    print(f"paraty FAIL: {msg}")
+    print(f"parity FAIL: {msg}")
     return False
 
 
@@ -30,24 +30,8 @@ def main():
         "cargo fmt --all -- --check",
         "cargo clippy --workspace --all-targets",
         "cargo test --workspace",
-        "test_qwen_",
-        "test_supervisor.py",
-        "test_detection.py",
-        "test_immunity.py",
-        "test_pins.py",
-        "test_security_court.py",
-        "test_fuzz_seeded.py",
-        "test_llama_replay.py",
-        "test_model_host_validation.py",
-        "test_model_quality.py",
-        "test_semantic_quality.py",
-        "test_release_gate.py",
-        "test_repair_trace.py",
-        "test_dashboard.py",
+        "make test-scripts",
         "make test-dashboard-http",
-        "test_model_validation_setup.py",
-        "eval-qwen-audit.py",
-        "smoke-qwen-watch.py",
         "make check-llama",
         "make test-llama",
         "make test-microvm",
