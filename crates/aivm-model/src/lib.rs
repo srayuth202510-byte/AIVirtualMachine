@@ -205,6 +205,15 @@ fn default_true() -> bool {
     true
 }
 
+///  estimate_tokens  =  max(words, ⌈bytes/4⌉, non‑ascii char count)
+///  ฟังก์ชันเปลี่ยนจาก split_whitespace ที่อาจต่ำกว่าเกินไปกับข้อความ CJK/Unicode
+pub fn estimate_tokens(text: &str) -> usize {
+    let words = text.split_whitespace().count();
+    let bytes = text.len();
+    let non_ascii = text.chars().filter(|c| !c.is_ascii()).count();
+    words.max(bytes.div_ceil(4)).max(non_ascii)
+}
+
 impl Default for LocalModelConfig {
     fn default() -> Self {
         Self {
@@ -529,7 +538,9 @@ impl Model for WorkerModel {
     }
 
     fn token_count(&self, text: &str) -> usize {
-        text.split_whitespace().count()
+        // ใช้ estimate_tokens เพื่อความระมัดระวัง (conservative overestimate)
+        // แทน split_whitespace ที่อาจต่ำเกินไปกับข้อความ CJK/Unicode
+        estimate_tokens(text)
     }
 
     fn last_usage(&self) -> Option<worker::InferenceUsage> {
@@ -571,7 +582,9 @@ impl Model for EchoModel {
         ))
     }
     fn token_count(&self, text: &str) -> usize {
-        text.split_whitespace().count()
+        // ใช้ estimate_tokens เพื่อความระมัดระวัง (conservative overestimate)
+        // แทน split_whitespace ที่อาจต่ำเกินไปกับข้อความ CJK/Unicode
+        estimate_tokens(text)
     }
     fn max_context(&self) -> usize {
         8192

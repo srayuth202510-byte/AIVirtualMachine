@@ -74,6 +74,13 @@ fn looks_like_secret(name: &str) -> bool {
         || lower.starts_with("secret")
         || lower.contains("service-account")
 }
+/// ตรวจสอบชื่อ VM ว่าเป็นชื่อที่ถูกต้อง (ไม่มีตัวละครพิเศษที่อันตราย)
+fn is_valid_vm_name(name: &str) -> bool {
+    !name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\0'])
+        && !name.starts_with('.')
+        && name.len() >= 3
+        && name.len() <= 64
+}
 
 #[derive(Parser)]
 #[command(name = "aivm", about = "AI Virtual Machine — isolate AI agency")]
@@ -509,6 +516,10 @@ fn main() -> Result<(), AnyErr> {
         Cmd::State { name } => println!("{}", sup.inspect(&name).map_err(err)?),
         Cmd::Capabilities { name } => println!("{}", sup.inspect(&name).map_err(err)?),
         Cmd::Logs { name } => {
+            if !is_valid_vm_name(&name) {
+                eprintln!("invalid VM name: '{name}'");
+                std::process::exit(2);
+            }
             let p = root.join(&name).join("audit.jsonl");
             match std::fs::read_to_string(&p) {
                 Ok(t) => {
@@ -527,6 +538,10 @@ fn main() -> Result<(), AnyErr> {
             }
         }
         Cmd::Audit { name } => {
+            if !is_valid_vm_name(&name) {
+                eprintln!("invalid VM name: '{name}'");
+                std::process::exit(2);
+            }
             // เก็บสายไฟล์: archive (audit.<suffix>.jsonl) เก่าไปใหม่
             // แล้วปิดท้ายด้วยไฟล์ live
             let dir = root.join(&name);
