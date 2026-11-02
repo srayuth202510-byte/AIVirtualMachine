@@ -516,6 +516,28 @@ mod linux {
         .map(OsString::from)
         .collect();
         args.extend(mount_args(&grants)?);
+        for (link, target) in [
+            ("/lib", "usr/lib"),
+            ("/lib64", "usr/lib64"),
+            ("/lib32", "usr/lib32"),
+            ("/libx32", "usr/libx32"),
+        ] {
+            if let Ok(meta) = std::fs::symlink_metadata(link) {
+                if meta.file_type().is_symlink() {
+                    if let Ok(dest) = std::fs::read_link(link) {
+                        let dest_str = dest.to_string_lossy();
+                        let clean_dest = dest_str.trim_start_matches('/');
+                        if clean_dest == target {
+                            args.extend([
+                                OsString::from("--symlink"),
+                                OsString::from(target),
+                                OsString::from(link),
+                            ]);
+                        }
+                    }
+                }
+            }
+        }
         args.extend([
             OsString::from("--ro-bind-fd"),
             init.as_raw_fd().to_string().into(),
