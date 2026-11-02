@@ -27,6 +27,8 @@ use std::path::PathBuf;
 
 /// เพดานขนาด artifact ตั้งต้น (kernel + initrd + image ไม่ควรเกินนี้)
 const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+/// เพดานขนาดไฟล์ certificate ที่ใช้อ่านตอน secure boot (กันไฟล์ยักษ์)
+const MAX_CERT_BYTES: u64 = 1024 * 1024; // 1 MiB
 /// เส้นตาย launch+run ตั้งต้น
 const LAUNCH_TIMEOUT_DEFAULT_SECS: u64 = 120;
 /// ขอบเขตเส้นตายที่อนุญาต
@@ -136,6 +138,9 @@ pub struct MeasuredBootConfig {
     /// Path to DB/DBX/KEK certificates for secure boot verification
     #[serde(default)]
     pub cert_paths: Vec<PathBuf>,
+    /// Path to `sbverify` (sbsigntool) — default = PATH
+    #[serde(default)]
+    pub sbverify_path: PathBuf,
 }
 
 fn default_firmware() -> String {
@@ -335,6 +340,52 @@ impl HardwareConfig {
         if self.measured_boot.enabled && !self.vtpm.enabled {
             return Err(bad("hardware measured_boot.enabled needs vtpm.enabled"));
         }
+        // expected_pcrs ยังเทียบกับ PCR จริงไม่ได้ (ไม่มี quote verification)
+        // — ปฏิเสธแทนการรันแล้วรายงาน degraded เพื่อไม่ให้ operator เข้าใจผิด
+        // ว่าค่าที่คาดหวังถูกตรวจแล้ว
+        if !self.measured_boot.expected_pcrs.is_empty() {
+            return Err(bad(
+                "hardware measured_boot.expected_pcrs is not implemented (no PCR quote verification); refusing to accept unverified expectations",
+            ));
+        }
+        // ฟิลด์ของ measured boot มีความหมายเฉพาะเมื่อเปิด measured boot —
+        // ตั้งไว้แบบปิดคือ config ที่สื่อเจตนาไม่ครบ ให้ตายตั้งแต่ shape
+        if (self.measured_boot.secure_boot || !self.measured_boot.cert_paths.is_empty())
+            && !self.measured_boot.enabled
+        {
+            return Err(bad(
+                "hardware measured_boot.secure_boot/cert_paths needs measured_boot.enabled",
+            ));
+        }
+        if !self.measured_boot.cert_paths.is_empty() && !self.measured_boot.secure_boot {
+            return Err(bad(
+                "hardware measured_boot.cert_paths needs secure_boot=true (unused otherwise)",
+            ));
+        }
+        if self.measured_boot.enabled {
+            // ใช้ OVMF ตัวเดียวเท่านั้น — ค่าอื่นคืออ้าง firmware ที่เราไม่ได้ใช้
+            if self.measured_boot.firmware != "ovmf" {
+                return Err(bad(
+                    "hardware measured_boot.firmware must be \"ovmf\" (only supported measured-boot firmware)",
+                ));
+            }
+        }
+        if self.measured_boot.secure_boot {
+            // secure boot ตรวจ signature ของ kernel/initrd จาก cert ที่ operator ให้
+            // — ไม่มี cert = ตรวจไม่ได้ ห้ามผ่านแบบเงียบ
+            if self.measured_boot.cert_paths.is_empty() {
+                return Err(bad(
+                    "hardware measured_boot.secure_boot needs cert_paths for signature verification",
+                ));
+            }
+            for cert in &self.measured_boot.cert_paths {
+                if cert.as_os_str().is_empty() {
+                    return Err(bad(
+                        "hardware measured_boot.cert_paths contains an empty path",
+                    ));
+                }
+            }
+        }
         // GPU passthrough ยังไม่ implement (กันเงียบผ่าน: เปิดไว้ต้องตาย
         // ตั้งแต่ shape พร้อมบอกว่ายังไม่รองรับ — workload จะได้ไม่รันแบบ
         // ขาด GPU ที่ operator คาดไว้โดยไม่มีใครรู้)
@@ -398,6 +449,40 @@ pub fn run_in_hardware(
     if let Some(alt) = &cfg.alt_rootfs {
         verify_artifact(&alt.path, &alt.sha256, cfg.max_artifact_bytes)
             .map_err(|e| (e, RunVerdict::Clean))?;
+    }
+
+    // 3c. secure boot: certificate ต้องมีจริงและเป็น regular file ขนาดพอเหมาะ
+    // ก่อนไป spawn เครื่องมือใด ๆ (fail-closed ตั้งแต่ประตู supply chain)
+    if cfg.measured_boot.secure_boot {
+        for cert in &cfg.measured_boot.cert_paths {
+            let meta = std::fs::metadata(cert).map_err(|e| {
+                (
+                    SandboxError::Invalid(format!(
+                        "hardware secure boot cert unreadable ({}): {e}",
+                        cert.display()
+                    )),
+                    RunVerdict::Clean,
+                )
+            })?;
+            if !meta.is_file() {
+                return Err((
+                    SandboxError::Invalid(format!(
+                        "hardware secure boot cert is not a regular file: {}",
+                        cert.display()
+                    )),
+                    RunVerdict::Clean,
+                ));
+            }
+            if meta.len() == 0 || meta.len() > MAX_CERT_BYTES {
+                return Err((
+                    SandboxError::Invalid(format!(
+                        "hardware secure boot cert size out of range 1..={MAX_CERT_BYTES} bytes: {}",
+                        cert.display()
+                    )),
+                    RunVerdict::Clean,
+                ));
+            }
+        }
     }
 
     // 4. host readiness (Linux + KVM + TEE device + QEMU)
@@ -683,6 +768,90 @@ mod tests {
         let (spec, policy, mut cfg, ws) = fixture("meas");
         cfg.measured_boot.enabled = true;
         cfg.vtpm.enabled = false;
+        assert!(matches!(
+            run_in_hardware(&spec, &policy, &cfg),
+            Err((SandboxError::Invalid(_), RunVerdict::Clean))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // expected_pcrs ที่ยัง verify ไม่ได้ต้องถูกปฏิเสธ ไม่ใช่รันแล้ว degraded
+    #[test]
+    fn expected_pcrs_are_rejected_until_pcr_verification_exists() {
+        let (spec, policy, mut cfg, ws) = fixture("expectedpcr");
+        cfg.measured_boot.enabled = true;
+        cfg.vtpm.enabled = true;
+        cfg.measured_boot.expected_pcrs.insert(0, "00".repeat(32));
+        assert!(matches!(
+            run_in_hardware(&spec, &policy, &cfg),
+            Err((SandboxError::Invalid(_), RunVerdict::Clean))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // secure boot ต้องมี cert ให้ตรวจ — ไม่มี = config ตรวจไม่ได้
+    #[test]
+    fn secure_boot_without_certs_fails_closed() {
+        let (spec, policy, mut cfg, ws) = fixture("sbcert");
+        cfg.measured_boot.enabled = true;
+        cfg.vtpm.enabled = true;
+        cfg.measured_boot.secure_boot = true;
+        assert!(matches!(
+            run_in_hardware(&spec, &policy, &cfg),
+            Err((SandboxError::Invalid(_), RunVerdict::Clean))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // ฟิลด์ secure boot ต้องมาคู่กับ measured_boot.enabled เสมอ
+    #[test]
+    fn secure_boot_without_measured_boot_fails_closed() {
+        let (spec, policy, mut cfg, ws) = fixture("sbdisabled");
+        cfg.measured_boot.secure_boot = true;
+        cfg.measured_boot.cert_paths = vec![ws.join("cert.pem")];
+        assert!(matches!(
+            run_in_hardware(&spec, &policy, &cfg),
+            Err((SandboxError::Invalid(_), RunVerdict::Clean))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // cert ที่ไม่มี secure_boot คือ config ที่สื่อเจตนาไม่ครบ
+    #[test]
+    fn cert_paths_without_secure_boot_fails_closed() {
+        let (spec, policy, mut cfg, ws) = fixture("certonly");
+        cfg.measured_boot.enabled = true;
+        cfg.vtpm.enabled = true;
+        cfg.measured_boot.cert_paths = vec![ws.join("cert.pem")];
+        assert!(matches!(
+            run_in_hardware(&spec, &policy, &cfg),
+            Err((SandboxError::Invalid(_), RunVerdict::Clean))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // firmware ที่ไม่ได้ใช้จริงต้องไม่ผ่านเงียบ ๆ
+    #[test]
+    fn unsupported_measured_boot_firmware_fails_closed() {
+        let (spec, policy, mut cfg, ws) = fixture("firmware");
+        cfg.measured_boot.enabled = true;
+        cfg.vtpm.enabled = true;
+        cfg.measured_boot.firmware = "sev-firmware".into();
+        assert!(matches!(
+            run_in_hardware(&spec, &policy, &cfg),
+            Err((SandboxError::Invalid(_), RunVerdict::Clean))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // cert หาย/ไม่ใช่ไฟล์จริงต้องตายที่ประตู supply chain ก่อนแตะ host
+    #[test]
+    fn missing_secure_boot_cert_fails_closed() {
+        let (spec, policy, mut cfg, ws) = fixture("certmissing");
+        cfg.measured_boot.enabled = true;
+        cfg.vtpm.enabled = true;
+        cfg.measured_boot.secure_boot = true;
+        cfg.measured_boot.cert_paths = vec![ws.join("no-such-cert.pem")];
         assert!(matches!(
             run_in_hardware(&spec, &policy, &cfg),
             Err((SandboxError::Invalid(_), RunVerdict::Clean))

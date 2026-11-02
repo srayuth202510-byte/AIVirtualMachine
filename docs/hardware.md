@@ -2,9 +2,10 @@
 
 สถานะ: 🚧 **experimental** — ประตู fail-closed ครบทุกลำดับ (spec/shape/supply-chain/host)
 โค้ดรัน workload (drive-stuffing แบบเดียวกับ MicroVM) และ **บูต QEMU/KVM
-โหมด Generic จริงผ่านแล้ว** (ดู [รายงาน host validation](host-validation-2026-10-16.md)) แต่ยังไม่ได้ยืนยัน TEE จริง และ
-attestation/measured-boot/disk-encryption/GPU ยังเป็น stub ที่รายงานซื่อสัตย์
-ใน `degraded` (ดู "ข้อจำกัดที่รู้ตัว" ท้ายไฟล์)
+โหมด Generic จริงผ่านแล้ว** (ดู [รายงาน host validation](host-validation-2026-10-16.md)) แต่ยังไม่ได้ยืนยัน TEE จริง
+attestation quote verification/PCR comparison/disk-encryption/GPU ยังเป็น stub
+ที่รายงานซื่อสัตย์ใน `degraded` หรือถูกปฏิเสธแบบ fail-closed (ดู "ข้อจำกัดที่รู้ตัว" ท้ายไฟล์)
+ส่วน secure boot ตรวจ signature ของ kernel/initrd ด้วย `sbverify` จริงแล้ว
 
 ## ต้องการอะไรบน host
 
@@ -58,19 +59,30 @@ hardware:
 2. `validate_shape` (ตัวเลข + config เป็นไปไม่ได้ เช่น measured-boot ไม่มี
    vTPM, GPU passthrough, `generic` + `strict`)
 3. supply chain: kernel/initrd/rootfs (+alt ทุกชุด) ตรง hash ที่ pin
+   + certificate ของ secure boot ต้องมีจริง (regular file, 1..=1 MiB)
 4. host readiness: KVM + TEE device + QEMU (+ pin ถ้าตั้ง)
 5. ก็อป kernel/initrd/rootfs ไป scratch + verify สำเนาซ้ำ (กันสลับกลางทาง)
-6. drive-stuffing: exe + ldd closure → data drive, ฉีด `/sbin/aivm-init`
+6. secure boot (ถ้าเปิด): ตรวจ signature ของสำเนา kernel/initrd ด้วย
+   `sbverify --cert <cert>` — ผ่านเมื่อ cert ตัวใดตัวหนึ่ง verify ได้
+   ไม่มี `sbverify`/cert = ไม่รัน, signature ไม่ผ่าน = `Invalid` (fail-closed)
+7. drive-stuffing: exe + ldd closure → data drive, ฉีด `/sbin/aivm-init`
    ด้วย debugfs, บูตด้วย `init=` จับผลทาง serial (`-nic none` — guest
    ไม่มีเน็ตเวิร์กเลยตั้งแต่เกิด)
-7. เส้นตายรวม `launch_timeout_secs` เกิน = `Suspect` + kill เก็บงานเสมอ
+8. เส้นตายรวม `launch_timeout_secs` เกิน = `Suspect` + kill เก็บงานเสมอ
 
 ## ข้อจำกัดที่รู้ตัว (รายงานใน `applied`/`degraded` ทุกครั้ง)
 
 - `attestation-tool-check` = มี tool ขอ report เฉย ๆ **ยังไม่มีการ verify
   quote กับ KDS/endorsement keys** (`quote-verification: not implemented`)
-- `measured-boot` / `disk-encryption` = รับ config + ตรวจ shape แต่**ยังไม่
-  เทียบ PCR / ไม่ unlock ให้** (guest initrd ต้องทำเองผ่าน vTPM)
+- `measured-boot` = บูตด้วย OVMF และ**ยังไม่เทียบ PCR** — ถ้าตั้ง
+  `expected_pcrs` (ไม่ว่าง) จะถูกปฏิเสธด้วย `Invalid` ตั้งแต่ shape
+  ไม่ใช่รันแล้วรายงาน `degraded` (กัน operator เข้าใจผิดว่าตรวจแล้ว)
+- `secure_boot` = ตรวจ signature ของ kernel/initrd ด้วย `sbverify` จริง
+  ก่อน spawn; ต้องมี `cert_paths` และเครื่องมือ (หรือ `sbverify_path`)
+  ถ้าไม่มี = ไม่รัน; ถ้า signature ไม่ผ่าน = `Invalid`; รายงาน
+  `secure-boot-signature-verify` ใน `applied`
+- `disk-encryption` = รับ config + ตรวจ shape แต่**ยังไม่ unlock ให้**
+  (guest initrd ต้องทำเองผ่าน vTPM)
 - GPU passthrough (MIG/SR-IOV/vGPU) = เปิดแล้วบูตไม่ขึ้น (`Invalid` ตั้งแต่
   shape — กันรันแบบขาด GPU โดยไม่มีใครรู้)
 - `env_extra` ถูกเมิน, cwd ใน guest คือ `/`, `pids_max` ไม่ enforce ใน guest,

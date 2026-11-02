@@ -139,11 +139,12 @@ policy:
 #     cipher: aes-xts-plain64
 #     key_size: 512
 #   measured_boot:                # เปิดได้เฉพาะเมื่อ vtpm.enabled = true
-#     enabled: false              # ขอ measured boot (PCR compare ยังไม่ implement — รายงานใน degraded)
-#     expected_pcrs: {}           # map PCR index -> expected sha256 hex (ยังไม่ถูกเทียบ)
-#     firmware: ovmf              # ovmf | sev-firmware
-#     secure_boot: false          # verify kernel/initrd signature (ยังไม่ implement)
-#     cert_paths: []
+#     enabled: false              # บูตด้วย OVMF (PCR compare ยังไม่ implement — รายงานใน degraded)
+#     expected_pcrs: {}           # ต้องว่าง; ตั้งค่าเมื่อยัง verify PCR ไม่ได้ = Invalid (fail-closed)
+#     firmware: ovmf              # รองรับเฉพาะ ovmf
+#     secure_boot: false          # true = ตรวจ signature kernel/initrd ด้วย sbverify ก่อนบูต
+#     cert_paths: []              # ต้องมีเมื่อ secure_boot=true (trusted cert สำหรับ sbverify)
+#     sbverify_path: ""           # path ไปยัง sbverify (default: PATH); ไม่มี = ไม่รัน
 #   vtpm:
 #     enabled: false              # swtpm + QEMU vTPM device
 #     swtpm_path: ""              # path to swtpm binary (default: PATH)

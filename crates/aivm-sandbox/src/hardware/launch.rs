@@ -441,6 +441,98 @@ fn verify_attestation(cfg: &HardwareConfig) -> Result<(), (SandboxError, RunVerd
     Ok(())
 }
 
+/// หา `sbverify` (sbsigntool) สำหรับตรวจ secure boot signature
+///
+/// ไม่มีเครื่องมือ = ตรวจไม่ได้ → `Disabled` ตั้งแต่ก่อน spawn (fail-closed)
+/// ไม่ใช่ข้ามเงียบ ๆ แล้วอ้างว่า secure boot ทำงาน
+fn resolve_sbverify(cfg: &HardwareConfig) -> Result<PathBuf, (SandboxError, RunVerdict)> {
+    if !cfg.measured_boot.sbverify_path.as_os_str().is_empty() {
+        let p = cfg.measured_boot.sbverify_path.clone();
+        if !p.is_file() {
+            return Err((
+                SandboxError::Disabled(format!(
+                    "secure boot verifier is not a file: {}",
+                    p.display()
+                )),
+                RunVerdict::Clean,
+            ));
+        }
+        return Ok(p);
+    }
+    which::which("sbverify").map_err(|_| {
+        (
+            SandboxError::Disabled(
+                "secure boot needs sbverify (sbsigntool) in PATH or measured_boot.sbverify_path"
+                    .into(),
+            ),
+            RunVerdict::Clean,
+        )
+    })
+}
+
+/// ตรวจ signature ของ artifact หนึ่งไฟล์ด้วย cert ชุดที่ operator ให้
+///
+/// ผ่านถ้า cert ตัวใดตัวหนึ่ง verify ได้ (PKI ปกติ: เซ็นด้วย cert ที่เชื่อถือ
+/// ตัวใดก็ได้) — ไม่ใช่ต้องผ่านทุก cert
+fn verify_secure_boot_artifact(
+    cfg: &HardwareConfig,
+    tool: &Path,
+    artifact: &Path,
+) -> Result<(), (SandboxError, RunVerdict)> {
+    let mut last = String::new();
+    for cert in &cfg.measured_boot.cert_paths {
+        let out = Command::new(tool)
+            .arg("--cert")
+            .arg(cert)
+            .arg(artifact)
+            .env_clear()
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| {
+                (
+                    SandboxError::Spawn(format!("secure boot verifier failed to execute: {e}")),
+                    RunVerdict::Suspect("secure-boot-verifier-exec-failed"),
+                )
+            })?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let mut msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if msg.is_empty() {
+            msg = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        }
+        last = msg.chars().take(300).collect();
+        if last.is_empty() {
+            last = format!("sbverify exited {}", out.status);
+        }
+    }
+    Err((
+        SandboxError::Invalid(format!(
+            "hardware secure boot signature verification failed for {}: {last}",
+            artifact.display()
+        )),
+        RunVerdict::Clean,
+    ))
+}
+
+/// ประตู secure boot: ตรวจ signature ของสำเนา kernel (และ initrd ถ้ามี)
+/// ก่อน spawn QEMU — ใช้สำเนาที่ hash ตรงแล้วเพื่อไม่ให้ TOCTOU หลุด
+fn verify_measured_boot(
+    cfg: &HardwareConfig,
+    kernel: &Path,
+    initrd: Option<&Path>,
+) -> Result<(), (SandboxError, RunVerdict)> {
+    if !cfg.measured_boot.enabled || !cfg.measured_boot.secure_boot {
+        return Ok(());
+    }
+    let tool = resolve_sbverify(cfg)?;
+    verify_secure_boot_artifact(cfg, &tool, kernel)?;
+    if let Some(initrd) = initrd {
+        verify_secure_boot_artifact(cfg, &tool, initrd)?;
+    }
+    Ok(())
+}
+
 /// Launch + run + capture output
 pub(super) fn launch_and_run(
     spec: &ExecSpec,
@@ -540,6 +632,14 @@ fn launch_and_run_inner(
     std::fs::copy(rpath, &guest_root).map_err(|e| spawn_err("rootfs copy", e))?;
     verify_artifact(&guest_root, rsha, cfg.max_artifact_bytes)
         .map_err(|e| (e, RunVerdict::Compromise("rootfs-copy-reverify-failed")))?;
+
+    // secure boot: ตรวจ signature ของสำเนา kernel/initrd ก่อน spawn QEMU
+    // (สเปก/cert ถูกตรวจตั้งแต่ประตูแล้ว — ที่นี่คือ cryptographic verification)
+    verify_measured_boot(
+        cfg,
+        &guest_kernel,
+        guest_initrd.as_ref().map(|(_, dst)| dst.as_path()),
+    )?;
 
     // ขนาด guest = clamp ด้วย quota ระดับ task ก่อน แล้ว jitter ลงถ้าเปิดไว้
     let (eff_vcpu, eff_mem) = effective_guest_size(cfg, &spec.limits);
@@ -753,6 +853,9 @@ fn launch_and_run_inner(
     if guest_initrd.is_some() {
         applied.push("initrd-copy-reverify".into());
     }
+    if cfg.measured_boot.secure_boot {
+        applied.push("secure-boot-signature-verify".into());
+    }
     let mut degraded = vec![
         "env_extra: ignored (not passed to guest)".to_string(),
         "cwd: guest sees / (workspace on read-only data drive)".to_string(),
@@ -792,8 +895,12 @@ fn launch_and_run_inner(
         );
     }
     if cfg.measured_boot.enabled {
-        // ยังไม่มีการอ่าน PCR จาก vTPM มาเทียบ expected_pcrs
-        degraded.push("measured-boot: requested, PCR comparison not implemented yet".into());
+        // expected_pcrs ถูกปฏิเสธตั้งแต่ shape (ยัง verify PCR ไม่ได้)
+        // ที่เหลือคือ OVMF boot + secure boot signature (ถ้าเปิด)
+        degraded.push(
+            "measured-boot: OVMF boot only; PCR comparison not implemented (expected_pcrs rejected at gate)"
+                .into(),
+        );
     }
     if cfg.vtpm.enabled {
         applied.push("vtpm-device".into());
@@ -1101,6 +1208,132 @@ mod tests {
         assert_eq!(sh_escape("a'b"), "'a'\\''b'");
         assert_eq!(sh_escape("$(id)"), "'$(id)'");
         assert_eq!(sh_escape("a;reboot"), "'a;reboot'");
+    }
+
+    fn write_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    // secure boot: ใช้ sbverify จริงหรือสคริปต์ทดสอบก็ได้ — ต้องเรียกบน
+    // สำเนา kernel/initrd และ fail-closed เมื่อ signature ไม่ผ่าน
+    #[test]
+    fn secure_boot_verifies_kernel_and_fails_closed_on_bad_signature() {
+        let dir = std::env::temp_dir().join(format!(
+            "aivm-hw-sbverify-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        std::fs::write(&cert, b"operator-cert").unwrap();
+        let kernel = dir.join("bzImage");
+        std::fs::write(&kernel, b"kernel").unwrap();
+        let ok = dir.join("sbverify-ok");
+        write_script(&ok, "#!/bin/sh\nexit 0\n");
+        let bad = dir.join("sbverify-bad");
+        write_script(&bad, "#!/bin/sh\necho bad-signature >&2\nexit 1\n");
+
+        let mut cfg = HardwareConfig {
+            measured_boot: crate::hardware::MeasuredBootConfig {
+                enabled: true,
+                secure_boot: true,
+                cert_paths: vec![cert],
+                sbverify_path: ok,
+                ..crate::hardware::MeasuredBootConfig::default()
+            },
+            ..HardwareConfig::default()
+        };
+        assert!(verify_measured_boot(&cfg, &kernel, None).is_ok());
+
+        cfg.measured_boot.sbverify_path = bad;
+        assert!(matches!(
+            verify_measured_boot(&cfg, &kernel, None),
+            Err((SandboxError::Invalid(_), RunVerdict::Clean))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // initrd ก็ต้องถูกตรวจด้วย ไม่ใช่แค่ kernel
+    #[test]
+    fn secure_boot_rejects_unsigned_initrd() {
+        let dir = std::env::temp_dir().join(format!(
+            "aivm-hw-sbinitrd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        std::fs::write(&cert, b"operator-cert").unwrap();
+        let kernel = dir.join("bzImage");
+        std::fs::write(&kernel, b"kernel").unwrap();
+        let initrd = dir.join("initrd.img");
+        std::fs::write(&initrd, b"initrd").unwrap();
+        // ผ่าน kernel แต่ปฏิเสธไฟล์ที่มีคำว่า initrd ใน argv
+        let tool = dir.join("sbverify");
+        write_script(
+            &tool,
+            "#!/bin/sh\ncase \"$3\" in *initrd*) echo unsigned >&2; exit 1;; esac\nexit 0\n",
+        );
+        let cfg = HardwareConfig {
+            measured_boot: crate::hardware::MeasuredBootConfig {
+                enabled: true,
+                secure_boot: true,
+                cert_paths: vec![cert],
+                sbverify_path: tool,
+                ..crate::hardware::MeasuredBootConfig::default()
+            },
+            ..HardwareConfig::default()
+        };
+        assert!(matches!(
+            verify_measured_boot(&cfg, &kernel, Some(&initrd)),
+            Err((SandboxError::Invalid(_), RunVerdict::Clean))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // เครื่องมือตรวจหาย = ตรวจ secure boot ไม่ได้ → Disabled ก่อน spawn
+    #[test]
+    fn secure_boot_missing_verifier_is_disabled() {
+        let cfg = HardwareConfig {
+            measured_boot: crate::hardware::MeasuredBootConfig {
+                enabled: true,
+                secure_boot: true,
+                cert_paths: vec![PathBuf::from("/operator/cert.pem")],
+                sbverify_path: PathBuf::from("/no/such/sbverify"),
+                ..crate::hardware::MeasuredBootConfig::default()
+            },
+            ..HardwareConfig::default()
+        };
+        assert!(matches!(
+            verify_measured_boot(&cfg, Path::new("/tmp/bzImage"), None),
+            Err((SandboxError::Disabled(_), RunVerdict::Clean))
+        ));
+    }
+
+    // ปิด secure boot = ห้ามเรียกเครื่องมือใด ๆ (path เพี้ยนก็ต้อง Ok)
+    #[test]
+    fn secure_boot_disabled_never_invokes_verifier() {
+        let mut cfg = HardwareConfig {
+            measured_boot: crate::hardware::MeasuredBootConfig {
+                enabled: true,
+                secure_boot: false,
+                sbverify_path: PathBuf::from("/no/such/sbverify"),
+                ..crate::hardware::MeasuredBootConfig::default()
+            },
+            ..HardwareConfig::default()
+        };
+        cfg.measured_boot.cert_paths.clear();
+        assert!(verify_measured_boot(&cfg, Path::new("/tmp/bzImage"), None).is_ok());
     }
 
     #[test]
