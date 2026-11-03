@@ -125,11 +125,12 @@ policy:
 #   mem_mb: 2048                  # 1024..=1048576 (default 2048)
 #   max_artifact_bytes: 1073741824  # เพดานไฟล์ artifact (default 1GiB, ต้อง > 0)
 #   launch_timeout_secs: 120      # 10..=1800 (default 120)
-#   gpu:                          # ทั้งบล็อกต้องปิดไว้ทั้งหมด (true ตัวใดตัวหนึ่ง = บูตไม่ขึ้น)
+#   gpu:                          # (ส่วนขยาย GPU — sriov รองรับแล้ว, mig/vGPU ยังปิด)
 #     mig_enabled: false          # MIG — ยังไม่ implement (เปิด = Invalid)
 #     mig_profile: ""
-#     sriov_enabled: false        # SR-IOV — ยังไม่ implement (เปิด = Invalid)
-#     sriov_num_vfs: 0
+#     sriov_enabled: false        # true = ผ่าน VF ที่ operator เตรียมผ่าน vfio-pci
+#     sriov_pci: "0000:41:10.0"   # BDF ของ VF (ต้อง bind vfio-pci + อยู่ใน IOMMU group)
+#     sriov_num_vfs: 0            # ต้องเป็น 0 — AIVM ไม่สร้าง VFs เอง (operator เตรียมเอง)
 #     vgpu_enabled: false         # vGPU — ยังไม่ implement (เปิด = Invalid)
 #     vgpu_type: ""
 #   disk_encryption:              # host ไม่ฉีดคีย์ให้ guest — initrd ของ guest ต้อง unlock เอง

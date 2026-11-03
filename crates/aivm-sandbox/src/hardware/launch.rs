@@ -377,6 +377,18 @@ fn build_qemu_cmd(
         cmd.arg("-device").arg("tpm-tis,tpmdev=tpm0");
     }
 
+    // GPU passthrough (SR-IOV) — ผ่าน shape + probe มาแล้ว: ที่นี่
+    // ประกอบ argv ตรง (BDF = hex ล้วน + `:/.` จึงไม่มี shell metachar ได้)
+    if cfg.gpu.sriov_enabled {
+        let addr = super::parse_pci_address(&cfg.gpu.sriov_pci).ok_or_else(|| {
+            clean_err(SandboxError::Invalid(format!(
+                "hardware gpu sriov_pci is not a valid PCI BDF: {}",
+                cfg.gpu.sriov_pci
+            )))
+        })?;
+        cmd.arg("-device").arg(format!("vfio-pci,host={addr}"));
+    }
+
     // Measured boot ต้องการเฟิร์มแวร์ที่รองรับ — ถ้าไฟล์ไม่มี QEMU จะล้ม
     // แบบ fail-closed เอง (Spawn ดัง ไม่เงียบข้าม)
     if cfg.measured_boot.enabled {
@@ -905,6 +917,18 @@ fn launch_and_run_inner(
     if cfg.vtpm.enabled {
         applied.push("vtpm-device".into());
     }
+    if cfg.gpu.sriov_enabled {
+        // BDF ผ่าน shape + probe มาแล้ว — parse ซ้ำเพื่อรายงาน normalized BDF
+        let addr =
+            super::parse_pci_address(&cfg.gpu.sriov_pci).unwrap_or_else(|| "unparsed".to_string());
+        applied.push(format!("gpu-vfio-passthrough:{addr}"));
+        if cfg.tee_type == TeeType::Generic {
+            degraded.push(
+                "gpu vfio: raw PCI VF on generic simulation (GPU DMA is IOMMU-mediated, no TEE encryption)"
+                    .into(),
+            );
+        }
+    }
 
     // DNA id ลง audit (ไม่มีช่องว่าง/อักขระพิเศษ — ปลอดภัยใน log)
     let dna_id = format!(
@@ -1199,6 +1223,62 @@ mod tests {
             .position(|a| a == "-nic")
             .expect("ต้องมี -nic กำกับ");
         assert_eq!(args[npos + 1], "none");
+    }
+
+    // SR-IOV passthrough: `-device vfio-pci,host=BDF` ครั้งเดียวเสมอ เมื่อเปิด
+    // และห้ามหลุดมาเมื่อไม่ได้เปิด (exec surface ใหม่ต้อง argv-shape คุม)
+    #[test]
+    fn qemu_sriov_vfio_device_is_exact() {
+        let mut cfg = HardwareConfig::default();
+        cfg.gpu.sriov_enabled = true;
+        cfg.gpu.sriov_pci = "0000:41:10.0".into();
+        let cmd = build_qemu_cmd(
+            &cfg,
+            Path::new("/usr/bin/qemu-system-x86_64"),
+            &std::env::temp_dir(),
+            Path::new("/k"),
+            None,
+            Path::new("/r"),
+            Path::new("/d"),
+            None,
+            2,
+            2048,
+        )
+        .unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let n = args.iter().filter(|a| *a == "-device").count();
+        assert_eq!(n, 1, "sriov เปิด = มี -device ก้อนเดียว: {args:?}");
+        let ipos = args.iter().position(|a| a == "-device").unwrap();
+        assert_eq!(args[ipos + 1], "vfio-pci,host=0000:41:10.0");
+    }
+
+    // ยังไม่เปิด sriov = argv ห้ามมี `-device vfio-pci` ค้าง (fail-silent กลับด้าน)
+    #[test]
+    fn qemu_without_sriov_has_no_vfio_device() {
+        let cmd = build_qemu_cmd(
+            &HardwareConfig::default(),
+            Path::new("/usr/bin/qemu-system-x86_64"),
+            &std::env::temp_dir(),
+            Path::new("/k"),
+            None,
+            Path::new("/r"),
+            Path::new("/d"),
+            None,
+            2,
+            2048,
+        )
+        .unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args.iter().any(|a| a.contains("vfio-pci")),
+            "argv ไม่ควรมี vfio-pci: {args:?}"
+        );
     }
 
     // sh_escape ต้องห่อ quote ครบ (init script ฝัง args ทั้งก้อน — payload

@@ -71,10 +71,14 @@ pub struct GpuConfig {
     /// MIG profile (เช่น "1g.5gb", "2g.10gb", "3g.20gb", "7g.40gb")
     #[serde(default)]
     pub mig_profile: String,
-    /// เปิด SR-IOV (Virtual Functions) — ต้องการ hardware support
+    /// เปิด SR-IOV (Virtual Functions) — บูตด้วย VF ที่ operator เตรียมผ่าน
+    /// vfio-pci (AIVM ไม่สร้าง VFs เอง)
     #[serde(default)]
     pub sriov_enabled: bool,
-    /// จำนวน VFs ที่สร้าง
+    /// PCI BDF ของ VF ที่จะ pass ผ่าน (เช่น "0000:41:10.0")
+    #[serde(default)]
+    pub sriov_pci: String,
+    /// จำนวน VFs ที่ operator สร้างแล้ว (เพียงข้อมูลรายงาน — AIVM ไม่สร้างเอง)
     #[serde(default)]
     pub sriov_num_vfs: u32,
     /// vGPU (mediated device) — ต้องการ NVIDIA vGPU license + driver
@@ -271,6 +275,37 @@ fn default_tee_dev_path() -> PathBuf {
     "/dev/sev".into() // default สำหรับ SEV-SNP; TDX ใช้ /dev/tdx_guest
 }
 
+/// ตรวจแปลง PCI BDF ตามรูป sysfs: `DDDD:BB:SS.F` (hex ล้วน ยาว 12 ตัวอักษร
+/// separator ตายตัว func 0..=7) — คืนค่า normalized แบบ lowercase
+///
+/// BDF ถูกใช้ประกอบทั้ง sysfs path และ QEMU argv จึงต้องกันอักขระพิเศษ
+/// (ช่องว่าง/`/`/`;`/`$()`) ตั้งแต่ประเมิน config ไม่ปล่อยให้ไปถึงประตู spawn
+pub(super) fn parse_pci_address(s: &str) -> Option<String> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() != 12 {
+        return None;
+    }
+    if chars[4] != ':' || chars[7] != ':' || chars[10] != '.' {
+        return None;
+    }
+    for (i, c) in chars.iter().enumerate() {
+        match i {
+            4 | 7 | 10 => {}
+            11 => {
+                if !c.is_ascii_digit() || (*c as u8 - b'0') > 7 {
+                    return None;
+                }
+            }
+            _ => {
+                if !c.is_ascii_hexdigit() {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(s.to_ascii_lowercase())
+}
+
 impl Default for HardwareConfig {
     fn default() -> Self {
         Self {
@@ -386,15 +421,74 @@ impl HardwareConfig {
                 }
             }
         }
-        // GPU passthrough ยังไม่ implement (กันเงียบผ่าน: เปิดไว้ต้องตาย
-        // ตั้งแต่ shape พร้อมบอกว่ายังไม่รองรับ — workload จะได้ไม่รันแบบ
-        // ขาด GPU ที่ operator คาดไว้โดยไม่มีใครรู้)
-        if self.gpu.mig_enabled || self.gpu.sriov_enabled || self.gpu.vgpu_enabled {
+        // GPU passthrough: ทางเดียวที่เปิดได้คือ SR-IOV VF ที่ operator เตรียม
+        // ผ่าน vfio-pci — MIG/vGPU ยังไม่ implement (ตายตั้งแต่ shape กันรัน
+        // แบบขาด GPU/ชุดประสิทธิภาพที่ operator คาดโดยไม่มีใครรู้)
+        if self.gpu.mig_enabled || self.gpu.vgpu_enabled {
             return Err(bad(
-                "hardware gpu passthrough not implemented yet (mig/sriov/vgpu must stay off)",
+                "hardware gpu MIG/vGPU not implemented yet (mig/vgpu must stay off)",
+            ));
+        }
+        if self.gpu.sriov_enabled && self.gpu.sriov_pci.is_empty() {
+            return Err(bad(
+                "hardware gpu sriov_enabled needs sriov_pci (operator-prepared VF BDF e.g. 0000:41:10.0)",
+            ));
+        }
+        if !self.gpu.sriov_pci.is_empty() {
+            if !self.gpu.sriov_enabled {
+                return Err(bad("hardware gpu sriov_pci needs sriov_enabled=true"));
+            }
+            // BDF ผิดรูปห้ามไปถึง sysfs path/QEMU argv — hex ล้วนตายตัว
+            if parse_pci_address(&self.gpu.sriov_pci).is_none() {
+                return Err(bad(
+                    "hardware gpu sriov_pci must be a PCI BDF like 0000:41:10.0 (hex DDDD:BB:SS.F, func 0..=7)",
+                ));
+            }
+        }
+        if self.gpu.sriov_enabled && self.gpu.sriov_num_vfs != 0 {
+            return Err(bad(
+                "hardware gpu sriov_num_vfs must stay 0 (AIVM does not create VFs; the operator prepares the VF and passes its BDF via sriov_pci)",
             ));
         }
         Ok(())
+    }
+}
+
+/// ตรวจความพร้อมของ GPU pass-through (SR-IOV VF) บน host (Linux)
+///
+/// ทุกข้อแม้ต้องผ่านก่อน spawn — ข้อใดขาดคือ fail-closed แบบบอกเหตุผล:
+/// device ต้องมีจริงตาม BDF, ต้องอยู่ใน IOMMU group (กัน DMA หลุดจาก guest),
+/// และต้อง bound ด้วย vfio-pci (driver อื่นถือ device อยู่ จึงผ่านให้ QEMU ไม่ได้)
+fn probe_gpu_passthrough(cfg: &HardwareConfig) -> Result<(), SandboxError> {
+    // shape ตรวจ BDF มาแล้ว — แปลงซ้ำเพื่อได้ BDF ที่ normalized (จาก sysfs)
+    let addr = parse_pci_address(&cfg.gpu.sriov_pci).ok_or_else(|| {
+        SandboxError::Invalid(format!(
+            "hardware gpu sriov_pci is not a valid PCI BDF: {}",
+            cfg.gpu.sriov_pci
+        ))
+    })?;
+    let dev = std::path::Path::new("/sys/bus/pci/devices").join(&addr);
+    if !dev.exists() {
+        return Err(SandboxError::Disabled(format!(
+            "gpu passthrough needs PCI device {addr} on host (operator prepares the VF first)"
+        )));
+    }
+    if !dev.join("iommu_group").exists() {
+        return Err(SandboxError::Disabled(format!(
+            "gpu passthrough needs {addr} in an IOMMU group (enable IOMMU on host first)"
+        )));
+    }
+    let driver_name = std::fs::read_link(dev.join("driver"))
+        .ok()
+        .and_then(|l| l.file_name().map(|f| f.to_string_lossy().into_owned()));
+    match driver_name {
+        Some(name) if name == "vfio-pci" => Ok(()),
+        Some(name) => Err(SandboxError::Disabled(format!(
+            "gpu passthrough needs {addr} bound to vfio-pci (currently {name}; unbind and rebind the VF)"
+        ))),
+        None => Err(SandboxError::Disabled(format!(
+            "gpu passthrough needs {addr} bound to vfio-pci (no driver is currently bound)"
+        ))),
     }
 }
 
@@ -542,6 +636,12 @@ pub fn run_in_hardware(
                 )),
                 RunVerdict::Clean,
             ));
+        }
+
+        // GPU passthrough (SR-IOV VF): เหมือน TEE device — host ต้องเตรียม
+        // device/ผูก vfio-pci ให้ครบก่อน ข้อใดขาดคือ Disabled ก่อน spawn
+        if cfg.gpu.sriov_enabled {
+            probe_gpu_passthrough(cfg).map_err(|e| (e, RunVerdict::Clean))?;
         }
 
         // Strict attestation บน generic (โหมดจำลอง) เป็น config ที่เป็นไปไม่ได้
@@ -873,19 +973,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 
-    // GPU passthrough ยังไม่ implement — เปิดไว้ต้องตายตั้งแต่ shape
+    // MIG/vGPU passthrough ยังไม่ implement — เปิดไว้ต้องตายตั้งแต่ shape
     // (กัน workload รันแบบขาด GPU ที่ operator คาดไว้โดยไม่มีใครรู้)
     #[test]
-    fn gpu_passthrough_fails_closed_as_unimplemented() {
+    fn gpu_mig_vgpu_fail_closed_as_unimplemented() {
         for (tag, mk) in [
             (
                 "mig",
                 Box::new(|c: &mut HardwareConfig| c.gpu.mig_enabled = true)
                     as Box<dyn Fn(&mut HardwareConfig)>,
-            ),
-            (
-                "sriov",
-                Box::new(|c: &mut HardwareConfig| c.gpu.sriov_enabled = true),
             ),
             (
                 "vgpu",
@@ -903,6 +999,150 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&ws);
         }
+    }
+
+    // SR-IOV เปิดแต่ไม่ระบุ VF ที่จะผ่าน = รันไม่ได้แบบมีความหวังลอย ๆ
+    #[test]
+    fn sriov_without_pci_fails_closed() {
+        let (spec, policy, mut cfg, ws) = fixture("sriov-nopci");
+        cfg.gpu.sriov_enabled = true;
+        assert!(matches!(
+            run_in_hardware(&spec, &policy, &cfg),
+            Err((SandboxError::Invalid(_), RunVerdict::Clean))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // sriov_pci โดดเดี่ยวโดยไม่เปิด sriov_enabled = config ที่สื่อเจตนาไม่ครบ
+    #[test]
+    fn sriov_pci_without_sriov_enabled_fails_closed() {
+        let (spec, policy, mut cfg, ws) = fixture("sriov-onlypci");
+        cfg.gpu.sriov_pci = "0000:41:10.0".into();
+        assert!(matches!(
+            run_in_hardware(&spec, &policy, &cfg),
+            Err((SandboxError::Invalid(_), RunVerdict::Clean))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // AIVM ไม่สร้าง VFs เอง (ต้อง root + driver binding) — num_vfs>0 คือ
+    // config ที่ให้คนอื่นล่วงรู้ว่าเราสั่ง mutate host ซึ่งจะกระทบ host จริง
+    #[test]
+    fn sriov_num_vfs_fails_closed() {
+        let (spec, policy, mut cfg, ws) = fixture("sriov-vfs");
+        cfg.gpu.sriov_enabled = true;
+        cfg.gpu.sriov_pci = "0000:41:10.0".into();
+        cfg.gpu.sriov_num_vfs = 2;
+        assert!(matches!(
+            run_in_hardware(&spec, &policy, &cfg),
+            Err((SandboxError::Invalid(_), RunVerdict::Clean))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // BDF ผิดรูป (รวม shell metachar) ห้ามไปถึง sysfs path/argv — ตายที่ shape
+    #[test]
+    fn sriov_bad_pci_address_fails_closed() {
+        for (tag, addr) in [
+            ("inj1", "../etc/passwd"),
+            ("inj2", "0000:41:10.$(id)"),
+            ("inj3", "0041:10.0"),
+            ("inj4", "0000:41:1 0.0"),
+            ("inj5", "0000:41:10.8"),
+            ("inj6", "00000041:100"),
+            ("inj7", "XXXX:41:1 0.0"),
+            ("inj8", "0000:41:10.0\nX"),
+        ] {
+            let (spec, policy, mut cfg, ws) = fixture(tag);
+            cfg.gpu.sriov_enabled = true;
+            cfg.gpu.sriov_pci = addr.into();
+            assert!(
+                matches!(
+                    run_in_hardware(&spec, &policy, &cfg),
+                    Err((SandboxError::Invalid(_), RunVerdict::Clean))
+                ),
+                "{addr:?} ต้องตายที่ shape"
+            );
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+    }
+
+    // parse_pci_address: ต้อง normalize ตัวพิมพ์และปฏิเสธเหลือบมากที่สุด
+    #[test]
+    fn pci_address_parse_exact() {
+        assert_eq!(
+            parse_pci_address("0000:41:10.0").as_deref(),
+            Some("0000:41:10.0")
+        );
+        assert_eq!(
+            parse_pci_address("0001:AE:Bf.3").as_deref(),
+            Some("0001:ae:bf.3")
+        );
+        assert_eq!(parse_pci_address(""), None);
+        assert_eq!(parse_pci_address("0000:41:10.10"), None);
+        assert_eq!(parse_pci_address("000:41:10.0"), None);
+        assert_eq!(parse_pci_address("0000:41:10:0"), None);
+        assert_eq!(parse_pci_address("0000:41:10.G"), None);
+        assert_eq!(parse_pci_address("0000:41:10.8"), None);
+        assert_eq!(parse_pci_address("0000;41:10.0"), None);
+        assert_eq!(parse_pci_address("../../etc/passwd "), None);
+    }
+
+    // host ไม่มี device ที่ส่งมา = Disabled ก่อน spawn (deterministic ทุกเครื่อง)
+    #[test]
+    fn sriov_missing_gpu_device_fails_closed() {
+        // BDF ที่กอดเว้นไว้ว่างไม่มีในเครื่อง host ใด ๆ (segment ffff = reserved)
+        // อย่าคิดถึง hardware แต่ต้องการยืนยันประตู probe ทำงานเป็น Disabled
+        let cfgr = "/sys/bus/pci/devices/ffff:ff:ff.7";
+        if std::path::Path::new(cfgr).exists() {
+            eprintln!("skip: เครื่องนี้มี PCI device ที่ ffff:ff:ff.7 (ประหลาดผิดคาด)");
+            return;
+        }
+        let (spec, policy, mut cfg, ws) = fixture("sriov-nodev");
+        cfg.gpu.sriov_enabled = true;
+        cfg.gpu.sriov_pci = "ffff:ff:ff.7".into();
+        let r = run_in_hardware(&spec, &policy, &cfg);
+        assert!(
+            matches!(r, Err((SandboxError::Disabled(_), RunVerdict::Clean))),
+            "device ที่ไม่มีต้อง Disabled ไม่ใช่ run เครื่องจริง: {r:?}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // device ที่มีจริงแต่ยังไม่ได้ bind vfio-pci = Disabled รายงานซื่อสัตย์
+    // (บน CI ที่ไม่มี GPU กระโดดไป skip — บนเครื่องที่มี CPU/GPU จะเจ็บจริง)
+    #[test]
+    fn sriov_device_without_vfio_binding_fails_closed() {
+        for candidate in ["0000:03:00.0", "0000:01:00.0"] {
+            let dev = std::path::Path::new("/sys/bus/pci/devices").join(candidate);
+            if !dev.exists() {
+                continue;
+            }
+            // ยัง bind โดย driver อื่น = ประตู probe ต้องปฏิเสธ; device แบบไม่มี
+            // driver เลยก็ต้องปฏิเสธเช่นกัน (เป็นความรับผิดของ operator ทั้งคู่)
+            // ไม่ลอง bind เอง (root เท่านั้น และเสี่ยงโปรดักชัน)
+            if std::fs::read_link(dev.join("driver"))
+                .ok()
+                .and_then(|l| l.file_name().map(|f| f.to_string_lossy().into_owned()))
+                .as_deref()
+                == Some("vfio-pci")
+            {
+                // เครื่องที่ device ถูก bind vfio แล้ว = ไม่เหมาะกับเทสต์ deny path
+                eprintln!("skip: {candidate} ถูกผูก vfio-pci แล้ว ใช้ตรวจ deny path ไม่ได้");
+                return;
+            }
+            let (spec, policy, mut cfg, ws) = fixture("sriov-bound");
+            cfg.gpu.sriov_enabled = true;
+            cfg.gpu.sriov_pci = candidate.into();
+            let r = run_in_hardware(&spec, &policy, &cfg);
+            assert!(
+                matches!(r, Err((SandboxError::Disabled(_), RunVerdict::Clean))),
+                "{candidate} ที่ไม่ได้ผูก vfio-pci ต้อง Disabled: {r:?}"
+            );
+            let _ = std::fs::remove_dir_all(&ws);
+            return;
+        }
+        eprintln!("skip: ไม่มี PCI device ทดสอบบนเครื่องนี้ (CI ธรรมดาหรือไม่มี GPU)");
     }
 
     // บูตจริงแบบ end-to-end (ต้องมี KVM + QEMU + debugfs + mkfs.ext4 + pins)

@@ -16,6 +16,7 @@ attestation quote verification/PCR comparison/disk-encryption/GPU ยังเ�
 | `debugfs`, `mkfs.ext4`, `ldd` | ใช่ (ตอน launch) | ใช้ฉีด init + สร้าง data drive — ไม่มี = `Spawn` ดัง |
 | `/dev/sev` (SEV-SNP) / `/dev/tdx_guest` (TDX) | เฉพาะ `tee_type` นั้น ๆ | `generic` ไม่ต้องการ device (โหมดจำลอง) |
 | `sev-tool` / `tdx-attest` | เฉพาะ attestation จริง | ไม่มี + `strict` = `Spawn` + `Suspect` |
+| PCI VF ที่ bind ด้วย `vfio-pci` + IOMMU group | เฉพาะ `gpu.sriov_enabled` | operator เตรียมเอง (AIVM ไม่สร้าง/ผูกแทน) — ตรวจไม่ผ่าน = ปฏิเสธก่อน spawn |
 | `swtpm` | เฉพาะ `vtpm.enabled` | spawn แบบ foreground + ถือ guard (ไม่มี daemon กำพร้า) |
 
 ## โหมดจำลอง (ตอบคำถาม "เทสโดยไม่มี hardware ได้ไหม")
@@ -83,8 +84,11 @@ hardware:
   `secure-boot-signature-verify` ใน `applied`
 - `disk-encryption` = รับ config + ตรวจ shape แต่**ยังไม่ unlock ให้**
   (guest initrd ต้องทำเองผ่าน vTPM)
-- GPU passthrough (MIG/SR-IOV/vGPU) = เปิดแล้วบูตไม่ขึ้น (`Invalid` ตั้งแต่
-  shape — กันรันแบบขาด GPU โดยไม่มีใครรู้)
+- GPU passthrough: `sriov_enabled` รองรับแล้ว — ผ่าน VF ที่ operator เตรียม
+  (bind vfio-pci + อยู่ใน IOMMU group, `sriov_pci` = BDF ตัวเดียวต่อรอน);
+  host ต้องว่าง device ให้ครบ (device โดน driver อื่นถือ/IOMMU ปิด = ไม่รัน)
+  และบน `tee_type: generic` GPU จะไม่มี TEE หุ้ม memory ให้ traffic ของ GPU
+  (รายงานใน `degraded` ทุกครั้ง) — MIG/vGPU ยังเป็น `Invalid` ตั้งแต่ shape
 - `env_extra` ถูกเมิน, cwd ใน guest คือ `/`, `pids_max` ไม่ enforce ใน guest,
   output ต้องเป็น UTF-8 (เหมือน MicroVM)
 - initrd ที่ให้มาต้องเคารพ `init=` (initramfs-tools/dracut ทั่วไปเคารพ)
