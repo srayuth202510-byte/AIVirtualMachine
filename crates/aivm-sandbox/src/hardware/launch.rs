@@ -12,7 +12,7 @@
 //! (ไม่มี shell มาต่อกลางเด็ดขาด ดูเทสต์ `shell_metachars_stay_single_argv`)
 
 use super::{AttestationMode, ExecOutcome, ExecSpec, HardwareConfig, TeeType};
-use crate::{verify_artifact, ResourceLimits, RunVerdict, SandboxError};
+use crate::{enforce_private_dir, verify_artifact, ResourceLimits, RunVerdict, SandboxError};
 use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -260,7 +260,8 @@ fn spawn_swtpm(
     } else {
         cfg.vtpm.tpm_state_dir.clone()
     };
-    std::fs::create_dir_all(&state_dir).map_err(|e| {
+    // state ของ vTPM เป็นความลับ — 0700 เสมอ (แม้ operator ชี้ dir ที่มีอยู่แล้ว)
+    enforce_private_dir(&state_dir).map_err(|e| {
         clean_err(SandboxError::Spawn(format!(
             "swtpm state dir create failed: {e}"
         )))
@@ -569,7 +570,8 @@ pub(super) fn launch_and_run(
         std::process::id()
     );
     let scratch = std::env::temp_dir().join(format!("aivm-hw-run-{nonce}"));
-    std::fs::create_dir_all(&scratch).map_err(|e| spawn_err("scratch", e))?;
+    // 0700: socket ของ swtpm/vTPM state อยู่ใต้นี้ — local user อื่นห้ามยุ่ง
+    enforce_private_dir(&scratch).map_err(|e| spawn_err("scratch", e))?;
 
     let r = launch_and_run_inner(spec, canon, cfg, qemu_bin, &scratch, &nonce);
 

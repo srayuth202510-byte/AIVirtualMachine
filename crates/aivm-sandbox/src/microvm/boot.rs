@@ -11,7 +11,7 @@
 //! ยกเว้น path ที่ผ่าน validate/verify มาแล้ว — agent ปนคำสั่งไม่ได้
 
 use super::{ExecOutcome, ExecSpec, MicroVmConfig};
-use crate::{verify_artifact, RunVerdict, SandboxError};
+use crate::{enforce_private_dir, verify_artifact, RunVerdict, SandboxError};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -478,7 +478,8 @@ pub(super) fn boot_and_run(
         std::process::id()
     );
     let scratch = std::env::temp_dir().join(format!("aivm-uvm-run-{nonce}"));
-    std::fs::create_dir_all(&scratch).map_err(|e| spawn_err("scratch", e))?;
+    // 0700: Firecracker api.sock อยู่ใต้นี้ — local user อื่น connect ไม่ได้
+    enforce_private_dir(&scratch).map_err(|e| spawn_err("scratch", e))?;
     let r = boot_and_run_inner(
         spec, canon, cfg, fc_bin, &scratch, &nonce, policy, cancelled, observer,
     );

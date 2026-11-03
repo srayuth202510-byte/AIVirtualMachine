@@ -78,7 +78,9 @@ pub struct GpuConfig {
     /// PCI BDF ของ VF ที่จะ pass ผ่าน (เช่น "0000:41:10.0")
     #[serde(default)]
     pub sriov_pci: String,
-    /// จำนวน VFs ที่ operator สร้างแล้ว (เพียงข้อมูลรายงาน — AIVM ไม่สร้างเอง)
+    /// จำนวน VFs ที่ operator สร้างแล้ว (ต้องเป็น 0 เสมอ — AIVM ไม่สร้าง VFs
+    /// เอง, operator เตรียมผ่าน vfio-pci แล้วส่ง BDF ตัวเดียวที่ `sriov_pci`;
+    /// ค่าอื่น = `Invalid` ตั้งแต่ shape)
     #[serde(default)]
     pub sriov_num_vfs: u32,
     /// vGPU (mediated device) — ต้องการ NVIDIA vGPU license + driver

@@ -1015,6 +1015,24 @@ pub fn verify_artifact(
     Ok(total)
 }
 
+/// เตรียม directory แบบเอกชน (0700) สำหรับ scratch/state ที่มี socket หรือ
+/// state ลับอยู่ตรง ๆ (swtpm.sock, Firecracker api.sock, vTPM tpmstate)
+///
+/// `create_dir_all` สร้างโดยคง umask (ปกติ 0755) — local user อื่นจะอ่านไฟล์
+/// state และ connect socket ภายในได้ จึงต้อง tighten เป็น 0700 ทุกครั้ง
+/// เรียกซ้ำได้ (idempotent): dir ที่มีอยู่แล้วก็ถูกปรับ mode ให้เป็น 0700 เสมอ
+pub fn enforce_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(dir)?.permissions();
+        perm.set_mode(0o700);
+        std::fs::set_permissions(dir, perm)?;
+    }
+    Ok(())
+}
+
 /// ตรวจ exe ซ้ำทันทีก่อน spawn (บีบหน้าต่าง TOCTOU ระหว่าง `validate` กับ spawn)
 ///
 /// `validate` คืน path ที่ canonicalize แล้ว แต่ไฟล์เป้าหมายอาจถูกสลับหลังตรวจ
@@ -1854,6 +1872,33 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aivm-sbx-{tag}-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir.canonicalize().unwrap_or(dir)
+    }
+
+    // enforce_private_dir: dir ที่มีอยู่แล้วแบบ world-readable ต้องถูกคุมเป็น 0700
+    // (กันการพึ่ง umask — swtpm.sock/fc api.sock อยู่ใต้ dir เหล่านี้)
+    #[test]
+    fn private_dir_tightens_existing_world_readable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_ws("privdir");
+        let bad = dir.join("loose");
+        std::fs::create_dir_all(&bad).unwrap();
+        let perm = std::fs::Permissions::from_mode(0o777);
+        std::fs::set_permissions(&bad, perm).unwrap();
+        enforce_private_dir(&bad).unwrap();
+        let mode = std::fs::metadata(&bad).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "แตะมาแล้วต้องถูก tighten: {mode:o}");
+    }
+
+    // path ลึกที่ยังไม่มี (tpm_state_dir ของ operator) = สร้าง + tighten ในครั้งเดียว
+    #[test]
+    fn private_dir_creates_nested_path_as_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_ws("privdir2");
+        let leaf = dir.join("a").join("b").join("tpmstate");
+        enforce_private_dir(&leaf).unwrap();
+        let mode = std::fs::metadata(&leaf).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "leaf ต้อง 0700: {mode:o}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn spec(exe: &str, ws: &Path) -> ExecSpec {
