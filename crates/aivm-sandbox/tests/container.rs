@@ -7,16 +7,31 @@ use aivm_sandbox::{
 use std::path::PathBuf;
 
 fn workspace() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "aivm-container-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&dir).unwrap();
-    dir
+    #[cfg(unix)]
+    use std::os::unix::fs::DirBuilderExt;
+    // รันขนาน: 3 เทสต์เริ่มพร้อมกันในเสี้ยวมิลลิวินาทีเดียว timestamp อาจซ้ำ
+    // (create_dir โดน EEXIST) — วนสุ่มชื่อใหม่ได้ + สร้างแบบ 0700 ตามแนวทาง
+    // owner-only ของ scratch dir (commit confine scratch dirs)
+    for attempt in 0u32..64 {
+        let dir = std::env::temp_dir().join(format!(
+            "aivm-container-test-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            attempt
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        match builder.create(&dir) {
+            Ok(()) => return dir,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create workspace {}: {error}", dir.display()),
+        }
+    }
+    panic!("find unique workspace dir failed after 64 attempts");
 }
 fn spec(exe: PathBuf, ws: &std::path::Path) -> ExecSpec {
     ExecSpec {

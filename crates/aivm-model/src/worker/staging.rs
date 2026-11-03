@@ -394,8 +394,21 @@ mod tests {
         StagedConfig::recover(&std::env::temp_dir()).unwrap();
         assert!(path.exists());
         active.lease.take();
-        StagedConfig::recover(&std::env::temp_dir()).unwrap();
-        assert!(!path.exists());
+        // เทสต์อื่นที่ spawn child แบบขนานอาจ fork จังหวะที่ fd lease ยังเปิด
+        // (fd close-on-exec ตาม std อยู่แล้ว แต่ช่วง fork→exec ลูกยังถือ flock
+        // shared fd จาก parent) — scanner จึง skip ถูกต้องตาม fail-safe; รอระยะ
+        // สั้นแล้วค่อยยืนยันว่า reclaim สำเร็จเทียบกับ dir ค้างจริงที่ไม่เคยถูกลบ
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while path.exists() {
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "recover ยังเหลือ staging directory ของ lease ที่ปล่อยแล้ว: {}",
+                    path.display()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            StagedConfig::recover(&std::env::temp_dir()).unwrap();
+        }
     }
 
     #[test]
