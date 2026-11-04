@@ -7,15 +7,18 @@ instance/session ตรวจ chain ได้ และแหล่งเดี�
 เรียกซ้ำด้วย inputs เดิมต้องได้ verdict เดิม (replay ได้โดยไม่เรียกโมเดลใหม่)
 """
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
+import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # รุ่นของกฎ (ทุก verdict ผูก law_version + law_hash ไว้ replay ได้)
-LAW_VERSION = "court-law-v1"
+LAW_VERSION = "court-law-v2"
 # ระดับ action จากเบาไปหนัก (veto ลดหนึ่งระดับเสมอ ไม่ใช่การยับยั้งลอยๆ)
 ACTIONS = ("none", "watch", "restrict", "quarantine", "replace")
 SEVERITY = {name: rank for rank, name in enumerate(ACTIONS)}
@@ -36,6 +39,17 @@ def law_hash(case):
         "min_sources": case["min_sources"],
         "quorum": case["quorum"],
     }).encode()).hexdigest()
+
+
+def bundle_hash(bundle):
+    """ผูกข้อมูลคดีทุกส่วน รวม instance/session และหลักฐานที่ถูกคัดออกด้วย."""
+    return hashlib.sha256(canonical(bundle).encode()).hexdigest()
+
+
+def _check_sha256(value, field):
+    if (not isinstance(value, str) or len(value) != 64
+            or any(c not in "0123456789abcdef" for c in value)):
+        raise ValueError(f"{field} must be lowercase sha256 hex")
 
 
 def _check_id(value, field):
@@ -183,18 +197,18 @@ def judge(case, evidences, allegations, objections, votes):
     sources = sorted({(e["source"], e["origin"]) for e in usable})
 
     # นับโหวตต่อ (voter, origin) ซ้ำครั้งเดียว งดออกเสียง/timeout ไม่นับฝั่งใด
-    guilty_keys, not_guilty, abstained, timed_out = set(), 0, 0, 0
+    unique_votes = {}
     for v in votes:
         key = (v["voter"], v["origin"])
-        if v["verdict"] == "abstain":
-            abstained += 1
-        elif v["verdict"] == "timeout":
-            timed_out += 1
-        elif v["verdict"] == "guilty":
-            guilty_keys.add(key)
-        else:
-            not_guilty += 1
-    guilty = len(guilty_keys)
+        if key in unique_votes and unique_votes[key] != v["verdict"]:
+            # ห้ามเลือกรับโหวตแรก/สุดท้าย เพราะจะทำให้ผลขึ้นกับลำดับข้อมูลที่ขัดกัน
+            raise ValueError(f"conflicting vote from juror: {key!r}")
+        unique_votes[key] = v["verdict"]
+    decisions = list(unique_votes.values())
+    guilty = decisions.count("guilty")
+    not_guilty = decisions.count("not-guilty")
+    abstained = decisions.count("abstain")
+    timed_out = decisions.count("timeout")
     requested = case["requested_action"]
     for allegation in allegations:
         if SEVERITY[allegation["requested_action"]] > SEVERITY[requested]:
@@ -232,6 +246,10 @@ def judge(case, evidences, allegations, objections, votes):
         "case_id": case["id"],
         "law_version": LAW_VERSION,
         "law_hash": law_hash(case),
+        "bundle_sha256": bundle_hash({
+            "case": case, "evidences": evidences, "allegations": allegations,
+            "objections": objections, "votes": votes,
+        }),
         "outcome": outcome,
         "action": action,
         "conditions": conditions,
@@ -416,13 +434,13 @@ RELEASE_MODES = {
 REVIEW_HORIZON_SECS = 86400
 VERDICT_FIELDS = {
     "case_id", "law_version", "law_hash", "outcome", "action", "conditions",
-    "evidence_used", "evidence_excluded", "independent_sources", "votes",
+    "evidence_used", "evidence_excluded", "independent_sources", "votes", "bundle_sha256",
 }
 DIRECTIVE_FIELDS = {
     "case_id", "instance", "session", "law_version", "law_hash", "outcome",
     "action", "directive", "applied", "reason", "conditions", "evidence_used",
     "votes", "independent_sources", "release_mode", "review_deadline_utc",
-    "rollback", "created_utc",
+    "rollback", "created_utc", "bundle_sha256",
 }
 
 
@@ -439,10 +457,8 @@ def validate_verdict(verdict):
     _check_id(verdict["case_id"], "verdict case_id")
     if verdict["law_version"] != LAW_VERSION:
         raise ValueError("verdict law_version mismatch (fail-closed)")
-    if (not isinstance(verdict["law_hash"], str)
-            or len(verdict["law_hash"]) != 64
-            or any(c not in "0123456789abcdef" for c in verdict["law_hash"])):
-        raise ValueError("verdict law_hash must be lowercase sha256 hex")
+    _check_sha256(verdict["law_hash"], "verdict law_hash")
+    _check_sha256(verdict["bundle_sha256"], "verdict bundle_sha256")
     if verdict["action"] not in ACTIONS:
         raise ValueError("verdict action unknown")
     if not isinstance(verdict["outcome"], str) or not verdict["outcome"]:
@@ -460,20 +476,23 @@ def validate_verdict(verdict):
     return verdict
 
 
-def enforcement_directive(verdict, case, policy, created_utc):
+def enforcement_directive(verdict, bundle, policy, created_utc):
     """แปล verdict → directive แบบ deterministic (จำกัดเท่านั้น, ไม่เพิ่มสิทธิ์)
 
-    verdict ถือเป็น trusted custody เดียวกับ case: ตรวจ integrity ซ้ำตามที่พิสูจน์ได้
-    (law_hash recompute, evidence refs ต้องอยู่ใน bundle) และห้าม action เกิน
-    case.requested_action — ส่วน hash-chain ของ verdict เองอยู่นอกขอบเขตนี้
+    ต้องมี bundle ต้นฉบับครบ: ตรวจ digest และ replay ทั้ง verdict ก่อนแปล
+    ป้องกันไฟล์เก่าปะปนกับคดีรุ่นใหม่; hash ไม่ใช่การรับรองผู้ส่งข้อมูล
     """
     verdict = validate_verdict(dict(verdict))
-    case = validate_case(dict(case))
+    case = validate_case(dict(bundle["case"]))
     _check_id(case["id"], "case id")
     if case["id"] != verdict["case_id"]:
         raise ValueError("verdict case_id mismatch against bundle")
     if law_hash(case) != verdict["law_hash"]:
         raise ValueError("verdict law_hash mismatch against case thresholds")
+    if bundle_hash(bundle) != verdict["bundle_sha256"]:
+        raise ValueError("verdict bundle_sha256 mismatch against bundle (fail-closed)")
+    if judge(**bundle) != verdict:
+        raise ValueError("verdict does not match bundle replay (fail-closed)")
     if SEVERITY[verdict["action"]] > SEVERITY[case["requested_action"]]:
         raise ValueError("verdict action exceeds case requested_action (fail-closed)")
     directive = apply_policy(verdict, policy)
@@ -500,6 +519,7 @@ def enforcement_directive(verdict, case, policy, created_utc):
         "session": case["session"],
         "law_version": LAW_VERSION,
         "law_hash": verdict["law_hash"],
+        "bundle_sha256": verdict["bundle_sha256"],
         "outcome": directive["outcome"],
         "action": action,
         "directive": action,
@@ -532,6 +552,9 @@ def _read_ledger(path):
         row = json.loads(line)
         if not isinstance(row, dict) or set(row) != DIRECTIVE_FIELDS:
             raise ValueError("ledger record fields mismatch (fail-closed)")
+        if row["law_version"] != LAW_VERSION:
+            raise ValueError("ledger law_version mismatch (fail-closed)")
+        _check_sha256(row["bundle_sha256"], "ledger bundle_sha256")
         if row["case_id"] in seen:
             raise ValueError("ledger already holds duplicate case_id (fail-closed)")
         seen.add(row["case_id"])
@@ -539,12 +562,25 @@ def _read_ledger(path):
     return rows
 
 
+@contextlib.contextmanager
+def _ledger_lock(path):
+    # เก็บ inode ของ lock ไว้หลังปล่อย ห้าม unlink จนผู้รอไปล็อกคนละ inode
+    fd = os.open(str(path) + ".lock",
+                 os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def enforce_run(corpus_dir, verdicts_path, policy, ledger_path, created_utc):
     """บังคับใช้ verdicts ภายใต้ policy: เขียน ledger แบบ idempotent + budget ก่อนเขียนจริง
 
     - kill switch: ไม่มี directive ใดถูกบังคับ (ยังบันทึก record เพื่อ audit)
-    - case_id ที่มีใน ledger แล้ว = duplicate: ไม่เขียนซ้ำ
+    - case_id ที่มีใน ledger แล้วต้องผูก bundle เดิม: ไม่เขียนซ้ำ
     - เกิน budget_cases = ValueError ก่อนแตะ ledger (atomic)
+    - ถือ lock ข้ามโปรเซสตั้งแต่อ่าน ledger จนเขียนเสร็จและเก็บ hash
     """
     policy = validate_policy(dict(policy))
     corpus = Path(corpus_dir)
@@ -561,9 +597,8 @@ def enforce_run(corpus_dir, verdicts_path, policy, ledger_path, created_utc):
             rows.append(json.loads(line))
     if len(rows) > policy["budget_cases"]:
         raise ValueError("enforcement budget exceeded")
-    existing = _read_ledger(ledger_path)
-    known = {row["case_id"] for row in existing}
-    appended, duplicates, killed = [], 0, 0
+    # ตรวจทุกคำตัดสินก่อนเปิด ledger เพื่อไม่ทิ้งผลบางส่วนเมื่อ input แถวท้ายผิด
+    records = []
     for row in rows:
         if set(row) != {"bundle", "verdict"} or row["bundle"] not in bundles:
             raise ValueError(f"verdict row bundle unknown: {row.get('bundle')!r}")
@@ -571,21 +606,34 @@ def enforce_run(corpus_dir, verdicts_path, policy, ledger_path, created_utc):
         evidence_ids = {e["id"] for e in bundle["evidences"]}
         if any(ref not in evidence_ids for ref in row["verdict"].get("evidence_used", [])):
             raise ValueError("verdict references evidence outside its bundle (fail-closed)")
-        record = enforcement_directive(row["verdict"], bundle["case"], policy, created_utc)
-        if record["case_id"] in known:
-            duplicates += 1
-            continue
-        if record["outcome"] == "killed":
-            killed += 1
-        known.add(record["case_id"])
-        appended.append(record)
-    with Path(ledger_path).open("a") as ledger:
-        for record in appended:
-            ledger.write(canonical(record) + "\n")
+        records.append(enforcement_directive(row["verdict"], bundle, policy, created_utc))
+    ledger_path = Path(ledger_path).resolve()
+    appended, duplicates, killed = [], 0, 0
+    with _ledger_lock(ledger_path):
+        existing = _read_ledger(ledger_path)
+        known = {row["case_id"]: row["bundle_sha256"] for row in existing}
+        for record in records:
+            if record["case_id"] in known:
+                if known[record["case_id"]] != record["bundle_sha256"]:
+                    raise ValueError("case_id already binds a different bundle (fail-closed)")
+                duplicates += 1
+                continue
+            if record["outcome"] == "killed":
+                killed += 1
+            known[record["case_id"]] = record["bundle_sha256"]
+            appended.append(record)
+        fd = os.open(ledger_path,
+                     os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as ledger:
+            for record in appended:
+                ledger.write(canonical(record) + "\n")
+            ledger.flush()
+            os.fsync(ledger.fileno())
+        data = ledger_path.read_bytes()
     directives = {}
     for record in appended:
         directives[record["directive"]] = directives.get(record["directive"], 0) + 1
-    data = Path(ledger_path).read_bytes() if Path(ledger_path).exists() else b""
     return {
         "cases": len(rows), "appended": len(appended), "duplicates": duplicates,
         "killed": killed, "directives": directives,

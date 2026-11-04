@@ -87,11 +87,38 @@ watcher/supervisor เดิม โดยเฉพาะกรณี config ผ�
   และ replay/idempotent; การบังคับใช้ใน Rust supervisor/gateway ยังเป็นงาน
   ถัดไปโดย design (ต้องมี adversarial case ก่อนเปิด exec surface ใหม่)
   (ทำแล้ว: `enforce` — `enforcement_table`, `enforcement_directive`,
-  `enforce_run`; ตรวจ law_hash ซ้ำกับ case, evidence refs ต้องอยู่ใน bundle,
+  `enforce_run`; ตรวจ law_hash ซ้ำกับ case, ผูก `bundle_sha256` กับข้อมูลคดี
+  ทั้งชุดและ replay verdict ก่อนแปล, evidence refs ต้องอยู่ใน bundle,
   action ห้ามเกิน `case.requested_action` หรือ `policy.max_action`,
   kill switch = ไม่มี directive, quarantine/restrict/replace ปล่อยสิทธิ์
   ผ่าน policy review เท่านั้น (deadline ใช้แค่กำหนดทบทวน), ledger ห้าม
-  case_id ซ้ำและ replay ได้ bytes เดิม; เทสต์ใน `EnforcementTests`)
+  case_id ซ้ำและ replay ได้ bytes เดิม; ถือ lock ข้ามโปรเซสตั้งแต่อ่านจนเขียน
+  ledger เสร็จ; เทสต์ใน `EnforcementTests`)
+
+## การเปลี่ยนเป็น court-law-v2
+
+รุ่น v2 แก้การนับโหวตซ้ำและเพิ่ม `bundle_sha256` ใน verdict และ directive:
+
+- นับหนึ่งเสียงต่อ `(voter, origin)` สำหรับทุกผล รวม not-guilty, abstain และ
+  timeout; ถ้าผู้โหวตเดียวกันให้ผลขัดกัน ให้ปฏิเสธทั้งคดีโดยไม่เลือกรับตามลำดับ
+- hash ครอบคลุม case, evidences, allegations, objections และ votes ทั้งชุด
+  รวม instance/session และหลักฐานที่ถูกคัดออก ใช้ canonical JSON ที่เรียง keys;
+  ลำดับรายการเป็นส่วนหนึ่งของข้อมูลที่ผูกไว้
+- `enforcement_directive` รับ bundle เต็มแทน case อย่างเดียว ตรวจ digest
+  และ replay ผลตัดสินก่อนสร้าง directive จึงไม่รับ verdict เก่ากับ bundle
+  ที่เปลี่ยน VM/session หรือหลักฐานแล้ว hash นี้ตรวจการจับคู่ข้อมูล
+  ภายใต้ trusted custody เดิม ไม่ใช่ลายเซ็นรับรองผู้ส่ง
+- `enforce` ใช้ไฟล์ `<ledger>.lock` กับ `flock` ครอบการอ่าน ตรวจ case ซ้ำ
+  append, flush/fsync และเก็บ hash ของ ledger; ไม่ลบไฟล์ lock หลังใช้งาน
+  เพื่อให้ทุก writer ล็อก inode เดียวกัน การเขียนพร้อมกันจึงไม่เพิ่ม case ซ้ำ
+- case ID เดิมที่ผูก bundle คนละ hash ถูกปฏิเสธก่อน append ทุกแถวในรอบนั้น
+  การ replay bundle เดิมไม่เพิ่ม record และคง bytes ของ ledger เดิม
+
+policy ต้องระบุ `law_version: court-law-v2` ส่วน verdict และ ledger รุ่นเก่า
+ที่ไม่มี bundle hash จะถูกปฏิเสธ ไม่เติม hash ให้โดยอนุมานย้อนหลัง:
+เก็บ ledger เก่าไว้เป็นหลักฐาน สร้าง verdict ใหม่ด้วย `judge`/`shadow` จาก
+bundle ต้นฉบับที่ตรวจทานแล้ว และใช้ ledger ใหม่สำหรับ v2 การตรวจนี้ยังไม่เชื่อม
+กับ enforcement ใน Rust supervisor/gateway
 
 ## เกณฑ์พิสูจน์ก่อนขยับแต่ละระยะ
 

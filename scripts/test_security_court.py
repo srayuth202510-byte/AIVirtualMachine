@@ -1,5 +1,11 @@
 """Phase 1 proof: unanimous votes cannot override supreme law; bad evidence never empowers."""
 import importlib.util
+import copy
+import itertools
+import json
+import multiprocessing
+import shutil
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -28,7 +34,47 @@ def vote(voter, verdict="guilty", origin="rule"):
     return {"voter": voter, "origin": origin, "verdict": verdict}
 
 
+def enforce_child(corpus, verdicts, policy, ledger, now, started, read, release, results):
+    # หยุด writer แรกหลังอ่าน ledger เพื่อบังคับให้ writer ที่สองชนช่วง read/write จริง
+    original = court._read_ledger
+
+    def paused_read(path):
+        rows = original(path)
+        read.set()
+        if release is not None and not release.wait(10):
+            raise RuntimeError("timed out waiting to release ledger reader")
+        return rows
+
+    court._read_ledger = paused_read
+    started.set()
+    try:
+        results.put(court.enforce_run(corpus, verdicts, policy, ledger, now))
+    except Exception as error:
+        results.put({"error": repr(error)})
+
+
 class JudgeTests(unittest.TestCase):
+    def test_duplicate_votes_do_not_change_counts_or_decision(self):
+        votes = [vote("j1"), vote("j2"), vote("n1", "not-guilty"),
+                 vote("a1", "abstain"), vote("t1", "timeout")]
+        args = (base_case(), [ev("v1"), ev("v2", source="rule")], [], [])
+        expected = court.judge(*args, votes)
+        for item in votes:
+            with self.subTest(verdict=item["verdict"]):
+                actual = court.judge(*args, votes + [dict(item)])
+                # bundle hash ต่างได้เพราะรับข้อมูลซ้ำมา แต่ผลตัดสินต้องไม่เปลี่ยน
+                for key in ("action", "outcome", "votes", "conditions"):
+                    self.assertEqual(actual[key], expected[key])
+
+    def test_conflicting_votes_from_one_juror_are_rejected_in_any_order(self):
+        for first, second in itertools.permutations(
+                ("guilty", "not-guilty", "abstain", "timeout"), 2):
+            with self.subTest(first=first, second=second):
+                with self.assertRaisesRegex(ValueError, "conflicting vote"):
+                    court.judge(base_case(), [ev("v1"), ev("v2", source="rule")],
+                                [], [], [vote("j1"), vote("j2"),
+                                         vote("duplicate", first), vote("duplicate", second)])
+
     def test_unanimous_votes_cannot_override_supreme_law(self):
         verdict = court.judge(
             base_case(supreme_violation=True), [ev("v1"), ev("v2", source="rule")],
@@ -193,6 +239,135 @@ class EnforcementTests(unittest.TestCase):
     def read_ledger(self, path):
         return [__import__("json").loads(line)
                 for line in Path(path).read_text().splitlines() if line.strip()]
+
+    def test_stale_verdict_rejects_changes_to_every_bundle_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, verdicts = self.shadow_in(tmp)
+            corpus = Path(tmp) / "corpus"
+            shutil.copytree(source, corpus)
+            path = corpus / "clear-quarantine.json"
+            original = json.loads(path.read_text())
+            changes = [
+                ("instance", lambda b: b["case"].update(instance="vm-b")),
+                ("session", lambda b: b["case"].update(session="s-2")),
+                ("events", lambda b: b["case"].update(events=["e3"])),
+                ("freshness", lambda b: b["case"].update(max_evidence_age_secs=0)),
+                ("supreme-law", lambda b: b["case"].update(supreme_violation=True)),
+                ("evidence", lambda b: b["evidences"][0].update(chain_ok=False)),
+                ("allegation", lambda b: b["allegations"][0].update(event_ids=["e2"])),
+                ("objection", lambda b: b["objections"].append(
+                    {"id": "o1", "kind": "veto", "ref_evidence_ids": ["audit-1"]})),
+                ("vote", lambda b: b["votes"][0].update(verdict="not-guilty")),
+            ]
+            for name, mutate in changes:
+                with self.subTest(change=name):
+                    changed = copy.deepcopy(original)
+                    mutate(changed)
+                    path.write_text(json.dumps(changed))
+                    ledger = Path(tmp) / f"{name}.jsonl"
+                    with self.assertRaisesRegex(ValueError, "bundle"):
+                        court.enforce_run(corpus, verdicts, self.policy(), ledger, self.NOW)
+                    self.assertFalse(ledger.exists())
+
+    def test_directive_checks_bundle_and_replays_verdict(self):
+        bundle = {"case": base_case(), "evidences": [ev("v1"), ev("v2", source="rule")],
+                  "allegations": [], "objections": [], "votes": [vote("j1"), vote("j2")]}
+        verdict = court.judge(**bundle)
+        record = court.enforcement_directive(verdict, bundle, self.policy(), self.NOW)
+        self.assertEqual(record["bundle_sha256"], verdict["bundle_sha256"])
+        changed = copy.deepcopy(bundle)
+        changed["case"]["session"] = "s-2"
+        with self.assertRaisesRegex(ValueError, "bundle"):
+            court.enforcement_directive(verdict, changed, self.policy(), self.NOW)
+        tampered = copy.deepcopy(verdict)
+        tampered["votes"]["guilty"] += 1
+        with self.assertRaisesRegex(ValueError, "replay"):
+            court.enforcement_directive(tampered, bundle, self.policy(), self.NOW)
+
+    def test_legacy_verdicts_and_ledgers_require_regeneration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            corpus, verdicts = self.shadow_in(tmp)
+            ledger = Path(tmp) / "ledger.jsonl"
+            rows = self.read_ledger(verdicts)
+            for row in rows:
+                row["verdict"].pop("bundle_sha256", None)
+            legacy = Path(tmp) / "legacy-verdicts.jsonl"
+            legacy.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with self.assertRaises(ValueError):
+                court.enforce_run(corpus, legacy, self.policy(), ledger, self.NOW)
+            self.assertFalse(ledger.exists())
+            court.enforce_run(corpus, verdicts, self.policy(), ledger, self.NOW)
+            rows = self.read_ledger(ledger)
+            for row in rows:
+                row.pop("bundle_sha256", None)
+            ledger.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            before = ledger.read_bytes()
+            with self.assertRaises(ValueError):
+                court.enforce_run(corpus, verdicts, self.policy(), ledger, self.NOW)
+            self.assertEqual(ledger.read_bytes(), before)
+
+    def test_same_case_id_with_changed_bundle_cannot_be_silently_deduplicated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, verdicts = self.shadow_in(tmp)
+            corpus = Path(tmp) / "corpus"
+            shutil.copytree(source, corpus)
+            ledger = Path(tmp) / "ledger.jsonl"
+            court.enforce_run(corpus, verdicts, self.policy(), ledger, self.NOW)
+            before = ledger.read_bytes()
+            path = corpus / "clear-quarantine.json"
+            bundle = json.loads(path.read_text())
+            bundle["evidences"][0]["age_secs"] += 1
+            path.write_text(json.dumps(bundle))
+            court.shadow_judge(corpus, verdicts)
+            with self.assertRaisesRegex(ValueError, "case_id.*different bundle"):
+                court.enforce_run(corpus, verdicts, self.policy(), ledger, self.NOW)
+            self.assertEqual(ledger.read_bytes(), before)
+
+    def test_concurrent_processes_serialize_the_entire_ledger_transaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            corpus, verdicts = self.shadow_in(tmp)
+            ledger = Path(tmp) / "ledger.jsonl"
+            context = multiprocessing.get_context("fork")
+            release = context.Event()
+            results = context.Queue()
+            started = [context.Event(), context.Event()]
+            read = [context.Event(), context.Event()]
+            processes = [context.Process(
+                target=enforce_child,
+                args=(corpus, verdicts, self.policy(), ledger, self.NOW,
+                      started[i], read[i], release if i == 0 else None, results),
+            ) for i in range(2)]
+            try:
+                processes[0].start()
+                self.assertTrue(read[0].wait(5), "first writer did not read ledger")
+                processes[1].start()
+                self.assertTrue(started[1].wait(5), "second writer did not start")
+                self.assertFalse(read[1].wait(0.3), "second writer read an unlocked ledger")
+                release.set()
+                for process in processes:
+                    process.join(10)
+                    self.assertEqual(process.exitcode, 0)
+                summaries = [results.get(timeout=2) for _ in processes]
+                self.assertTrue(all("error" not in s for s in summaries), summaries)
+                self.assertEqual(sorted(s["appended"] for s in summaries), [0, 3])
+                self.assertEqual(sorted(s["duplicates"] for s in summaries), [0, 3])
+                records = court._read_ledger(ledger)
+                self.assertEqual(len(records), 3)
+                self.assertEqual(len({r["case_id"] for r in records}), 3)
+                again = court.enforce_run(corpus, verdicts, self.policy(), ledger, self.NOW)
+                self.assertEqual((again["appended"], again["duplicates"]), (0, 3))
+                self.assertTrue(all(s["ledger_sha256"] == again["ledger_sha256"]
+                                    for s in summaries))
+            finally:
+                release.set()
+                for process in processes:
+                    if process.pid is not None:
+                        process.join(2)
+                        if process.is_alive():
+                            process.kill()
+                            process.join(2)
+                results.close()
+                results.join_thread()
 
     def test_examples_translate_to_restrictive_directives_only(self):
         import tempfile
