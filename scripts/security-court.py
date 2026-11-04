@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # รุ่นของกฎ (ทุก verdict ผูก law_version + law_hash ไว้ replay ได้)
@@ -391,6 +392,210 @@ def review_verdicts(verdicts_path, policy):
                        "kill_switch": policy["kill_switch"]}}
 
 
+# ระยะ 6: เชื่อม verdict เข้า enforcement ผ่าน translation layer + ledger
+# - directive ทำได้แค่ "จำกัด" สิทธิ์เท่านั้น ไม่มีทางเพิ่ม capability/permission
+# - quarantine/restrict/replace ปล่อยสิทธิ์คืนได้ผ่าน policy review เท่านั้น
+#   review_deadline_utc ใช้แค่กำหนดเวลาทบทวน ห้ามตีความเป็น auto-release
+# - ทุก record ผูก law_version/law_hash + evidence refs + votes + conditions (I-7)
+# - replay: ไฟล์ verdicts + case เดิม + created_utc เดิม ต้องได้ ledger bytes เดิม
+ENFORCEMENT = {
+    "none": "no runtime change",
+    "watch": "monitor only; permissions unchanged",
+    "restrict": "cap agent capabilities; release only by policy review",
+    "quarantine": "hold instance/session; release only by policy review, never automatic",
+    "replace": "schedule replacement under supervisor policy; original stays confined",
+}
+RELEASE_MODES = {
+    "none": "n/a",
+    "watch": "monitor-only",
+    "restrict": "policy-review",
+    "quarantine": "policy-review",
+    "replace": "policy-review",
+}
+# ใช้กำหนดเวลาทบทวนเท่านั้น (ไม่ทำให้สิทธิ์คืนเองโดยอัตโนมัติ)
+REVIEW_HORIZON_SECS = 86400
+VERDICT_FIELDS = {
+    "case_id", "law_version", "law_hash", "outcome", "action", "conditions",
+    "evidence_used", "evidence_excluded", "independent_sources", "votes",
+}
+DIRECTIVE_FIELDS = {
+    "case_id", "instance", "session", "law_version", "law_hash", "outcome",
+    "action", "directive", "applied", "reason", "conditions", "evidence_used",
+    "votes", "independent_sources", "release_mode", "review_deadline_utc",
+    "rollback", "created_utc",
+}
+
+
+def enforcement_table():
+    """ตารางแปล action → directive (ตรวจทานได้; ไม่มีแถวใดเพิ่มสิทธิ์)."""
+    return [{"action": action, "directive": ENFORCEMENT[action],
+             "release_mode": RELEASE_MODES[action]} for action in ACTIONS]
+
+
+def validate_verdict(verdict):
+    """ตรวจ verdict ก่อนบังคับใช้: ฟิลด์/ชนิด/รุ่นกฎ/โหวตต้องครบ (fail-closed)."""
+    if not isinstance(verdict, dict) or set(verdict) != VERDICT_FIELDS:
+        raise ValueError("verdict fields mismatch (fail-closed)")
+    _check_id(verdict["case_id"], "verdict case_id")
+    if verdict["law_version"] != LAW_VERSION:
+        raise ValueError("verdict law_version mismatch (fail-closed)")
+    if (not isinstance(verdict["law_hash"], str)
+            or len(verdict["law_hash"]) != 64
+            or any(c not in "0123456789abcdef" for c in verdict["law_hash"])):
+        raise ValueError("verdict law_hash must be lowercase sha256 hex")
+    if verdict["action"] not in ACTIONS:
+        raise ValueError("verdict action unknown")
+    if not isinstance(verdict["outcome"], str) or not verdict["outcome"]:
+        raise ValueError("verdict outcome must be a non-empty string")
+    for field in ("conditions", "evidence_used", "evidence_excluded"):
+        if not isinstance(verdict[field], list):
+            raise ValueError(f"verdict {field} must be a list")
+    if not isinstance(verdict["independent_sources"], int) or verdict["independent_sources"] < 0:
+        raise ValueError("verdict independent_sources must be >= 0")
+    votes = verdict["votes"]
+    if (not isinstance(votes, dict)
+            or set(votes) != {"guilty", "not_guilty", "abstained", "timed_out"}
+            or any(type(count) is not int or count < 0 for count in votes.values())):
+        raise ValueError("verdict votes must be non-negative integer counts")
+    return verdict
+
+
+def enforcement_directive(verdict, case, policy, created_utc):
+    """แปล verdict → directive แบบ deterministic (จำกัดเท่านั้น, ไม่เพิ่มสิทธิ์)
+
+    verdict ถือเป็น trusted custody เดียวกับ case: ตรวจ integrity ซ้ำตามที่พิสูจน์ได้
+    (law_hash recompute, evidence refs ต้องอยู่ใน bundle) และห้าม action เกิน
+    case.requested_action — ส่วน hash-chain ของ verdict เองอยู่นอกขอบเขตนี้
+    """
+    verdict = validate_verdict(dict(verdict))
+    case = validate_case(dict(case))
+    _check_id(case["id"], "case id")
+    if case["id"] != verdict["case_id"]:
+        raise ValueError("verdict case_id mismatch against bundle")
+    if law_hash(case) != verdict["law_hash"]:
+        raise ValueError("verdict law_hash mismatch against case thresholds")
+    if SEVERITY[verdict["action"]] > SEVERITY[case["requested_action"]]:
+        raise ValueError("verdict action exceeds case requested_action (fail-closed)")
+    directive = apply_policy(verdict, policy)
+    action = directive["action"]
+    # ครอบ policy แล้วระดับต้องไม่เกินเพดานเดิม (defense in depth)
+    if SEVERITY[action] > SEVERITY[policy["max_action"]]:
+        raise ValueError("directive exceeds policy max_action (fail-closed)")
+    if action in ("restrict", "quarantine", "replace") and not directive["evidence_used"]:
+        raise ValueError("restrictive directive requires evidence references")
+    applied = action != "none"
+    if directive["outcome"] == "killed":
+        reason = "kill-switch"
+    elif not applied:
+        reason = f"outcome:{directive['outcome']}"
+    else:
+        reason = "enforced"
+    created = datetime.fromisoformat(created_utc)
+    if created.tzinfo is None:
+        raise ValueError("created_utc must carry a timezone offset")
+    created = created.astimezone(timezone.utc)
+    record = {
+        "case_id": verdict["case_id"],
+        "instance": case["instance"],
+        "session": case["session"],
+        "law_version": LAW_VERSION,
+        "law_hash": verdict["law_hash"],
+        "outcome": directive["outcome"],
+        "action": action,
+        "directive": action,
+        "applied": applied,
+        "reason": reason,
+        "conditions": list(directive["conditions"]),
+        "evidence_used": list(directive["evidence_used"]),
+        "votes": dict(directive["votes"]),
+        "independent_sources": directive["independent_sources"],
+        "release_mode": RELEASE_MODES[action],
+        "review_deadline_utc": (created + timedelta(seconds=REVIEW_HORIZON_SECS))
+        .isoformat(timespec="seconds"),
+        "rollback": "recovery-policy",
+        "created_utc": created.isoformat(timespec="seconds"),
+    }
+    if set(record) != DIRECTIVE_FIELDS:
+        raise ValueError("directive fields mismatch (fail-closed)")
+    return record
+
+
+def _read_ledger(path):
+    """อ่าน ledger เดิม: ต้อง parse ได้ ห้าม case_id ซ้ำ (fail-closed)."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    rows, seen = [], set()
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict) or set(row) != DIRECTIVE_FIELDS:
+            raise ValueError("ledger record fields mismatch (fail-closed)")
+        if row["case_id"] in seen:
+            raise ValueError("ledger already holds duplicate case_id (fail-closed)")
+        seen.add(row["case_id"])
+        rows.append(row)
+    return rows
+
+
+def enforce_run(corpus_dir, verdicts_path, policy, ledger_path, created_utc):
+    """บังคับใช้ verdicts ภายใต้ policy: เขียน ledger แบบ idempotent + budget ก่อนเขียนจริง
+
+    - kill switch: ไม่มี directive ใดถูกบังคับ (ยังบันทึก record เพื่อ audit)
+    - case_id ที่มีใน ledger แล้ว = duplicate: ไม่เขียนซ้ำ
+    - เกิน budget_cases = ValueError ก่อนแตะ ledger (atomic)
+    """
+    policy = validate_policy(dict(policy))
+    corpus = Path(corpus_dir)
+    bundles = {}
+    for bundle_path in sorted(corpus.glob("*.json")):
+        if bundle_path.name == "labels.json":
+            continue
+        bundles[bundle_path.name] = read_bundle(bundle_path)
+    if not bundles:
+        raise ValueError("corpus has no bundles")
+    rows = []
+    for line in Path(verdicts_path).read_text().splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    if len(rows) > policy["budget_cases"]:
+        raise ValueError("enforcement budget exceeded")
+    existing = _read_ledger(ledger_path)
+    known = {row["case_id"] for row in existing}
+    appended, duplicates, killed = [], 0, 0
+    for row in rows:
+        if set(row) != {"bundle", "verdict"} or row["bundle"] not in bundles:
+            raise ValueError(f"verdict row bundle unknown: {row.get('bundle')!r}")
+        bundle = bundles[row["bundle"]]
+        evidence_ids = {e["id"] for e in bundle["evidences"]}
+        if any(ref not in evidence_ids for ref in row["verdict"].get("evidence_used", [])):
+            raise ValueError("verdict references evidence outside its bundle (fail-closed)")
+        record = enforcement_directive(row["verdict"], bundle["case"], policy, created_utc)
+        if record["case_id"] in known:
+            duplicates += 1
+            continue
+        if record["outcome"] == "killed":
+            killed += 1
+        known.add(record["case_id"])
+        appended.append(record)
+    with Path(ledger_path).open("a") as ledger:
+        for record in appended:
+            ledger.write(canonical(record) + "\n")
+    directives = {}
+    for record in appended:
+        directives[record["directive"]] = directives.get(record["directive"], 0) + 1
+    data = Path(ledger_path).read_bytes() if Path(ledger_path).exists() else b""
+    return {
+        "cases": len(rows), "appended": len(appended), "duplicates": duplicates,
+        "killed": killed, "directives": directives,
+        "applied": sum(1 for record in appended if record["applied"]),
+        "policy": {"max_action": policy["max_action"],
+                   "kill_switch": policy["kill_switch"]},
+        "ledger_sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
 def decision_table():
     """ตารางตัดสิน (ตรวจทานได้ ไม่ให้โมเดลเปลี่ยน threshold ระหว่างพิจารณา)."""
     return [
@@ -444,6 +649,12 @@ def main(argv=None):
     review_cmd = sub.add_parser("review", help="ทบทวน verdicts ภายใต้ policy (ไม่คืนสิทธิ์เอง)")
     review_cmd.add_argument("verdicts_jsonl")
     review_cmd.add_argument("policy_json")
+    enforce_cmd = sub.add_parser("enforce", help="แปล verdicts เป็น directive จำกัดสิทธิ์ + ledger")
+    enforce_cmd.add_argument("corpus_dir")
+    enforce_cmd.add_argument("verdicts_jsonl")
+    enforce_cmd.add_argument("policy_json")
+    enforce_cmd.add_argument("ledger_jsonl")
+    enforce_cmd.add_argument("--now", help="เวลา ISO8601 (ค่าเริ่มต้น: ปัจจุบัน) เพื่อ replay")
     args = parser.parse_args(argv)
     if args.command == "decision-table":
         print(json.dumps(decision_table(), indent=2))
@@ -454,6 +665,13 @@ def main(argv=None):
     if args.command == "review":
         policy = json.loads(Path(args.policy_json).read_bytes().decode())
         print(json.dumps(review_verdicts(args.verdicts_jsonl, policy), indent=2, sort_keys=True))
+        return
+    if args.command == "enforce":
+        policy = json.loads(Path(args.policy_json).read_bytes().decode())
+        now = args.now or datetime.now(timezone.utc).isoformat(timespec="seconds")
+        print(json.dumps(enforce_run(args.corpus_dir, args.verdicts_jsonl,
+                                     policy, args.ledger_jsonl, now),
+                         indent=2, sort_keys=True))
         return
     bundle = read_bundle(args.bundle)
     print(json.dumps(judge(bundle["case"], bundle["evidences"], bundle["allegations"],

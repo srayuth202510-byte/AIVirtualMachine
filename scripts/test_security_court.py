@@ -175,5 +175,139 @@ class JudgeTests(unittest.TestCase):
                                          "kill_switch": False, "budget_cases": 10})
 
 
+class EnforcementTests(unittest.TestCase):
+    NOW = "2026-11-04T00:00:00+00:00"
+
+    def shadow_in(self, tmp):
+        corpus = Path(__file__).resolve().parent.parent / "examples" / "security-court"
+        out = Path(tmp) / "verdicts.jsonl"
+        court.shadow_judge(str(corpus), str(out))
+        return corpus, out
+
+    def policy(self, **over):
+        policy = {"law_version": court.LAW_VERSION, "max_action": "replace",
+                  "kill_switch": False, "budget_cases": 10}
+        policy.update(over)
+        return policy
+
+    def read_ledger(self, path):
+        return [__import__("json").loads(line)
+                for line in Path(path).read_text().splitlines() if line.strip()]
+
+    def test_examples_translate_to_restrictive_directives_only(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            corpus, verdicts = self.shadow_in(tmp)
+            ledger = Path(tmp) / "ledger.jsonl"
+            summary = court.enforce_run(str(corpus), str(verdicts), self.policy(),
+                                        str(ledger), self.NOW)
+            self.assertEqual((summary["cases"], summary["appended"], summary["killed"]),
+                             (3, 3, 0))
+            self.assertEqual(summary["directives"], {"none": 1, "quarantine": 1, "restrict": 1})
+            records = {r["case_id"]: r for r in self.read_ledger(ledger)}
+            self.assertEqual(set(records), {"clear-exfil", "weak-signal", "contested-access"})
+            self.assertEqual(records["clear-exfil"]["directive"], "quarantine")
+            self.assertEqual(records["clear-exfil"]["release_mode"], "policy-review")
+            self.assertTrue(records["clear-exfil"]["applied"])
+            self.assertEqual(records["contested-access"]["directive"], "restrict")
+            self.assertEqual(records["weak-signal"]["directive"], "none")
+            self.assertEqual(records["weak-signal"]["reason"], "outcome:insufficient-evidence")
+            self.assertFalse(records["weak-signal"]["applied"])
+            self.assertTrue(records["clear-exfil"]["review_deadline_utc"]
+                            > records["clear-exfil"]["created_utc"])
+            for record in records.values():
+                self.assertEqual(set(record), court.DIRECTIVE_FIELDS)
+                self.assertEqual(record["rollback"], "recovery-policy")
+                self.assertLessEqual(court.SEVERITY[record["directive"]],
+                                     court.SEVERITY[court.ACTIONS[-1]])
+                self.assertFalse({k for k in record
+                                  if "capability" in k or "grant" in k or "permission" in k})
+
+    def test_kill_switch_blocks_every_directive(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            corpus, verdicts = self.shadow_in(tmp)
+            ledger = Path(tmp) / "ledger.jsonl"
+            summary = court.enforce_run(
+                str(corpus), str(verdicts), self.policy(kill_switch=True),
+                str(ledger), self.NOW)
+            self.assertEqual((summary["applied"], summary["killed"]), (0, 3))
+            self.assertEqual(summary["directives"], {"none": 3})
+            for record in self.read_ledger(ledger):
+                self.assertEqual((record["directive"], record["reason"]),
+                                 ("none", "kill-switch"))
+
+    def test_replay_is_deterministic_and_ledger_is_idempotent(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            corpus, verdicts = self.shadow_in(tmp)
+            ledger_a, ledger_b = Path(tmp) / "a.jsonl", Path(tmp) / "b.jsonl"
+            first = court.enforce_run(str(corpus), str(verdicts), self.policy(),
+                                      str(ledger_a), self.NOW)
+            court.enforce_run(str(corpus), str(verdicts), self.policy(),
+                              str(ledger_b), self.NOW)
+            self.assertEqual(ledger_a.read_bytes(), ledger_b.read_bytes())
+            same = court.enforce_run(str(corpus), str(verdicts), self.policy(),
+                                     str(ledger_a), self.NOW)
+            self.assertEqual((same["appended"], same["duplicates"]), (0, 3))
+            self.assertEqual(same["ledger_sha256"], first["ledger_sha256"])
+
+    def test_tampered_or_escalated_verdicts_fail_closed(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            corpus, verdicts = self.shadow_in(tmp)
+            rows = [json.loads(line) for line in verdicts.read_text().splitlines()]
+            ledger = Path(tmp) / "ledger.jsonl"
+            bad_hash = json.loads(json.dumps(rows))
+            for row in bad_hash:
+                row["verdict"]["law_hash"] = "0" * 64
+            bad = Path(tmp) / "bad-hash.jsonl"
+            bad.write_text("\n".join(json.dumps(r) for r in bad_hash) + "\n")
+            with self.assertRaises(ValueError):
+                court.enforce_run(str(corpus), str(bad), self.policy(),
+                                  str(ledger), self.NOW)
+            escalated = json.loads(json.dumps(rows))
+            for row in escalated:
+                if row["verdict"]["case_id"] == "weak-signal":
+                    row["verdict"]["action"] = "replace"
+            bad_action = Path(tmp) / "bad-action.jsonl"
+            bad_action.write_text("\n".join(json.dumps(r) for r in escalated) + "\n")
+            with self.assertRaises(ValueError):
+                court.enforce_run(str(corpus), str(bad_action), self.policy(),
+                                  str(ledger), self.NOW)
+            self.assertFalse(ledger.exists())
+
+    def test_budget_and_evidence_binding_fail_closed(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            corpus, verdicts = self.shadow_in(tmp)
+            ledger = Path(tmp) / "ledger.jsonl"
+            with self.assertRaises(ValueError):
+                court.enforce_run(str(corpus), str(verdicts),
+                                  self.policy(budget_cases=2), str(ledger), self.NOW)
+            self.assertFalse(ledger.exists())
+            rows = [json.loads(line) for line in verdicts.read_text().splitlines()]
+            rows[0]["verdict"]["evidence_used"] = ["invented-evidence"]
+            tampered = Path(tmp) / "tampered.jsonl"
+            tampered.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+            with self.assertRaises(ValueError):
+                court.enforce_run(str(corpus), str(tampered), self.policy(),
+                                  str(ledger), self.NOW)
+            self.assertFalse(ledger.exists())
+
+    def test_enforcement_table_cannot_grant(self):
+        table = court.enforcement_table()
+        self.assertEqual([row["action"] for row in table], list(court.ACTIONS))
+        for row in table:
+            self.assertEqual(set(row), {"action", "directive", "release_mode"})
+            self.assertNotIn("allow", row["directive"].split())
+        self.assertEqual(
+            [row["release_mode"] for row in table if row["action"] in
+             ("restrict", "quarantine", "replace")],
+            ["policy-review"] * 3)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 # แผนงาน: ศาลจำลองสำหรับการตอบสนองด้านความปลอดภัย
 
-สถานะ: **แผนงาน ยังไม่ได้พัฒนา** — บันทึกวันที่ 2026-10-15
+สถานะ: **ระยะ 1–6 เสร็จ (ศาลจำลอง + ท่อแปล directive)** — อัปเดต 2026-11-04;
+ยังไม่ผูก supervisor/gateway จริง (งานถัดไปต้องมี adversarial case ก่อน)
 
 เป้าหมายคือเพิ่มกระบวนการพิจารณาที่มีกฎเป็นหลัก มีการทักท้วงและตรวจหลักฐาน
 ก่อนเสนอการตอบสนองต่อความเสี่ยง เริ่มจาก shadow mode และวัดผลเทียบกับ
@@ -80,8 +81,17 @@ watcher/supervisor เดิม โดยเฉพาะกรณี config ผ�
   สรุปผลและข้อจำกัด กำหนด deployment policy, kill switch, rollback,
   budget และช่องทางทบทวน ก่อนพิจารณาเปิดการตอบสนองจริงในงานถัดไป
   (ทำแล้ว: `validate_policy`/`apply_policy`/`review` — kill switch หยุดทุก
-  action, เพดานกด action ลง, law รุ่นผิด fail-closed, review ไม่คืนสิทธิ์เอง;
-  การต่อ enforcement จริงยังเป็นงานถัดไปโดย design)
+  action, เพดานกด action ลง, law รุ่นผิด fail-closed, review ไม่คืนสิทธิ์เอง)
+- [x] **ระยะ 6 — ท่อแปลคำตัดสินเป็น directive (ยังไม่ผูก gateway จริง)**
+  แปล verdict → directive ที่ "จำกัดได้เท่านั้น" พร้อม ledger ตรวจย้อนกลับได้
+  และ replay/idempotent; การบังคับใช้ใน Rust supervisor/gateway ยังเป็นงาน
+  ถัดไปโดย design (ต้องมี adversarial case ก่อนเปิด exec surface ใหม่)
+  (ทำแล้ว: `enforce` — `enforcement_table`, `enforcement_directive`,
+  `enforce_run`; ตรวจ law_hash ซ้ำกับ case, evidence refs ต้องอยู่ใน bundle,
+  action ห้ามเกิน `case.requested_action` หรือ `policy.max_action`,
+  kill switch = ไม่มี directive, quarantine/restrict/replace ปล่อยสิทธิ์
+  ผ่าน policy review เท่านั้น (deadline ใช้แค่กำหนดทบทวน), ledger ห้าม
+  case_id ซ้ำและ replay ได้ bytes เดิม; เทสต์ใน `EnforcementTests`)
 
 ## เกณฑ์พิสูจน์ก่อนขยับแต่ละระยะ
 
@@ -99,6 +109,9 @@ watcher/supervisor เดิม โดยเฉพาะกรณี config ผ�
   votes/objections, เงื่อนไขที่ผ่าน/ไม่ผ่าน และเหตุผลของ action ที่เสนอได้
 - ทบทวนด้วยหลักฐานใหม่ได้ แต่การทบทวนไม่คืนสิทธิ์หรือปล่อย instance
   ที่ถูกกักกันโดยอัตโนมัติ ต้องผ่านนโยบายที่กำหนดอีกครั้ง
+- directive ทุกใบต้องจำกัดสิทธิ์เท่านั้น ห้ามมีช่องเพิ่ม capability/permission,
+  ต้องไม่เกิน `case.requested_action`/`policy.max_action` และ replay แล้ว
+  ledger ต้องได้ bytes เดิม (case_id ซ้ำไม่ได้)
 
 ฐานที่ใช้ต่อยอด: [detection evaluation](detection-evaluation.md),
 [recovery supervisor](recovery-supervisor.md) และ [Immunity Lab](immunity-lab.md)
