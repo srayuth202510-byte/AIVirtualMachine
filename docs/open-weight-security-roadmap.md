@@ -63,6 +63,9 @@ TEE และ confidential computing เป็นความสามารถ�
 4. **Evidence-backed completion:** กำหนดรูปแบบผลลัพธ์และ verifier สำหรับงานที่ agent รายงานว่าสำเร็จ
 5. **Operational evaluation:** เพิ่ม replay/evaluation สำหรับ prompt injection, artifact tampering,
    resource exhaustion และความไม่ตรงกันระหว่าง summary กับผลจริง
+   (เริ่มทำแล้ว: `scripts/eval-operational.py` รวม 4 มิติแบบ deterministic
+   ดู [operational-evaluation](operational-evaluation.md) — ชุด recovery ต่อ tier
+   ที่ต้องมีโมเดล/kvm ยังอยู่ที่ `validate-model-host.py`)
 6. **Artifact manifest:** ขยายการตรวจจาก weights เดี่ยวไปยัง dependencies และ provenance ที่เกี่ยวข้อง
 
 ## เกณฑ์ความสำเร็จ
