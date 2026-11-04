@@ -1,7 +1,7 @@
 # แผนงาน: ศาลจำลองสำหรับการตอบสนองด้านความปลอดภัย
 
-สถานะ: **ระยะ 1–6 เสร็จ (ศาลจำลอง + ท่อแปล directive)** — อัปเดต 2026-11-04;
-ยังไม่ผูก supervisor/gateway จริง (งานถัดไปต้องมี adversarial case ก่อน)
+สถานะ: **ระยะ 1–6 เสร็จ (ศาลจำลอง + ท่อแปล directive)** — อัปเดต 2026-11-05;
+เพิ่ม adversarial tests ก่อนเชื่อมระบบแล้ว; ยังไม่ผูก supervisor/gateway จริง
 
 เป้าหมายคือเพิ่มกระบวนการพิจารณาที่มีกฎเป็นหลัก มีการทักท้วงและตรวจหลักฐาน
 ก่อนเสนอการตอบสนองต่อความเสี่ยง เริ่มจาก shadow mode และวัดผลเทียบกับ
@@ -119,6 +119,35 @@ policy ต้องระบุ `law_version: court-law-v2` ส่วน verdict
 เก็บ ledger เก่าไว้เป็นหลักฐาน สร้าง verdict ใหม่ด้วย `judge`/`shadow` จาก
 bundle ต้นฉบับที่ตรวจทานแล้ว และใช้ ledger ใหม่สำหรับ v2 การตรวจนี้ยังไม่เชื่อม
 กับ enforcement ใน Rust supervisor/gateway
+
+## Adversarial gate ก่อนเชื่อม supervisor (2026-11-05)
+
+รัน `python3 -m unittest discover -s scripts -p 'test_security_court.py'`
+ได้ 38 tests (รวม subtests หลาย inputs ต่อ test) โดยเพิ่มการตรวจต่อไปนี้:
+
+- หลักฐานผิด instance/session, หมดอายุ, chain เสีย หรือ event แต่งขึ้น:
+  แม้โหวต guilty เอกฉันท์ ก็ต้องเหลือ `none` เมื่อแหล่งอิสระไม่พอ
+  ตรวจทั้ง verdict และ ledger ที่เขียนผ่าน `enforce_run`
+- ขอบเขตอายุหลักฐาน: เท่ากับเพดานยังใช้ได้; เกินหนึ่งวินาทีถูกคัดออก
+  อายุในขั้นนี้ยังเป็น `age_secs` ที่ bundle ให้มา ไม่ใช่การตรวจเวลาปัจจุบัน
+  ของ supervisor ตอนรับ directive
+- สำเนาหลักฐานสิบชิ้นจากแหล่งเดียวไม่นับเป็นสิบแหล่งอิสระ
+- ฟิลด์เพิ่มสิทธิ์ (`grant`, `capabilities`, `permissions`) ในทุกส่วนของ
+  bundle ถูกปฏิเสธ แม้คำนวณ bundle hash ใหม่; `grant` ใน verdict,
+  policy หรือ ledger ก็ถูกปฏิเสธก่อนเขียนผลใหม่
+- allegation ที่แรงเกิน case ถูกปฏิเสธ; ตรวจ action × policy cap ครบ
+  25 คู่ และ directive จำกัดสิทธิ์ต้องคง `policy-review`
+- verdict แถวท้ายเสียต้องไม่เพิ่มแถวก่อนหน้าเข้า ledger เดิมบางส่วน
+  ส่วนการส่งซ้ำและการชนกันข้ามโปรเซสยังใช้ regression tests เดิมคุม
+- boolean ต้องไม่แทน integer ใน thresholds, อายุหลักฐาน, budget,
+  เวลาลูกขุน หรือ `independent_sources` โดยเฉพาะ `true` ที่ Python
+  เทียบเท่ากับ `1` ซึ่งเดิมผ่านการเทียบ verdict กับผล replay ได้
+
+ชุดนี้ยืนยันขอบเขตของ Python judge/translator เท่านั้น ไม่ได้ยืนยันการรับ
+directive ของ Rust supervisor, การกัน session เปลี่ยนระหว่างตรวจและลงมือ,
+การตรวจ freshness ณ เวลาลงมือ หรือผลลด false positives เทียบ baseline
+งานถัดไปคือทำ receiver แบบ dry-run พร้อม adversarial tests ของ receiver
+ก่อนเปิดเปลี่ยนสถานะ VM จริง
 
 ## เกณฑ์พิสูจน์ก่อนขยับแต่ละระยะ
 

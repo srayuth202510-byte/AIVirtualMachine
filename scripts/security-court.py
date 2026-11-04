@@ -72,11 +72,12 @@ def validate_case(case):
     if (not isinstance(case["events"], list) or not case["events"]
             or any(not isinstance(e, str) or not e for e in case["events"])):
         raise ValueError("events must be a non-empty string list")
-    if (not isinstance(case["max_evidence_age_secs"], int)
+    # bool เป็น subclass ของ int ใน Python แต่ห้ามใช้แทน threshold จาก JSON
+    if (type(case["max_evidence_age_secs"]) is not int
             or not 0 <= case["max_evidence_age_secs"] <= 86400):
         raise ValueError("max_evidence_age_secs must be 0..86400")
     for field in ("min_sources", "quorum"):
-        if not isinstance(case[field], int) or not 1 <= case[field] <= 9:
+        if type(case[field]) is not int or not 1 <= case[field] <= 9:
             raise ValueError(f"{field} must be 1..9")
     if case["requested_action"] not in ACTIONS:
         raise ValueError("unknown requested_action")
@@ -100,7 +101,7 @@ def validate_evidence(evidence):
     if (not isinstance(evidence["event_ids"], list) or not evidence["event_ids"]
             or any(not isinstance(e, str) or not e for e in evidence["event_ids"])):
         raise ValueError("event_ids must be a non-empty string list")
-    if not isinstance(evidence["age_secs"], int) or evidence["age_secs"] < 0:
+    if type(evidence["age_secs"]) is not int or evidence["age_secs"] < 0:
         raise ValueError("age_secs must be >= 0")
     if not isinstance(evidence["chain_ok"], bool):
         raise ValueError("chain_ok must be bool")
@@ -141,7 +142,7 @@ def validate_vote(item):
 
 def simulate_jury(specs, timeout_secs):
     """ลูกขุนจำลองระยะ 2: ช้ากว่าเส้นตายกลายเป็น timeout (ไม่นับฝั่งใด) determinism ล้วน."""
-    if not isinstance(timeout_secs, int) or timeout_secs < 0:
+    if type(timeout_secs) is not int or timeout_secs < 0:
         raise ValueError("timeout_secs must be >= 0")
     if not isinstance(specs, list) or not specs:
         raise ValueError("specs must be a non-empty list")
@@ -151,7 +152,7 @@ def simulate_jury(specs, timeout_secs):
             raise ValueError("juror spec fields must be exactly voter, origin, verdict, latency_secs")
         if spec["verdict"] not in {"guilty", "not-guilty", "abstain"}:
             raise ValueError("unknown juror verdict")
-        if not isinstance(spec["latency_secs"], int) or spec["latency_secs"] < 0:
+        if type(spec["latency_secs"]) is not int or spec["latency_secs"] < 0:
             raise ValueError("latency_secs must be >= 0")
         verdict = "timeout" if spec["latency_secs"] > timeout_secs else spec["verdict"]
         votes.append({"voter": spec["voter"], "origin": spec["origin"], "verdict": verdict})
@@ -367,7 +368,7 @@ def validate_policy(policy):
         raise ValueError("unknown max_action")
     if not isinstance(policy["kill_switch"], bool):
         raise ValueError("kill_switch must be bool")
-    if not isinstance(policy["budget_cases"], int) or policy["budget_cases"] < 0:
+    if type(policy["budget_cases"]) is not int or policy["budget_cases"] < 0:
         raise ValueError("budget_cases must be >= 0")
     return policy
 
@@ -466,7 +467,8 @@ def validate_verdict(verdict):
     for field in ("conditions", "evidence_used", "evidence_excluded"):
         if not isinstance(verdict[field], list):
             raise ValueError(f"verdict {field} must be a list")
-    if not isinstance(verdict["independent_sources"], int) or verdict["independent_sources"] < 0:
+    # True == 1 จึงต้องตรวจชนิดก่อนเทียบ verdict กับผล replay
+    if type(verdict["independent_sources"]) is not int or verdict["independent_sources"] < 0:
         raise ValueError("verdict independent_sources must be >= 0")
     votes = verdict["votes"]
     if (not isinstance(votes, dict)

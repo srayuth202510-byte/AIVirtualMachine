@@ -1,4 +1,4 @@
-"""Phase 1 proof: unanimous votes cannot override supreme law; bad evidence never empowers."""
+"""Security court proofs: supreme law, evidence binding, replay and restrictive directives."""
 import importlib.util
 import copy
 import itertools
@@ -172,6 +172,16 @@ class JudgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             court.simulate_jury([{"voter": "j1"}], timeout_secs=10)
 
+    def test_boolean_juror_timings_are_rejected(self):
+        spec = {"voter": "j1", "origin": "rule", "verdict": "guilty", "latency_secs": 1}
+        for value in (False, True):
+            with self.subTest(field="timeout_secs", value=value):
+                with self.assertRaisesRegex(ValueError, "timeout_secs"):
+                    court.simulate_jury([spec], timeout_secs=value)
+            with self.subTest(field="latency_secs", value=value):
+                with self.assertRaisesRegex(ValueError, "latency_secs"):
+                    court.simulate_jury([{**spec, "latency_secs": value}], timeout_secs=10)
+
     def test_advisory_with_outside_events_or_commands_is_dropped(self):
         with self.assertRaises(ValueError):
             court.advisory_to_votes(
@@ -224,6 +234,22 @@ class JudgeTests(unittest.TestCase):
 class EnforcementTests(unittest.TestCase):
     NOW = "2026-11-04T00:00:00+00:00"
 
+    def strong_bundle(self):
+        return {"case": base_case(),
+                "evidences": [ev("audit-1"), ev("rule-1", source="rule")],
+                "allegations": [], "objections": [],
+                "votes": [vote("j1"), vote("j2", origin="runtime")]}
+
+    def write_bundle_run(self, tmp, bundle):
+        # ใช้เส้นทางไฟล์จริงตั้งแต่ corpus ถึง ledger ไม่ข้าม validation ของ enforce
+        corpus = Path(tmp) / "corpus"
+        corpus.mkdir(exist_ok=True)
+        (corpus / "case.json").write_text(json.dumps(bundle))
+        verdicts = Path(tmp) / "verdicts.jsonl"
+        verdicts.write_text(json.dumps({"bundle": "case.json",
+                                        "verdict": court.judge(**bundle)}) + "\n")
+        return corpus, verdicts
+
     def shadow_in(self, tmp):
         corpus = Path(__file__).resolve().parent.parent / "examples" / "security-court"
         out = Path(tmp) / "verdicts.jsonl"
@@ -239,6 +265,177 @@ class EnforcementTests(unittest.TestCase):
     def read_ledger(self, path):
         return [__import__("json").loads(line)
                 for line in Path(path).read_text().splitlines() if line.strip()]
+
+    def test_bad_evidence_cannot_produce_containment_even_with_unanimous_votes(self):
+        attacks = [
+            ("wrong-instance", {"instance": "vm-b"}, "wrong-binding"),
+            ("wrong-session", {"session": "s-2"}, "wrong-binding"),
+            ("stale", {"age_secs": 301}, "stale"),
+            ("broken-chain", {"chain_ok": False}, "chain-broken"),
+            ("invented-event", {"event_ids": ["invented"]}, "invented-event"),
+        ]
+        for name, fields, reason in attacks:
+            with self.subTest(attack=name), tempfile.TemporaryDirectory() as tmp:
+                bundle = self.strong_bundle()
+                bundle["evidences"][1].update(fields)
+                corpus, verdicts = self.write_bundle_run(tmp, bundle)
+                verdict = self.read_ledger(verdicts)[0]["verdict"]
+                self.assertEqual(verdict["votes"]["guilty"], 2)
+                self.assertEqual(verdict["evidence_excluded"],
+                                 [{"id": "rule-1", "reason": reason}])
+                ledger = Path(tmp) / "ledger.jsonl"
+                summary = court.enforce_run(corpus, verdicts, self.policy(), ledger, self.NOW)
+                self.assertEqual((summary["applied"], summary["directives"]),
+                                 (0, {"none": 1}))
+                record, = self.read_ledger(ledger)
+                self.assertEqual(record["outcome"], "insufficient-evidence")
+                self.assertEqual(record["evidence_used"], ["audit-1"])
+                self.assertEqual(record["independent_sources"], 1)
+
+    def test_evidence_age_boundary_is_enforced_before_translation(self):
+        for age, expected in ((300, "quarantine"), (301, "none")):
+            with self.subTest(age=age):
+                bundle = self.strong_bundle()
+                bundle["evidences"][1]["age_secs"] = age
+                record = court.enforcement_directive(
+                    court.judge(**bundle), bundle, self.policy(), self.NOW)
+                self.assertEqual(record["directive"], expected)
+
+    def test_duplicate_sources_cannot_manufacture_containment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = self.strong_bundle()
+            bundle["evidences"] = [ev(f"copy-{i}") for i in range(10)]
+            corpus, verdicts = self.write_bundle_run(tmp, bundle)
+            ledger = Path(tmp) / "ledger.jsonl"
+            summary = court.enforce_run(corpus, verdicts, self.policy(), ledger, self.NOW)
+            self.assertEqual(summary["directives"], {"none": 1})
+            record, = self.read_ledger(ledger)
+            self.assertEqual(record["independent_sources"], 1)
+
+    def test_permission_fields_in_any_bundle_section_fail_before_ledger_write(self):
+        for section in ("case", "evidences", "allegations", "objections", "votes"):
+            for field, value in (("grant", "process.exec"),
+                                 ("capabilities", ["filesystem.write"]),
+                                 ("permissions", {"network": True})):
+                with self.subTest(section=section, field=field), \
+                        tempfile.TemporaryDirectory() as tmp:
+                    bundle = self.strong_bundle()
+                    bundle["allegations"] = [{"id": "a1", "event_ids": ["e1"],
+                                               "requested_action": "quarantine"}]
+                    bundle["objections"] = [{"id": "o1", "kind": "alternate-cause",
+                                              "ref_evidence_ids": ["audit-1"]}]
+                    corpus, verdicts = self.write_bundle_run(tmp, bundle)
+                    item = bundle[section] if section == "case" else bundle[section][0]
+                    item[field] = value
+                    (corpus / "case.json").write_text(json.dumps(bundle))
+                    # hash ใหม่กันการผ่านเทสต์เพียงเพราะ digest เก่าไม่ตรง
+                    rows = self.read_ledger(verdicts)
+                    rows[0]["verdict"]["bundle_sha256"] = court.bundle_hash(bundle)
+                    verdicts.write_text(json.dumps(rows[0]) + "\n")
+                    ledger = Path(tmp) / "ledger.jsonl"
+                    with self.assertRaisesRegex(ValueError, "fields"):
+                        court.enforce_run(corpus, verdicts, self.policy(), ledger, self.NOW)
+                    self.assertFalse(ledger.exists())
+
+    def test_permission_fields_in_verdict_policy_or_ledger_are_rejected(self):
+        for target in ("verdict", "policy", "ledger"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp:
+                corpus, verdicts = self.write_bundle_run(tmp, self.strong_bundle())
+                ledger = Path(tmp) / "ledger.jsonl"
+                policy = self.policy()
+                before = None
+                if target == "verdict":
+                    rows = self.read_ledger(verdicts)
+                    rows[0]["verdict"]["grant"] = ["process.exec"]
+                    verdicts.write_text(json.dumps(rows[0]) + "\n")
+                elif target == "policy":
+                    policy["grant"] = ["process.exec"]
+                else:
+                    court.enforce_run(corpus, verdicts, policy, ledger, self.NOW)
+                    rows = self.read_ledger(ledger)
+                    rows[0]["grant"] = ["process.exec"]
+                    ledger.write_text(json.dumps(rows[0]) + "\n")
+                    before = ledger.read_bytes()
+                with self.assertRaisesRegex(ValueError, "fields"):
+                    court.enforce_run(corpus, verdicts, policy, ledger, self.NOW)
+                if before is None:
+                    self.assertFalse(ledger.exists())
+                else:
+                    self.assertEqual(ledger.read_bytes(), before)
+
+    def test_allegations_cannot_escalate_beyond_case_request(self):
+        for requested, allegation in itertools.product(court.ACTIONS, repeat=2):
+            if court.SEVERITY[allegation] <= court.SEVERITY[requested]:
+                continue
+            with self.subTest(requested=requested, allegation=allegation):
+                bundle = self.strong_bundle()
+                bundle["case"]["requested_action"] = requested
+                bundle["allegations"] = [{"id": "a1", "event_ids": ["e1"],
+                                           "requested_action": allegation}]
+                # verdict ถูก judge สร้างจริงก็ต้องผ่านเพดาน case ก่อนแปล
+                with self.assertRaisesRegex(ValueError, "exceeds case requested_action"):
+                    court.enforcement_directive(
+                        court.judge(**bundle), bundle, self.policy(), self.NOW)
+
+    def test_policy_caps_every_action_and_preserves_policy_review(self):
+        for requested, cap in itertools.product(court.ACTIONS, repeat=2):
+            with self.subTest(requested=requested, cap=cap):
+                bundle = self.strong_bundle()
+                bundle["case"]["requested_action"] = requested
+                record = court.enforcement_directive(
+                    court.judge(**bundle), bundle, self.policy(max_action=cap), self.NOW)
+                self.assertEqual(record["directive"],
+                                 min((requested, cap), key=court.SEVERITY.__getitem__))
+                self.assertEqual(record["applied"], record["directive"] != "none")
+                if record["directive"] in ("restrict", "quarantine", "replace"):
+                    self.assertEqual(record["release_mode"], "policy-review")
+                    self.assertEqual(record["rollback"], "recovery-policy")
+
+    def test_invalid_last_verdict_never_partially_updates_existing_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            corpus, verdicts = self.shadow_in(tmp)
+            rows = self.read_ledger(verdicts)
+            first = Path(tmp) / "first.jsonl"
+            first.write_text(json.dumps(rows[0]) + "\n")
+            ledger = Path(tmp) / "ledger.jsonl"
+            court.enforce_run(corpus, first, self.policy(), ledger, self.NOW)
+            before = ledger.read_bytes()
+            rows[-1]["verdict"]["action"] = "replace"
+            verdicts.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with self.assertRaises(ValueError):
+                court.enforce_run(corpus, verdicts, self.policy(), ledger, self.NOW)
+            self.assertEqual(ledger.read_bytes(), before)
+
+    def test_boolean_source_count_cannot_impersonate_replayed_integer(self):
+        bundle = self.strong_bundle()
+        bundle["case"]["min_sources"] = 1
+        bundle["evidences"] = bundle["evidences"][:1]
+        verdict = court.judge(**bundle)
+        self.assertEqual(verdict["independent_sources"], 1)
+        verdict["independent_sources"] = True
+        # Python ถือ True == 1 จึงต้องตรวจชนิดก่อนเทียบ replay
+        with self.assertRaisesRegex(ValueError, "independent_sources"):
+            court.enforcement_directive(verdict, bundle, self.policy(), self.NOW)
+
+    def test_boolean_limits_are_not_accepted_as_integer_thresholds(self):
+        for field, value in itertools.product(
+                ("max_evidence_age_secs", "min_sources", "quorum"), (False, True)):
+            with self.subTest(field=field, value=value):
+                bundle = self.strong_bundle()
+                bundle["case"][field] = value
+                with self.assertRaisesRegex(ValueError, field):
+                    court.judge(**bundle)
+        for value in (False, True):
+            with self.subTest(field="age_secs", value=value):
+                bundle = self.strong_bundle()
+                bundle["evidences"][0]["age_secs"] = value
+                with self.assertRaisesRegex(ValueError, "age_secs"):
+                    court.judge(**bundle)
+            with self.subTest(field="budget_cases", value=value):
+                bundle = self.strong_bundle()
+                with self.assertRaisesRegex(ValueError, "budget_cases"):
+                    court.enforcement_directive(court.judge(**bundle), bundle,
+                                                self.policy(budget_cases=value), self.NOW)
 
     def test_stale_verdict_rejects_changes_to_every_bundle_section(self):
         with tempfile.TemporaryDirectory() as tmp:
