@@ -165,6 +165,67 @@ One-shot คืน exit 2 เมื่อ `blocked`; watch mode รายงา�
 เมื่อ hold ต้องตรวจหลักฐานและแก้สาเหตุก่อน drain/เริ่ม deployment ใหม่
 ไม่แก้ state ด้วยมือเพื่อล้างข้อผิดพลาด
 
+## Security Court dry-run
+
+ตัวรับ Court ใน external Python supervisor เป็นโหมด one-shot สำหรับตรวจแผน
+บน deployment ที่มี `controller.json` อยู่แล้ว ใช้ flag ทั้งสามพร้อมกัน:
+
+```sh
+python3 scripts/aivm-supervisor.py /trusted/deployment.json \
+  --state-dir /private/controller-state \
+  --court-ledger /trusted/directives.jsonl \
+  --court-corpus /trusted/cases \
+  --court-policy /trusted/court-policy.json
+```
+
+`directives.jsonl` มาจากคำสั่ง `security-court.py enforce` และ corpus ต้องเป็น
+bundle ต้นฉบับที่ operator ตรวจแล้วตาม [court schemas](security-court-roadmap.md)
+policy เป็น JSON ที่มี `law_version`, `max_action`, `kill_switch`, `budget_cases`
+เช่น `{"law_version":"court-law-v2","max_action":"quarantine","kill_switch":false,"budget_cases":32}`
+ไฟล์เหล่านี้และ state directory ต้องอยู่นอกพื้นที่ที่ agent เขียนได้
+
+การเตรียม bundle สำหรับ receiver:
+
+- `case.instance` ต้องเป็น instance ID ที่ persist ใน controller state และ
+  phase ต้องเป็น `running`; draining, hold และ phase อื่นถูกปฏิเสธ
+- `case.session` ต้องตรงกับ `session_id` ของ audit record ล่าสุด ซึ่งต้องมี
+  `agent` ตรงกับ instance นั้น Runtime ปัจจุบันใช้ `sess_<instance-id>`;
+  ชื่อนี้ไม่ใช่ process nonce หรือหลักฐานว่า process ยังมีชีวิตอยู่
+- `case.events` และ `evidences[].event_ids` ใช้ค่า `hash_entry` เต็มของ audit
+  record ที่อ้างถึง ไม่ใช้ sequence number หรือชื่อจำลอง `e1`/`e2`
+  ตัวอย่างเดิมใน `examples/security-court/` จึงไม่ใช่ bundle ของ deployment จริง
+- หลักฐานทุกชิ้นที่ verdict ใช้ต้องอ้าง record ใน snapshot ที่ Rust CLI
+  ตรวจ chain ผ่าน มี agent/session ตรง และ `เวลาปัจจุบัน - timestamp`
+  อยู่ในช่วง `0..max_evidence_age_secs` ไม่เชื่อ `age_secs` ที่ส่งมาอย่างเดียว
+
+Receiver ถือ lock เดียวกับ controller แล้วอ่าน state, ledger, policy และ
+audit snapshot โดยไม่แก้ `controller.json`, audit หรือ watcher state
+replay bundle ด้วย deterministic judge แล้วแปล directive กลับมาเทียบทุกฟิลด์
+รวมชนิดข้อมูล ห้าม field เพิ่มสิทธิ์, case ซ้ำ, หลักฐานแต่งขึ้น หรือ deadline
+ที่ต้องทบทวนแล้ว ใช้ policy ปัจจุบันลด action ลงได้เท่านั้น และ kill switch
+ทำให้แผนเป็น `none` ไม่ว่าคำตัดสินเดิมจะเป็นอะไร
+
+ไฟล์ input แต่ละไฟล์จำกัด 1 MiB และต้องเป็น regular file ที่ไม่ใช่ symlink;
+corpus จำกัด 256 bundles และ ledger จำกัดไม่เกิน `budget_cases` หรือ 256 แถว
+แถวใดผิดจะไม่ปล่อยแผนของแถวอื่น: JSONL stdout และไฟล์ล่าสุด
+`<state-dir>/court-preview.json` จะรายงาน `status: blocked`, `cases: []`, exit 2
+เมื่อผ่านจะเป็น `status: ready`, exit 0 พร้อม state/ledger/policy hashes,
+bundle hashes, audit tips และ event references เพื่อทบทวนผล
+รายงานไฟล์ใช้ atomic write + fsync และ mode 0600 ภายใต้ private state directory
+
+รายงานระบุ `enforcement_enabled: false` และทุกแผนมี `would_apply`, `applied: false`
+CLI ปฏิเสธการใช้ร่วมกับ `--apply`, `--watch` หรือ `--drain` จึงไม่เรียก
+reconcile หรือ systemd เพื่อเริ่ม/หยุด workload และไม่ใช้ replacement budget
+ค่า `applied` ใน ledger ของ translator เดิมหมายถึงเลือก directive แล้ว
+ไม่ใช่หลักฐานว่ามีการบังคับใช้กับ runtime
+
+ขอบเขตนี้ยังไม่พิสูจน์ว่า process ยังทำงานอยู่หรือ session ไม่เปลี่ยนหลัง
+อ่าน snapshot และไม่ติดตามหลักฐานย้อนหลังข้าม rotation: หาก anchor ที่
+persist ไว้หรือ event ที่อ้างหายจาก audit ปัจจุบัน จะ blocked ให้ทบทวนใหม่
+audit hash chain และ bundle hash ไม่ใช่ลายเซ็นรับรองผู้ส่ง; operator/host
+และ custody ของ inputs ยังเป็น trust root ส่วน Rust supervisor/gateway
+ยังไม่รับ directive เพื่อเปลี่ยน runtime ในรอบนี้
+
 ## การทดสอบ
 
 ```sh
@@ -177,6 +238,8 @@ AIVM_SUPERVISOR_HOST_TEST=1 \
 
 เทสต์ปกติครอบคลุม state machine, dry-run, restart, lock, replacement budget,
 timeout, drain, การหยุดล้มเหลว และการตรวจ hash chain ด้วย Rust CLI จริง
+รวม Court receiver ที่ตรวจ directive, freshness, binding, policy และ CLI
+โดยใช้ adapter จำลองและยืนยันว่า controller state/audit เดิมไม่เปลี่ยน
 Host tests เริ่ม CLI จริงจนจบงาน และใช้ workload จำลองที่ส่ง audit สังเคราะห์
 เพื่อทดสอบ containment/replacement จริงผ่าน systemd รวมถึง process ลูกที่
 แยก session และย้ายเข้า cgroup ลูกอีกกลุ่ม มี cleanup เฉพาะ test units หลังทดสอบ

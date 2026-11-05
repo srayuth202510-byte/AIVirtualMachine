@@ -168,7 +168,7 @@ crates/
 - [`docs/recovery-supervisor.md`](./docs/recovery-supervisor.md) — controller ภายนอกสำหรับงานบนเครื่องเดียว: dry-run, กักกัน, สร้างทดแทน, จำกัดการเกิดใหม่ และ drain
 - [`docs/detection-evaluation.md`](./docs/detection-evaluation.md) — พิสูจน์ขอบเขตการตรวจจับด้วย 30 สถานการณ์ วัด false positives/misses แยกจากการทำตาม policy
 - [`docs/immunity-lab.md`](./docs/immunity-lab.md) — ห้องทดลองกฎตรวจจับ: สร้างรูปแบบดัดแปลง ให้ Qwen เสนอ ทดสอบ holdout ออกรุ่น shadow และ rollback
-- [`docs/security-court-roadmap.md`](./docs/security-court-roadmap.md) — แผนงานศาลจำลองที่ยึดกฎเป็นหลัก มีฝ่ายทักท้วง ลูกขุน และผู้พิพากษาแบบ deterministic (มี deterministic shadow evaluation; ยังไม่เชื่อม enforcement)
+- [`docs/security-court-roadmap.md`](./docs/security-court-roadmap.md) — ศาลจำลองแบบ deterministic, ท่อแปล directive และตัวรับ dry-run ใน external supervisor พร้อมตรวจ audit/freshness; ยังไม่เปิด enforcement จริง
 
 - [`docs/audit-reviewer.md`](./docs/audit-reviewer.md) — วิเคราะห์ audit แบบอ่านอย่างเดียว ด้วยกฎและคำแนะนำจาก Qwen
 

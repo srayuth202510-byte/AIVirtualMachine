@@ -5,9 +5,11 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 
 module = importlib.util.spec_from_file_location("supervisor", Path(__file__).with_name("aivm-supervisor.py"))
 sup = importlib.util.module_from_spec(module)
@@ -318,6 +320,304 @@ class EvidenceTests(unittest.TestCase):
         self.path.write_bytes((FIXTURES / "boundary.jsonl").read_bytes()[:-1])
         with self.assertRaisesRegex(ValueError, "complete audit"):
             self.evidence.inspect(self.instance, final=True)
+
+
+class CourtPreviewTests(unittest.TestCase):
+    NOW = 1793836800
+
+    @classmethod
+    def setUpClass(cls):
+        subprocess.run(["cargo", "build", "-q", "-p", "aivm-cli"],
+                       cwd=PROJECT, check=True, timeout=600)
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.spec = json.loads((PROJECT / "examples/supervisor.json").read_text())
+        self.spec.update(binary=str(PROJECT / "target/debug/aivm"),
+                         binary_sha256=sup.digest((PROJECT / "target/debug/aivm").read_bytes()))
+        self.spec_path = self.root / "deployment.json"
+        self.spec_path.write_text(json.dumps(self.spec))
+        self.store = sup.Store(self.root, self.spec)
+        self.adapter = FakeAdapter()
+        sup.Controller(self.store, self.adapter, FakeEvidence(), True,
+                       lambda: self.NOW - 20).reconcile()
+        self.adapter.operations.clear()
+        self.instance = self.store.load()["instances"][0]
+        self.audit = self.root / "instances" / self.instance["id"] / "audit.jsonl"
+        self.audit.parent.mkdir(parents=True)
+        self.records = self.audit_records()
+        self.audit.write_text("".join(json.dumps(row) + "\n" for row in self.records))
+        self.corpus = self.root / "corpus"
+        self.corpus.mkdir()
+        self.policy = {"law_version": sup.court.LAW_VERSION, "max_action": "replace",
+                       "kill_switch": False, "budget_cases": 10}
+        self.policy_path = self.root / "policy.json"
+        self.ledger = self.root / "ledger.jsonl"
+        events = [row["hash_entry"] for row in self.records]
+        self.bundle = {
+            "case": {"id": "case-1", "instance": self.instance["id"],
+                     "session": "sess_" + self.instance["id"], "events": events,
+                     "max_evidence_age_secs": 300, "min_sources": 2, "quorum": 2,
+                     "requested_action": "quarantine", "supreme_violation": False},
+            "evidences": [
+                {"id": f"proof-{i}", "source": source, "origin": "trusted-host",
+                 "event_ids": [events[i]], "instance": self.instance["id"],
+                 "session": "sess_" + self.instance["id"], "age_secs": 0, "chain_ok": True}
+                for i, source in enumerate(("audit", "rule"))],
+            "allegations": [], "objections": [],
+            "votes": [{"voter": f"j{i}", "origin": origin, "verdict": "guilty"}
+                      for i, origin in enumerate(("rule", "runtime"))],
+        }
+        self.write_inputs()
+        self.evidence = sup.Evidence(self.root, self.spec)
+        self.addCleanup(self.evidence.close)
+        self.preview = sup.CourtPreview(self.store, self.evidence, lambda: self.NOW)
+
+    def audit_records(self, first_actor=None, last_session=None):
+        template = sup.watch.audit.load_records((FIXTURES / "boundary.jsonl").read_bytes())[0]
+        fields = ["hash_version", "seq", "timestamp", "agent", "session_id", "request_id", "state",
+                  "action", "resource", "decision", "policy", "capability", "result",
+                  "rule_matched", "state_transition", "hash_prev"]
+        rows, previous = [], ""
+        for i in range(2):
+            row = {**template, "seq": i, "timestamp": self.NOW - 10 + i,
+                   "agent": self.instance["id"], "session_id": "sess_" + self.instance["id"],
+                   "hash_prev": previous}
+            if i == 0 and first_actor:
+                row["agent"] = first_actor
+            if i == 1 and last_session:
+                row["session_id"] = last_session
+            row["hash_entry"] = hashlib.sha256(json.dumps(
+                [row[key] for key in fields], separators=(",", ":")).encode()).hexdigest()
+            rows.append(row)
+            previous = row["hash_entry"]
+        return rows
+
+    def use_audit(self, records):
+        self.records = records
+        self.audit.write_text("".join(json.dumps(row) + "\n" for row in records))
+        events = [row["hash_entry"] for row in records]
+        self.bundle["case"]["events"] = events
+        for i, evidence in enumerate(self.bundle["evidences"]):
+            evidence["event_ids"] = [events[i]]
+        self.write_inputs()
+
+    def write_inputs(self):
+        self.policy_path.write_text(json.dumps(self.policy))
+        (self.corpus / "case.json").write_text(json.dumps(self.bundle))
+        verdict = sup.court.judge(**self.bundle)
+        created = datetime.fromtimestamp(self.NOW - 5, timezone.utc).isoformat()
+        self.directive = sup.court.enforcement_directive(
+            verdict, self.bundle, self.policy, created)
+        self.ledger.write_text(json.dumps(self.directive) + "\n")
+
+    def run_preview(self):
+        before = self.store.path.read_bytes()
+        audit_before = self.audit.read_bytes() if self.audit.exists() else None
+        result = self.preview.preview(self.corpus, self.ledger, self.policy_path)
+        self.assertEqual(self.store.path.read_bytes(), before)
+        if audit_before is not None:
+            self.assertEqual(self.audit.read_bytes(), audit_before)
+        self.assertEqual(self.adapter.operations, [])
+        self.assertTrue(result["dry_run"])
+        self.assertFalse(result["enforcement_enabled"])
+        self.assertEqual(json.loads((self.root / "court-preview.json").read_text()), result)
+        self.assertEqual((self.root / "court-preview.json").stat().st_mode & 0o777, 0o600)
+        return result
+
+    def assert_blocked(self, fragment):
+        report = self.run_preview()
+        self.assertEqual(report["status"], "blocked")
+        self.assertEqual(report["cases"], [])
+        self.assertIn(fragment, report["error"])
+
+    def test_valid_directive_previews_and_replays_without_runtime_effects(self):
+        report = self.run_preview()
+        self.assertEqual(report["status"], "ready")
+        plan, = report["cases"]
+        self.assertEqual((plan["instance"], plan["session"], plan["directive"]),
+                         (self.instance["id"], self.bundle["case"]["session"], "quarantine"))
+        self.assertTrue(plan["would_apply"])
+        self.assertFalse(plan["applied"])
+        self.assertEqual(plan["release_mode"], "policy-review")
+        self.assertEqual(report["ledger_sha256"], sup.digest(self.ledger.read_bytes()))
+        before = (self.root / "court-preview.json").read_bytes()
+        self.assertEqual(self.run_preview(), report)
+        self.assertEqual((self.root / "court-preview.json").read_bytes(), before)
+
+    def test_forged_directive_fields_are_rejected_before_preview(self):
+        for field, value in (("instance", "vm-b"), ("session", "old-session"),
+                             ("directive", "grant"), ("action", "replace"),
+                             ("release_mode", "automatic"), ("applied", False),
+                             ("law_hash", "0" * 64), ("bundle_sha256", "0" * 64),
+                             ("independent_sources", True), ("grant", ["process.exec"])):
+            with self.subTest(field=field):
+                self.ledger.write_text(json.dumps({**self.directive, field: value}) + "\n")
+                self.assert_blocked("directive")
+
+    def test_wrong_target_and_session_are_rejected_even_with_freshly_judged_bundle(self):
+        for field, value, error in (("instance", "vm-b", "instance"),
+                                   ("session", "old-session", "session")):
+            with self.subTest(field=field):
+                original = self.bundle["case"][field]
+                self.bundle["case"][field] = value
+                for evidence in self.bundle["evidences"]:
+                    evidence[field] = value
+                self.write_inputs()
+                self.assert_blocked(error)
+                self.bundle["case"][field] = original
+                for evidence in self.bundle["evidences"]:
+                    evidence[field] = original
+
+    def test_receiver_uses_audit_time_instead_of_claimed_age(self):
+        self.preview.now = lambda: self.NOW + 290
+        self.assertEqual(self.run_preview()["status"], "ready")
+        self.preview.now = lambda: self.NOW + 291
+        self.assert_blocked("stale")
+
+    def test_session_rollover_and_cross_actor_audit_events_are_rejected(self):
+        self.use_audit(self.audit_records(last_session="new-session"))
+        self.assert_blocked("session")
+        self.use_audit(self.audit_records(first_actor="other-instance"))
+        self.assert_blocked("binding")
+
+    def test_persisted_audit_anchor_must_be_present_in_verified_snapshot(self):
+        state = self.store.load()
+        state["instances"][0]["audit_tip"] = self.records[0]["hash_entry"]
+        self.store.save(state)
+        self.assertEqual(self.run_preview()["status"], "ready")
+        state["instances"][0]["audit_tip"] = "0" * 64
+        self.store.save(state)
+        self.assert_blocked("continuity")
+
+    def test_missing_invented_or_corrupt_audit_cannot_authorize_a_plan(self):
+        original = self.audit.read_bytes()
+        self.audit.unlink()
+        self.assert_blocked("audit")
+        self.audit.write_bytes(original.replace(b"path-traversal", b"path-traversaL"))
+        self.assert_blocked("audit")
+        self.audit.write_bytes(original)
+        self.bundle["case"]["events"] = ["invented"]
+        for evidence in self.bundle["evidences"]:
+            evidence["event_ids"] = ["invented"]
+        self.write_inputs()
+        self.assert_blocked("event")
+
+    def test_retired_held_or_draining_instances_cannot_receive_plans(self):
+        original = self.store.load()
+        for flag in ("retired", "completed", "quarantining", "hold", "draining"):
+            with self.subTest(flag=flag):
+                state = json.loads(json.dumps(original))
+                if flag == "draining":
+                    state["draining"] = True
+                elif flag == "hold":
+                    state["instances"][0]["hold"] = True
+                else:
+                    state["instances"][0]["phase"] = flag
+                self.store.save(state)
+                self.assert_blocked("state")
+
+    def test_current_policy_caps_and_kill_switch_suppress_old_directives(self):
+        self.policy["max_action"] = "watch"
+        self.policy_path.write_text(json.dumps(self.policy))
+        plan, = self.run_preview()["cases"]
+        self.assertEqual(plan["directive"], "watch")
+        self.policy["kill_switch"] = True
+        self.policy_path.write_text(json.dumps(self.policy))
+        plan, = self.run_preview()["cases"]
+        self.assertEqual(plan["directive"], "none")
+        self.assertFalse(plan["would_apply"])
+        self.assertEqual(plan["reason"], "kill-switch")
+
+    def test_policy_expansion_cannot_raise_a_previously_capped_or_killed_directive(self):
+        for cap, killed, expected in (("watch", False, "watch"), ("replace", True, "none")):
+            with self.subTest(cap=cap, killed=killed):
+                self.policy.update(max_action=cap, kill_switch=killed)
+                self.write_inputs()
+                self.policy.update(max_action="replace", kill_switch=False)
+                self.policy_path.write_text(json.dumps(self.policy))
+                plan, = self.run_preview()["cases"]
+                self.assertEqual(plan["directive"], expected)
+
+    def test_controller_lock_prevents_a_racing_preview(self):
+        with self.store.locked():
+            with self.assertRaises(BlockingIOError):
+                self.preview.preview(self.corpus, self.ledger, self.policy_path)
+        self.assertFalse((self.root / "court-preview.json").exists())
+
+    def test_duplicate_or_invalid_last_record_blocks_the_entire_preview(self):
+        row = json.dumps(self.directive)
+        self.ledger.write_text(row + "\n" + row + "\n")
+        self.assert_blocked("duplicate")
+        self.ledger.write_text(row + "\n" + json.dumps({**self.directive, "case_id": "other"}) + "\n")
+        self.assert_blocked("bundle")
+
+    def test_future_creation_and_expired_review_never_mean_auto_release(self):
+        self.preview.now = lambda: self.NOW - 6
+        self.assert_blocked("future")
+        self.preview.now = lambda: self.NOW + sup.court.REVIEW_HORIZON_SECS
+        self.assert_blocked("review")
+
+    def test_empty_oversized_symlink_and_duplicate_json_inputs_fail_closed(self):
+        original = self.ledger.read_bytes()
+        for raw, error in ((b"", "empty"), (b" " * (1024 * 1024 + 1), "limit"),
+                           (b'{"case_id":"a","case_id":"b"}\n', "duplicate")):
+            with self.subTest(error=error):
+                self.ledger.write_bytes(raw)
+                self.assert_blocked(error)
+        self.ledger.unlink()
+        source = self.root / "source.jsonl"
+        source.write_bytes(original)
+        self.ledger.symlink_to(source)
+        self.assert_blocked("input")
+        self.ledger.unlink()
+        os.mkfifo(self.ledger)
+        self.assert_blocked("regular file")
+
+    def test_duplicate_bundle_identity_is_not_selected_by_file_order(self):
+        (self.corpus / "duplicate.json").write_text(json.dumps(self.bundle))
+        self.assert_blocked("duplicate court bundle")
+
+    def test_budget_exceeded_blocks_all_cases_and_replaces_previous_preview(self):
+        self.run_preview()
+        self.policy["budget_cases"] = 0
+        self.policy_path.write_text(json.dumps(self.policy))
+        self.assert_blocked("budget")
+
+    def cli(self, *extra):
+        return subprocess.run(
+            [sys.executable, str(Path(sup.__file__)), str(self.spec_path),
+             "--state-dir", str(self.root), "--court-ledger", str(self.ledger),
+             "--court-corpus", str(self.corpus), "--court-policy", str(self.policy_path), *extra],
+            capture_output=True, text=True, timeout=10)
+
+    def test_cli_emits_preview_and_blocked_exit_without_reconciling(self):
+        # CLI ใช้นาฬิกาจริง จึงสร้าง audit และ directive ที่สดสำหรับรอบนี้
+        self.NOW = int(time.time())
+        self.use_audit(self.audit_records())
+        state_before = self.store.path.read_bytes()
+        result = self.cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "ready")
+        self.assertTrue(report["dry_run"])
+        self.assertFalse(report["enforcement_enabled"])
+        self.assertEqual(self.store.path.read_bytes(), state_before)
+        self.ledger.write_text("{}\n")
+        result = self.cli()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["status"], "blocked")
+        self.assertEqual(self.store.path.read_bytes(), state_before)
+
+    def test_cli_rejects_apply_watch_and_drain_before_creating_a_preview(self):
+        for flag in ("--apply", "--watch", "--drain"):
+            with self.subTest(flag=flag):
+                result = self.cli(flag)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("incompatible", result.stderr)
+                self.assertFalse((self.root / "court-preview.json").exists())
 
 
 @unittest.skipUnless(os.environ.get("AIVM_SUPERVISOR_HOST_TEST") == "1", "opt-in: needs systemd user bus and delegation")

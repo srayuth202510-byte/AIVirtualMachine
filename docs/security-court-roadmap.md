@@ -1,7 +1,8 @@
 # แผนงาน: ศาลจำลองสำหรับการตอบสนองด้านความปลอดภัย
 
-สถานะ: **ระยะ 1–6 เสร็จ (ศาลจำลอง + ท่อแปล directive)** — อัปเดต 2026-11-05;
-เพิ่ม adversarial tests ก่อนเชื่อมระบบแล้ว; ยังไม่ผูก supervisor/gateway จริง
+สถานะ: **ระยะ 1–7 เสร็จ (ศาลจำลอง + ท่อแปล directive + supervisor dry-run)**
+— อัปเดต 2026-11-05; ตัวรับใน external Python supervisor ยังไม่เปลี่ยน runtime
+และยังไม่เปิด enforcement ใน Rust supervisor/gateway
 
 เป้าหมายคือเพิ่มกระบวนการพิจารณาที่มีกฎเป็นหลัก มีการทักท้วงและตรวจหลักฐาน
 ก่อนเสนอการตอบสนองต่อความเสี่ยง เริ่มจาก shadow mode และวัดผลเทียบกับ
@@ -94,6 +95,15 @@ watcher/supervisor เดิม โดยเฉพาะกรณี config ผ�
   ผ่าน policy review เท่านั้น (deadline ใช้แค่กำหนดทบทวน), ledger ห้าม
   case_id ซ้ำและ replay ได้ bytes เดิม; ถือ lock ข้ามโปรเซสตั้งแต่อ่านจนเขียน
   ledger เสร็จ; เทสต์ใน `EnforcementTests`)
+- [x] **ระยะ 7 — Receiver แบบ dry-run ใน external supervisor**
+  `scripts/aivm-supervisor.py --court-ledger … --court-corpus … --court-policy …`
+  replay directive ทุกฟิลด์กับ bundle, ตรวจ instance จาก controller state,
+  session จาก audit ล่าสุด และอายุหลักฐานจาก timestamp ของ audit ที่ Rust
+  ตรวจ chain แล้ว ใช้ hash ของ audit record เป็น event ID; ตรวจ kill switch
+  และ action cap ปัจจุบันอีกครั้ง บันทึก `court-preview.json` พร้อม provenance
+  และ `applied: false` เสมอ แถวใดผิดต้อง blocked ทั้งรอบ ไม่เรียก reconcile,
+  systemd หรือ gateway; CLI ปฏิเสธ `--apply`, `--watch` และ `--drain`
+  ดู [วิธีใช้และข้อจำกัด](recovery-supervisor.md#security-court-dry-run)
 
 ## การเปลี่ยนเป็น court-law-v2
 
@@ -146,8 +156,16 @@ bundle ต้นฉบับที่ตรวจทานแล้ว และ
 ชุดนี้ยืนยันขอบเขตของ Python judge/translator เท่านั้น ไม่ได้ยืนยันการรับ
 directive ของ Rust supervisor, การกัน session เปลี่ยนระหว่างตรวจและลงมือ,
 การตรวจ freshness ณ เวลาลงมือ หรือผลลด false positives เทียบ baseline
-งานถัดไปคือทำ receiver แบบ dry-run พร้อม adversarial tests ของ receiver
-ก่อนเปิดเปลี่ยนสถานะ VM จริง
+ต่อยอดด้วย `CourtPreviewTests` ใน `scripts/test_supervisor.py` แล้ว:
+มี replay ของ directive ที่ถูกแก้, VM/session ผิด, session เปลี่ยน,
+event ข้าม actor, audit หาย/เสีย/anchor ขาด, อายุจริงเกินเพดาน,
+review deadline, policy cap/kill switch, duplicate, budget, input ไม่ถูกต้อง
+และ CLI ที่ต้องไม่เปลี่ยน controller state/audit หรือเปิด apply mode
+เทสต์ใช้ controller/adapter จำลอง แต่ตรวจ audit ผ่าน Rust CLI จริง
+
+ขั้นถัดไปคือวัดผลเทียบ baseline บน corpus ที่มี labels อิสระ รวม false
+positives/misses ก่อนพิจารณา enforcement จริง ซึ่งยังต้องตรวจ process/session
+ณ เวลาลงมือและทำ transaction/recovery ของการเปลี่ยน runtime เพิ่มเติม
 
 ## เกณฑ์พิสูจน์ก่อนขยับแต่ละระยะ
 

@@ -11,13 +11,18 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import stat
 import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
 
 module = importlib.util.spec_from_file_location("security_watch", Path(__file__).with_name("qwen-audit-watch.py"))
 watch = importlib.util.module_from_spec(module)
 module.loader.exec_module(watch)
+court_module = importlib.util.spec_from_file_location("security_court", Path(__file__).with_name("security-court.py"))
+court = importlib.util.module_from_spec(court_module)
+court_module.loader.exec_module(court)
 MAX_INSTANCES = 256
 
 
@@ -27,6 +32,21 @@ def digest(raw):
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def court_input(path):
+    """อ่าน snapshot จำกัดขนาด: ไม่ตาม symlink และไม่รอ FIFO/device."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as error:
+        raise ValueError("court input cannot be read: " + Path(path).name) from error
+    with os.fdopen(fd, "rb") as file:
+        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+            raise ValueError("court input must be a regular file")
+        raw = file.read(watch.audit.MAX_BYTES + 1)
+    if len(raw) > watch.audit.MAX_BYTES:
+        raise ValueError("court input exceeds 1 MiB limit")
+    return raw
 
 
 def private_write(path, value):
@@ -197,6 +217,25 @@ class Evidence:
             path.write_bytes(raw)
             subprocess.run([self.spec["binary"], "verify-audit", str(path)],
                            check=True, capture_output=True, timeout=30)
+
+    def court_records(self, instance):
+        """ตรวจ audit โดยไม่แก้ watcher/audit_tip หรือเรียก runtime ที่อาจกู้ state."""
+        raw = court_input(self.root / "instances" / instance["id"] / "audit.jsonl")
+        if not raw.endswith(b"\n"):
+            raise ValueError("audit snapshot is incomplete")
+        rows = watch.audit.load_records(raw)
+        try:
+            self.verify(raw)
+        except subprocess.SubprocessError as error:
+            raise ValueError("audit verification failed") from error
+        anchor = instance.get("audit_tip")
+        if anchor and not any(row["hash_entry"] == anchor for row in rows):
+            raise ValueError("audit continuity lost against controller state")
+        if not anchor and rows[0]["hash_prev"]:
+            raise ValueError("audit genesis is missing")
+        if any(a["timestamp"] > b["timestamp"] for a, b in zip(rows, rows[1:])):
+            raise ValueError("audit timestamp regressed")
+        return rows
 
     def inspect(self, instance, final=False):
         name = instance["id"]
@@ -404,6 +443,121 @@ class Controller:
                 for item in state["instances"] if item["phase"] not in {"retired", "completed"}]
 
 
+class CourtPreview:
+    """Receiver แบบ dry-run เท่านั้น ไม่มี adapter หรือเส้นทางเปลี่ยน runtime."""
+    def __init__(self, store, evidence, now=time.time):
+        self.store, self.evidence, self.now = store, evidence, now
+
+    def preview(self, corpus_dir, ledger_path, policy_path):
+        # ล็อกเดียวกับ controller ป้องกัน reconcile เปลี่ยน instance ระหว่างอ่าน
+        with self.store.locked():
+            now = self.now()
+            report = {"action": "court_preview", "dry_run": True, "enforcement_enabled": False,
+                      "status": "blocked", "evaluated_utc": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                      "cases": []}
+            try:
+                if not self.store.path.is_file():
+                    raise ValueError("court preview requires persisted controller state")
+                state = self.store.load()
+                report["state_sha256"] = digest(canonical(state).encode())
+                report["deployment"] = state["deployment"]
+                raw = court_input(ledger_path)
+                report["ledger_sha256"] = digest(raw)
+                policy_raw = court_input(policy_path)
+                report["policy_sha256"] = digest(policy_raw)
+                policy = court.validate_policy(watch.audit.decode(policy_raw.decode()))
+                rows = [watch.audit.decode(line) for line in raw.decode().splitlines() if line.strip()]
+                if not rows:
+                    raise ValueError("court ledger is empty")
+                if len(rows) > min(policy["budget_cases"], MAX_INSTANCES):
+                    raise ValueError("court preview budget exceeded")
+                bundles = {}
+                for path in Path(corpus_dir).glob("*.json"):
+                    if path.name == "labels.json":
+                        continue
+                    if len(bundles) >= MAX_INSTANCES:
+                        raise ValueError("court corpus file limit exceeded")
+                    bundle = watch.audit.decode(court_input(path).decode())
+                    if not isinstance(bundle, dict) or set(bundle) != {
+                            "case", "evidences", "allegations", "objections", "votes"}:
+                        raise ValueError("court bundle fields mismatch")
+                    case_id = bundle["case"]["id"]
+                    if case_id in bundles:
+                        raise ValueError("duplicate court bundle case_id")
+                    bundles[case_id] = bundle
+                instances = {item["id"]: item for item in state["instances"]}
+                if len(instances) != len(state["instances"]):
+                    raise ValueError("duplicate instance in controller state")
+                plans, seen, snapshots = [], set(), {}
+                for row in rows:
+                    if not isinstance(row, dict) or set(row) != court.DIRECTIVE_FIELDS:
+                        raise ValueError("court directive fields mismatch")
+                    case_id = row["case_id"]
+                    if case_id in seen:
+                        raise ValueError("duplicate directive case_id")
+                    seen.add(case_id)
+                    if case_id not in bundles:
+                        raise ValueError("court directive has no matching bundle")
+                    bundle = bundles[case_id]
+                    # ถอดเพดานที่เกิดผลจาก record แล้ว replay ทุกฟิลด์ ไม่เชื่อ applied
+                    # หรือตัวเลขที่ Python อาจเทียบ True == 1; policy ปัจจุบันครอบอีกชั้น
+                    replay_policy = {**policy, "max_action": row["action"],
+                                     "kill_switch": row["outcome"] == "killed"}
+                    expected = court.enforcement_directive(
+                        court.judge(**bundle), bundle, replay_policy, row["created_utc"])
+                    if canonical(expected) != canonical(row):
+                        raise ValueError("court directive does not match bundle replay")
+                    created = datetime.fromisoformat(row["created_utc"]).timestamp()
+                    if created > now:
+                        raise ValueError("court directive creation is in the future")
+                    if now >= datetime.fromisoformat(row["review_deadline_utc"]).timestamp():
+                        raise ValueError("court directive requires policy review; no automatic release")
+                    name = row["instance"]
+                    if name not in instances or not re.fullmatch(r"aivm-[0-9a-f]{12}-[0-9]+", name):
+                        raise ValueError("court directive targets an unknown instance")
+                    instance = instances[name]
+                    if (state.get("draining") or instance.get("hold")
+                            or instance["phase"] != "running"):
+                        raise ValueError("controller state does not permit a court plan")
+                    if name not in snapshots:
+                        snapshots[name] = self.evidence.court_records(instance)
+                    records = snapshots[name]
+                    latest = records[-1]
+                    if (latest["agent"] != name or not latest["session_id"]
+                            or latest["session_id"] != row["session"]):
+                        raise ValueError("court directive session does not match latest audit")
+                    by_hash = {record["hash_entry"]: record for record in records}
+                    used = set(row["evidence_used"])
+                    refs = {ref for evidence in bundle["evidences"] if evidence["id"] in used
+                            for ref in evidence["event_ids"]}
+                    for ref in refs:
+                        record = by_hash.get(ref)
+                        if record is None:
+                            raise ValueError("court evidence event is absent from verified audit")
+                        if record["agent"] != name or record["session_id"] != row["session"]:
+                            raise ValueError("court evidence event has wrong instance/session binding")
+                        age = now - record["timestamp"]
+                        if age < 0 or age > bundle["case"]["max_evidence_age_secs"]:
+                            raise ValueError("court evidence is stale or has a future timestamp")
+                    action = min((row["directive"], policy["max_action"]), key=court.SEVERITY.__getitem__)
+                    reason = "validated-preview"
+                    if policy["kill_switch"]:
+                        action, reason = "none", "kill-switch"
+                    elif action != row["directive"]:
+                        reason = "policy-cap"
+                    plans.append({"case_id": case_id, "instance": name, "session": row["session"],
+                                  "directive": action, "would_apply": action != "none", "applied": False,
+                                  "release_mode": court.RELEASE_MODES[action], "reason": reason,
+                                  "bundle_sha256": row["bundle_sha256"], "audit_tip": latest["hash_entry"],
+                                  "evidence_events": sorted(refs)})
+                report.update(status="ready", cases=plans)
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as error:
+                # แถวท้ายผิดก็ไม่ปล่อยแผนแถวต้น และแทนรายงาน ready เก่าด้วย blocked
+                report["error"] = str(error)[:2000]
+            private_write(self.store.root / "court-preview.json", report)
+            return report
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("spec", type=Path, help="Trusted deployment JSON")
@@ -412,7 +566,13 @@ def main():
     parser.add_argument("--watch", action="store_true", help="Reconcile until Ctrl+C; otherwise one pass")
     parser.add_argument("--drain", action="store_true", help="Stop this deployment and persistently disable new starts")
     parser.add_argument("--interval", type=float, default=2)
+    parser.add_argument("--court-ledger", type=Path, help="Preview court directives; never reconciles or applies")
+    parser.add_argument("--court-corpus", type=Path, help="Trusted original court bundles for replay")
+    parser.add_argument("--court-policy", type=Path, help="Current operator court policy")
     args = parser.parse_args()
+    court_args = (args.court_ledger, args.court_corpus, args.court_policy)
+    if any(court_args) and (not all(court_args) or args.apply or args.watch or args.drain):
+        parser.error("court preview requires ledger, corpus and policy; incompatible with --apply/--watch/--drain")
     if not 0.1 <= args.interval <= 60:
         raise ValueError("interval must be 0.1..60 seconds")
     # Emergency drain controls only persisted units; it must still work when
@@ -421,6 +581,12 @@ def main():
     store = Store(args.state_dir.absolute(), spec)
     evidence = Evidence(store.root, spec)
     try:
+        if args.court_ledger:
+            report = CourtPreview(store, evidence).preview(args.court_corpus, args.court_ledger, args.court_policy)
+            print(json.dumps(report), flush=True)
+            if report["status"] == "blocked":
+                sys.exit(2)
+            return
         with store.locked():
             controller = Controller(store, SystemdAdapter(store.root, spec), evidence, args.apply)
             while True:
