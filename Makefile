@@ -12,7 +12,7 @@ build: ## คอมไพล์ทั้ง workspace
 check: ## ตรวจ type เร็ว ไม่สร้างโค้ด
 	cargo check --workspace --all-targets
 
-PYTHON_TEST_PATTERNS := test_qwen_*.py test_supervisor.py test_detection.py test_immunity.py test_pins.py test_security_court.py test_fuzz_seeded.py test_llama_replay.py test_model_host_validation.py test_model_quality.py test_semantic_quality.py test_release_gate.py test_repair_trace.py test_dashboard.py test_model_validation_setup.py test_operational.py
+PYTHON_TEST_PATTERNS := test_qwen_*.py test_supervisor.py test_detection.py test_immunity.py test_pins.py test_security_court.py test_security_court_evaluation.py test_qwen_concerns.py test_fuzz_seeded.py test_llama_replay.py test_model_host_validation.py test_model_quality.py test_semantic_quality.py test_release_gate.py test_repair_trace.py test_dashboard.py test_model_validation_setup.py test_operational.py
 
 test: test-scripts ## เทสต์ unit + integration ทั้งหมด
 	cargo test --workspace

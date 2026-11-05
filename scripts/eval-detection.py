@@ -137,6 +137,7 @@ def response_test(case, rows, raw, directory, binary):
             return {"actual": response, "expected": case["response"], "effects": adapter.effects,
                     "matches_policy": response == case["response"] and ordered,
                     "source_unchanged": unchanged, "stopped_instances": stopped,
+                    "observed_reason": instances[0].get("reason"),
                     "blocked_reports": [row for row in reports if row["action"] == "blocked"]}
     finally:
         evidence.close()

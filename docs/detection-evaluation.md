@@ -108,6 +108,14 @@ Baseline นี้ยังไม่ยืนยันการตรวจ expl
 
 ## Holdout ที่แยกจาก baseline
 
+ผลเทียบ Court กับ supervisor บน baseline/holdout เดียวกัน พร้อม FP/FN,
+abstentions และ paired improvement gate อยู่ใน
+[Security Court evaluation (2026-11-05)](security-court-evaluation-2026-11-05.md)
+Court ที่ใช้หลักฐานเดิมยังไม่แสดงการลด false containment โดยไม่เพิ่ม misses
+ผลการเรียก Qwen จริงแยกสามบทบาทอยู่ใน
+[Qwen role-jury evaluation](security-court-qwen-evaluation-2026-11-05.md):
+เสียงข้างมากเสนอ containment ทุกกรณี จึงมี false positives เพิ่มจาก baseline
+
 `examples/detection/holdout.json` เพิ่ม synthetic regression holdout 12 กรณี:
 งานปกติ, sensitive access ที่อนุญาต, quoted injection, rule tag ใหม่, slow probing และ rotation
 ใช้ `python3 scripts/eval-detection.py --corpus examples/detection/holdout.json --output <report.json>`

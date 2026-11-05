@@ -169,6 +169,8 @@ crates/
 - [`docs/detection-evaluation.md`](./docs/detection-evaluation.md) — พิสูจน์ขอบเขตการตรวจจับด้วย 30 สถานการณ์ วัด false positives/misses แยกจากการทำตาม policy
 - [`docs/immunity-lab.md`](./docs/immunity-lab.md) — ห้องทดลองกฎตรวจจับ: สร้างรูปแบบดัดแปลง ให้ Qwen เสนอ ทดสอบ holdout ออกรุ่น shadow และ rollback
 - [`docs/security-court-roadmap.md`](./docs/security-court-roadmap.md) — ศาลจำลองแบบ deterministic, ท่อแปล directive และตัวรับ dry-run ใน external supervisor พร้อมตรวจ audit/freshness; ยังไม่เปิด enforcement จริง
+- [`docs/security-court-evaluation-2026-11-05.md`](./docs/security-court-evaluation-2026-11-05.md) — ผลเทียบ Court กับ baseline/holdout แบบจับคู่: ยังไม่ผ่านเกณฑ์ลด false containment โดยไม่เพิ่ม misses
+- [`docs/security-court-qwen-evaluation-2026-11-05.md`](./docs/security-court-qwen-evaluation-2026-11-05.md) — ทดสอบ Qwen จริงแยกสามบทบาท พร้อมคำตอบดิบ เสียงข้างมาก และคะแนนแยกจาก deterministic controls
 
 - [`docs/audit-reviewer.md`](./docs/audit-reviewer.md) — วิเคราะห์ audit แบบอ่านอย่างเดียว ด้วยกฎและคำแนะนำจาก Qwen
 

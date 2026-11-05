@@ -4,6 +4,13 @@
 — อัปเดต 2026-11-05; ตัวรับใน external Python supervisor ยังไม่เปลี่ยน runtime
 และยังไม่เปิด enforcement ใน Rust supervisor/gateway
 
+การวัดระยะ 8 ทำแล้ว: [paired baseline/holdout evaluation](security-court-evaluation-2026-11-05.md)
+ยังไม่ผ่านเกณฑ์ลด false containment โดยไม่เพิ่ม misses จึงคง shadow/dry-run
+
+ระยะ 9 เรียก Qwen จริงครบ 114 รอบแล้ว:
+[สามบทบาทและเสียงข้างมาก](security-court-qwen-evaluation-2026-11-05.md)
+เสนอ containment ทุก 38 เคส รวม benign 11 เคส จึงยังไม่ผ่าน improvement gate
+
 เป้าหมายคือเพิ่มกระบวนการพิจารณาที่มีกฎเป็นหลัก มีการทักท้วงและตรวจหลักฐาน
 ก่อนเสนอการตอบสนองต่อความเสี่ยง เริ่มจาก shadow mode และวัดผลเทียบกับ
 watcher/supervisor เดิม โดยเฉพาะกรณี config ผิดที่ทำให้เกิด containment เกินเหตุ
@@ -104,6 +111,44 @@ watcher/supervisor เดิม โดยเฉพาะกรณี config ผ�
   และ `applied: false` เสมอ แถวใดผิดต้อง blocked ทั้งรอบ ไม่เรียก reconcile,
   systemd หรือ gateway; CLI ปฏิเสธ `--apply`, `--watch` และ `--drain`
   ดู [วิธีใช้และข้อจำกัด](recovery-supervisor.md#security-court-dry-run)
+- [x] **ระยะ 8 — วัด Court เทียบ baseline และ holdout แบบจับคู่**
+  `scripts/eval-security-court.py` ใช้ labels เดิมเพื่อ scoring เท่านั้น;
+  Court ที่ใช้ audit เดิมให้ containment เท่า baseline ส่วน profile ที่ต้องการ
+  สองแหล่งยังงดตัดสินทุกเคสเพราะมี stream เดียว จึงไม่ผ่าน improvement gate
+  รายงาน FP/FN, abstentions, coverage, cases ที่เปลี่ยน และ provenance แยก
+  baseline/holdout; ผลนี้ยังไม่อนุมัติ enforcement
+- [x] **ระยะ 9 — Qwen จริงแบบฝ่ายเดียวและสามบทบาท**
+  เพิ่ม `--model`/`--model-sha256` ใน evaluator และ `qwen-court-jury.py`
+  แต่ละฝ่ายเรียก pinned process-namespace worker แยก context ไม่เห็นคำตอบกัน
+  เก็บ prompt/output/error/citations พร้อม provenance 114 invocations;
+  เป็นโมเดลเดียวหลายบทบาทและยังมีหลักฐาน stream เดียว ไม่ปลอมเป็นหลายแหล่ง
+  ผล majority: baseline TP 20 / FP 6, holdout TP 7 / FP 5 — เลือก containment
+  ทุกเคส จึงยังไม่พิสูจน์ประโยชน์ในการแยกแยะ รายละเอียดและข้อจำกัดอยู่ใน
+  [รายงาน Qwen](security-court-qwen-evaluation-2026-11-05.md)
+- [x] **ระยะ 10 — concern mode: facts โค้ดคำนวณ + กฎเป็นผู้ตัดสิน**
+  เขียน `qwen-court-jury.py` ใหม่เป็น schema `{"concern", "cited_event_ids",
+  "missing_evidence"}` (ไม่มี verdict/โหวต) และ `rule_decision()` ให้กฎ
+  `deny-burst-with-boundary-or-sensitive-access` ตัดสิน containment เสมอ
+  (โหวตเดียวจาก `supervisor-rule`, `min_sources:1/quorum:1`); facts
+  (จำนวนนับ/ช่วงเวลา 60 วินาที/actor-session/hidden-from-context) คำนวณด้วยโค้ด
+  ส่งให้โมเดลโดยตรงและบังคับ grounding: ห้ามตัวเลขในข้อความ
+  (Thai digits รวม), อ้าง event เฉพาะที่มีจริง (≤32 ตัว), ห้ามคำสั่ง/code fence
+  และห้ามลอกคำ placeholder ของตัวอย่าง, retry บอกเฉพาะ schema พร้อมย้ำ
+  คงเนื้อหาเดิม; `eval-qwen-concerns.py` รันชุด `concern-dev` (8 เคส
+  ใช้ปรับ prompt) และ `concern-holdout` (9 เคส วัดครั้งเดียว) ตรวจ dev∩holdout
+  ซ้ำกันจะไม่ผ่าน, แยก attempt kinds (schema / grounded_digits /
+  grounded_citation / grounded_command / timeout / unavailable) และเกณฑ์ผ่าน
+  `no_fabricated_facts`, `no_false_positives_beyond_baseline`,
+  `no_lost_baseline_attacks`, `containment_matches_baseline`,
+  `all_calls_resolved`; ผล Qwen2.5-Coder-1.5B (GGUF pin ที่รู้จัก):
+  **dev ผ่านทุกเกณฑ์** (9 calls / 8 cases, ลอก placeholder ถูกจับแล้ว
+  แก้ด้วย anti-echo validation + prompt ย้ำคงเขียนของตัวเอง), **holdout ไม่ผ่าน
+  2 เกณฑ์** (1 attempt มีตัวเลขในข้อความ = grounded_digits, และ 2 เคสไม่ได้
+  concern ที่ผ่านหลัง retry เนื่องทิ้งคำนำหน้า `Concern:`; ส่วน
+  `containment_matches_baseline` ผ่านครบ 9 เคส — กฎไม่เสียการตัดสินเพียงชั้นเดียว)
+  ขั้นถัดไป: ปรับ prompt ต่อบน dev เท่านั้น เช่น ย้ำรูปแบบคำนำหน้ากับชื่อ actor
+  แล้ววัดใหม่บน holdout ที่แตกเคสใหม่ (ห้ามถอดไปปรับจากเคสเดิม)
+
 
 ## การเปลี่ยนเป็น court-law-v2
 
@@ -163,9 +208,12 @@ review deadline, policy cap/kill switch, duplicate, budget, input ไม่ถ�
 และ CLI ที่ต้องไม่เปลี่ยน controller state/audit หรือเปิด apply mode
 เทสต์ใช้ controller/adapter จำลอง แต่ตรวจ audit ผ่าน Rust CLI จริง
 
-ขั้นถัดไปคือวัดผลเทียบ baseline บน corpus ที่มี labels อิสระ รวม false
-positives/misses ก่อนพิจารณา enforcement จริง ซึ่งยังต้องตรวจ process/session
-ณ เวลาลงมือและทำ transaction/recovery ของการเปลี่ยน runtime เพิ่มเติม
+วัด paired baseline/holdout แล้วใน [รายงานระยะ 8](security-court-evaluation-2026-11-05.md)
+ยังไม่พิสูจน์การลด false containment โดยไม่เพิ่ม misses และ Qwen จริงรอบนี้
+ยังแต่งข้อเท็จจริง/โหวตขัดเหตุผลได้แม้ schema ผ่าน ขั้นถัดไปต้องตรวจ grounding
+และความสอดคล้องของ output รวมทั้งเพิ่มบริบทที่ตรวจสอบได้แล้ววัดใหม่
+ก่อนพิจารณา enforcement จริง
+ซึ่งยังต้องตรวจ process/session ณ เวลาลงมือและทำ transaction/recovery เพิ่มเติม
 
 ## เกณฑ์พิสูจน์ก่อนขยับแต่ละระยะ
 
