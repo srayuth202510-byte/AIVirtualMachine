@@ -1,5 +1,9 @@
 # Real Qwen role-jury evaluation — 5 November 2026
 
+ผลติดตาม concern mode วันที่ 6 พฤศจิกายน:
+[ปรับ prompt/retry บน dev และตรึงก่อนวัด holdout ใหม่](security-concerns-evaluation-2026-11-06.md)
+แยกผล schema/grounding gate ออกจากข้อผิดพลาดเชิงความหมายที่ gate เดิมยังตรวจไม่ได้
+
 รอบนี้เรียก Qwen จริงแยก context ต่อบทบาท ต่างจาก
 [การทดลอง deterministic เดิม](security-court-evaluation-2026-11-05.md)
 ไม่มีคำตอบจากกฎมาแทนคำตอบของโมเดลที่ผิดรูปแบบหรือรันไม่สำเร็จ

@@ -74,8 +74,10 @@ def classify_attempt(attempt):
     if attempt["status"] in {"timeout", "unavailable"}:
         return attempt["status"]
     error = attempt.get("validation_error") or ""
+    # schema อาจเป็น error แรก แต่ห้ามบดบัง grounding violation ที่มาทีหลัง
+    codes = {part.strip().split(":", 1)[0] for part in error.split("; ")}
     for prefix, kind in GROUNDING_PREFIXES.items():
-        if error.startswith(prefix):
+        if prefix in codes:
             return kind
     return "schema"
 
@@ -231,7 +233,9 @@ def main(argv=None):
             parser.error("real runs need --model and --model-sha256 (or use --stub for harness checks)")
         subprocess.run(["cargo", "build", "-q", "--release", "--locked", "-p", "aivm-model-worker",
                         "--features", "llama"], cwd=PROJECT, check=True, timeout=600)
-        subprocess.run(["cargo", "build", "-q", "-p", "aivm-cli"], cwd=PROJECT, check=True, timeout=600)
+        # ใช้ release binary ที่ build จาก source ปัจจุบันจริง ไม่คัดลอก release เก่าหลัง build debug
+        subprocess.run(["cargo", "build", "-q", "--release", "--locked", "-p", "aivm-cli"],
+                       cwd=PROJECT, check=True, timeout=600)
         model = args.model.resolve(strict=True)
         if jury.file_hash(model) != args.model_sha256:
             raise ValueError("model SHA256 does not match the approved pin")

@@ -7,11 +7,13 @@ validate_concern บังคับ: ขึ้นต้น "Concern:", ไม่
 """
 import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 module = importlib.util.spec_from_file_location("detection", Path(__file__).with_name("eval-detection.py"))
 detection = importlib.util.module_from_spec(module)
@@ -102,6 +104,15 @@ class AttemptClassificationTests(unittest.TestCase):
         self.assertEqual(classify({"status": "rejected", "validation_error": "QC-COMMAND: exec"}),
                          "grounded_command")
 
+    def test_schema_error_cannot_hide_a_grounding_violation(self):
+        # concern ที่ขาด prefix และแต่งตัวเลขต้องทำ grounding gate ตกด้วย
+        attempt = {"status": "invalid_response",
+                   "validation_error": "QC-SCHEMA: missing prefix; QC-DIGITS: invented count"}
+        self.assertEqual(concerns.classify_attempt(attempt), "grounded_digits")
+        rows = [ScoreProfileTests.row("mixed-error", "benign", False, False)]
+        score = concerns.score_profile(rows, [("mixed-error", concerns.classify_attempt(attempt))], None)
+        self.assertFalse(score["no_fabricated_facts"])
+
 
 class SplitIntegrityTests(unittest.TestCase):
     """ชุด dev/holdout ต้องมี label+response รู้จริง และไม่ซ้ำกันเด็ดขาด."""
@@ -140,6 +151,21 @@ class SplitIntegrityTests(unittest.TestCase):
                 {"id": "case-1", "label": "benign", "response": "none"}]}) as path:
             with self.assertRaises(ValueError):
                 concerns.load_split(str(path))
+
+    def test_fresh_holdout_has_no_reused_normalized_inputs(self):
+        # เปลี่ยนแค่ชื่อเคสไม่ทำให้เป็น holdout ใหม่: เทียบข้อมูลที่โมเดลเห็นจริงด้วย
+        path = detection.PROJECT / "examples/security-concerns/concern-holdout-2026-11-06.json"
+        fresh = concerns.load_split(str(path))
+        previous = [case for split in ("dev", "holdout") for case in concerns.load_split(split)["cases"]]
+        prior_inputs = {jury.rule_decision(detection.records(case))[2]["input_sha256"] for case in previous}
+        seen = set()
+        for case in fresh["cases"]:
+            with self.subTest(case=case["id"]):
+                concerns.disjoint_split(str(path), {case["id"]})
+                rule = jury.rule_decision(detection.records(case))[2]
+                self.assertNotIn(rule["input_sha256"], prior_inputs | seen)
+                self.assertEqual(rule["planned_containment"], case["response"] == "replace")
+                seen.add(rule["input_sha256"])
 
 
 class ScoreProfileTests(unittest.TestCase):
@@ -215,6 +241,37 @@ class StubHarnessTests(unittest.TestCase):
             self.assertTrue(saved["provenance"]["engine_inventory"]["stub"])
             self.assertTrue(saved["qwen"]["query_variants_selected"])
             self.assertTrue(all(data["pass"] for data in saved["profiles"].values()))
+
+    def test_real_run_snapshots_the_cli_built_from_current_source(self):
+        # จำลอง release เก่าค้างไว้: build debug แล้ว copy release จะถูกจับทันที
+        with tempfile.TemporaryDirectory(prefix="aivm-concern-build-") as temporary:
+            root = Path(temporary)
+            release = root / "target/release"
+            release.mkdir(parents=True)
+            (release / "aivm").write_bytes(b"stale-cli")
+            model = root / "model.gguf"
+            model.write_bytes(b"approved-model")
+
+            def build(command, **kwargs):
+                profile = "release" if "--release" in command else "debug"
+                name = "aivm" if "aivm-cli" in command else "aivm-model-worker"
+                path = root / "target" / profile / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"current-cli" if name == "aivm" else b"current-worker")
+
+            def engine(binary, worker, *args, **kwargs):
+                self.assertEqual(binary.read_bytes(), b"current-cli")
+                self.assertEqual(worker.read_bytes(), b"current-worker")
+                return concerns.StubJury()
+
+            with patch.object(concerns, "PROJECT", root), \
+                    patch.object(concerns.subprocess, "run", side_effect=build), \
+                    patch.object(concerns.subprocess, "check_output", return_value="test-commit"), \
+                    patch.object(concerns.jury, "QwenJury", side_effect=engine), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(concerns.main([
+                    "--model", str(model), "--model-sha256", jury.file_hash(model),
+                    "--output", str(root / "results/report.json")]), 0)
 
     def test_main_requires_consistent_model_args(self):
         with self.assertRaises(SystemExit):

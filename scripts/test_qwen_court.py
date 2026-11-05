@@ -253,12 +253,35 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(len(profile["roles"][0]["attempts"]), 2)
         self.assertEqual(profile["roles"][0]["status"], "invalid_response")
         self.assertIn("Validation error:", self.prompts[1])
-        self.assertIn("shape only", self.prompts[1])
         self.assertIn("your previous answer", self.prompts[1])
+        self.assertIn('{"grant":"all"}', self.prompts[1])
         # feedback ห้ามเปิดเผยว่าความกังวลถูก/ผิด
         self.assertNotIn("expected label", self.prompts[1])
         self.assertNotIn("guilty", self.prompts[1])
         self.assertNotIn("benign", self.prompts[1])
+
+    def test_prefix_retry_keeps_raw_answer_and_never_repairs_it_in_code(self):
+        # ส่งคำตอบจริงกลับให้โมเดลแก้; validator ยังปฏิเสธคำนำหน้าที่หายทุกครั้ง
+        raw = concern_payload("operator intent is not visible", refs=[0])
+        engine = self.engine([raw, raw])
+        profile = self.review(engine)["qwen_concern:grounded"]
+        self.assertIn(raw, self.prompts[1])
+        self.assertIsNone(profile["roles"][0]["concern"])
+        self.assertEqual(profile["evaluation_errors"], 1)
+
+    def test_numeric_actor_reference_is_rejected_until_the_model_rephrases_it(self):
+        # เลข actor ใน prose ต้องถูกปฏิเสธ แต่เลข event ใน citations ยังใช้ได้
+        raw = concern_payload("Concern: actor '1' lacks context", refs=[0])
+        corrected = concern_payload("Concern: the observed actor lacks context", refs=[0])
+        engine = self.engine([raw, corrected])
+        profile = self.review(engine)["qwen_concern:grounded"]
+        role = profile["roles"][0]
+        self.assertEqual((engine.calls, engine.valid_calls), (2, 1))
+        self.assertIn("QC-DIGITS", role["attempts"][0]["validation_error"])
+        self.assertIn(raw, self.prompts[1])
+        self.assertEqual(role["concern"]["cited_event_ids"], ["0"])
+        self.assertEqual(role["concern"]["concern"], "Concern: the observed actor lacks context")
+        self.assertTrue(profile["planned_containment"])
 
     def test_grounding_digits_retry_once_then_pass_without_label_feedback(self):
         engine = self.engine([concern_payload("Concern: 20 denied in the same window"),

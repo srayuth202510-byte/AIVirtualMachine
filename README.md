@@ -171,6 +171,7 @@ crates/
 - [`docs/security-court-roadmap.md`](./docs/security-court-roadmap.md) — ศาลจำลองแบบ deterministic, ท่อแปล directive และตัวรับ dry-run ใน external supervisor พร้อมตรวจ audit/freshness; ยังไม่เปิด enforcement จริง
 - [`docs/security-court-evaluation-2026-11-05.md`](./docs/security-court-evaluation-2026-11-05.md) — ผลเทียบ Court กับ baseline/holdout แบบจับคู่: ยังไม่ผ่านเกณฑ์ลด false containment โดยไม่เพิ่ม misses
 - [`docs/security-court-qwen-evaluation-2026-11-05.md`](./docs/security-court-qwen-evaluation-2026-11-05.md) — ทดสอบ Qwen จริงแยกสามบทบาท พร้อมคำตอบดิบ เสียงข้างมาก และคะแนนแยกจาก deterministic controls
+- [`docs/security-concerns-evaluation-2026-11-06.md`](./docs/security-concerns-evaluation-2026-11-06.md) — ปรับ concern prompt/retry บน dev และตรึงก่อนวัด holdout ใหม่; ยังไม่ผ่านเกณฑ์และคง shadow/dry-run
 
 - [`docs/audit-reviewer.md`](./docs/audit-reviewer.md) — วิเคราะห์ audit แบบอ่านอย่างเดียว ด้วยกฎและคำแนะนำจาก Qwen
 

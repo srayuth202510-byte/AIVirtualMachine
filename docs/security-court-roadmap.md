@@ -1,11 +1,18 @@
 # แผนงาน: ศาลจำลองสำหรับการตอบสนองด้านความปลอดภัย
 
 สถานะ: **ระยะ 1–7 เสร็จ (ศาลจำลอง + ท่อแปล directive + supervisor dry-run)**
-— อัปเดต 2026-11-05; ตัวรับใน external Python supervisor ยังไม่เปลี่ยน runtime
+— อัปเดต 2026-11-06; ตัวรับใน external Python supervisor ยังไม่เปลี่ยน runtime
 และยังไม่เปิด enforcement ใน Rust supervisor/gateway
 
 การวัดระยะ 8 ทำแล้ว: [paired baseline/holdout evaluation](security-court-evaluation-2026-11-05.md)
 ยังไม่ผ่านเกณฑ์ลด false containment โดยไม่เพิ่ม misses จึงคง shadow/dry-run
+
+ติดตามระยะ 10 วันที่ 2026-11-06: [ปรับ concern prompt/retry และวัด holdout ใหม่](security-concerns-evaluation-2026-11-06.md)
+dev ของฉบับสุดท้ายได้ grounded/missing-context ผ่าน 7/8 เคส และ policy 6/8 เคส
+ส่วน holdout ใหม่ของ grounded ผ่านรูปแบบ 9/12 เคสและ containment ตรง baseline 12/12
+จึงยังไม่ผ่านเกณฑ์ครบชุด อีกทั้งคำตอบที่ผ่าน schema ยังกล่าวถึง actor ที่สอง
+ในเคสที่ facts ยืนยันว่ามี actor เดียว ระยะ 10 มี harness แล้วแต่คุณภาพ
+semantic grounding ยังไม่ผ่าน จึงคง shadow/dry-run
 
 ระยะ 9 เรียก Qwen จริงครบ 114 รอบแล้ว:
 [สามบทบาทและเสียงข้างมาก](security-court-qwen-evaluation-2026-11-05.md)
