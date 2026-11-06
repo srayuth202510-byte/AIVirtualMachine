@@ -19,6 +19,11 @@ COUNT_FACT_PATHS = {
         "denied_one_actor_hidden_from_context")},
 }
 CONTEXT_FACTS = ("operator_intent", "process_state", "task_contract")
+CONTEXT_VALUES = {
+    "operator_intent": ("maintenance", "diagnostic", "user_task"),
+    "process_state": ("running", "stopped"),
+    "task_contract": ("read_only", "build_and_test", "bounded_diagnostics"),
+}
 FACT_IDS = (*COUNT_FACT_PATHS, "actors_total", "actor_ids_visible", *CONTEXT_FACTS)
 MAX_UINT = 999999999
 
@@ -29,6 +34,35 @@ def fail(code, message):
 
 def uint(value):
     return type(value) is int and 0 <= value <= MAX_UINT
+
+
+def context_values(trusted_context):
+    """รับเฉพาะบริบทจาก operator/fixture ที่ caller ส่งแยกจาก audit และ model output."""
+    if trusted_context is None:
+        return {}
+    if not isinstance(trusted_context, dict) or set(trusted_context) - set(CONTEXT_FACTS):
+        fail("QC-SOURCE", "unknown trusted context fields")
+    for key, value in trusted_context.items():
+        if not isinstance(value, str) or value not in CONTEXT_VALUES[key]:
+            fail("QC-SOURCE", "invalid trusted context value for " + key)
+    return dict(trusted_context)
+
+
+def fact_availability(facts):
+    """คำนวณ presence จาก field/หลักฐานที่มี ไม่ใช้ truthiness ของค่าหรือชื่อ field."""
+    for section, field in COUNT_FACT_PATHS.values():
+        facts[section][field]
+    facts["counts"]["actors_total"]
+    facts["actor_ids_visible"]
+    if not isinstance(facts["context_values"], dict):
+        fail("QC-SOURCE", "context_values must be a typed mapping")
+    values = context_values(facts["context_values"])
+    flags = facts["context_availability"]
+    if (not isinstance(flags, dict) or set(flags) != set(CONTEXT_FACTS)
+            or any(type(flags[key]) is not bool or flags[key] != (key in values) for key in CONTEXT_FACTS)):
+        fail("QC-SOURCE", "context values and availability disagree")
+    missing = sorted(key for key in CONTEXT_FACTS if not flags[key])
+    return {"present_fact_ids": sorted(set(FACT_IDS) - set(missing)), "missing_fact_ids": missing}
 
 
 def validate(raw, role, origin, view):
@@ -61,6 +95,8 @@ def validate(raw, role, origin, view):
                 or not isinstance(visible, list) or any(not uint(ref) for ref in visible)
                 or any(type(context[key]) is not bool for key in CONTEXT_FACTS)):
             raise ValueError("invalid computed fact types")
+        if facts["fact_availability"] != fact_availability(facts):
+            raise ValueError("fact availability inventory mismatch")
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("QC-SOURCE: incomplete code-computed facts") from error
     if any(ref not in visible for ref in refs):

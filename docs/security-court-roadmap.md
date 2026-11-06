@@ -22,6 +22,13 @@ dev ผ่าน 10/10 เคส; holdout ใหม่รับ advisory ได�
 สร้างข้อความสรุป จึงไม่อ้างว่าแก้ semantic grounding ของ free prose ได้ทั่วไป
 และยังไม่อนุมัติ Court enforcement
 
+ผลล่าสุดของ [availability inventory แบบคู่เปรียบเทียบ](security-concern-availability-evaluation-2026-11-06.md):
+โค้ดระบุ present/missing IDs และ tag source ให้โมเดลถ่ายทอดอย่างชัดเจน
+dev 4 คู่/8 views และ holdout ใหม่ 6 คู่/12 views ผ่านครบตั้งแต่ attempt แรก
+รวม gate ความครบถ้วนและ first-attempt ไม่มี retry หรือ rejects ในฉบับสุดท้าย
+holdout ไม่ได้เสนอ actor/count claims เพิ่ม จึงยืนยันเฉพาะงานถ่ายทอด availability
+และไม่อ้างว่าคุณภาพโมเดลผ่านทั่วไปหรือช่วยลด false containment; คง shadow/dry-run
+
 ระยะ 9 เรียก Qwen จริงครบ 114 รอบแล้ว:
 [สามบทบาทและเสียงข้างมาก](security-court-qwen-evaluation-2026-11-05.md)
 เสนอ containment ทุก 38 เคส รวม benign 11 เคส จึงยังไม่ผ่าน improvement gate

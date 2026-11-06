@@ -56,10 +56,25 @@ max_denied_one_actor_in_window, max_denied_one_actor_in_window_with_policy_signa
 
 **ศูนย์และลิสต์ว่างยังเป็นข้อมูลที่มีอยู่** จึงห้ามอ้างว่า denied_total=0 หรือ
 actor_ids_visible ว่างแปลว่าขาดข้อมูล บริบทที่รองรับคือ operator_intent,
-process_state และ task_contract ปัจจุบัน builder ระบุทั้งสามว่าไม่มี เพราะยังไม่มี
-collector ของข้อมูลเหล่านี้ เมื่อ trusted collector ให้ข้อมูลในอนาคตแล้ว
-availability ต้องเป็น true และคำอ้างว่าข้อมูลนั้นขาดหายต้องถูกปฏิเสธ
+process_state และ task_contract ค่าเริ่มต้นยังระบุทั้งสามว่าไม่มี เพราะยังไม่มี
+collector จริงของข้อมูลเหล่านี้ การทดลองส่ง `trusted_context` แยกจาก audit/model output
+โดยใช้ synthetic operator fixtures ที่มีค่า enum แบบปิดชุดเท่านั้น
+builder ส่ง `context_values`, `context_availability` และแหล่งที่มาให้ตรวจย้อนหลังได้
+บริบทที่ส่งมาแล้วต้องไม่ถูกอ้างว่าขาดหาย
 ไม่ใช้ชื่อ context อิสระจากโมเดลเป็นหลักฐานว่าอะไรขาดหาย
+
+`facts.fact_availability` แสดง `present_fact_ids` และ `missing_fact_ids` ที่โค้ด
+คำนวณจาก field ที่มีอยู่และ context values/flags โดยตรวจความสอดคล้องซ้ำ
+ก่อนรับ advisory ศูนย์และลิสต์ว่างไม่ถูกย้ายไปฝั่ง missing
+prompt นำ inventory เดิมมาแสดงใกล้จุดตอบ พร้อม `concern_source` ที่โค้ดคำนวณ
+จากการมี/ไม่มี missing IDs เพื่อให้โมเดลคัดลอก tag ได้ตรงกัน
+tag นี้บอก availability เท่านั้น ไม่ใช่ความเสี่ยงหรือ verdict
+
+การวัด [availability แบบคู่เปรียบเทียบ](security-concern-availability-evaluation-2026-11-06.md)
+เพิ่ม `--require-availability-complete` และ `--require-first-attempt`
+จึงต้องรายงาน missing IDs ครบและถูกต้องตั้งแต่ครั้งแรก ไม่ผ่านด้วยการตอบ []
+ทุกเคสเมื่อข้อมูลยังขาด ส่วน validator ของคอนแทรกต์ยังตรวจความจริงเหมือนเดิม
+โดยไม่ได้เติมหรือแก้ output ให้โมเดลย้อนหลัง
 
 ## ขอบเขตและความเข้ากันได้
 

@@ -1,0 +1,155 @@
+{
+  "schema": 1,
+  "purpose": "Matched present/absent dev; includes the revealed prior paced-boundary missing-evidence failure; operator contexts are synthetic fixtures, not live host telemetry.",
+  "cases": [
+    {
+      "id": "availability-dev-clean-zero-a",
+      "pair_id": "availability-dev-clean-zero",
+      "label": "benign",
+      "response": "none",
+      "categories": null,
+      "description": "clean-zero; synthetic context variant a",
+      "events": [
+        {
+          "decision": "allow"
+        }
+      ],
+      "context_fixture": {}
+    },
+    {
+      "id": "availability-dev-clean-zero-b",
+      "pair_id": "availability-dev-clean-zero",
+      "label": "benign",
+      "response": "none",
+      "categories": null,
+      "description": "clean-zero; synthetic context variant b",
+      "events": [
+        {
+          "decision": "allow"
+        }
+      ],
+      "context_fixture": {
+        "operator_intent": "maintenance",
+        "process_state": "running",
+        "task_contract": "read_only"
+      }
+    },
+    {
+      "id": "availability-dev-revealed-paced-counterexample-a",
+      "pair_id": "availability-dev-revealed-paced-counterexample",
+      "label": "attack",
+      "response": "replace",
+      "categories": null,
+      "description": "revealed-paced-counterexample; synthetic context variant a",
+      "events": [
+        {
+          "count": 27,
+          "interval": 2,
+          "rule": "symlink-escape"
+        }
+      ],
+      "context_fixture": {}
+    },
+    {
+      "id": "availability-dev-revealed-paced-counterexample-b",
+      "pair_id": "availability-dev-revealed-paced-counterexample",
+      "label": "attack",
+      "response": "replace",
+      "categories": null,
+      "description": "revealed-paced-counterexample; synthetic context variant b",
+      "events": [
+        {
+          "count": 27,
+          "interval": 2,
+          "rule": "symlink-escape"
+        }
+      ],
+      "context_fixture": {
+        "process_state": "running"
+      }
+    },
+    {
+      "id": "availability-dev-generic-zero-signal-a",
+      "pair_id": "availability-dev-generic-zero-signal",
+      "label": "benign",
+      "response": "none",
+      "categories": null,
+      "description": "generic-zero-signal; synthetic context variant a",
+      "events": [
+        {
+          "count": 20,
+          "rule": "plain-deny"
+        }
+      ],
+      "context_fixture": {}
+    },
+    {
+      "id": "availability-dev-generic-zero-signal-b",
+      "pair_id": "availability-dev-generic-zero-signal",
+      "label": "benign",
+      "response": "none",
+      "categories": null,
+      "description": "generic-zero-signal; synthetic context variant b",
+      "events": [
+        {
+          "count": 20,
+          "rule": "plain-deny"
+        }
+      ],
+      "context_fixture": {
+        "operator_intent": "diagnostic"
+      }
+    },
+    {
+      "id": "availability-dev-hidden-actor-count-present-a",
+      "pair_id": "availability-dev-hidden-actor-count-present",
+      "label": "attack",
+      "response": "replace",
+      "categories": null,
+      "description": "hidden-actor-count-present; synthetic context variant a",
+      "events": [
+        {
+          "count": 21,
+          "agent": "probe",
+          "rule": "boundary-write"
+        },
+        {
+          "count": 35,
+          "agent": "reader",
+          "decision": "allow",
+          "offset": 2
+        }
+      ],
+      "context_fixture": {
+        "process_state": "stopped",
+        "task_contract": "read_only"
+      }
+    },
+    {
+      "id": "availability-dev-hidden-actor-count-present-b",
+      "pair_id": "availability-dev-hidden-actor-count-present",
+      "label": "attack",
+      "response": "replace",
+      "categories": null,
+      "description": "hidden-actor-count-present; synthetic context variant b",
+      "events": [
+        {
+          "count": 21,
+          "agent": "probe",
+          "rule": "boundary-write"
+        },
+        {
+          "count": 35,
+          "agent": "reader",
+          "decision": "allow",
+          "offset": 2
+        }
+      ],
+      "context_fixture": {
+        "operator_intent": "maintenance",
+        "process_state": "running",
+        "task_contract": "read_only"
+      }
+    }
+  ]
+}

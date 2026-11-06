@@ -58,8 +58,8 @@ class ClaimsValidationTests(unittest.TestCase):
             self.validate(payload(), incomplete)
 
     def test_context_becomes_present_when_a_trusted_collector_supplies_it(self):
-        view = copy.deepcopy(self.view)
-        view["facts"]["context_availability"]["process_state"] = True
+        view, _, _ = jury.normalized_view(detection.records({"events": [{"decision": "allow"}]}),
+                                          trusted_context={"process_state": "running"})
         with self.assertRaisesRegex(ValueError, "QC-MISSING"):
             self.validate(payload(missing=["process_state"]), view)
 

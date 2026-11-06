@@ -1,5 +1,9 @@
 # Typed concern claims — 6 November 2026
 
+ผลต่อเนื่องด้านคุณภาพทุก attempt:
+[explicit availability inventory และ matched holdout ใหม่](security-concern-availability-evaluation-2026-11-06.md)
+เพิ่มเกณฑ์ความครบถ้วนและ first-attempt โดยยังเก็บผลคอนแทรกต์เดิมด้านล่างไว้ตามจริง
+
 **ตัวตรวจปฏิเสธข้ออ้างผิดจากโมเดลจริงได้แล้ว แต่ยังไม่เปิด enforcement**
 ใน holdout โมเดลยังอ้างว่าข้อมูลที่ให้มาแล้วขาดหาย จึงถูกปฏิเสธและไม่ผ่าน
 เกณฑ์คุณภาพทุก attempts การคง containment ของกฎไม่ขึ้นกับ advisory

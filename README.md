@@ -173,6 +173,7 @@ crates/
 - [`docs/security-court-qwen-evaluation-2026-11-05.md`](./docs/security-court-qwen-evaluation-2026-11-05.md) — ทดสอบ Qwen จริงแยกสามบทบาท พร้อมคำตอบดิบ เสียงข้างมาก และคะแนนแยกจาก deterministic controls
 - [`docs/security-concerns-evaluation-2026-11-06.md`](./docs/security-concerns-evaluation-2026-11-06.md) — ปรับ concern prompt/retry บน dev และตรึงก่อนวัด holdout ใหม่; ยังไม่ผ่านเกณฑ์และคง shadow/dry-run
 - [`docs/concern-claims.md`](./docs/concern-claims.md) — คอนแทรกต์ข้ออ้าง actor/count/missing-evidence ที่ตรวจด้วย facts และ output grammar พร้อม [ผล dev/holdout ใหม่](./docs/security-concern-claims-evaluation-2026-11-06.md)
+- [`docs/security-concern-availability-evaluation-2026-11-06.md`](./docs/security-concern-availability-evaluation-2026-11-06.md) — inventory ที่โค้ดระบุ present/missing และ tag source; dev 8/8 กับ holdout 12/12 ถูกตั้งแต่แรกในงานถ่ายทอด availability โดยยังคง shadow/dry-run
 
 - [`docs/audit-reviewer.md`](./docs/audit-reviewer.md) — วิเคราะห์ audit แบบอ่านอย่างเดียว ด้วยกฎและคำแนะนำจาก Qwen
 

@@ -53,6 +53,8 @@ def load_split(name_or_path):
             raise ValueError("concern split needs a known baseline response: " + case["id"])
         if "events" not in case:
             raise ValueError("concern split case lacks events: " + case["id"])
+        if "context_fixture" in case:
+            jury.claims_contract.context_values(case["context_fixture"])
         cases.append(case)
     return {"cases": cases, "sha256": sup.digest(raw)}
 
@@ -88,16 +90,24 @@ def measure_profile(cases, engine):
     paired, attempts, case_records = [], {}, []
     for case_index, case in enumerate(cases):
         rows = detection.records(case)
-        profiles = engine.review(rows)
+        profiles = (engine.review(rows, trusted_context=case["context_fixture"])
+                    if "context_fixture" in case else engine.review(rows))
         for profile_key, profile in profiles.items():
             baseline_containment = case["response"] == "replace"
             planned = bool(profile["planned_containment"])
             accepted = [entry["concern"] for entry in profile["roles"] if entry["concern"] is not None]
+            expected_missing = profile["facts"]["fact_availability"]["missing_fact_ids"]
             coverage = {
                 "accepted_advisories": len(accepted),
                 "typed_verified_advisories": sum(item.get("contract") == jury.claims_contract.CONTRACT for item in accepted),
                 "verified_claims": sum(len(item.get("claims", [])) for item in accepted),
                 "empty_advisories": sum(not item.get("claims") and not item["missing_evidence"] for item in accepted),
+                "expected_missing_evidence": list(expected_missing),
+                "missing_evidence_complete": bool(accepted) and all(
+                    set(item["missing_evidence"]) == set(expected_missing) for item in accepted),
+                "first_attempt_validated": bool(profile["roles"]) and all(
+                    entry["attempts"] and entry["attempts"][0]["status"] == "validated_structure"
+                    for entry in profile["roles"]),
             }
             paired.append({"case_index": case_index, "profile": profile_key, "id": case["id"],
                            "label": case["label"], "baseline_containment": baseline_containment,
@@ -122,7 +132,8 @@ def score_profile(paired_rows, attempts, dataset):
     paired = [{"id": row["id"], "label": row["label"],
                "baseline_containment": row["baseline_containment"],
                "planned_containment": row["planned_containment"], "abstained": False,
-               "evaluation_errors": row.get("evaluation_errors", 0)}
+               "evaluation_errors": row.get("evaluation_errors", 0),
+               "missing_evidence_complete": row.get("missing_evidence_complete", False)}
               for row in paired_rows]
     pairs = [(row["label"] == "attack", row["planned_containment"]) for row in paired]
     base = [(row["label"] == "attack", row["baseline_containment"]) for row in paired]
@@ -138,6 +149,12 @@ def score_profile(paired_rows, attempts, dataset):
         "accepted_advisories", "typed_verified_advisories", "verified_claims", "empty_advisories")}
     return {"paired_rows": paired, "attempt_kinds": kinds, "cases": len(paired),
             **coverage,
+            "availability_exact_cases": sum(row.get("missing_evidence_complete", False) for row in paired_rows),
+            "missing_evidence_complete": bool(paired_rows) and all(
+                row.get("missing_evidence_complete", False) for row in paired_rows),
+            "first_attempt_valid_cases": sum(row.get("first_attempt_validated", False) for row in paired_rows),
+            "all_first_attempts_valid": bool(paired_rows) and all(
+                row.get("first_attempt_validated", False) for row in paired_rows),
             "all_accepted_claims_verified": (coverage["accepted_advisories"] > 0
                                              and coverage["accepted_advisories"] == coverage["typed_verified_advisories"]),
             "model_risk_metrics": detection.confusion(pairs), "baseline_containment_risk_metrics": detection.confusion(base),
@@ -153,7 +170,7 @@ def score_profile(paired_rows, attempts, dataset):
                                    and not any(row["evaluation_errors"] for row in paired))}
 
 
-def measure_split(selection, engine):
+def measure_split(selection, engine, require_availability_complete=False, require_first_attempt=False):
     """รันหนึ่งชุดครบทุก variant/role ได้ report รวมต่อชุด."""
     dataset = load_split(selection)
     disjoint_split(selection, {case["id"] for case in dataset["cases"]})
@@ -172,8 +189,14 @@ def measure_split(selection, engine):
                                                        "containment_matches_baseline",
                                                        "all_accepted_claims_verified",
                                                        "all_calls_resolved"))
+        if require_availability_complete:
+            report["pass"] = report["pass"] and report["missing_evidence_complete"]
+        if require_first_attempt:
+            report["pass"] = report["pass"] and report["all_first_attempts_valid"]
         reports[key] = report
     return {"split": selection, "corpus_sha256": dataset["sha256"], "cases": len(dataset["cases"]),
+            "availability_complete_required": require_availability_complete,
+            "first_attempt_required": require_first_attempt,
             "profiles": reports,
             "provenance": {"evaluator_sha256": detection.file_hash(Path(__file__)),
                            "corpus_sha256": dataset["sha256"],
@@ -189,8 +212,8 @@ class StubJury:
         self.variants = ["stub"]
         self.provenance = {"stub": True, "note": "harness check only; not a model measurement"}
 
-    def review(self, rows):
-        view, events, rule = jury.rule_decision(rows)
+    def review(self, rows, trusted_context=None):
+        view, events, rule = jury.rule_decision(rows, trusted_context=trusted_context)
         advisory = jury.validate_claims_concern(
             json.dumps({"concern": "Concern: none", "claims": [], "cited_event_ids": [], "missing_evidence": []}),
             "concern-advisor", "stub:harness", view)
@@ -221,6 +244,10 @@ def main(argv=None):
     parser.add_argument("--model-sha256", help="Approved model pin with --model")
     parser.add_argument("--stub", action="store_true", help="Harness check without any model call")
     parser.add_argument("--require-pass", action="store_true", help="Exit 1 unless every profile passes")
+    parser.add_argument("--require-availability-complete", action="store_true",
+                        help="Also require every advisory to enumerate all and only actually missing facts")
+    parser.add_argument("--require-first-attempt", action="store_true",
+                        help="Also require each case to validate on its first model invocation")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     if bool(args.model) != bool(args.model_sha256):
@@ -240,7 +267,8 @@ def main(argv=None):
         if args.variants:
             parser.error("--stub ignores --variants")
         engine = StubJury()
-        report = measure_split(args.corpus, engine)
+        report = measure_split(args.corpus, engine, require_availability_complete=args.require_availability_complete,
+                               require_first_attempt=args.require_first_attempt)
         engine_provenance = engine.finish()
     else:
         if not args.model:
@@ -261,7 +289,9 @@ def main(argv=None):
         shutil.copy2(PROJECT / "target/release/aivm-model-worker", worker)
         binary_sha256 = detection.file_hash(binary)
         engine = jury.QwenJury(binary, worker, model, args.model_sha256, artifacts, variants=variants)
-        report = measure_split(str(args.corpus_path) if args.corpus == "path" else args.corpus, engine)
+        report = measure_split(str(args.corpus_path) if args.corpus == "path" else args.corpus, engine,
+                               require_availability_complete=args.require_availability_complete,
+                               require_first_attempt=args.require_first_attempt)
         engine_provenance = engine.finish()
         if detection.file_hash(binary) != binary_sha256:
             raise ValueError("evaluation binary changed")
@@ -283,6 +313,10 @@ def main(argv=None):
     sup.private_write(args.output, report)
     gates = ("no_fabricated_facts", "no_false_positives_beyond_baseline", "no_lost_baseline_attacks",
              "containment_matches_baseline", "all_accepted_claims_verified", "all_calls_resolved")
+    if args.require_availability_complete:
+        gates += ("missing_evidence_complete",)
+    if args.require_first_attempt:
+        gates += ("all_first_attempts_valid",)
     summary = {profile: {**{gate: data[gate] for gate in gates}, "pass": data["pass"]}
                for profile, data in report["profiles"].items()}
     print(json.dumps({"report": str(args.output), "model_calls": report["model_calls"], "gates": summary},
