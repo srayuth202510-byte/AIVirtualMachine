@@ -14,6 +14,14 @@ dev ของฉบับสุดท้ายได้ grounded/missing-context
 ในเคสที่ facts ยืนยันว่ามี actor เดียว ระยะ 10 มี harness แล้วแต่คุณภาพ
 semantic grounding ยังไม่ผ่าน จึงคง shadow/dry-run
 
+คอนแทรกต์ใหม่ [typed claims + grammar](security-concern-claims-evaluation-2026-11-06.md):
+dev ผ่าน 10/10 เคส; holdout ใหม่รับ advisory ได้ 11/12 เคส รวมข้ออ้างที่ตรวจแล้ว
+30 ข้อ และ containment ตรง baseline 12/12 ตัวตรวจปฏิเสธ false missing-evidence
+ทั้งคำตอบแรกและ retry ในอีกหนึ่งเคส ทุก output มี prefix ถูกต้องจาก grammar
+แต่ gate คุณภาพทุก attempts ยังไม่ผ่าน คอนแทรกต์นี้ปิดชุดข้ออ้างและให้โค้ด
+สร้างข้อความสรุป จึงไม่อ้างว่าแก้ semantic grounding ของ free prose ได้ทั่วไป
+และยังไม่อนุมัติ Court enforcement
+
 ระยะ 9 เรียก Qwen จริงครบ 114 รอบแล้ว:
 [สามบทบาทและเสียงข้างมาก](security-court-qwen-evaluation-2026-11-05.md)
 เสนอ containment ทุก 38 เคส รวม benign 11 เคส จึงยังไม่ผ่าน improvement gate

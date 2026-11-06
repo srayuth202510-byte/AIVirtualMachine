@@ -267,8 +267,9 @@ class StubHarnessTests(unittest.TestCase):
             with patch.object(concerns, "PROJECT", root), \
                     patch.object(concerns.subprocess, "run", side_effect=build), \
                     patch.object(concerns.subprocess, "check_output", return_value="test-commit"), \
-                    patch.object(concerns.jury, "QwenJury", side_effect=engine), \
+                    patch.object(concerns.jury, "QwenJury", side_effect=engine) as mocked_engine, \
                     contextlib.redirect_stdout(io.StringIO()):
+                mocked_engine.query_variants = {"grounded": ""}
                 self.assertEqual(concerns.main([
                     "--model", str(model), "--model-sha256", jury.file_hash(model),
                     "--output", str(root / "results/report.json")]), 0)

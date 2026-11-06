@@ -1,6 +1,6 @@
 # Structured output: GBNF + Serde
 
-Caller เลือก `text`, `json` หรือ `agent_intent` ต่อ request ได้ ค่าเริ่มต้นของ
+Caller เลือก `text`, `json`, `agent_intent` หรือ `concern_claims` ต่อ request ได้ ค่าเริ่มต้นของ
 model-only inference ยังเป็น `text` ส่วน agent loop ขอ `agent_intent` โดยตรง
 และยังส่งทุก tool ผ่าน gateway, capability, policy และ audit ตามเดิม
 
@@ -23,6 +23,7 @@ JSON ที่ผ่าน schema อาจยังคำนวณผิด, �
 
 Local llama backend ต่อ grammar sampler ก่อน sampling และสร้าง grammar state ใหม่
 ต่อ inference ใช้ GBNF คงที่ `aivm-json-v1` หรือ `aivm-agent-intent-v1`
+และ `aivm-concern-claims-v1` สำหรับ [ข้ออ้างของ Concern mode](concern-claims.md)
 ไม่มี expected answers ของ corpus อยู่ใน grammar Backend อื่นที่ใช้ default trait
 method ตรวจคำตอบสุดท้ายด้วย parser/schema แต่ไม่ได้เพิ่ม constrained sampling ให้ provider
 

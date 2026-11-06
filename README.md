@@ -172,6 +172,7 @@ crates/
 - [`docs/security-court-evaluation-2026-11-05.md`](./docs/security-court-evaluation-2026-11-05.md) — ผลเทียบ Court กับ baseline/holdout แบบจับคู่: ยังไม่ผ่านเกณฑ์ลด false containment โดยไม่เพิ่ม misses
 - [`docs/security-court-qwen-evaluation-2026-11-05.md`](./docs/security-court-qwen-evaluation-2026-11-05.md) — ทดสอบ Qwen จริงแยกสามบทบาท พร้อมคำตอบดิบ เสียงข้างมาก และคะแนนแยกจาก deterministic controls
 - [`docs/security-concerns-evaluation-2026-11-06.md`](./docs/security-concerns-evaluation-2026-11-06.md) — ปรับ concern prompt/retry บน dev และตรึงก่อนวัด holdout ใหม่; ยังไม่ผ่านเกณฑ์และคง shadow/dry-run
+- [`docs/concern-claims.md`](./docs/concern-claims.md) — คอนแทรกต์ข้ออ้าง actor/count/missing-evidence ที่ตรวจด้วย facts และ output grammar พร้อม [ผล dev/holdout ใหม่](./docs/security-concern-claims-evaluation-2026-11-06.md)
 
 - [`docs/audit-reviewer.md`](./docs/audit-reviewer.md) — วิเคราะห์ audit แบบอ่านอย่างเดียว ด้วยกฎและคำแนะนำจาก Qwen
 

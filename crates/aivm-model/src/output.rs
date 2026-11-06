@@ -9,6 +9,7 @@ pub enum OutputMode {
     Text,
     Json,
     AgentIntent,
+    ConcernClaims,
 }
 
 impl std::str::FromStr for OutputMode {
@@ -18,7 +19,8 @@ impl std::str::FromStr for OutputMode {
             "text" => Ok(Self::Text),
             "json" => Ok(Self::Json),
             "agent_intent" => Ok(Self::AgentIntent),
-            _ => Err("expected text, json, or agent_intent"),
+            "concern_claims" => Ok(Self::ConcernClaims),
+            _ => Err("expected text, json, agent_intent, or concern_claims"),
         }
     }
 }
@@ -117,6 +119,7 @@ impl OutputMode {
             Self::Text => None,
             Self::Json => Some("aivm-json-v1"),
             Self::AgentIntent => Some("aivm-agent-intent-v1"),
+            Self::ConcernClaims => Some("aivm-concern-claims-v1"),
         }
     }
 
@@ -125,6 +128,7 @@ impl OutputMode {
             Self::Text => return None,
             Self::Json => "root ::= ws value ws\n",
             Self::AgentIntent => AGENT_GRAMMAR,
+            Self::ConcernClaims => return Some(crate::concern::grammar()),
         };
         Some(format!("{root}{JSON_RULES}"))
     }
@@ -137,6 +141,7 @@ impl OutputMode {
                 .map(|_| ())
                 .map_err(|_| ModelError::InvalidOutput("invalid or incomplete JSON".into())),
             Self::AgentIntent => parse_agent_intent(output).map(|_| ()),
+            Self::ConcernClaims => crate::concern::validate(output),
         }
     }
 }

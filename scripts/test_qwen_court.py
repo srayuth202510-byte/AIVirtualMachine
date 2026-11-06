@@ -183,7 +183,7 @@ class OrchestrationTests(unittest.TestCase):
                 return raw
             return {"stdout": raw, "stderr_tail": "", "returncode": 0,
                     "timed_out": False, "elapsed_ms": 1}
-        return jury.QwenJury(self.binary, self.worker, self.model, jury.file_hash(self.model),
+        return jury.LegacyQwenJury(self.binary, self.worker, self.model, jury.file_hash(self.model),
                              self.root / "run", invoke=invoke, variants=variants)
 
     def review(self, engine):

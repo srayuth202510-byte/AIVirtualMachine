@@ -1,5 +1,9 @@
 # Concern mode — 6 November 2026
 
+ผลต่อเนื่องเมื่อเปลี่ยนเป็นคอนแทรกต์ปิดชุด:
+[typed claims + grammar และการวัดชุดใหม่](security-concern-claims-evaluation-2026-11-06.md)
+ผลด้านล่างยังเป็นผลของคอนแทรกต์ข้อความเดิม ไม่ได้แก้คะแนนย้อนหลัง
+
 **ยังไม่ผ่าน semantic grounding และยังคง shadow/dry-run**: คำตอบที่ผ่าน
 schema ยังอ้างว่าจำนวนนับที่ให้มาแล้วขาดหาย และใน holdout ยังกล่าวถึง
 “second actor” ทั้งที่ facts ยืนยันว่ามี actor เดียว คะแนนอัตโนมัติด้านรูปแบบ

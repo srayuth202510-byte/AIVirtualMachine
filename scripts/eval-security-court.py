@@ -247,6 +247,7 @@ def main(argv=None):
         jury_module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(jury_module)
         sources["qwen-court-jury.py"] = detection.file_hash(Path(jury_module.__file__))
+        sources["concern-claims.py"] = detection.file_hash(Path(jury_module.__file__).with_name("concern-claims.py"))
     corpora = {"custom": args.corpus} if args.corpus else {
         "baseline": detection.CORPUS, "holdout": PROJECT / "examples/detection/holdout.json"}
     with tempfile.TemporaryDirectory(prefix="aivm-court-evaluation-") as temporary:
@@ -268,7 +269,7 @@ def main(argv=None):
         jury_provenance = jury.finish() if jury else None
     if any(detection.file_hash(Path(__file__).with_name(name)) != sha for name, sha in sources.items()):
         raise ValueError("evaluator sources changed")
-    profiles = {**PROFILES, **(jury_module.JURY_PROFILES if jury else {})}
+    profiles = {**PROFILES, **(jury.profiles if jury else {})}
     gates = {profile: all(data["profiles"][profile]["no_regression"] for data in datasets.values())
              and any(data["profiles"][profile]["false_containments_reduced"] for data in datasets.values())
              for profile in profiles}

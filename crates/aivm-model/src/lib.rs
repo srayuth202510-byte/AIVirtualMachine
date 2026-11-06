@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod artifact;
+mod concern;
 pub mod output;
 pub mod worker;
 pub use output::OutputMode;

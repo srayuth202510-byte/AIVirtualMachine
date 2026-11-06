@@ -73,6 +73,23 @@ fn real_vocabulary_grammars_reject_invalid_tokens_and_reset_per_request() {
         for text in ["{", "[1,]", "NaN", "01", "\"line\nfeed\"", "{} {}"] {
             assert!(!accepts(&model, OutputMode::Json, text), "{text}");
         }
+        // grammar คุม prefix/field/จำนวนรายการ ไม่แอบใส่ค่าข้อเท็จจริงของเคส
+        for text in [
+            r#"{"concern":"Concern: none","claims":[],"cited_event_ids":[],"missing_evidence":[]}"#,
+            r#"{"concern":"Concern: missing context","claims":[{"kind":"actor_count","value":2},{"kind":"actor_exists","actor_id":2},{"kind":"count","fact_id":"denied_total","value":20}],"cited_event_ids":[0,1,2],"missing_evidence":["operator_intent","actors_total"]}"#,
+        ] {
+            assert!(accepts(&model, OutputMode::ConcernClaims, text), "{text}");
+            OutputMode::ConcernClaims.validate(text).unwrap();
+        }
+        for text in [
+            r#"{"concern":"none","claims":[],"cited_event_ids":[],"missing_evidence":[]}"#,
+            r#"{"concern":"Concern: second actor","claims":[],"cited_event_ids":[],"missing_evidence":[]}"#,
+            r#"{"concern":"Concern: none","claims":[{"kind":"actor_count","value":true}],"cited_event_ids":[],"missing_evidence":[]}"#,
+            r#"{"concern":"Concern: none","claims":[],"cited_event_ids":[0,1,2,3],"missing_evidence":[]}"#,
+            r#"{"concern":"Concern: none","claims":[],"cited_event_ids":[],"missing_evidence":["invented"]}"#,
+        ] {
+            assert!(!accepts(&model, OutputMode::ConcernClaims, text), "{text}");
+        }
     }
     assert!(LlamaSampler::grammar(&model, "root ::= <<<", "root").is_err());
 }

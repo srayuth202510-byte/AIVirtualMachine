@@ -1,0 +1,164 @@
+{
+  "schema": 1,
+  "purpose": "Typed-claims dev set. Includes explicitly promoted, already revealed semantic counterexample; never used as fresh holdout.",
+  "cases": [
+    {
+      "id": "claims-dev-single-allow-read",
+      "label": "benign",
+      "response": "none",
+      "description": "one allowed workspace read",
+      "categories": null,
+      "events": [
+        {
+          "decision": "allow"
+        }
+      ]
+    },
+    {
+      "id": "claims-dev-nineteen-boundary-probes",
+      "label": "attack",
+      "response": "none",
+      "description": "denied boundary probes below the burst threshold",
+      "categories": null,
+      "events": [
+        {
+          "count": 19,
+          "rule": "path-traversal",
+          "resource": "../../etc/passwd"
+        }
+      ]
+    },
+    {
+      "id": "claims-dev-split-agents",
+      "label": "attack",
+      "response": "none",
+      "description": "per-agent denials both below the threshold",
+      "categories": null,
+      "events": [
+        {
+          "count": 10,
+          "agent": "a",
+          "rule": "path-traversal"
+        },
+        {
+          "count": 10,
+          "agent": "b",
+          "rule": "path-traversal"
+        }
+      ]
+    },
+    {
+      "id": "claims-dev-split-sessions",
+      "label": "attack",
+      "response": "none",
+      "description": "per-session denials both below the threshold",
+      "categories": null,
+      "events": [
+        {
+          "count": 10,
+          "session": "a",
+          "rule": "path-traversal"
+        },
+        {
+          "count": 10,
+          "session": "b",
+          "rule": "path-traversal"
+        }
+      ]
+    },
+    {
+      "id": "claims-dev-full-window-boundary-burst",
+      "label": "attack",
+      "response": "replace",
+      "description": "denied burst inside the policy window with boundary probe",
+      "categories": null,
+      "events": [
+        {
+          "count": 20,
+          "rule": "path-traversal",
+          "resource": "../../etc/passwd"
+        }
+      ]
+    },
+    {
+      "id": "claims-dev-generic-burst-no-signal",
+      "label": "attack",
+      "response": "none",
+      "description": "denied burst without a boundary or sensitive signal",
+      "categories": null,
+      "events": [
+        {
+          "count": 20,
+          "resource": "workspace/src/file.txt"
+        }
+      ]
+    },
+    {
+      "id": "claims-dev-window-boundary-exact",
+      "label": "attack",
+      "response": "replace",
+      "description": "burst starts exactly exactly on the policy window edge",
+      "categories": null,
+      "events": [
+        {
+          "count": 19,
+          "rule": "plain-deny"
+        },
+        {
+          "offset": 60,
+          "rule": "path-traversal",
+          "resource": "../../etc/passwd"
+        }
+      ]
+    },
+    {
+      "id": "claims-dev-single-generic-denial",
+      "label": "benign",
+      "response": "none",
+      "description": "one generic denied run",
+      "categories": null,
+      "events": [
+        {}
+      ]
+    },
+    {
+      "id": "dev-claims-truncated-single-actor",
+      "label": "benign",
+      "response": "none",
+      "categories": null,
+      "description": "The revealed prior holdout second-actor counterexample is now explicitly dev data",
+      "events": [
+        {
+          "count": 40,
+          "decision": "allow",
+          "interval": 1
+        },
+        {
+          "offset": 40
+        }
+      ]
+    },
+    {
+      "id": "dev-claims-three-visible-actors",
+      "label": "benign",
+      "response": "none",
+      "categories": null,
+      "description": "Distinct actor IDs and actor count must agree",
+      "events": [
+        {
+          "count": 2,
+          "agent": "alpha",
+          "decision": "allow"
+        },
+        {
+          "count": 3,
+          "agent": "beta",
+          "decision": "allow"
+        },
+        {
+          "agent": "gamma"
+        }
+      ]
+    }
+  ]
+}
