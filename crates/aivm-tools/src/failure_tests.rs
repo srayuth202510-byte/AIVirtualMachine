@@ -1,6 +1,8 @@
 //! SIGKILL จริงที่ source/quota/audit/receipt boundaries; ไม่มี kill switch ใน production
 use super::*;
+use aivm_audit::AuditRecord;
 use aivm_capability::Capability;
+use aivm_cube::Cube;
 use std::os::unix::process::ExitStatusExt;
 
 fn fixture(root: &Path) -> (ToolGateway, Cube) {

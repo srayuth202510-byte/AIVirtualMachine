@@ -238,6 +238,8 @@ enum Cmd {
     VerifyAudit {
         path: PathBuf,
     },
+    /// Evaluate a verified watcher window from stdin; emit a reason or JSON null.
+    InspectContainment,
     /// Inspect the configured local model artifact and compare its SHA-256 pin.
     ModelStatus {
         #[arg(long)]
@@ -584,6 +586,11 @@ fn main() -> Result<(), AnyErr> {
         Cmd::VerifyAudit { path } => {
             let count = aivm_audit::AuditWriter::verify(path)?;
             println!("audit snapshot: {count} entries, chain verified");
+        }
+        Cmd::InspectContainment => {
+            let reason =
+                aivm_supervisor::containment::inspect_containment(std::io::stdin().lock())?;
+            println!("{}", serde_json::to_string(&reason)?);
         }
         Cmd::ModelStatus { config, json } => {
             let config = VmConfig::from_file(&config).map_err(err)?;

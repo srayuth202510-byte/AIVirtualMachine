@@ -23,7 +23,8 @@ Trusted deployment JSON + private state (host)
              External controller
               |              |
        verified audit     systemd user manager
-       watcher/rules          |
+       Python watcher        |
+       Rust containment      |
                         per-instance service cgroup
                               |
                        AIVM agent process
@@ -36,6 +37,18 @@ Trusted deployment JSON + private state (host)
 Supervisor อ่าน audit จริงผ่าน `Watcher` เดิม และตรวจ snapshot ด้วย Rust CLI
 `verify-audit` โดยไม่รับคำสั่งหรือ event inbox จากโมเดล Qwen watcher เดิม
 รันขนานกันเพื่อให้คำแนะนำได้ แต่ผล Qwen ไม่มีสิทธิ์สร้าง/หยุด instance
+
+กฎตัดสิน containment อยู่ใน `aivm-supervisor/src/containment.rs` เรียกผ่าน
+`aivm inspect-containment` โดยส่งหน้าต่าง audit ทาง stdin เป็น JSON
+Rust ตรวจ v2 hashes, ลำดับ event/source sequence, timestamp และ seal ข้าม rotation
+ก่อนประเมินกฎเดิม จำกัด input 8 MiB และ 4096 records แล้วคืน reason หรือ `null`
+หากคำสั่งล้มเหลว หมดเวลา หรือคำตอบผิดรูปแบบ controller จะกักกันและ hold
+ไม่มีการถอยไปตัดสินด้วยกฎ Python ต้อง build และ pin binary ใหม่ก่อนใช้ controller รุ่นนี้
+
+Python ยังเป็น trusted operational code สำหรับ watcher, continuity anchor,
+reconciliation, durable controller state, replacement budget และ systemd adapter
+ส่วนเหล่านี้ยังต้องรีวิวและทดสอบแยก การย้ายกฎครั้งนี้ไม่ได้ทำให้ระบบปฏิบัติการ
+ทั้งหมดได้รับการรับประกัน memory safety ของ Rust หรือพิสูจน์ความถูกต้องของ policy
 
 ตามโครงสร้าง runtime ปัจจุบัน Container/MicroVM ใช้กับการเรียก process tool
 ผ่าน gateway ไม่ได้ย้าย model inference และ agent loop ทั้งหมดเข้า guest

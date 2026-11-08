@@ -265,21 +265,30 @@ class Evidence:
         recent = watcher.history
         if not recent:
             return None
-        alerts = watch.audit.inspect_records(recent)
-        sensitive = {event for alert in alerts if alert["category"] in {"boundary_violation", "sensitive_access"}
-                     for event in alert["event_ids"]}
-        actors = {}
-        for row in recent:
-            if row["decision"] == "deny":
-                actors.setdefault((row["agent"], row["session_id"]), []).append(row)
-        for rows in actors.values():
-            if len(rows) >= 20 and sensitive.intersection(row["seq"] for row in rows):
-                proof = rows[-20:]
-                if not sensitive.intersection(row["seq"] for row in proof):
-                    proof = [next(row for row in rows if row["seq"] in sensitive)] + rows[-19:]
-                return {"policy": "deny-burst-with-boundary-or-sensitive-access", "count": len(rows),
-                        "evidence": [watcher.evidence(row) for row in proof]}
-        return None
+        # Restore sealed source sequences; watcher event IDs span rotations.
+        # Rust owns the containment rule. No Python fallback if it fails.
+        records = [{"event_id": row["seq"], "generation": row["_generation"],
+                    "record": {**{key: value for key, value in row.items()
+                                  if key not in {"_source_seq", "_generation"}},
+                               "seq": row["_source_seq"]}} for row in recent]
+        result = subprocess.run([self.spec["binary"], "inspect-containment"],
+                                input=canonical({"records": records}), text=True,
+                                capture_output=True, check=True, timeout=30)
+        reason = watch.audit.decode(result.stdout)
+        if reason is not None and (
+                not isinstance(reason, dict) or set(reason) != {"policy", "count", "evidence"}
+                or reason["policy"] != "deny-burst-with-boundary-or-sensitive-access"
+                or type(reason["count"]) is not int or not 20 <= reason["count"] <= 4096
+                or not isinstance(reason["evidence"], list) or len(reason["evidence"]) != 20):
+            raise ValueError("invalid Rust containment response")
+        if reason is not None:
+            expected = {row["seq"]: watcher.evidence(row) for row in recent}
+            proof = reason["evidence"]
+            if (any(not isinstance(item, dict) or type(item.get("event_id")) is not int
+                    or item != expected.get(item["event_id"]) for item in proof)
+                    or len({item["event_id"] for item in proof}) != 20):
+                raise ValueError("Rust containment response references invalid evidence")
+        return reason
 
     def release(self, instance):
         watcher = self.watchers.pop(instance["id"], None)

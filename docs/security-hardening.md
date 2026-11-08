@@ -2,6 +2,27 @@
 
 การแก้ไขนี้ปิดทางข้าม capability/policy ผ่าน RAG, search และ subprocess พร้อมเพิ่ม regression tests และแก้ lifecycle ข้าม CLI
 
+## จุดเริ่มต้นสำหรับรีวิว gateway
+
+`aivm-tools/src/lib.rs` เก็บโครงสร้างและ re-export ของ API เดิม ส่วน implementation
+และ regression tests แยกตามหน้าที่ เพื่อไล่เส้นทาง authorization และ side effect ได้ชัดเจน
+
+| ไฟล์ใน `crates/aivm-tools/src/` | ขอบเขตที่ต้องตรวจ |
+|---|---|
+| `api.rs` | request/response และ strict request schemas |
+| `gateway.rs` | dispatch, capability/policy, audit และ checkpoint ก่อน side effect |
+| `deny_tracker.rs` | deny burst, quarantine และ operator reset |
+| `filesystem.rs`, `secure_fs.rs` | path boundary, file quotas และ durable writes |
+| `process.rs` | sandbox execution, secret environment และ verification receipts |
+| `network.rs` | HTTPS/TCP, destination checks และ byte accounting |
+| `secrets.rs` | secret request, retained authority และ lease lifecycle |
+| `registry.rs` | tool registration และ audit sink adapter |
+| `tests/`, `failure_tests.rs` | regression suites ตามหน้าที่และ crash boundaries |
+
+การแยกไฟล์คง public API และลำดับการตรวจเดิมไว้ สำหรับกฎ containment ที่ย้ายจาก
+Python ไป Rust และส่วน operational ที่ยังอยู่ใน Python ดู
+[recovery-supervisor.md](recovery-supervisor.md#โครงสร้างและขอบเขตการควบคุม)
+
 ## ข้อมูลและ filesystem
 
 - Runtime สร้าง RAG จาก gateway workspace เท่านั้น ไม่ใช้ root ที่ผู้เรียกส่งมา ทุกไฟล์ผ่าน read policy/capability ก่อนเข้าบริบทโมเดล
@@ -30,7 +51,7 @@ secrets:
   hitl_required_for: ["high"]
 ```
 
-หากไม่ตั้ง `low_risk_allow` ค่าเริ่มต้นของ resource เป็น High โปรแกรมที่ได้รับ secret จะได้รับผ่าน environment variable (inject ผ่าน `env_extra` ใน `ExecSpec`) และค่า secret จะถูก zeroize ทันทีหลัง spawn เสร็จ ผลลัพธ์ที่คืนให้ agent จะเป็น `[REDACTED]` แทน stdout/stderr จริง เพื่อป้องกันการส่งค่า secret กลับมา ต้องตรวจผลการทำงานผ่าน exit status/audit metadata แทน (ดู `crates/aivm-tools/src/lib.rs` ฟังก์ชัน `exec_inner`)
+หากไม่ตั้ง `low_risk_allow` ค่าเริ่มต้นของ resource เป็น High โปรแกรมที่ได้รับ secret จะได้รับผ่าน environment variable (inject ผ่าน `env_extra` ใน `ExecSpec`) และค่า secret จะถูก zeroize ทันทีหลัง spawn เสร็จ ผลลัพธ์ที่คืนให้ agent จะเป็น `[REDACTED]` แทน stdout/stderr จริง เพื่อป้องกันการส่งค่า secret กลับมา ต้องตรวจผลการทำงานผ่าน exit status/audit metadata แทน (ดู `crates/aivm-tools/src/process.rs` ฟังก์ชัน `exec_inner`)
 
 Secret leases ที่คืนหลัง restart ต้องมี capability ที่ยังครอบคลุม resource/scope
 และค่า secret เดิมใน `secrets.yaml` ปัจจุบัน การลบหรือหมุนค่า secret ทำให้ lease เดิม

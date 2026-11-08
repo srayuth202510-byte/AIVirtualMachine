@@ -8,6 +8,7 @@ use aivm_runtime::{Runtime, VmConfig};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use thiserror::Error;
+pub mod containment;
 mod lifecycle;
 mod snapshot;
 pub use snapshot::SnapshotSummary;

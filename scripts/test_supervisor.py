@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone
 
 module = importlib.util.spec_from_file_location("supervisor", Path(__file__).with_name("aivm-supervisor.py"))
@@ -300,6 +301,45 @@ class EvidenceTests(unittest.TestCase):
     def test_boundary_after_initial_generic_burst_still_triggers(self):
         self.path.write_bytes(self.severe_bytes(late_boundary=True))
         self.assertEqual(self.evidence.inspect(self.instance)["count"], 21)
+
+    def test_rust_decision_failure_or_malformed_response_contains_and_holds(self):
+        real_run = subprocess.run
+        malformed_proof = json.dumps({"policy": "deny-burst-with-boundary-or-sensitive-access",
+                                      "count": 20, "evidence": [None] * 20})
+        for failure in ["exit", "timeout", "false", "{}", "not JSON", malformed_proof]:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                spec = {"replicas": 1, "max_replacements": 2, "window_seconds": 60,
+                        "job_timeout_seconds": 100, **self.evidence.spec}
+                store = sup.Store(root, spec)
+                adapter = FakeAdapter()
+                evidence = sup.Evidence(root, spec)
+                self.addCleanup(evidence.close)
+                controller = sup.Controller(store, adapter, evidence, True, lambda: 1000)
+                controller.reconcile()
+                instance = store.load()["instances"][0]
+                path = root / "instances" / instance["id"] / "audit.jsonl"
+                path.parent.mkdir(parents=True)
+                path.write_bytes(self.severe_bytes())
+
+                def decision_failure(args, **kwargs):
+                    if args[1] != "inspect-containment":
+                        return real_run(args, **kwargs)
+                    if failure == "exit":
+                        raise subprocess.CalledProcessError(2, args)
+                    if failure == "timeout":
+                        raise subprocess.TimeoutExpired(args, 30)
+                    return subprocess.CompletedProcess(args, 0, stdout=failure)
+
+                with patch.object(sup.subprocess, "run", side_effect=decision_failure):
+                    reports = controller.reconcile()
+                retained = store.load()["instances"]
+                self.assertEqual(len(retained), 1)
+                self.assertEqual(retained[0]["phase"], "retired")
+                self.assertTrue(retained[0]["hold"])
+                self.assertEqual(retained[0]["reason"]["policy"], "observation-failure")
+                self.assertEqual([op[0] for op in adapter.operations], ["start", "stop"])
+                self.assertEqual(reports[-1]["action"], "blocked")
 
     def test_corruption_fails_closed_and_restart_checks_previous_tip(self):
         raw = (FIXTURES / "boundary.jsonl").read_bytes()
