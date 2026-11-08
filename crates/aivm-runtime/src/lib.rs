@@ -285,7 +285,7 @@ pub struct PolicyExtra {
 
 impl VmConfig {
     pub fn from_yaml(text: &str) -> Result<Self, RuntimeError> {
-        serde_yaml::from_str(text).map_err(|e| RuntimeError::Config(e.to_string()))
+        serde_yaml_ng::from_str(text).map_err(|e| RuntimeError::Config(e.to_string()))
     }
 
     pub fn from_file(path: &Path) -> Result<Self, RuntimeError> {
@@ -1071,7 +1071,7 @@ fn load_secrets_file(
         }
     }
     let map: HashMap<String, String> =
-        serde_yaml::from_str(&text).map_err(|e| RuntimeError::Config(e.to_string()))?;
+        serde_yaml_ng::from_str(&text).map_err(|e| RuntimeError::Config(e.to_string()))?;
     for (k, v) in map {
         if k.is_empty() || k.len() > 128 || v.is_empty() || v.len() > 8192 {
             return Err(RuntimeError::Config("bad secrets.yaml entry".into()));
@@ -1713,7 +1713,7 @@ capabilities:
             assert_eq!(model, "selected-model");
             assert_eq!(env, key);
             let roundtrip =
-                VmConfig::from_yaml(&serde_yaml::to_string(&rt.config).unwrap()).unwrap();
+                VmConfig::from_yaml(&serde_yaml_ng::to_string(&rt.config).unwrap()).unwrap();
             assert_eq!(roundtrip.model.provider, provider);
             drop(rt);
             std::env::remove_var(key);

@@ -3,7 +3,7 @@
 การปรับปรุงนี้ครอบคลุม executable identity, checked cleanup, supervised deadline,
 structured errors, admission/cache และการประเมินคุณภาพแยกจาก protocol success
 ผล real-model validation รอบล่าสุดเก็บใน `target/control-hardening-2026-10-25/` เมื่อรันบน host
-สรุปผลและข้อจำกัดของรอบนี้: [host validation 25 ตุลาคม 2026](host-validation-2026-10-25.md)
+สรุปผลและข้อจำกัดของรอบนี้: [host validation 25 ตุลาคม 2026](archive/host-validation-2026-10-25.md)
 
 ## ไฟล์ที่ตรวจต้องเป็นไฟล์ที่รัน
 
@@ -120,7 +120,7 @@ worker failed: worker returned no completion; worker_exit: exit_code=73; signal=
 ```
 
 การเปลี่ยนนี้ช่วยวิเคราะห์ failure ครั้งถัดไป ไม่ได้ระบุย้อนหลังว่าสาเหตุของ
-`worker returned no response` ใน [ผลรอบก่อน](host-validation-2026-10-25.md) คืออะไร
+`worker returned no response` ใน [ผลรอบก่อน](archive/host-validation-2026-10-25.md) คืออะไร
 หลักฐาน CI, process-failure และ namespace regressions ของ exit diagnostics อยู่ใน
 `target/worker-exit-diagnostics-2026-10-25/`; ผล GGUF/coding quality ยังคงอ้าง snapshot รอบก่อน
 
@@ -226,11 +226,11 @@ Corpus ใหม่เขียนหลังเห็น baseline จึงไ
 นำ suffix ที่ประเมินแล้วไปต่อท้าย prompt ก่อนส่ง request ได้ โดยเก็บ prompt
 เต็มเพื่อให้ context/output limits และหลักฐานตรงกับงานที่รันจริง
 
-ผล [เปรียบเทียบวันที่ 26 ตุลาคม](model-quality-2026-10-26.md): baseline ดีขึ้น
+ผล [เปรียบเทียบวันที่ 26 ตุลาคม](archive/model-quality-2026-10-26.md): baseline ดีขึ้น
 4/6 → 5/6 แต่ synthetic transfer คงที่ 3/8 และยังมี semantic errors
 suffix นี้จึงยังเป็น candidate สำหรับการประเมิน ไม่ใช่ production default
 
-ผล [coding validation วันที่ 26 ตุลาคม](coding-validation-2026-10-26.md):
+ผล [coding validation วันที่ 26 ตุลาคม](archive/coding-validation-2026-10-26.md):
 ใช้ `verification.prepare` จาก operator ให้ runtime build/test ผ่าน gateway
 หลัง model edit ได้ทั้ง `agent_verified=true` และผลตรวจอิสระ 289 input pairs ผ่าน
 

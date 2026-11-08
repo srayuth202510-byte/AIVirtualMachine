@@ -59,7 +59,7 @@ python3 scripts/eval-model-quality.py \
 ```
 
 ใช้ worker build/pins เดิมและ output directory ใหม่ ดู prerequisites และข้อจำกัด
-ใน [model control hardening](model-control-hardening.md)
+ใน [model control hardening](../model-control-hardening.md)
 Config ของ A/B ใช้ context 512, output สูงสุด 96 tokens, 2 threads,
 temperature 0, top-k 1, seed 42 และปิด sealed cache; มีสำเนา config ใน evidence directory
 

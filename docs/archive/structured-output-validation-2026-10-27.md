@@ -2,7 +2,7 @@
 
 Baseline source: `aee1c18` พร้อม README และแผนงานที่ยังไม่ได้ commit
 หลักฐานของรอบนี้อยู่ใน `target/structured-output-2026-10-27/`
-ดูวิธีใช้และ protocol migration ใน [structured output](structured-output.md)
+ดูวิธีใช้และ protocol migration ใน [structured output](../structured-output.md)
 
 ## ขอบเขตที่เปลี่ยน
 

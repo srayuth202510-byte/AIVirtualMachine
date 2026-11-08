@@ -23,7 +23,7 @@ worker ทั้งสาม tier ผ่านบน host จริง ส่ว
 Reproduction B1 หลังแก้: inspect คืน busy โดย journal ยังอยู่, transition เดิม
 exit 0 และ `aivm audit` ตรวจผ่าน (ก่อนแก้ transition exit 1 และ chain เสีย)
 การเปลี่ยนพฤติกรรมนี้หมายความว่า inspect/state/capabilities ระหว่างมี operation
-จะต้องเรียกใหม่หลังงานจบ รายละเอียดอยู่ใน [transactions](verification-and-transactions.md)
+จะต้องเรียกใหม่หลังงานจบ รายละเอียดอยู่ใน [transactions](../verification-and-transactions.md)
 
 ผลหลังแก้: `CARGO_NET_OFFLINE=true make ci` **exit 0** ครบ format, strict clippy,
 workspace tests, Python tests/evaluation, demo/e2e และ lint/tests ของฟีเจอร์
@@ -68,9 +68,9 @@ gateway, audit/transaction, supervisor/lifecycle และ Python monitoring เ
 
 ### B1 — P1: inspect กู้ transaction ซ้อนกับงานที่ยังถือ lock จน audit chain เสีย
 
-ตำแหน่ง: [Supervisor::inspect](../crates/aivm-supervisor/src/lib.rs#L306),
-[Runtime::init](../crates/aivm-runtime/src/lib.rs#L458),
-[transaction recovery](../crates/aivm-runtime/src/transaction.rs#L152)
+ตำแหน่ง: [Supervisor::inspect](../../crates/aivm-supervisor/src/lib.rs#L306),
+[Runtime::init](../../crates/aivm-runtime/src/lib.rs#L458),
+[transaction recovery](../../crates/aivm-runtime/src/transaction.rs#L152)
 
 `inspect` เรียก `Runtime::init` โดยไม่ acquire VM lease แต่ `init` สามารถกู้
 state transaction และแก้ audit/state ได้ ขณะที่ `transition` กับ `approve-secret`
@@ -107,8 +107,8 @@ audit มี rollback seq 0 ตามด้วย prepare seq 0 และ commit
 
 ### B2 — P2: audit รายงาน chain verified ทั้งที่ archive ต้นสายหายไป
 
-ตำแหน่ง: [verify_sequence](../crates/aivm-audit/src/lib.rs#L421),
-[CLI audit](../crates/aivm-cli/src/main.rs#L418)
+ตำแหน่ง: [verify_sequence](../../crates/aivm-audit/src/lib.rs#L421),
+[CLI audit](../../crates/aivm-cli/src/main.rs#L418)
 
 `verify_sequence` ตรวจรอยต่อเฉพาะไฟล์ที่สองเป็นต้นไป แต่ไม่ตรวจว่า record แรก
 ของไฟล์แรกมี `hash_prev` ว่างหรือมี trusted anchor ที่ยืนยันต้นทาง
@@ -131,8 +131,8 @@ audit audit-prefix: 1 file(s), 2 entries, chain verified
 
 ### B3 — P2: search:code เพียงสิทธิ์เดียวค้นไม่เจอไฟล์ แต่คืน success
 
-ตำแหน่ง: [context_files](../crates/aivm-tools/src/lib.rs#L750),
-[search](../crates/aivm-tools/src/lib.rs#L781)
+ตำแหน่ง: [context_files](../../crates/aivm-tools/src/lib.rs#L750),
+[search](../../crates/aivm-tools/src/lib.rs#L781)
 
 Config ยอมรับ `capabilities.initial: [search:code]` และ `search()` authorize
 capability นี้สำเร็จ แต่ `context_files()` คัดเฉพาะไฟล์ที่มี capability `read`
@@ -153,8 +153,8 @@ SEARCH_ONLY decision=allow ok=true output=""
 
 ### B4 — P2: inspect/capabilities แสดงสิทธิ์แบบ hardcoded ไม่ตรงกับ state จริง
 
-ตำแหน่ง: [Runtime::inspect](../crates/aivm-runtime/src/lib.rs#L838),
-[CLI aliases](../crates/aivm-cli/src/main.rs#L404)
+ตำแหน่ง: [Runtime::inspect](../../crates/aivm-runtime/src/lib.rs#L838),
+[CLI aliases](../../crates/aivm-cli/src/main.rs#L404)
 
 ข้อความแสดง `READ <workspace>`, `Denied: NETWORK`, `DEPLOY` และ `Processes: 0`
 เป็น literal ไม่ได้สร้างจาก capability set, policy หรือสถานะ process
@@ -172,8 +172,8 @@ SEARCH_ONLY decision=allow ok=true output=""
 
 ### D1 — Dashboard มีช่องว่างการเก็บเหตุการณ์ระหว่างการอ่าน
 
-ตำแหน่ง: [deque ก่อน filter](../scripts/aivm-dashboard.py#L79),
-[เอกสารขอบเขต](dashboard.md#L41)
+ตำแหน่ง: [deque ก่อน filter](../../scripts/aivm-dashboard.py#L79),
+[เอกสารขอบเขต](../dashboard.md#L41)
 
 อ่านเฉพาะ `max_entries` บรรทัดท้าย ก่อนคัด DENY/budget/quarantine
 จำลอง `max_entries=3` แล้วเพิ่ม DENY 1 บรรทัดตามด้วย ALLOW 3 บรรทัดระหว่าง sync
@@ -187,8 +187,8 @@ SEARCH_ONLY decision=allow ok=true output=""
 
 ### D2 — อายุ plaintext ในสำเนา secret lease ยังยาวกว่าการใช้งาน
 
-ตำแหน่ง: [use_lease/revoke_lease](../crates/aivm-secrets/src/lib.rs#L374),
-[cleanup](../crates/aivm-secrets/src/lib.rs#L506)
+ตำแหน่ง: [use_lease/revoke_lease](../../crates/aivm-secrets/src/lib.rs#L374),
+[cleanup](../../crates/aivm-secrets/src/lib.rs#L506)
 
 หลังใช้ one-time lease จน Exhausted และหลัง revoke ยังพบ `lease.value`
 ของข้อมูลสังเคราะห์ยาว 20 bytes อยู่ใน broker ส่วน `cleanup` ลบ String
@@ -202,8 +202,8 @@ SEARCH_ONLY decision=allow ok=true output=""
 
 ### D3 — มีตัวสร้าง policy สองชุดที่ให้ความหมายต่างกัน
 
-ตำแหน่ง: [Runtime::init](../crates/aivm-runtime/src/lib.rs#L351),
-[config::build_default_policy](../crates/aivm-runtime/src/lib.rs#L1169)
+ตำแหน่ง: [Runtime::init](../../crates/aivm-runtime/src/lib.rs#L351),
+[config::build_default_policy](../../crates/aivm-runtime/src/lib.rs#L1169)
 
 Runtime ใช้ workspace จริงและ `filesystem.read/write` จาก config แต่ config API
 สร้าง scope `/workspace/<name>` และค่าคงที่ read/write อีกชุดหนึ่ง

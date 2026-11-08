@@ -985,7 +985,181 @@ mod tests {
         assert!(looks_like_secret("id_rsa"));
         assert!(looks_like_secret("server.pem"));
         assert!(looks_like_secret("secrets.yaml"));
+        assert!(looks_like_secret("secret.txt"));
+        assert!(looks_like_secret("service-account.json"));
+        assert!(looks_like_secret("credentials.json"));
+        assert!(looks_like_secret("production.env"));
         assert!(!looks_like_secret("main.rs"));
         assert!(!looks_like_secret("src/lib.rs"));
+    }
+
+    #[test]
+    fn vm_names_reject_path_and_special_characters() {
+        assert!(is_valid_vm_name("trusted-vm"));
+        assert!(is_valid_vm_name("recovered"));
+        assert!(!is_valid_vm_name("ab"));
+        assert!(!is_valid_vm_name(".hidden"));
+        assert!(!is_valid_vm_name("a/b"));
+        assert!(!is_valid_vm_name("a\\b"));
+        assert!(!is_valid_vm_name("a:b"));
+        assert!(!is_valid_vm_name("a|b"));
+        assert!(!is_valid_vm_name("../escape"));
+        let long = "v".repeat(65);
+        assert!(!is_valid_vm_name(&long));
+        let long = "v".repeat(64);
+        assert!(is_valid_vm_name(&long));
+    }
+
+    #[test]
+    fn semantic_task_loader_accepts_bounded_tasks() {
+        let dir = unique_test_dir("aivm-semantic-ok");
+        std::fs::write(dir.join("task.json"), r#"{"kind":"sort","values":[3,1,2]}"#).unwrap();
+        let task = load_semantic_task(&dir.join("task.json")).unwrap();
+        assert!(task.program_source().is_ok());
+        assert!(dir.exists());
+        let dir = unique_test_dir("aivm-semantic-cadd");
+        std::fs::write(
+            dir.join("task.json"),
+            r#"{"kind":"c_add","left":2,"right":3}"#,
+        )
+        .unwrap();
+        assert!(load_semantic_task(&dir.join("task.json")).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn semantic_task_loader_rejects_bad_and_oversized_input() {
+        let dir = unique_test_dir("aivm-semantic-bad");
+        std::fs::write(dir.join("bad.json"), "not json").unwrap();
+        assert!(load_semantic_task(&dir.join("bad.json")).is_err());
+        // task ที่ parse ผ่านแต่ validate ไม่ผ่าน → ต้องไม่ออกไปถึงโมเดล
+        let overflow = format!(r#"{{"kind":"sort","values":{}}}"#, vec_of_i32(65));
+        std::fs::write(dir.join("overflow.json"), overflow).unwrap();
+        assert!(load_semantic_task(&dir.join("overflow.json")).is_err());
+        // ไฟล์เกินขีด 16384 ไบต์ ต้องถูกปัดให้ล้มเหลวก่อน parse
+        let big = vec![b' '; 16_385];
+        std::fs::write(dir.join("big.json"), big).unwrap();
+        assert!(load_semantic_task(&dir.join("big.json")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn vec_of_i32(n: usize) -> String {
+        let items: Vec<String> = (0..n as i32).map(|i| i.to_string()).collect();
+        format!("[{}]", items.join(","))
+    }
+
+    fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// เตรียม LocalModelConfig สำหรับทดสอบ inspect_manifest (คืน (config, temp dir))
+    /// manifest_sha256 ถ้าไม่ระบุ "จริง" จะปักด้วย digest ของไฟล์ที่เพิ่งเขียน
+    fn manifest_fixture(
+        dir: &std::path::Path,
+        model_sha256: &str,
+        manifest: Option<(&str, Option<String>)>,
+    ) -> aivm_model::LocalModelConfig {
+        let model_path = dir.join("model.bin");
+        std::fs::write(&model_path, b"gguf-fixture").unwrap();
+        let mut cfg = aivm_model::LocalModelConfig {
+            model_path: model_path.to_string_lossy().to_string(),
+            model_sha256: model_sha256.to_string(),
+            ..Default::default()
+        };
+        if let Some((manifest_body, sha)) = manifest {
+            let manifest_path = dir.join("manifest.json");
+            std::fs::write(&manifest_path, manifest_body).unwrap();
+            cfg.manifest_path = Some(manifest_path.to_string_lossy().to_string());
+            cfg.manifest_sha256 = Some(
+                sha.unwrap_or(
+                    aivm_model::model_file_sha256(cfg.manifest_path.as_deref().unwrap_or_default())
+                        .unwrap_or_default(),
+                ),
+            );
+        }
+        cfg
+    }
+
+    fn hex64(c: char) -> String {
+        String::from_utf8(vec![c as u8; 64]).unwrap()
+    }
+
+    #[test]
+    fn manifest_status_without_configuration_follows_production() {
+        let dir = unique_test_dir("aivm-manifest-none");
+        let dev = manifest_fixture(&dir, "", None);
+        assert_eq!(inspect_manifest(&dev, false).status, "not-configured");
+        assert_eq!(inspect_manifest(&dev, true).status, "required");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_status_rejects_half_pins() {
+        // ปักครึ่งเดียว (path อย่างเดียว หรือ sha อย่างเดียว) = เฟรมไม่ปกป้อง
+        // สองด้าน → invalid เสมอ ไม่ว่า profile ใด
+        for dev in [false, true] {
+            let dir = unique_test_dir("aivm-manifest-half");
+            let mut path_only = manifest_fixture(&dir, "", None);
+            path_only.manifest_path = Some(dir.join("any.json").to_string_lossy().to_string());
+            assert_eq!(inspect_manifest(&path_only, dev).status, "invalid");
+            let mut sha_only = manifest_fixture(&dir, "", None);
+            sha_only.manifest_sha256 = Some(hex64('e'));
+            assert_eq!(inspect_manifest(&sha_only, dev).status, "invalid");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn manifest_status_reports_unavailable_mismatch_and_unpinned() {
+        // ปัก digest ปลอมให้ไฟล์ที่ไม่มีตัวตน → unavailable (ไม่เงียบผ่าน)
+        let dir = unique_test_dir("aivm-manifest-unavailable");
+        let mut cfg = manifest_fixture(&dir, &hex64('d'), Some(("foo", Some(hex64('e')))));
+        cfg.manifest_path = Some(dir.join("missing.json").to_string_lossy().to_string());
+        assert_eq!(inspect_manifest(&cfg, true).status, "unavailable");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // ไฟล์อยู่จริงแต่ digest ไม่ตรงที่ปักไว้ → mismatch
+        let dir = unique_test_dir("aivm-manifest-mismatch");
+        let cfg = manifest_fixture(&dir, &hex64('d'), Some(("manifest-body", Some(hex64('0')))));
+        assert_eq!(inspect_manifest(&cfg, true).status, "mismatch");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // ไฟล์อยู่และ digest ตรง แต่ค่า expected ว่าง → unpinned (ต้องขึ้นรายงาน)
+        let dir = unique_test_dir("aivm-manifest-unpinned");
+        let cfg = manifest_fixture(&dir, &hex64('d'), Some(("foo", Some(String::new()))));
+        assert_eq!(inspect_manifest(&cfg, true).status, "unpinned");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_status_verifies_declared_model_sha256() {
+        let dir = unique_test_dir("aivm-manifest-verified");
+        let pin = hex64('d');
+        let cfg = manifest_fixture(
+            &dir,
+            &pin,
+            Some((&format!(r#"{{"model_sha256":"{pin}"}}"#), None)),
+        );
+        assert_eq!(inspect_manifest(&cfg, true).status, "verified");
+        // ประกาศ pin โมเดลที่ต่างจาก config → model-mismatch
+        let diverged = manifest_fixture(
+            &dir,
+            &pin,
+            Some((&format!(r#"{{"model_sha256":"{}"}}"#, hex64('e')), None)),
+        );
+        assert_eq!(inspect_manifest(&diverged, false).status, "model-mismatch");
+        // manifest ที่ไม่ประกาศ model_sha256 → ต่าง (ว่าง) จากปินใน config = invalid
+        let undeclared = manifest_fixture(&dir, &pin, Some(("{}", None)));
+        assert_eq!(inspect_manifest(&undeclared, false).status, "invalid");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

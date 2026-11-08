@@ -4,17 +4,17 @@
 — อัปเดต 2026-11-06; ตัวรับใน external Python supervisor ยังไม่เปลี่ยน runtime
 และยังไม่เปิด enforcement ใน Rust supervisor/gateway
 
-การวัดระยะ 8 ทำแล้ว: [paired baseline/holdout evaluation](security-court-evaluation-2026-11-05.md)
+การวัดระยะ 8 ทำแล้ว: [paired baseline/holdout evaluation](archive/security-court-evaluation-2026-11-05.md)
 ยังไม่ผ่านเกณฑ์ลด false containment โดยไม่เพิ่ม misses จึงคง shadow/dry-run
 
-ติดตามระยะ 10 วันที่ 2026-11-06: [ปรับ concern prompt/retry และวัด holdout ใหม่](security-concerns-evaluation-2026-11-06.md)
+ติดตามระยะ 10 วันที่ 2026-11-06: [ปรับ concern prompt/retry และวัด holdout ใหม่](archive/security-concerns-evaluation-2026-11-06.md)
 dev ของฉบับสุดท้ายได้ grounded/missing-context ผ่าน 7/8 เคส และ policy 6/8 เคส
 ส่วน holdout ใหม่ของ grounded ผ่านรูปแบบ 9/12 เคสและ containment ตรง baseline 12/12
 จึงยังไม่ผ่านเกณฑ์ครบชุด อีกทั้งคำตอบที่ผ่าน schema ยังกล่าวถึง actor ที่สอง
 ในเคสที่ facts ยืนยันว่ามี actor เดียว ระยะ 10 มี harness แล้วแต่คุณภาพ
 semantic grounding ยังไม่ผ่าน จึงคง shadow/dry-run
 
-คอนแทรกต์ใหม่ [typed claims + grammar](security-concern-claims-evaluation-2026-11-06.md):
+คอนแทรกต์ใหม่ [typed claims + grammar](archive/security-concern-claims-evaluation-2026-11-06.md):
 dev ผ่าน 10/10 เคส; holdout ใหม่รับ advisory ได้ 11/12 เคส รวมข้ออ้างที่ตรวจแล้ว
 30 ข้อ และ containment ตรง baseline 12/12 ตัวตรวจปฏิเสธ false missing-evidence
 ทั้งคำตอบแรกและ retry ในอีกหนึ่งเคส ทุก output มี prefix ถูกต้องจาก grammar
@@ -22,7 +22,7 @@ dev ผ่าน 10/10 เคส; holdout ใหม่รับ advisory ได�
 สร้างข้อความสรุป จึงไม่อ้างว่าแก้ semantic grounding ของ free prose ได้ทั่วไป
 และยังไม่อนุมัติ Court enforcement
 
-ผลล่าสุดของ [availability inventory แบบคู่เปรียบเทียบ](security-concern-availability-evaluation-2026-11-06.md):
+ผลล่าสุดของ [availability inventory แบบคู่เปรียบเทียบ](archive/security-concern-availability-evaluation-2026-11-06.md):
 โค้ดระบุ present/missing IDs และ tag source ให้โมเดลถ่ายทอดอย่างชัดเจน
 dev 4 คู่/8 views และ holdout ใหม่ 6 คู่/12 views ผ่านครบตั้งแต่ attempt แรก
 รวม gate ความครบถ้วนและ first-attempt ไม่มี retry หรือ rejects ในฉบับสุดท้าย
@@ -30,7 +30,7 @@ holdout ไม่ได้เสนอ actor/count claims เพิ่ม จึ
 และไม่อ้างว่าคุณภาพโมเดลผ่านทั่วไปหรือช่วยลด false containment; คง shadow/dry-run
 
 ระยะ 9 เรียก Qwen จริงครบ 114 รอบแล้ว:
-[สามบทบาทและเสียงข้างมาก](security-court-qwen-evaluation-2026-11-05.md)
+[สามบทบาทและเสียงข้างมาก](archive/security-court-qwen-evaluation-2026-11-05.md)
 เสนอ containment ทุก 38 เคส รวม benign 11 เคส จึงยังไม่ผ่าน improvement gate
 
 เป้าหมายคือเพิ่มกระบวนการพิจารณาที่มีกฎเป็นหลัก มีการทักท้วงและตรวจหลักฐาน
@@ -146,7 +146,7 @@ watcher/supervisor เดิม โดยเฉพาะกรณี config ผ�
   เป็นโมเดลเดียวหลายบทบาทและยังมีหลักฐาน stream เดียว ไม่ปลอมเป็นหลายแหล่ง
   ผล majority: baseline TP 20 / FP 6, holdout TP 7 / FP 5 — เลือก containment
   ทุกเคส จึงยังไม่พิสูจน์ประโยชน์ในการแยกแยะ รายละเอียดและข้อจำกัดอยู่ใน
-  [รายงาน Qwen](security-court-qwen-evaluation-2026-11-05.md)
+  [รายงาน Qwen](archive/security-court-qwen-evaluation-2026-11-05.md)
 - [x] **ระยะ 10 — concern mode: facts โค้ดคำนวณ + กฎเป็นผู้ตัดสิน**
   เขียน `qwen-court-jury.py` ใหม่เป็น schema `{"concern", "cited_event_ids",
   "missing_evidence"}` (ไม่มี verdict/โหวต) และ `rule_decision()` ให้กฎ
@@ -230,7 +230,7 @@ review deadline, policy cap/kill switch, duplicate, budget, input ไม่ถ�
 และ CLI ที่ต้องไม่เปลี่ยน controller state/audit หรือเปิด apply mode
 เทสต์ใช้ controller/adapter จำลอง แต่ตรวจ audit ผ่าน Rust CLI จริง
 
-วัด paired baseline/holdout แล้วใน [รายงานระยะ 8](security-court-evaluation-2026-11-05.md)
+วัด paired baseline/holdout แล้วใน [รายงานระยะ 8](archive/security-court-evaluation-2026-11-05.md)
 ยังไม่พิสูจน์การลด false containment โดยไม่เพิ่ม misses และ Qwen จริงรอบนี้
 ยังแต่งข้อเท็จจริง/โหวตขัดเหตุผลได้แม้ schema ผ่าน ขั้นถัดไปต้องตรวจ grounding
 และความสอดคล้องของ output รวมทั้งเพิ่มบริบทที่ตรวจสอบได้แล้ววัดใหม่

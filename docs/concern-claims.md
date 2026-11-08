@@ -70,7 +70,7 @@ prompt นำ inventory เดิมมาแสดงใกล้จุดต�
 จากการมี/ไม่มี missing IDs เพื่อให้โมเดลคัดลอก tag ได้ตรงกัน
 tag นี้บอก availability เท่านั้น ไม่ใช่ความเสี่ยงหรือ verdict
 
-การวัด [availability แบบคู่เปรียบเทียบ](security-concern-availability-evaluation-2026-11-06.md)
+การวัด [availability แบบคู่เปรียบเทียบ](archive/security-concern-availability-evaluation-2026-11-06.md)
 เพิ่ม `--require-availability-complete` และ `--require-first-attempt`
 จึงต้องรายงาน missing IDs ครบและถูกต้องตั้งแต่ครั้งแรก ไม่ผ่านด้วยการตอบ []
 ทุกเคสเมื่อข้อมูลยังขาด ส่วน validator ของคอนแทรกต์ยังตรวจความจริงเหมือนเดิม
@@ -115,4 +115,4 @@ AIVM_WORKER_HOST_CONFIG=/absolute/path/model-config.json \
 ```
 
 ผลจริงของ dev/holdout ใหม่อยู่ใน
-[รายงาน typed claims](security-concern-claims-evaluation-2026-11-06.md)
+[รายงาน typed claims](archive/security-concern-claims-evaluation-2026-11-06.md)

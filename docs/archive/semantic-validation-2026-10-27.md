@@ -1,7 +1,7 @@
 # Semantic verification validation — 27 ตุลาคม 2026
 
 Baseline `9e85010` หลักฐานอยู่ใน `target/semantic-verification-2026-10-27/`
-เพิ่ม workflow ตาม [คู่มือ](semantic-verification.md) โดยไม่แก้ model weights,
+เพิ่ม workflow ตาม [คู่มือ](../semantic-verification.md) โดยไม่แก้ model weights,
 worker/controller pins หรือ corpus คุณภาพเดิม 6+8 งาน
 
 ## ผลที่ตรวจแล้ว

@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 serde = { workspace = true }
-serde_yaml = { workspace = true }
+serde_yaml_ng = { workspace = true }
 thiserror = { workspace = true }
 aivm-capability = { path = "../aivm-capability" }
 glob = { workspace = true }

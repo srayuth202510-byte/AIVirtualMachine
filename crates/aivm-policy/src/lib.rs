@@ -136,7 +136,7 @@ impl Policy {
     /// โหลดแบบ fail-closed: YAML เสียได้ Err ผู้เรียกต้องปฏิเสธการสตาร์ต
     pub fn from_yaml(text: &str) -> Result<Self, PolicyError> {
         let policy: Self =
-            serde_yaml::from_str(text).map_err(|e| PolicyError::Parse(e.to_string()))?;
+            serde_yaml_ng::from_str(text).map_err(|e| PolicyError::Parse(e.to_string()))?;
         policy.validate_syntax()?;
         // เชิงความหมายด้วย — โหลด YAML ตรง ๆ ต้องได้ policy ชุดเดียวกับ
         // ที่ `PolicyManager` รับ (เดิมข้ามแล้วได้ policy อ่อน ๆ)
@@ -1706,7 +1706,7 @@ system:
                 .0,
             Decision::Deny
         );
-        assert!(Policy::from_yaml(&serde_yaml::to_string(&policy).unwrap()).is_err());
+        assert!(Policy::from_yaml(&serde_yaml_ng::to_string(&policy).unwrap()).is_err());
     }
 
     #[test]

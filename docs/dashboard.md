@@ -99,8 +99,8 @@ cursor/backlog, DB retry, truncation, rotation ระหว่างมี backl
 การคืน slots และกราฟที่ช้า CI เปิดชุดนี้แยกจาก unit tests ปกติ
 
 ผลทดสอบ HTTP server จริงต่อเนื่อง 30 นาที พร้อม restart 5 รอบและ live rotation
-14 รอบ อยู่ใน [รายงาน soak 24 ตุลาคม 2026](dashboard-soak-2026-10-24.md)
+14 รอบ อยู่ใน [รายงาน soak 24 ตุลาคม 2026](archive/dashboard-soak-2026-10-24.md)
 
 ผลหลังแยก importer และเพิ่ม bounded HTTP อยู่ใน
-[รายงาน async validation](dashboard-async-validation-2026-10-24.md): traffic 2 นาที,
+[รายงาน async validation](archive/dashboard-async-validation-2026-10-24.md): traffic 2 นาที,
 DB lock latency, restart/rotation และ recovery หลัง `SIGKILL`

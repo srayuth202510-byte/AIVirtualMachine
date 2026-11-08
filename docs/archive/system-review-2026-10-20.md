@@ -9,11 +9,11 @@
 |---|---|
 | H-1 | `696a15e` เพิ่ม strict config parsing และ regression สำหรับ security/isolation typo |
 | M-1 | `696a15e` รักษา deadline เดิมเมื่อ restore พร้อม regression test |
-| M-2 | แทน runner-name/argv heuristic ด้วย operator verifier contract และ gateway receipt ที่ผูก contract/executable/workspace digest แล้ว ดู [รายละเอียดและข้อจำกัด](verification-and-transactions.md) |
-| M-3 | เพิ่ม durable transaction journal, startup recovery, runtime fencing และ SIGKILL/fault-injection coverage แล้ว; ยังไม่ได้ทดลองตัดไฟ storage จริง ดู [ขอบเขตหลักฐาน](verification-and-transactions.md) |
+| M-2 | แทน runner-name/argv heuristic ด้วย operator verifier contract และ gateway receipt ที่ผูก contract/executable/workspace digest แล้ว ดู [รายละเอียดและข้อจำกัด](../verification-and-transactions.md) |
+| M-3 | เพิ่ม durable transaction journal, startup recovery, runtime fencing และ SIGKILL/fault-injection coverage แล้ว; ยังไม่ได้ทดลองตัดไฟ storage จริง ดู [ขอบเขตหลักฐาน](../verification-and-transactions.md) |
 | M-4 | `44aba9e` เพิ่ม protected snapshot/fd loading; ผล loader และ worker บน host จริงอยู่ใน [รายงาน 21 ตุลาคม](host-validation-2026-10-21.md) และ [ผลตรวจล่าสุด](host-validation-2026-10-22.md) |
-| M-5 | เพิ่ม `llama` clippy/tests ใน CI หลักแล้ว; recurring workflow และ setup tooling พร้อม; เตรียม pinned runner บน host เดิมแล้ว แต่ยังไม่ register/เปิด service/ตั้ง variables เพราะ GitHub ยังไม่เชื่อมต่อ ดู [ขั้นตอน](model-validation-runner.md) |
-| L-1 | แก้ dashboard paths/config, HTML escaping/runtime error, retention และ Prometheus exposition พร้อม HTTP/regression tests แล้ว ดู [คู่มือ](dashboard.md) |
+| M-5 | เพิ่ม `llama` clippy/tests ใน CI หลักแล้ว; recurring workflow และ setup tooling พร้อม; เตรียม pinned runner บน host เดิมแล้ว แต่ยังไม่ register/เปิด service/ตั้ง variables เพราะ GitHub ยังไม่เชื่อมต่อ ดู [ขั้นตอน](../model-validation-runner.md) |
+| L-1 | แก้ dashboard paths/config, HTML escaping/runtime error, retention และ Prometheus exposition พร้อม HTTP/regression tests แล้ว ดู [คู่มือ](../dashboard.md) |
 | L-2 | ปรับ sandbox/runtime/network comments และเอกสาร hardware/workflow ให้ตรงกับ backend ปัจจุบันแล้ว |
 
 จึงต้องอ่านข้อสรุป production readiness เดิมประกอบสถานะข้างบนและขอบเขตหลักฐานใหม่
@@ -58,7 +58,7 @@ formal verification หรือการรับรอง isolation บน pro
 **ระดับ: สูง**
 
 `VmConfig`, `RuntimeBlock` และ `SecurityBlock` ไม่ใช้ `deny_unknown_fields`
-([runtime config](../crates/aivm-runtime/src/lib.rs#L48)) ขณะที่ฟิลด์ `runtime` และ
+([runtime config](../../crates/aivm-runtime/src/lib.rs#L48)) ขณะที่ฟิลด์ `runtime` และ
 `security` มีค่า default เมื่อฟิลด์ที่คาดไว้หายไป การสะกดชื่อ field ผิดจึงไม่ล้มเหลว
 
 Reproduction ที่ยืนยันแล้ว:
@@ -97,8 +97,8 @@ requirements แต่ระบบใช้ process sandbox และ developmen
 **ระดับ: กลาง**
 
 เมื่อ restore state ระบบสร้าง state grants ใหม่จาก config ก่อน แล้วคืนเฉพาะ usage counters
-จาก state เดิม ([restore path](../crates/aivm-runtime/src/lib.rs#L451)) แต่ network grant
-กำหนด expiry เป็น `now + 300` ทุกครั้ง ([state_grants](../crates/aivm-runtime/src/lib.rs#L793))
+จาก state เดิม ([restore path](../../crates/aivm-runtime/src/lib.rs#L451)) แต่ network grant
+กำหนด expiry เป็น `now + 300` ทุกครั้ง ([state_grants](../../crates/aivm-runtime/src/lib.rs#L793))
 จึงไม่รักษาเวลาหมดอายุเดิม
 
 Reproduction ใน VM สถานะ `VALIDATE`:
@@ -123,8 +123,8 @@ restart หลายครั้งแล้ว expiry ไม่เปลี่�
 
 ตัวตรวจความสำเร็จพิจารณาเพียง `process.exec`, output มี `exit status: 0`, task มีคำว่า
 `test` และ argv มีค่า `test`, `tests` หรือ suffix `_test`
-([is_successful_test](../crates/aivm-runtime/src/agent.rs#L330)) จากนั้นสรุปทันทีว่า
-`Requested tests passed` ([completion path](../crates/aivm-runtime/src/agent.rs#L600))
+([is_successful_test](../../crates/aivm-runtime/src/agent.rs#L330)) จากนั้นสรุปทันทีว่า
+`Requested tests passed` ([completion path](../../crates/aivm-runtime/src/agent.rs#L600))
 
 ตัวอย่าง `/usr/bin/true test` ผ่าน heuristic นี้ได้หาก executable ถูก allowlist แม้ไม่ได้รัน
 test suite ใดเลย ประเด็นนี้ไม่ข้าม capability/policy แต่ทำลาย evidence-backed completion
@@ -140,9 +140,9 @@ argv schema, working tree revision และ expected output/exit contract แ�
 
 `transition_to` append audit สำหรับ revoke, grant และ transition ก่อนสลับ state และเรียก
 `persist`; หาก persist ล้ม state ใน memory ถูก rollback แต่ audit ที่เขียนแล้วไม่ถูกชดเชย
-([transition](../crates/aivm-runtime/src/lib.rs#L547)) เส้น secret approval มีลำดับเดียวกัน:
+([transition](../../crates/aivm-runtime/src/lib.rs#L547)) เส้น secret approval มีลำดับเดียวกัน:
 audit `secret-approve` ก่อน persist และ revoke เมื่อ persist ล้ม
-([approval](../crates/aivm-runtime/src/lib.rs#L596))
+([approval](../../crates/aivm-runtime/src/lib.rs#L596))
 
 ผลคือ audit chain ยังตรวจ hash ผ่าน แต่บอกว่า action สำเร็จทั้งที่ durable state ไม่เคยรับ action
 นั้น ซึ่งลดความน่าเชื่อถือของ audit ในเหตุการณ์ disk-full, permission failure หรือ I/O failure
@@ -156,8 +156,8 @@ state fsync/rename ล้มหลัง audit append
 **ระดับ: กลาง**
 
 local model ถูก hash ผ่าน path แล้วคืนจาก verifier
-([verify_model_file](../crates/aivm-model/src/lib.rs#L219)) จากนั้น backend เปิด path เดิมอีกครั้ง
-เพื่อ load ([LocalLlamaModel::new](../crates/aivm-model/src/lib.rs#L423)) ผู้ที่เปลี่ยนไฟล์หรือ
+([verify_model_file](../../crates/aivm-model/src/lib.rs#L219)) จากนั้น backend เปิด path เดิมอีกครั้ง
+เพื่อ load ([LocalLlamaModel::new](../../crates/aivm-model/src/lib.rs#L423)) ผู้ที่เปลี่ยนไฟล์หรือ
 สลับ symlink ใน directory ของ model ได้ระหว่างสองขั้นอาจทำให้ไฟล์ที่โหลดไม่ใช่ไฟล์ที่ hash ผ่าน
 
 Container/MicroVM staging ลดความเสี่ยงบางส่วนเพราะ worker ตรวจ artifact ใน boundary อีกครั้ง
@@ -172,7 +172,7 @@ file descriptor เดียวกับที่ส่งให้ loader ห�
 **ระดับ: กลาง**
 
 CI default รัน workspace โดยไม่เปิด features และเพิ่มเฉพาะ `microvm` กับ `hardware`
-([workflow](../.github/workflows/ci.yml#L26), [Makefile](../Makefile#L37)) ขณะที่ local GGUF
+([workflow](../../.github/workflows/ci.yml#L26), [Makefile](../../Makefile#L37)) ขณะที่ local GGUF
 backend อยู่หลัง feature `llama` และเป็นแกนหลักตาม product positioning
 
 การตรวจครั้งนี้รันเพิ่ม:
@@ -203,7 +203,7 @@ PASS
 **ระดับ: ต่ำ**
 
 comment ใน sandbox ยังระบุ MicroVM ว่าเป็น skeleton แม้ backend ปัจจุบันมี boot path จริง
-([sandbox module](../crates/aivm-sandbox/src/lib.rs#L25)) และข้อความบางส่วนยังเรียก network crate
+([sandbox module](../../crates/aivm-sandbox/src/lib.rs#L25)) และข้อความบางส่วนยังเรียก network crate
 ว่า MVP-A no-egress ทั้งที่ network tools ถูก implement ใน `aivm-tools` แล้ว ความคลาดเคลื่อนนี้
 เพิ่มโอกาสประเมิน assurance หรือ maintenance ผิด
 

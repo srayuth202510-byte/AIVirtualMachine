@@ -1,27 +1,30 @@
 [workspace]
 members = [
+    # ลำดับตามชั้น dependency ตาราง Crate map ใน docs/architecture.md
+    # (ชั้น 0–7 ชั้นล่างไม่พึ่งชั้นบน) — `adversarial` เป็นชุดเทสต์ dev-deps
     "crates/aivm-capability",
-    "crates/aivm-policy",
     "crates/aivm-cube",
     "crates/aivm-audit",
-    "crates/aivm-tools",
-    "crates/aivm-memory",
-    "crates/aivm-network",
+    "crates/aivm-policy",
     "crates/aivm-sandbox",
+    "crates/aivm-network",
+    "crates/aivm-memory",
+    "crates/aivm-secrets",
     "crates/aivm-model",
+    "crates/aivm-tools",
     "crates/aivm-model-worker",
     "crates/aivm-runtime",
     "crates/aivm-supervisor",
     "crates/aivm-cli",
     "crates/aivm-adversarial",
-    "crates/aivm-secrets",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+# serde_yaml ถูก archive แล้ว (RUSTSEC-2024-0320) — ใช้ fork ที่ยังดูแล ใช้งานแบบ drop-in
+serde_yaml_ng = "0.10"
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"

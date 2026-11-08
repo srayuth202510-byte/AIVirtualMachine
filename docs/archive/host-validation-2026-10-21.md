@@ -92,9 +92,9 @@ python3 scripts/validate-model-host.py \
 เก็บ raw logs, commands, elapsed time, summaries และ artifact hashes ใน output directory
 ไฟล์ใต้ `target` ถูก ignore และอาจหายเมื่อ `cargo clean`; รายงานนี้อยู่ใน Git
 
-เพิ่ม [workflow](../.github/workflows/model-host-validation.yml) สำหรับ daily/manual
+เพิ่ม [workflow](../../.github/workflows/model-host-validation.yml) สำหรับ daily/manual
 validation และ upload evidence ไว้แล้ว ยังไม่ได้ตั้ง repository variables หรือเปิด runner
-ดู prerequisites/ตัวแปรใน [testing](testing.md#pinned-gguf-บน-host-จริง)
+ดู prerequisites/ตัวแปรใน [testing](../testing.md#pinned-gguf-บน-host-จริง)
 
 ผลนี้ยืนยัน protected loading และ worker contracts บน host/fixture ที่ระบุ ไม่ได้วัด
 ความถูกต้องเชิงความหมายของคำตอบ, รับรอง host อื่น, พิสูจน์ TEE/attestation หรือปิด

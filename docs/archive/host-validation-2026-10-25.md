@@ -115,5 +115,5 @@ The coding benchmark source changed after the core host run to tighten its
 infrastructure gate, record the effective limits, and enlarge only its test CPU
 allowance. Core worker/controller/sandbox validation sources remained unchanged;
 the final coding report identifies its own compiled source. See
-[control hardening](model-control-hardening.md) for reproduction commands and the
+[control hardening](../model-control-hardening.md) for reproduction commands and the
 deadline/cleanup, cooperative admission, cache, and host-trust boundaries.

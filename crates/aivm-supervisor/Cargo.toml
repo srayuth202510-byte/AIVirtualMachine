@@ -10,7 +10,7 @@ serde_json = { workspace = true }
 aivm-tools = { path = "../aivm-tools" }
 aivm-audit = { path = "../aivm-audit" }
 serde = { workspace = true }
-serde_yaml = { workspace = true }
+serde_yaml_ng = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }

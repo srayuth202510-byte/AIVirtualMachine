@@ -16,7 +16,7 @@
 | 6 | Hardware/MicroVM ปฏิเสธ secret ก่อน consume; lease ยังใช้ได้ | `unsupported_guest_secret_injection_preserves_the_lease` |
 | 7 | ตรวจ QEMU pin ก่อน KVM readiness และใช้ fake artifact ที่เทสต์ควบคุม ไม่ต้องติดตั้ง QEMU/KVM | `wrong_qemu_pin_fails_closed_as_invalid` |
 
-การเลือก cloud model และการกู้ state อธิบายเพิ่มเติมใน [configuration.md](configuration.md)
+การเลือก cloud model และการกู้ state อธิบายเพิ่มเติมใน [configuration.md](../configuration.md)
 
 ทดสอบนอก sandbox บน host จริงเพิ่มเติมแล้ว: Local inference และ MicroVM ผ่าน
 รวมถึง QEMU Generic boot; Container boundary test ผ่านหลังติดตั้ง helper

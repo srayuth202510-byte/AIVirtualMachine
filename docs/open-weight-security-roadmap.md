@@ -85,4 +85,4 @@ TEE และ confidential computing เป็นความสามารถ�
 Hardware/TEE ยังเป็น experimental และ generic QEMU ไม่ได้ยืนยัน confidential computing;
 host/operator compromise อยู่นอก threat model; และความถูกต้องของคำตอบโมเดลต้องวัดตามงาน
 ไม่อนุมานจากการที่ inference หรือ tool call ทำงานสำเร็จ ดูผลตรวจเดิมใน
-[system review](system-review-2026-10-15.md) และ [host validation](host-validation-2026-10-15.md)
+[system review](archive/system-review-2026-10-15.md) และ [host validation](archive/host-validation-2026-10-15.md)

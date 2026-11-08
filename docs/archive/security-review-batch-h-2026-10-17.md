@@ -55,4 +55,4 @@ prerequisites are absent.
 
 Config and secret-file edits apply when a Runtime reloads. Broker API removal or
 rotation takes effect immediately in that broker. See
-[security-hardening.md](security-hardening.md#secrets) for the lease rules.
+[security-hardening.md](../security-hardening.md#secrets) for the lease rules.

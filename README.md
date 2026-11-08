@@ -47,7 +47,7 @@ AIVM คือ runtime สำหรับรัน open-weight models โดย�
 สถานะ Tier หมายถึงระดับการรองรับในโค้ด ไม่ใช่การรับรองความปลอดภัยของ host ทุกเครื่อง:
 Tier1 process เป็นค่าเริ่มต้น; Container และ MicroVM ต้องเตรียม host ตามคู่มือและ
 ตรวจผล probe/host validation สำหรับเครื่องเป้าหมาย; Hardware ยังเป็น experimental
-และ Generic QEMU ไม่ได้ยืนยัน TEE หรือ attestation. ดู [ผล host validation](./docs/host-validation-2026-10-25.md)
+และ Generic QEMU ไม่ได้ยืนยัน TEE หรือ attestation. ดู [ผล host validation](./docs/archive/host-validation-2026-10-25.md)
 ซึ่งเป็น snapshot ณ 25 ตุลาคม 2026 ที่ baseline `16e00f3` พร้อม working-tree changes
 ทดสอบ pinned GGUF loader และ worker ทั้งสาม tier ไม่ใช่ผล probe แบบ live ของทุก host.
 
@@ -164,8 +164,6 @@ capability, cube, audit
 - [`docs/dashboard.md`](./docs/dashboard.md) — audit dashboard, private SQLite storage และ Prometheus/JSON endpoints
 - [`docs/model-control-hardening.md`](./docs/model-control-hardening.md) — sealed worker/controller, checked cleanup, event deadlines, host quotas/cache และ quality evaluation
 - [`docs/semantic-verification.md`](./docs/semantic-verification.md) — verifier, bounded repair และตัวช่วย sort/C ผ่าน gateway
-- [`docs/semantic-validation-2026-10-27.md`](./docs/semantic-validation-2026-10-27.md) — ผล replay, Proptest และ Qwen semantic evaluation
-- [`docs/structured-output-validation-2026-10-27.md`](./docs/structured-output-validation-2026-10-27.md) — หลักฐานการตรวจ GBNF + Serde และผลเทียบโมเดล
 - [`docs/structured-output.md`](./docs/structured-output.md) — เลือกโหมด text/JSON/agent intent, GBNF + Serde และ protocol migration
 - [`docs/structured-output-quality-test-plan.md`](./docs/structured-output-quality-test-plan.md) — แผน GBNF + Serde, verifier + Proptest และ staging recovery ด้วย nextest/strace พร้อมเกณฑ์ผ่าน
 - [`docs/model-validation-runner.md`](./docs/model-validation-runner.md) — เตรียม KVM runner และเปิด recurring real-model CI
@@ -183,11 +181,8 @@ capability, cube, audit
 - [`docs/detection-evaluation.md`](./docs/detection-evaluation.md) — พิสูจน์ขอบเขตการตรวจจับด้วย 30 สถานการณ์ วัด false positives/misses แยกจากการทำตาม policy
 - [`docs/immunity-lab.md`](./docs/immunity-lab.md) — ห้องทดลองกฎตรวจจับ: สร้างรูปแบบดัดแปลง ให้ Qwen เสนอ ทดสอบ holdout ออกรุ่น shadow และ rollback
 - [`docs/security-court-roadmap.md`](./docs/security-court-roadmap.md) — ศาลจำลองแบบ deterministic, ท่อแปล directive และตัวรับ dry-run ใน external supervisor พร้อมตรวจ audit/freshness; ยังไม่เปิด enforcement จริง
-- [`docs/security-court-evaluation-2026-11-05.md`](./docs/security-court-evaluation-2026-11-05.md) — ผลเทียบ Court กับ baseline/holdout แบบจับคู่: ยังไม่ผ่านเกณฑ์ลด false containment โดยไม่เพิ่ม misses
-- [`docs/security-court-qwen-evaluation-2026-11-05.md`](./docs/security-court-qwen-evaluation-2026-11-05.md) — ทดสอบ Qwen จริงแยกสามบทบาท พร้อมคำตอบดิบ เสียงข้างมาก และคะแนนแยกจาก deterministic controls
-- [`docs/security-concerns-evaluation-2026-11-06.md`](./docs/security-concerns-evaluation-2026-11-06.md) — ปรับ concern prompt/retry บน dev และตรึงก่อนวัด holdout ใหม่; ยังไม่ผ่านเกณฑ์และคง shadow/dry-run
-- [`docs/concern-claims.md`](./docs/concern-claims.md) — คอนแทรกต์ข้ออ้าง actor/count/missing-evidence ที่ตรวจด้วย facts และ output grammar พร้อม [ผล dev/holdout ใหม่](./docs/security-concern-claims-evaluation-2026-11-06.md)
-- [`docs/security-concern-availability-evaluation-2026-11-06.md`](./docs/security-concern-availability-evaluation-2026-11-06.md) — inventory ที่โค้ดระบุ present/missing และ tag source; dev 8/8 กับ holdout 12/12 ถูกตั้งแต่แรกในงานถ่ายทอด availability โดยยังคง shadow/dry-run
+- [`docs/concern-claims.md`](./docs/concern-claims.md) — คอนแทรกต์ข้ออ้าง actor/count/missing-evidence ที่ตรวจด้วย facts และ output grammar พร้อม [ผล dev/holdout ล่าสุด](./docs/archive/security-concern-claims-evaluation-2026-11-06.md)
+- [`docs/archive/README.md`](./docs/archive/README.md) — ดรรชนีรายงานแบบลงวันที่ (host validation, system review, structured output, dashboard, Security Court/concern) — สถานะปัจจุบันสรุปอยู่ในเอกสารถาวรที่เกี่ยวข้อง
 
 - [`docs/audit-reviewer.md`](./docs/audit-reviewer.md) — วิเคราะห์ audit แบบอ่านอย่างเดียว ด้วยกฎและคำแนะนำจาก Qwen
 

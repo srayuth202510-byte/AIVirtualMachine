@@ -70,7 +70,7 @@ Prometheus และ JSON ระหว่างเขียน audit สัง�
 ของแถวที่ยังเหลือใน DB ไม่ได้จัดลำดับใหม่ แต่แถวเก่าที่ถูก purge ถูก reinsert
 ด้วย event IDs ที่ใหม่กว่า แล้ว purge กลับไปลบรายการที่ควรเก็บ
 
-แก้ใน [dashboard](../scripts/aivm-dashboard.py) ดังนี้:
+แก้ใน [dashboard](../../scripts/aivm-dashboard.py) ดังนี้:
 
 1. เก็บ cursor, inode/offset, witness bytes และ continuity/coverage state ใน SQLite
    transaction เดียวกับ events เมื่อ restart จึงอ่านต่อจากจุดที่ commit แล้ว

@@ -110,10 +110,10 @@ Baseline นี้ยังไม่ยืนยันการตรวจ expl
 
 ผลเทียบ Court กับ supervisor บน baseline/holdout เดียวกัน พร้อม FP/FN,
 abstentions และ paired improvement gate อยู่ใน
-[Security Court evaluation (2026-11-05)](security-court-evaluation-2026-11-05.md)
+[Security Court evaluation (2026-11-05)](archive/security-court-evaluation-2026-11-05.md)
 Court ที่ใช้หลักฐานเดิมยังไม่แสดงการลด false containment โดยไม่เพิ่ม misses
 ผลการเรียก Qwen จริงแยกสามบทบาทอยู่ใน
-[Qwen role-jury evaluation](security-court-qwen-evaluation-2026-11-05.md):
+[Qwen role-jury evaluation](archive/security-court-qwen-evaluation-2026-11-05.md):
 เสียงข้างมากเสนอ containment ทุกกรณี จึงมี false positives เพิ่มจาก baseline
 
 `examples/detection/holdout.json` เพิ่ม synthetic regression holdout 12 กรณี:

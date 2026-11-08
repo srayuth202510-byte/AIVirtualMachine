@@ -40,5 +40,5 @@ Host tests ทั้ง 4 รายการรันจริงโดยไม
 - **ยังไม่ได้เปิด recurring workflow หรือ dispatch GitHub Actions job**
 
 ผล manual host validation ที่ผ่านข้างต้นไม่ใช่หลักฐานว่า scheduled CI เปิดแล้ว
-ขั้นตอนเปิดจริงอยู่ใน [runner setup](model-validation-runner.md)
-และการแก้ Dashboard อยู่ใน [dashboard guide](dashboard.md)
+ขั้นตอนเปิดจริงอยู่ใน [runner setup](../model-validation-runner.md)
+และการแก้ Dashboard อยู่ใน [dashboard guide](../dashboard.md)

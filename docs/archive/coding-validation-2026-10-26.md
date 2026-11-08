@@ -33,7 +33,7 @@ Oracle ของ operator ถูกเก็บใน `verify.c` นอก write
 ## การแก้
 
 - เพิ่ม `verification.prepare` แบบ opt-in ให้ operator ระบุ build steps
-  ตาม [ตัวอย่าง](build-workflow.md#operator-managed-verification-build)
+  ตาม [ตัวอย่าง](../build-workflow.md#operator-managed-verification-build)
   หลัง filesystem write runtime ส่งทุก prepare step และ final verifier ผ่าน gateway ปกติ
 - ไม่เปิด `/tmp` หรือ random temporary files; GCC compile ใช้ `-pipe`
   และเขียนเฉพาะ output slots ที่จองไว้

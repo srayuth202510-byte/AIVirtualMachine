@@ -150,7 +150,7 @@ impl Supervisor {
             std::fs::create_dir_all(dir.join("workspace/src"))
                 .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
             config.name = name.into();
-            let yaml = serde_yaml::to_string(&config)
+            let yaml = serde_yaml_ng::to_string(&config)
                 .map_err(|e| SupervisorError::Runtime(e.to_string()))?;
             let rt = Runtime::init(config, dir.clone())
                 .map_err(|e| SupervisorError::Runtime(e.to_string()))?;

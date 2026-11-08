@@ -2,7 +2,7 @@
 
 สถานะ: 🚧 **experimental** — ประตู fail-closed ครบทุกลำดับ (spec/shape/supply-chain/host)
 โค้ดรัน workload (drive-stuffing แบบเดียวกับ MicroVM) และ **บูต QEMU/KVM
-โหมด Generic จริงผ่านแล้ว** (ดู [รายงาน host validation](host-validation-2026-10-16.md)) แต่ยังไม่ได้ยืนยัน TEE จริง
+โหมด Generic จริงผ่านแล้ว** (ดู [รายงาน host validation](archive/host-validation-2026-10-16.md)) แต่ยังไม่ได้ยืนยัน TEE จริง
 attestation quote verification/PCR comparison/disk-encryption/GPU ยังเป็น stub
 ที่รายงานซื่อสัตย์ใน `degraded` หรือถูกปฏิเสธแบบ fail-closed (ดู "ข้อจำกัดที่รู้ตัว" ท้ายไฟล์)
 ส่วน secure boot ตรวจ signature ของ kernel/initrd ด้วย `sbverify` จริงแล้ว

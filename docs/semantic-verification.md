@@ -103,4 +103,4 @@ Validator ตรวจคะแนนซ้ำจาก output, task/config/corp
 Model infrastructure error ไม่ถูกนับเป็นผลประเมินสดผ่าน แม้ helper จะตอบถูกได้
 ชุดนี้เป็น targeted synthetic probes ไม่ใช่ independent production benchmark
 
-ดู [ผลการตรวจ 27 ตุลาคม](semantic-validation-2026-10-27.md)
+ดู [ผลการตรวจ 27 ตุลาคม](archive/semantic-validation-2026-10-27.md)

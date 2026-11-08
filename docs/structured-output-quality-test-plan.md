@@ -1,9 +1,9 @@
 # แผน: Structured output, semantic verification และ staging recovery
 
 สถานะ: **ส่วน 1–2 เสร็จและตรวจแล้ว รวม Qwen รอบสด; ส่วน 3 ยังไม่ได้ implement** — อัปเดต 27 ตุลาคม 2026
-ผลและข้อจำกัด: [structured output](structured-output-validation-2026-10-27.md), [semantic verification](semantic-validation-2026-10-27.md)
-Baseline: `aee1c18` พร้อมผล [coding validation](coding-validation-2026-10-26.md)
-และ [model quality](model-quality-2026-10-26.md)
+ผลและข้อจำกัด: [structured output](archive/structured-output-validation-2026-10-27.md), [semantic verification](archive/semantic-validation-2026-10-27.md)
+Baseline: `aee1c18` พร้อมผล [coding validation](archive/coding-validation-2026-10-26.md)
+และ [model quality](archive/model-quality-2026-10-26.md)
 
 เป้าหมายคือใช้ backend และ verifier เดิมให้มากที่สุด แบ่งงานเป็นสามชุด
 ที่ review และตรวจผลแยกกันได้: GBNF + Serde, verifier + Proptest,
