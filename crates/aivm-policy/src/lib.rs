@@ -4,6 +4,8 @@
 //! fail-closed ทุกจุด ตัดสินแบบ deterministic และรับรู้ state
 //! MVP: allowlist ใน YAML + deny list ที่ระบุชัดเจน
 
+#![forbid(unsafe_code)]
+
 use aivm_capability::CapabilitySet;
 use cel::{Context, Env, Value};
 use serde::{Deserialize, Serialize};

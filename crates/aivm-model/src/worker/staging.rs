@@ -79,6 +79,7 @@ impl StagedConfig {
                 unix::fs::{MetadataExt, OpenOptionsExt},
             };
             // serialize recovery เพื่อไม่ให้อีก scanner กำลังลบ entry เดียวกันตอนเรารายงานผล
+            // SAFETY: geteuid เป็น pure syscall ไม่มี precondition
             let lock_path = PathBuf::from(format!("/tmp/.aivm-staging-recovery-{}.lock", unsafe {
                 libc::geteuid()
             }));
@@ -95,12 +96,14 @@ impl StagedConfig {
                 .metadata()
                 .map_err(|_| WorkerError::Cleanup("stat recovery lock".into()))?;
             if !lock_meta.is_file()
+                // SAFETY: geteuid เป็น pure syscall ไม่มี precondition
                 || lock_meta.uid() != unsafe { libc::geteuid() }
                 || lock_meta.nlink() != 1
                 || lock_meta.mode() & 0o077 != 0
             {
                 return Err(WorkerError::Cleanup("invalid recovery lock".into()));
             }
+            // SAFETY: lock เป็น fd ที่เปิดอยู่ตลอดอายุการสแกนนี้
             if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
                 return Err(WorkerError::Cleanup("lock recovery registry".into()));
             }
@@ -128,6 +131,7 @@ impl StagedConfig {
                     }
                 };
                 if !meta.is_dir()
+                    // SAFETY: geteuid เป็น pure syscall ไม่มี precondition
                     || meta.uid() != unsafe { libc::geteuid() }
                     || meta.mode() & 0o777 != 0o700
                 {
@@ -148,6 +152,7 @@ impl StagedConfig {
                 let meta = lease
                     .metadata()
                     .map_err(|_| WorkerError::Cleanup("cannot stat staging lease".into()))?;
+                // SAFETY: geteuid เป็น pure syscall ไม่มี precondition
                 if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.nlink() != 1
                 {
                     continue;
@@ -294,9 +299,12 @@ pub(super) fn prepare_image(
         if fd < 0 {
             return Err(WorkerError::Failed("create sealed worker image".into()));
         }
+        // SAFETY: fd >= 0 เป็น memfd ใหม่ที่เพิ่งสร้างและส่งมอบ ownership ให้ File ทันที
         let mut file = unsafe { File::from_raw_fd(fd) };
         control.copy(&mut input, &mut file, maximum, "worker snapshot")?;
+        // SAFETY: fd เป็นของ file ที่ยังเปิดอยู่ใน scope นี้
         if unsafe { libc::fchmod(fd, 0o500) } != 0
+            // SAFETY: fd เป็น memfd ที่เปิดด้วย MFD_ALLOW_SEALING และยังเปิดอยู่
             || unsafe {
                 libc::fcntl(
                     fd,

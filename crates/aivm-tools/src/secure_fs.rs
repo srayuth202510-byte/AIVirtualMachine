@@ -25,6 +25,7 @@ fn open_dir(fd: i32, part: &CString) -> Result<File, ToolError> {
     if raw < 0 {
         return Err(io_error());
     }
+    // SAFETY: raw >= 0 คือ fd ใหม่จาก openat ที่ยังไม่มีเจ้าของ; File รับ ownership แต่ผู้เดียว
     Ok(unsafe { File::from_raw_fd(raw) })
 }
 fn parent(workspace: &Path, path: &Path, write: bool) -> Result<(File, CString), ToolError> {
@@ -43,6 +44,7 @@ fn parent(workspace: &Path, path: &Path, write: bool) -> Result<(File, CString),
             Ok(next) => dir = next,
             Err(_) if write => {
                 // mkdirat/openat ใช้ parent fd เดิม จึงไม่ตาม parent ที่ถูกสลับ
+                // SAFETY: dir เป็น fd ที่เปิดอยู่ และ part เป็น CString ที่ NUL-terminated มีชีวิตตลอด call
                 let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), part.as_ptr(), 0o700) };
                 if rc < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
                     return Err(io_error());
@@ -66,10 +68,12 @@ pub fn open(workspace: &Path, path: &Path, write: bool) -> Result<File, ToolErro
         } else {
             libc::O_RDONLY
         };
+    // SAFETY: dir เป็น fd ที่เปิดอยู่ และ last เป็น CString ที่ NUL-terminated; ส่ง mode เผื่อกรณี O_CREAT
     let raw = unsafe { libc::openat(dir.as_raw_fd(), last.as_ptr(), flags, 0o600) };
     if raw < 0 {
         return Err(io_error());
     }
+    // SAFETY: raw >= 0 คือ fd ใหม่จาก openat ที่ยังไม่มีเจ้าของ; File รับ ownership แต่ผู้เดียว
     let file = unsafe { File::from_raw_fd(raw) };
     let meta = file.metadata().map_err(|e| ToolError::Io(e.to_string()))?;
     if !meta.is_file() || meta.nlink() != 1 {
@@ -87,6 +91,7 @@ pub const WRITE_PREFIX: &str = ".aivm-write-";
 
 fn sync_directory(dir: &File) -> Result<(), ToolError> {
     let dot = name(b".")?;
+    // SAFETY: dir เป็น fd ที่เปิดอยู่ และ dot เป็น CString "." ที่ NUL-terminated มีชีวิตตลอด call
     let raw = unsafe {
         libc::openat(
             dir.as_raw_fd(),
@@ -97,6 +102,7 @@ fn sync_directory(dir: &File) -> Result<(), ToolError> {
     if raw < 0 {
         return Err(io_error());
     }
+    // SAFETY: raw >= 0 คือ fd ใหม่จาก openat ที่ยังไม่มีเจ้าของ; File ชั่วคราวรับ ownership และปิดเมื่อ drop
     unsafe { File::from_raw_fd(raw) }
         .sync_all()
         .map_err(|error| ToolError::Io(error.to_string()))
@@ -113,6 +119,7 @@ pub fn replace_with_hook(
     let (dir, last) = parent(workspace, path, true)?;
     // เคลียร์ทุกไบต์รวมถึง padding ของ C struct ก่อนส่งให้ syscall
     let mut metadata = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: dir เปิดอยู่, last เป็น CString ที่ NUL-terminated และ metadata ชี้ไปยัง buffer ขนาด libc::stat ที่ writable
     let exists = unsafe {
         libc::fstatat(
             dir.as_raw_fd(),
@@ -122,6 +129,7 @@ pub fn replace_with_hook(
         )
     };
     let mode = if exists == 0 {
+        // SAFETY: fstatat คืน 0 จึงเขียน struct stat ครบแล้ว (อีกทั้งถูก zeroed ไว้ก่อนซึ่งเป็นค่า valid ของ POD struct)
         let metadata = unsafe { metadata.assume_init() };
         if metadata.st_mode & libc::S_IFMT != libc::S_IFREG || metadata.st_nlink != 1 {
             return Err(ToolError::Denied(
@@ -135,6 +143,7 @@ pub fn replace_with_hook(
         return Err(io_error());
     };
     let temporary = name(format!("{WRITE_PREFIX}{}.tmp", uuid::Uuid::new_v4()).as_bytes())?;
+    // SAFETY: dir เป็น fd ที่เปิดอยู่, temporary เป็น CString ที่ NUL-terminated; ส่ง mode เพราะใช้ O_CREAT
     let raw = unsafe {
         libc::openat(
             dir.as_raw_fd(),
@@ -146,6 +155,7 @@ pub fn replace_with_hook(
     if raw < 0 {
         return Err(io_error());
     }
+    // SAFETY: raw >= 0 คือ fd ใหม่จาก openat ที่ยังไม่มีใครเป็นเจ้าของ; File รับ ownership แต่ผู้เดียว
     let mut file = unsafe { File::from_raw_fd(raw) };
     let result = (|| {
         let io = |error: std::io::Error| ToolError::Io(error.to_string());
@@ -156,6 +166,7 @@ pub fn replace_with_hook(
         file.write_all(&bytes[half..]).map_err(io)?;
         file.sync_all().map_err(io)?;
         hook("file-synced").map_err(io)?;
+        // SAFETY: dir เปิดอยู่ทั้งสองฝั่ง และ temporary/last เป็น CString ที่ NUL-terminated มีชีวิตตลอด call
         if unsafe {
             libc::renameat(
                 dir.as_raw_fd(),
@@ -168,6 +179,7 @@ pub fn replace_with_hook(
             return Err(io_error());
         }
         hook("file-renamed").map_err(io)?;
+        // SAFETY: file เป็นเจ้าของ fd ที่ยังเปิดอยู่ (ไม่ถูกปิดแม้ rename แล้ว); mode มาจาก st_mode & 0o777 หรือ 0o600
         if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
             return Err(io_error());
         }
@@ -175,6 +187,7 @@ pub fn replace_with_hook(
         sync_directory(&dir)?;
         hook("file-directory-synced").map_err(io)
     })();
+    // SAFETY: dir ยังเปิดอยู่และ temporary เป็น CString ที่มีชีวิตจนจบฟังก์ชัน; best-effort cleanup จึงละเลยค่า return (ENOENT หลัง rename สำเร็จ)
     unsafe {
         libc::unlinkat(dir.as_raw_fd(), temporary.as_ptr(), 0);
     }
@@ -202,10 +215,12 @@ pub fn recover_pending(workspace: &Path) -> Result<usize, ToolError> {
         let metadata = file
             .metadata()
             .map_err(|error| ToolError::Io(error.to_string()))?;
+        // SAFETY: geteuid ไม่รับ argument, ไม่มี precondition และไม่มีทางล้มเหลว
         if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
             return Err(ToolError::Denied("invalid pending write owner/mode".into()));
         }
         let (dir, filename) = parent(workspace, entry.path(), false)?;
+        // SAFETY: dir เป็น fd ที่เปิดอยู่ตลอด scope และ filename เป็น CString ที่ NUL-terminated มีชีวิตอยู่ระหว่าง call
         if unsafe { libc::unlinkat(dir.as_raw_fd(), filename.as_ptr(), 0) } != 0 {
             return Err(io_error());
         }

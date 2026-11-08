@@ -21,3 +21,6 @@ microvm = []
 # Backend Hardware Isolation (TEE/Confidential Computing) — Level 3
 # ต้องการ host ที่รองรับ SEV-SNP (AMD) หรือ TDX (Intel)
 hardware = []
+
+[lints]
+workspace = true

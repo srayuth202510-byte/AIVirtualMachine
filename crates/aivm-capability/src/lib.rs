@@ -5,6 +5,8 @@
 //! ที่ระบุชัด ยังไม่หมดอายุ และใช้ไม่เกินโควต้าเท่านั้นจึงจะ ALLOW
 //! (invariants I-2, I-6, I-8).
 
+#![forbid(unsafe_code)]
+
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;

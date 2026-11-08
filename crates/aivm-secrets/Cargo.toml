@@ -19,3 +19,5 @@ aivm-cube = { path = "../aivm-cube" }
 [dev-dependencies]
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["full"] }
+[lints]
+workspace = true

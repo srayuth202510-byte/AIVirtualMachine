@@ -4,6 +4,8 @@
 //! MVP-A ใช้ state machine ที่ผ่านการ validate แล้ว
 //! ส่วน projection / event-sourcing แบบเต็มมาใน milestone หลัง
 
+#![forbid(unsafe_code)]
+
 pub mod rag;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

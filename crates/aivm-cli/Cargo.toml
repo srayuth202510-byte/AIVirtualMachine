@@ -27,3 +27,6 @@ llama = ["aivm-runtime/llama", "aivm-supervisor/llama"]
 microvm = ["aivm-runtime/microvm"]
 # เปิด Hardware Isolation backend (config + skeleton) ทั้งสาย cli -> runtime -> tools -> sandbox
 hardware = ["aivm-runtime/hardware"]
+
+[lints]
+workspace = true

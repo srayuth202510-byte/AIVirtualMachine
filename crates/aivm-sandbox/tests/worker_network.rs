@@ -6,6 +6,7 @@ fn filter_child() {
         return;
     };
     aivm_sandbox::install_worker_network_seccomp().unwrap();
+    // SAFETY: เรียกใน child ของเทสต์หลังติดตั้ง seccomp เพื่อตรวจว่า kernel บล็อก socket/x32 syscall จริง
     unsafe {
         match kind.as_str() {
             "socket" => {

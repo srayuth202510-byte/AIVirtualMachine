@@ -887,6 +887,7 @@ fn bounded_process(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // SAFETY: pre_exec ใช้เฉพาะ setpgid/prctl/setrlimit ที่เป็น async-signal-safe ก่อน exec
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) != 0 || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
@@ -913,6 +914,7 @@ fn bounded_process(
     struct Group(u32);
     impl Drop for Group {
         fn drop(&mut self) {
+            // SAFETY: child แยก process group ด้วย setpgid(0, 0) แล้ว ส่ง SIGKILL ให้เฉพาะกลุ่มนั้น
             unsafe {
                 libc::kill(-(self.0 as i32), libc::SIGKILL);
             }
@@ -949,6 +951,7 @@ fn bounded_process(
         }
         if start.elapsed() >= Duration::from_millis(timeout) {
             timed_out = true;
+            // SAFETY: child แยก process group ด้วย setpgid(0, 0) แล้ว ส่ง SIGKILL ให้เฉพาะกลุ่มนั้นเมื่อ timeout
             unsafe {
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }

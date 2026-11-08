@@ -20,3 +20,6 @@ aivm-runtime = { path = "../aivm-runtime" }
 
 [features]
 llama = ["aivm-runtime/llama"]
+
+[lints]
+workspace = true

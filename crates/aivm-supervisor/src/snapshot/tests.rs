@@ -261,6 +261,7 @@ fn rejects_workspace_and_payload_symlinks_hardlinks_and_special_files() {
             "hardlink" => std::fs::hard_link(&outside, &path).unwrap(),
             _ => {
                 let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                // SAFETY: path is a NUL-terminated CString that outlives the mkfifo call.
                 assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
             }
         }

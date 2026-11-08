@@ -1,5 +1,7 @@
 //! CLI ของ `aivm` — ดูสเปก §29-§30
 
+#![forbid(unsafe_code)]
+
 use aivm_runtime::VmConfig;
 use aivm_supervisor::Supervisor;
 use clap::{Parser, Subcommand};

@@ -103,6 +103,8 @@ impl PreparedModelFile {
         if unsafe { libc::fstatvfs(source.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
             return Err(failed("cannot inspect model mount"));
         }
+        // SAFETY: fstatvfs คืน 0 แล้ว เคอร์เนลเขียน statvfs ครบ; อีกทั้ง buffer ถูก zeroed
+        // ไว้ก่อน และ statvfs เป็น struct ของจำนวนเต็มล้วน ทุก bit pattern จึง valid
         let stat = unsafe { stat.assume_init() };
         let meta = source
             .metadata()
@@ -111,6 +113,7 @@ impl PreparedModelFile {
         // ต้องไม่มี hard link หรือสิทธิ์เขียนจาก UID ที่ไม่อยู่ใน trust root
         let read_only_staged = stat.f_flag & libc::ST_RDONLY != 0
             && meta.nlink() == 1
+            // SAFETY: geteuid ไม่รับ pointer ไม่มี precondition และล้มเหลวไม่ได้ตาม POSIX
             && (meta.uid() == 0 || meta.uid() == unsafe { libc::geteuid() })
             && meta.mode() & 0o022 == 0;
         let mut file = if read_only_staged || is_sealed(&source) {
@@ -156,6 +159,8 @@ impl PreparedModelFile {
             if unsafe { libc::fstatfs(output.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
                 return Err(failed("cannot inspect snapshot filesystem"));
             }
+            // SAFETY: fstatfs คืน 0 แล้ว เคอร์เนลเขียน statfs ครบ; อีกทั้ง buffer ถูก zeroed
+            // ไว้ก่อน และ statfs เป็น struct ของจำนวนเต็มล้วน ทุก bit pattern จึง valid
             let ram_backed = unsafe { filesystem.assume_init() }.f_type == libc::TMPFS_MAGIC;
             copy_bounded(&mut source, &mut output, MAX_MODEL_BYTES, ram_backed)?;
             output

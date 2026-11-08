@@ -19,6 +19,7 @@ pub struct HostResources {
 impl Default for HostResources {
     fn default() -> Self {
         #[cfg(unix)]
+        // SAFETY: geteuid เป็น pure syscall ไม่มี precondition
         let uid = unsafe { libc::geteuid() };
         #[cfg(not(unix))]
         let uid = 0;
@@ -56,11 +57,14 @@ fn staging_capacity() -> Result<(bool, u64), WorkerError> {
         let mut space = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
         // SAFETY: fd มีเจ้าของ และอ่าน struct เฉพาะเมื่อ syscall สำเร็จ
         if unsafe { libc::fstatfs(file.as_raw_fd(), fs.as_mut_ptr()) } != 0
+            // SAFETY: file ยังเปิดอยู่ และ space เป็น MaybeUninit<statvfs> ที่จัดวางถูกต้อง
             || unsafe { libc::fstatvfs(file.as_raw_fd(), space.as_mut_ptr()) } != 0
         {
             return Err(WorkerError::Resources("inspect staging capacity".into()));
         }
+        // SAFETY: fstatfs คืนค่า 0 ยืนยันว่า kernel เขียนค่าเริ่มต้นให้ fs ครบแล้ว
         let fs = unsafe { fs.assume_init() };
+        // SAFETY: fstatvfs คืนค่า 0 ยืนยันว่า kernel เขียนค่าเริ่มต้นให้ space ครบแล้ว
         let space = unsafe { space.assume_init() };
         let free = (u128::from(space.f_bavail) * u128::from(space.f_frsize) / (1024 * 1024))
             .min(u128::from(u64::MAX)) as u64;
@@ -81,6 +85,7 @@ impl Drop for Permit {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
+            // SAFETY: self._lease ยังเปิดอยู่ตลอดช่วง drop ของ Permit
             unsafe {
                 libc::flock(self._lease.as_raw_fd(), libc::LOCK_UN);
             }
@@ -172,6 +177,7 @@ impl Permit {
             let meta = std::fs::symlink_metadata(&cfg.root)
                 .map_err(|_| WorkerError::Resources("stat host quota root".into()))?;
             if !meta.is_dir()
+                // SAFETY: geteuid เป็น pure syscall ไม่มี precondition
                 || meta.uid() != unsafe { libc::geteuid() }
                 || meta.mode() & 0o777 != 0o700
             {
@@ -194,6 +200,7 @@ impl Permit {
                     .map_err(|_| WorkerError::Resources("stat quota lease".into()))?;
                 if !meta.is_file()
                     || meta.nlink() != 1
+                    // SAFETY: geteuid เป็น pure syscall ไม่มี precondition
                     || meta.uid() != unsafe { libc::geteuid() }
                     || meta.mode() & 0o077 != 0
                 {
@@ -250,6 +257,7 @@ impl Permit {
                     for (is_cache, prefix) in [(false, "slot"), (true, "cache")] {
                         for index in 0..cfg.max_requests {
                             let mut file = open(&cfg.root.join(format!("{prefix}-{index}")))?;
+                            // SAFETY: file เป็น fd ที่เปิดอยู่และเป็นเจ้าของโดยตัวแปร file
                             if unsafe {
                                 libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
                             } == 0
@@ -258,6 +266,7 @@ impl Permit {
                                     available = Some(file);
                                 } else {
                                     // unlock ชัดเจน: fork ของ thread อื่นอาจถือสำเนา fd ก่อน exec
+                                    // SAFETY: file เป็น fd ที่เพิ่ง lock สำเร็จและยังเปิดอยู่
                                     unsafe {
                                         libc::flock(file.as_raw_fd(), libc::LOCK_UN);
                                     }
@@ -274,6 +283,7 @@ impl Permit {
                                 // ต้องรอ ไม่ถือว่าไม่มีการจอง และไม่ตีความเป็นข้อมูลเสียทันที
                                 if text.is_empty() {
                                     if let Some(file) = available.take() {
+                                        // SAFETY: file เป็น fd ที่เปิดอยู่และถือ lock ไว้ในรอบนี้
                                         unsafe {
                                             libc::flock(file.as_raw_fd(), libc::LOCK_UN);
                                         }
@@ -305,6 +315,7 @@ impl Permit {
                         || storage.saturating_add(limits.storage_mb) > free_staging
                     {
                         if let Some(file) = available.take() {
+                            // SAFETY: file เป็น fd ที่เปิดอยู่และถือ lock ไว้ในรอบนี้
                             unsafe {
                                 libc::flock(file.as_raw_fd(), libc::LOCK_UN);
                             }
@@ -322,6 +333,7 @@ impl Permit {
                     }
                     Ok(None)
                 })();
+                // SAFETY: registry เป็น fd ที่เปิดอยู่และถือ LOCK_EX ไว้ก่อนเข้าบล็อกด้านบน
                 unsafe {
                     libc::flock(registry.as_raw_fd(), libc::LOCK_UN);
                 }
@@ -468,6 +480,7 @@ mod tests {
             .open(root.join("cache-0"))
             .unwrap();
         assert_eq!(
+            // SAFETY: file เป็น fd ที่เปิดอยู่ในเทสต์นี้
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
@@ -476,6 +489,7 @@ mod tests {
             while Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(1));
             }
+            // SAFETY: file ถูกย้ายเข้ามาใน thread นี้และยังเปิดอยู่
             unsafe {
                 libc::flock(file.as_raw_fd(), libc::LOCK_UN);
             }

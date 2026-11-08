@@ -107,6 +107,22 @@ I-10 boundary ระดับโครงสร้าง (namespace/seccomp/moun
 
 ## Crate map
 
-`capability` → `policy` → `cube`, `audit` → `tools` →
-`memory` / `network` / `sandbox` / `model` → `runtime` (รวม `runtime::demo`) →
-`supervisor` → `cli` (ห้ามวน) ดู `crates/<ชื่อ>/src/` ตามแผนที่นี้ได้เลย
+ชั้นล่างไม่พึ่งชั้นบน (ห้ามวน) ตรงกับ `[dependencies]` ใน `crates/*/Cargo.toml`:
+
+| ชั้น | crate | พึ่ง (ภายใน workspace) |
+|---|---|---|
+| 0 | `capability`, `cube`, `audit` | — |
+| 1 | `policy` | `capability` |
+| 2 | `sandbox`, `network` | `policy` |
+| 2 | `memory` | `cube` |
+| 3 | `secrets` | `capability`, `policy`, `audit`, `cube` |
+| 3 | `model` | `policy`, `sandbox` |
+| 4 | `tools` | `capability`, `policy`, `audit`, `cube`, `sandbox`, `secrets` |
+| 4 | `model-worker` (binary) | `model`, `sandbox` |
+| 5 | `runtime` (รวม `runtime::demo`) | ชั้น 0–4 ยกเว้น `model-worker` |
+| 6 | `supervisor` | `runtime`, `tools`, `audit`, `cube` |
+| 7 | `cli` | `supervisor`, `runtime`, `model`, `sandbox`, `cube`, `audit` |
+| — | `adversarial` | dev-dependencies เท่านั้น (ชุดเทสต์) |
+
+`network` เป็น legacy deny-only adapter; เส้นทาง network จริงอยู่ใน `tools`
+ดู `crates/<ชื่อ>/src/` ตามแผนที่นี้ได้เลย

@@ -850,9 +850,11 @@ impl WorkerClient {
                 .memory_mb
                 .checked_mul(1024 * 1024)
                 .ok_or_else(|| WorkerError::LimitExceeded("memory bytes overflow".into()))?;
+            // SAFETY: getpid เป็น pure syscall ไม่มี precondition หรือ memory side effect
             let parent_pid = unsafe { libc::getpid() };
             let cpu_seconds = limits.cpu_seconds;
             let pids_max = limits.pids_max;
+            // SAFETY: pre_exec รันใน child หลัง fork ก่อน exec ใช้เฉพาะ async-signal-safe syscalls/helpers
             unsafe {
                 command.pre_exec(move || {
                     if libc::setpgid(0, 0) != 0 {
@@ -1179,6 +1181,7 @@ impl ChildGuard {
         }
         self.terminated = true;
         #[cfg(unix)]
+        // SAFETY: child ตั้ง process group แยกด้วย setpgid(0, 0) แล้ว ส่ง SIGKILL ให้ทั้งกลุ่มของ worker
         unsafe {
             libc::kill(-(self.child.id() as i32), libc::SIGKILL);
         }
@@ -1198,6 +1201,7 @@ fn set_limit(resource: libc::__rlimit_resource_t, soft: u64, hard: u64) -> std::
         rlim_cur: soft as libc::rlim_t,
         rlim_max: hard as libc::rlim_t,
     };
+    // SAFETY: limit ชี้ไปยัง stack struct libc::rlimit ที่กำหนดค่าครบถ้วนแล้ว
     if unsafe { libc::setrlimit(resource, &limit) } != 0 {
         Err(std::io::Error::last_os_error())
     } else {

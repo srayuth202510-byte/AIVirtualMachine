@@ -197,8 +197,16 @@ Never re-read whole files the graph already located.
 
 ## Crate map (dependency order)
 
-`capability` → `policy` → `cube`, `audit` → `tools` → `memory/network/sandbox/model`
-→ `runtime` (incl. `runtime::demo`) → `supervisor` → `cli`. No cycles; keep it so.
+`capability`, `cube`, `audit` → `policy` → `sandbox`, `network`, `memory` →
+`secrets`, `model` → `tools`, `model-worker` → `runtime` (incl. `runtime::demo`)
+→ `supervisor` → `cli`. `adversarial` is dev-deps only. No cycles; keep it so.
+Full per-crate table: `docs/architecture.md#crate-map`.
+
+## Unsafe code policy
+
+Crates without unsafe carry `#![forbid(unsafe_code)]`. Every remaining unsafe
+block needs a `// SAFETY:` comment stating the concrete invariant
+(`clippy::undocumented_unsafe_blocks`, enforced via `[workspace.lints]` + `-D warnings`).
 
 ## MVP-B status (sandboxed exec, spec Phase 4)
 

@@ -4,6 +4,8 @@
 //! later replace the transport with a Unix socket or a MicroVM channel without
 //! changing the request/response contract.
 
+#![forbid(unsafe_code)]
+
 use aivm_model::worker::{
     InferenceLimits, InferenceRequest, InferenceResponse, InferenceUsage, WorkerError,
 };

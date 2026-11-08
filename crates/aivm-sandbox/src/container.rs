@@ -118,7 +118,9 @@ mod linux {
             }
             let root = root.canonicalize().map_err(disabled)?;
             let dir = File::open(&root).map_err(disabled)?;
+            // SAFETY: libc::statfs เป็น plain-old-data C struct ที่ zero-initialize ได้อย่างปลอดภัย
             let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+            // SAFETY: dir เป็น fd ที่เปิดอยู่ และ stat เป็น mutable reference ที่จัดวางถูกต้อง
             if unsafe { libc::fstatfs(dir.as_raw_fd(), &mut stat) } != 0
                 || stat.f_type != 0x63677270
             {
@@ -199,6 +201,7 @@ mod linux {
         }
         fn cleanup(&self) -> Result<(), SandboxError> {
             // cgroup.kill reaches descendants regardless of sessions/process groups.
+            // SAFETY: self.kill เป็น fd ที่เปิดอยู่ และ b"1" มีความยาว 1 ไบต์ตรงตามที่ส่งให้ pwrite
             if unsafe { libc::pwrite(self.kill.as_raw_fd(), b"1".as_ptr().cast(), 1, 0) } != 1 {
                 return Err(spawn_error(std::io::Error::last_os_error()));
             }
@@ -226,16 +229,19 @@ mod linux {
     }
 
     fn memfile(name: &std::ffi::CStr) -> Result<File, SandboxError> {
+        // SAFETY: name เป็น CStr ที่ NUL-terminated เสมอ
         let fd = unsafe {
             libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
         };
         if fd < 0 {
             return Err(spawn_error(std::io::Error::last_os_error()));
         }
+        // SAFETY: fd >= 0 เป็น memfd ใหม่ที่เพิ่งสร้างและส่งมอบ ownership ให้ File ทันที
         Ok(unsafe { File::from_raw_fd(fd) })
     }
     fn seal(file: &mut File) -> Result<(), SandboxError> {
         file.seek(SeekFrom::Start(0)).map_err(spawn_error)?;
+        // SAFETY: file เป็น memfd ที่เปิดด้วย MFD_ALLOW_SEALING และยังเปิดอยู่
         if unsafe {
             libc::fcntl(
                 file.as_raw_fd(),
@@ -279,6 +285,7 @@ mod linux {
             rlim_cur: plan.fsize,
             rlim_max: plan.fsize,
         };
+        // SAFETY: limit เป็น rlimit บน stack ที่กำหนดค่าครบถ้วนแล้ว
         if unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limit) } != 0 {
             return Err(spawn_error(std::io::Error::last_os_error()));
         }
@@ -287,6 +294,7 @@ mod linux {
             rlim_cur: 0,
             rlim_max: 0,
         };
+        // SAFETY: no_core เป็น rlimit บน stack ที่กำหนดค่าครบถ้วนแล้ว
         if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) } != 0 {
             return Err(spawn_error(std::io::Error::last_os_error()));
         }
@@ -477,6 +485,7 @@ mod linux {
         seal(&mut plan)?;
         let cgroup = Cgroup::create(&cfg.cgroup_root, &spec.limits)?;
         let mut filter = memfile(c"aivm-container-seccomp")?;
+        // SAFETY: build_container_filter สร้างชุดคำสั่ง BPF ในหน่วยความจำโดยไม่เรียก syscall
         for instruction in unsafe { crate::build_container_filter() } {
             filter
                 .write_all(&instruction.code.to_ne_bytes())
@@ -579,6 +588,7 @@ mod linux {
             plan.as_raw_fd(),
         ]);
         let procs = cgroup.procs.as_raw_fd();
+        // SAFETY: getpid เป็น pure syscall ไม่มี precondition
         let parent_pid = unsafe { libc::getpid() };
         let memory = spec
             .limits
@@ -602,6 +612,7 @@ mod linux {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+        // SAFETY: pre_exec รันใน child หลัง fork ก่อน exec ใช้เฉพาะ async-signal-safe syscalls
         unsafe {
             cmd.pre_exec(move || {
                 if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0

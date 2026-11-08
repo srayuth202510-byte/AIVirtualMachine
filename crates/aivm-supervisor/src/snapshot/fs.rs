@@ -35,6 +35,8 @@ pub(super) fn pin(parent: &File, part: &OsStr) -> Result<File> {
     if fd < 0 {
         return Err(error(std::io::Error::last_os_error()));
     }
+    // SAFETY: fd >= 0 is a fresh descriptor from openat that nothing else
+    // owns; File takes sole ownership and closes it on drop.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
@@ -54,6 +56,8 @@ pub(super) fn directory(parent: &File, part: &OsStr) -> Result<File> {
 
 pub(super) fn mkdir(parent: &File, part: &OsStr) -> Result<File> {
     let c = name(part)?;
+    // SAFETY: parent is a live directory descriptor and c is a NUL-terminated
+    // CString that outlives the mkdirat call.
     if unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), 0o700) } != 0 {
         return Err(error(std::io::Error::last_os_error()));
     }
@@ -62,6 +66,8 @@ pub(super) fn mkdir(parent: &File, part: &OsStr) -> Result<File> {
 
 pub(super) fn new_file(parent: &File, part: &OsStr) -> Result<File> {
     let part = name(part)?;
+    // SAFETY: the live parent descriptor and NUL-terminated CString outlive
+    // openat; the mode argument is supplied because O_CREAT is set.
     let fd = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -73,6 +79,8 @@ pub(super) fn new_file(parent: &File, part: &OsStr) -> Result<File> {
     if fd < 0 {
         return Err(error(std::io::Error::last_os_error()));
     }
+    // SAFETY: fd >= 0 is a fresh descriptor from openat that nothing else
+    // owns; File takes sole ownership and closes it on drop.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
@@ -273,6 +281,8 @@ pub(super) fn set_executable(root: &File, path: &str, executable: bool) -> Resul
 pub(super) fn publish(root: &File, temporary: &str, id: &str) -> Result<()> {
     let old = name(OsStr::new(temporary))?;
     let new = name(OsStr::new(id))?;
+    // SAFETY: root is a live directory descriptor used for both sides, and
+    // old/new are NUL-terminated CStrings that outlive the renameat2 syscall.
     if unsafe {
         libc::syscall(
             libc::SYS_renameat2,

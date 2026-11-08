@@ -70,6 +70,7 @@ fn add(rules: &PreparedRules, path: &Path, access: u64) -> Result<(), SandboxErr
                 // ตรึงไว้แล้ว ไม่เดิน symlink ชั้นกลาง ปิด symlink-swap TOCTOU
                 resolve: 0x08 | 0x04 | 0x01,
             };
+            // SAFETY: root เปิดอยู่, relative เป็น CString ที่ NUL-terminated และ how มี layout ตรง open_how
             unsafe {
                 libc::syscall(
                     libc::SYS_openat2,
@@ -101,6 +102,7 @@ fn add(rules: &PreparedRules, path: &Path, access: u64) -> Result<(), SandboxErr
         }
         return Err(error());
     }
+    // SAFETY: raw >= 0 เป็น fd ใหม่จาก openat2 ที่ส่งมอบ ownership ให้ File ทันที
     let file = unsafe { File::from_raw_fd(raw) };
     let mut access = access;
     if !file
@@ -114,6 +116,7 @@ fn add(rules: &PreparedRules, path: &Path, access: u64) -> Result<(), SandboxErr
         allowed: access,
         parent_fd: file.as_raw_fd(),
     };
+    // SAFETY: rules และ file ยังเปิดอยู่ และ rule มี layout ตรงกับ landlock_path_beneath_attr
     if unsafe { libc::syscall(libc::SYS_landlock_add_rule, rules.as_raw_fd(), 1, &rule, 0) } < 0 {
         return Err(error());
     }
@@ -172,6 +175,7 @@ fn prepare_inner(
         // symlink ตัวพ่นช้าตอนเดินรายการ
         let name = CString::new(workspace.as_os_str().as_bytes())
             .map_err(|_| SandboxError::Invalid("NUL in workspace".into()))?;
+        // SAFETY: name เป็น CString ที่ NUL-terminated เสมอ
         let fd = unsafe {
             libc::open(
                 name.as_ptr(),
@@ -181,6 +185,7 @@ fn prepare_inner(
         if fd < 0 {
             return Err(error());
         }
+        // SAFETY: fd >= 0 เป็น fd ใหม่ที่เพิ่งเปิดและส่งมอบ ownership ให้ File ทันที
         rules.workspace = Some((workspace.to_path_buf(), unsafe { File::from_raw_fd(fd) }));
     }
     // libraries/toolchain อ่านได้ แต่ไม่มีสิทธิ์เขียน host directories
@@ -405,6 +410,7 @@ fn prepare_inner(
 }
 
 fn new_rules(collect_mounts: bool) -> Result<PreparedRules, SandboxError> {
+    // SAFETY: เรียก landlock_create_ruleset ด้วย pointer ว่างและ flag 1 เพื่อถามรุ่น ABI ตามสเปก kernel
     let abi = unsafe {
         libc::syscall(
             libc::SYS_landlock_create_ruleset,
@@ -421,6 +427,7 @@ fn new_rules(collect_mounts: bool) -> Result<PreparedRules, SandboxError> {
     let attributes = Ruleset {
         handled: (1 << 15) - 1,
     };
+    // SAFETY: attributes มี layout ตรงกับ landlock_ruleset_attr และส่งขนาดตรงตาม struct
     let fd = unsafe {
         libc::syscall(
             libc::SYS_landlock_create_ruleset,
@@ -433,6 +440,7 @@ fn new_rules(collect_mounts: bool) -> Result<PreparedRules, SandboxError> {
         return Err(error());
     }
     Ok(PreparedRules {
+        // SAFETY: fd >= 0 เป็น ruleset fd ใหม่ที่ส่งมอบ ownership ให้ File ทันที
         file: unsafe { File::from_raw_fd(fd) },
         mounts: RefCell::new(collect_mounts.then(Vec::new)),
         workspace: None,
@@ -449,6 +457,7 @@ fn open_no_symlink_follow(name: &std::ffi::CStr) -> i32 {
         mode: 0,
         resolve: RESOLVE_NO_SYMLINKS,
     };
+    // SAFETY: name เป็น CStr ที่ NUL-terminated และ how มี layout ตรงกับ open_how ของ kernel
     unsafe {
         libc::syscall(
             libc::SYS_openat2,
@@ -465,7 +474,9 @@ pub(crate) fn restrict_mounts(grants: &[(PathBuf, u64)]) -> Result<(), SandboxEr
     for (path, access) in grants {
         add(&rules, path, *access)?;
     }
+    // SAFETY: PR_SET_NO_NEW_PRIVS เป็น prctl มาตรฐานของโปรเซสปัจจุบัน
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
+        // SAFETY: rules เป็น ruleset fd ที่เปิดอยู่และเตรียมไว้สำหรับโปรเซสนี้
         || unsafe { libc::syscall(libc::SYS_landlock_restrict_self, rules.as_raw_fd(), 0) } < 0
     {
         return Err(error());

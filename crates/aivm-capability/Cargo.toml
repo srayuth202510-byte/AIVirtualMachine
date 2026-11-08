@@ -7,3 +7,6 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true

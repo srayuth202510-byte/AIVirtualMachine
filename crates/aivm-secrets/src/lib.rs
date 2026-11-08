@@ -787,6 +787,7 @@ pub fn zeroize_secret(secret: &mut String) {
     // SAFETY: เขียนทับ byte ของ string ตัวนี้เท่านั้น ไม่อ่านค่าเก่า
     let bytes = unsafe { secret.as_bytes_mut() };
     for b in bytes.iter_mut() {
+        // SAFETY: b มาจาก mutable reference ที่ valid และ aligned สำหรับ u8
         unsafe { std::ptr::write_volatile(b, 0u8) };
     }
     // กันการย้าย/ตัดคำสั่งข้ามขอบเขตนี้อีกชั้น

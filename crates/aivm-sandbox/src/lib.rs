@@ -761,6 +761,7 @@ pub fn install_worker_network_seccomp() -> std::io::Result<()> {
     }
     filter.push(allow);
     filter.push(kill);
+    // SAFETY: rlimit และ sock_fprog ชี้ไปยัง buffer ในหน่วยความจำที่อยู่ครบตลอดการเรียก setrlimit/prctl
     unsafe {
         // ปิดการสร้าง core dump ของ worker เพื่อไม่ให้ตำแหน่งหน่วยความจำหรือข้อมูลโมเดลรั่วลงดิสก์เมื่อ crash
         let no_core = libc::rlimit {
@@ -781,6 +782,7 @@ pub fn install_worker_network_seccomp() -> std::io::Result<()> {
 /// `/proc/<pid>/maps` และ `/proc/<pid>/auxv` ไม่ให้โปรเซสอื่นใน UID เดียวกันอ่านตำแหน่ง ASLR หรือหน่วยความจำได้
 #[cfg(target_os = "linux")]
 pub fn disable_process_dumpable() -> std::io::Result<()> {
+    // SAFETY: setrlimit ใช้ rlimit บน stack ที่กำหนดค่าครบถ้วน และ PR_SET_DUMPABLE ไม่ใช้ pointer
     unsafe {
         let no_core = libc::rlimit {
             rlim_cur: 0,
@@ -800,6 +802,7 @@ pub fn disable_process_dumpable() -> std::io::Result<()> {
 /// ของ worker ออกจากจำนวนโปรเซสรวมของ UID บน host
 #[cfg(target_os = "linux")]
 pub fn enter_worker_user_namespace() -> std::io::Result<()> {
+    // SAFETY: เรียกในโปรเซสลูกก่อนเริ่มงาน ใช้เฉพาะ unshare/uid_map/prctl สำหรับ namespace ปัจจุบัน
     unsafe {
         enter_user_ns()?;
         drop_capabilities()
@@ -809,6 +812,7 @@ pub fn enter_worker_user_namespace() -> std::io::Result<()> {
 /// Enter an empty network namespace; failure is fatal to a requested namespace tier.
 #[cfg(target_os = "linux")]
 pub fn enter_worker_network_namespace() -> std::io::Result<()> {
+    // SAFETY: เรียกในโปรเซสลูกก่อนเริ่มงาน ใช้เฉพาะ unshare/uid_map/prctl สำหรับ namespace ปัจจุบัน
     unsafe {
         enter_user_ns()?;
         if libc::unshare(libc::CLONE_NEWNET) != 0 {
@@ -1357,8 +1361,10 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
         )?
     };
     #[cfg(target_os = "linux")]
+    // SAFETY: build_hybrid_filter สร้างชุดคำสั่ง BPF ในหน่วยความจำโดยไม่เรียก syscall
     let dangerous_filter = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
     #[cfg(target_os = "linux")]
+    // SAFETY: cpu_set_t เป็น plain-old-data ที่ zero-initialize ได้ และเรียกเฉพาะมาโคร CPU_ISSET/CPU_SET กับขนาดจริงของ struct
     let cpu_mask = unsafe {
         let mut available: libc::cpu_set_t = std::mem::zeroed();
         if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut available) != 0 {
@@ -1383,11 +1389,13 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
     let (mut isolation_reader, isolation_writer) = {
         use std::os::fd::FromRawFd;
         let mut fds = [0; 2];
+        // SAFETY: fds เป็นอาร์เรย์ c_int 2 ช่องบน stack ที่ส่งให้ pipe2 เขียนค่า fd ใหม่
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
             return Err(SandboxError::Spawn(
                 std::io::Error::last_os_error().to_string(),
             ));
         }
+        // SAFETY: pipe2 คืนค่า 0 ยืนยันว่า fds[0] และ fds[1] เป็น fd ใหม่ที่ส่งมอบ ownership ให้ File ทันที
         unsafe {
             (
                 std::fs::File::from_raw_fd(fds[0]),
@@ -1409,6 +1417,7 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
     }
 
     #[cfg(target_os = "linux")]
+    // SAFETY: pre_exec รันใน child หลัง fork ก่อน exec ใช้เฉพาะ async-signal-safe syscalls โดยไม่ allocate หรือ panic
     unsafe {
         // pre_exec รันใน child หลัง fork ก่อน exec: เรียกได้แค่ syscall
         // ห้าม allocate/panic (panic ตรงนี้คือ abort) ทุกขั้นล้มคือ
@@ -1560,6 +1569,7 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
                 std::thread::sleep(std::time::Duration::from_millis(10))
             }
             Ok(None) => {
+                // SAFETY: child แยก process group ด้วย setpgid(0, 0) แล้ว ส่ง SIGKILL ให้ทั้งกลุ่มเมื่อเกิน deadline
                 unsafe {
                     libc::kill(-(child.id() as i32), libc::SIGKILL);
                 }
@@ -1577,6 +1587,7 @@ pub fn run_checked(spec: &ExecSpec, policy: &Policy) -> Result<ExecOutcome, Sand
         }
     };
     // ลูกที่ fork แล้วถือ pipe ค้างต้องตายด้วย แม้ process หลักจบก่อน
+    // SAFETY: child แยก process group ด้วย setpgid(0, 0) แล้ว ส่ง SIGKILL กวาดโปรเซสลูกที่อาจค้างหลังตัวหลักจบ
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
@@ -2037,6 +2048,7 @@ mod tests {
             }
             // kernel ต้องเห็นตัวเราเป็น uid/gid 0 ใน namespace ใหม่จริง
             // หาก probe ตรวจแค่ unshare จะเห็น overflow IDs แทน
+            // SAFETY: getuid/getgid เป็น pure syscalls ไม่มี precondition
             if unsafe { libc::getuid() != 0 || libc::getgid() != 0 } {
                 return Err(std::io::Error::from_raw_os_error(libc::EPERM));
             }
@@ -2096,6 +2108,7 @@ mod tests {
 
     #[test]
     fn seccomp_filter_debug() {
+        // SAFETY: build_hybrid_filter สร้างชุดคำสั่ง BPF ในหน่วยความจำโดยไม่เรียก syscall
         let f = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
         eprintln!("Filter len: {}", f.len());
         for (i, ins) in f.iter().enumerate() {
@@ -2111,6 +2124,7 @@ mod tests {
 
     #[test]
     fn seccomp_filter_allows_listed_and_kills_rest() {
+        // SAFETY: build_hybrid_filter สร้างชุดคำสั่ง BPF ในหน่วยความจำโดยไม่เรียก syscall
         let f = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
         assert_eq!(
             bpf_verdict(&f, 0xc000003e, libc::SYS_read as u32),
@@ -2141,6 +2155,7 @@ mod tests {
     fn seccomp_hybrid_kills_unlisted_syscall() {
         // allowlist จริง: syscall ที่ไม่อยู่ทั้ง allowlist และ denylist ต้อง KILL
         // (regression: เดิม default เป็น ALLOW ทำให้ syscall นอกลิสต์หลุด)
+        // SAFETY: build_hybrid_filter สร้างชุดคำสั่ง BPF ในหน่วยความจำโดยไม่เรียก syscall
         let f = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
         assert!(!ALLOWED_SYSCALLS.contains(&libc::SYS_getpgid));
         assert!(!DANGEROUS_SYSCALLS.contains(&libc::SYS_getpgid));
@@ -2156,6 +2171,7 @@ mod tests {
             "unlisted syscall must be KILLed under Hybrid (fail-closed allowlist)"
         );
         // DenylistOnly ยังคง default ALLOW สำหรับ syscall นอกลิสต์ (legacy)
+        // SAFETY: build_hybrid_filter สร้างชุดคำสั่ง BPF ในหน่วยความจำโดยไม่เรียก syscall
         let legacy = unsafe { build_hybrid_filter(SeccompMode::DenylistOnly) };
         assert_eq!(
             bpf_verdict(&legacy, 0xc000003e, libc::SYS_getpgid as u32),
@@ -2165,7 +2181,9 @@ mod tests {
 
     #[test]
     fn container_filter_allows_security_setup_without_weakening_other_verdicts() {
+        // SAFETY: build_container_filter สร้างชุดคำสั่ง BPF ในหน่วยความจำโดยไม่เรียก syscall
         let container = unsafe { build_container_filter() };
+        // SAFETY: build_hybrid_filter สร้างชุดคำสั่ง BPF ในหน่วยความจำโดยไม่เรียก syscall
         let process = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
         let setup = [
             libc::SYS_landlock_create_ruleset,
@@ -2198,6 +2216,7 @@ mod tests {
 
     #[test]
     fn seccomp_filter_network_profile_adds_socket_syscalls() {
+        // SAFETY: build_hybrid_filter สร้างชุดคำสั่ง BPF ในหน่วยความจำโดยไม่เรียก syscall
         let f = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
         assert_eq!(
             bpf_verdict(&f, 0xc000003e, libc::SYS_socket as u32),
@@ -2211,6 +2230,7 @@ mod tests {
 
     #[test]
     fn seccomp_denylist_kills_dangerous_syscalls() {
+        // SAFETY: build_hybrid_filter สร้างชุดคำสั่ง BPF ในหน่วยความจำโดยไม่เรียก syscall
         let f = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
         // syscall อันตราย -> KILL
         for &nr in DANGEROUS_SYSCALLS {
@@ -2491,6 +2511,7 @@ mod tests {
     }
     #[test]
     fn x32_syscalls_cannot_bypass_seccomp() {
+        // SAFETY: build_hybrid_filter สร้างชุดคำสั่ง BPF ในหน่วยความจำโดยไม่เรียก syscall
         let filter = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
         assert_eq!(
             bpf_verdict(&filter, 0xc000003e, 0x40000000 | libc::SYS_socket as u32),
@@ -2503,6 +2524,7 @@ mod tests {
     }
     #[test]
     fn filesystem_ioctl_cannot_bypass_artifact_quota_or_source_readonly() {
+        // SAFETY: build_hybrid_filter สร้างชุดคำสั่ง BPF ในหน่วยความจำโดยไม่เรียก syscall
         let filter = unsafe { build_hybrid_filter(SeccompMode::Hybrid) };
         for command in [0x40049409, 0x4020940d, 0xc0189436, 0x40086602, 0x401c5820] {
             assert_eq!(

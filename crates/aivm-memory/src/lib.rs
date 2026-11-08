@@ -4,6 +4,8 @@
 //! Cube ทำหน้าที่เป็นชั้น index ส่วนการค้นคืนตั้งใจให้ง่าย
 //! (กวาดแบบ prefix) ไปก่อนจนกว่าจะมี CubeRAG (Phase 6)
 
+#![forbid(unsafe_code)]
+
 use aivm_cube::Cube;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

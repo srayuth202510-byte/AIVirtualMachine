@@ -40,6 +40,7 @@ fn crash_child() {
     let (mut gateway, mut cube) = fixture(Path::new(&root));
     let mut hook = |stage: &str| {
         if stage == phase {
+            // SAFETY: raise ไม่มี memory precondition; SIGKILL จงใจฆ่า child process ทดสอบเพื่อจำลอง crash
             unsafe {
                 libc::raise(libc::SIGKILL);
             }

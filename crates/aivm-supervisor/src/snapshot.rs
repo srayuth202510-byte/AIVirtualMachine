@@ -200,6 +200,7 @@ impl Repository {
         }
         let root = fs::root(&proposed)?;
         let meta = root.metadata().map_err(error)?;
+        // SAFETY: geteuid takes no arguments, has no preconditions and cannot fail.
         if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
             return Err(error(
                 "snapshot store must be owned by the operator and private (0700)",
@@ -215,6 +216,8 @@ impl Repository {
             .open(proposed.join("snapshot.lock"))
             .map_err(error)?;
         let lock_kind = if create { libc::LOCK_EX } else { libc::LOCK_SH };
+        // SAFETY: lock owns an open descriptor for the duration of the call;
+        // flock takes no pointers and failure is reported via the return value.
         if unsafe { libc::flock(lock.as_raw_fd(), lock_kind | libc::LOCK_NB) } != 0 {
             return Err(error("snapshot store is busy"));
         }
@@ -295,6 +298,8 @@ impl Repository {
 }
 impl Drop for Repository {
     fn drop(&mut self) {
+        // SAFETY: _lock still owns its open descriptor (fields drop after this
+        // body); LOCK_UN takes no pointers and errors are harmless during drop.
         unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN) };
     }
 }

@@ -4,6 +4,8 @@
 //! network.fetch/network.connect ที่รันจริงอยู่ใน aivm-tools::ToolGateway
 //! ซึ่งบังคับ capability/policy, public-IP checks, TLS และ byte/time quotas
 
+#![forbid(unsafe_code)]
+
 use aivm_policy::{EvalContext, Policy};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

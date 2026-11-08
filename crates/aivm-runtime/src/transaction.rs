@@ -320,6 +320,7 @@ mod tests {
     fn crash_hook(stage: &str) -> std::io::Result<()> {
         if std::env::var("AIVM_TX_TEST_STAGE").as_deref() == Ok(stage) {
             // SIGKILL ไม่รัน destructors หรือ rollback ของ process ที่กำลังทดสอบ
+            // SAFETY: raise(SIGKILL) ใช้ใน crash hook ของเทสต์เพื่อจำลองโปรเซสตายทันที
             unsafe {
                 libc::raise(libc::SIGKILL);
             }

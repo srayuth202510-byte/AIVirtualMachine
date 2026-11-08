@@ -8,3 +8,6 @@ license = "MIT OR Apache-2.0"
 serde = { workspace = true }
 thiserror = { workspace = true }
 aivm-policy = { path = "../aivm-policy" }
+
+[lints]
+workspace = true

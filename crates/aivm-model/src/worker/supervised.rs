@@ -314,6 +314,7 @@ fn supervise(
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
+            // SAFETY: getpid เป็น pure syscall ไม่มี precondition
             let parent = unsafe { libc::getpid() };
             // SAFETY: pre_exec ใช้เฉพาะ async-signal-safe syscalls
             unsafe {

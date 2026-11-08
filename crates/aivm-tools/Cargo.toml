@@ -30,3 +30,6 @@ microvm = ["aivm-sandbox/microvm"]
 # ส่งต่อฟีเจอร์ Hardware Isolation (Generic QEMU/KVM; TEE experimental) ไปยัง aivm-sandbox
 # ปิดไว้โดยปริยายเพื่อให้ `make verify` เบาและไม่พึ่ง KVM/QEMU ใน CI
 hardware = ["aivm-sandbox/hardware"]
+
+[lints]
+workspace = true

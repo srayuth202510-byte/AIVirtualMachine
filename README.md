@@ -131,19 +131,33 @@ make demo        # self-test เร็วสุดสำหรับดีบั
 
 ```
 crates/
-  aivm-capability    สิทธิ์ + authorize            \
-  aivm-policy        ประเมิน policy (deny-by-default) \
-  aivm-cube          state machine + guards (§14)      \
-  aivm-audit         append-only log + hash chain       }  boundary
-  aivm-tools         gateway (filesystem/network/exec)  /
-  aivm-memory  aivm-network  aivm-sandbox  aivm-model    /
+  aivm-capability    สิทธิ์ + authorize                    ┐
+  aivm-policy        ประเมิน policy (deny-by-default)      │
+  aivm-cube          state machine + guards (§14)          │
+  aivm-audit         append-only log + hash chain          ├ boundary
+  aivm-sandbox       process/container/microvm/hardware    │
+  aivm-secrets       secret broker + one-time lease        │
+  aivm-tools         gateway (filesystem/network/exec)     ┘
+  aivm-memory        session memory
+  aivm-network       legacy deny-only adapter (network จริงอยู่ใน tools)
+  aivm-model         model backends + worker supervision
+  aivm-model-worker  binary worker แยก process สำหรับ inference
   aivm-runtime       model runtime + optional agent loop + demo
   aivm-supervisor    lifecycle + multi-VM root
   aivm-cli           คำสั่ง aivm
-  aivm-adversarial   ชุด must-deny (สเปก §38)
+  aivm-adversarial   ชุด must-deny (สเปก §38, dev-dependencies เท่านั้น)
 ```
 
-ลำดับ dependency: `capability` → `policy` → `cube`, `audit` → `tools` → `memory/network/sandbox/model` → `runtime` → `supervisor` → `cli` (ห้ามวน)
+ลำดับ dependency (ชั้นล่างไม่พึ่งชั้นบน ห้ามวน):
+
+```text
+capability, cube, audit
+  → policy
+  → sandbox, network, memory
+  → secrets, model
+  → tools, model-worker
+  → runtime → supervisor → cli
+```
 
 ## เอกสาร
 

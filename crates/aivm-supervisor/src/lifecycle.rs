@@ -59,6 +59,8 @@ fn lock_file(path: &Path) -> Result<Lock, SupervisorError> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .map_err(error)?;
+    // SAFETY: lock owns an open descriptor for the duration of the call;
+    // flock takes no pointers and failure is reported via the return value.
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(error("VM already has an active operation"));
     }
@@ -73,6 +75,8 @@ impl Drop for Lock {
     fn drop(&mut self) {
         // A concurrent fork may inherit this open file description. Explicitly
         // unlock rather than waiting for every inherited descriptor to close.
+        // SAFETY: self.file still owns its open descriptor (it is dropped after
+        // this body); LOCK_UN takes no pointers and errors are harmless here.
         unsafe {
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
@@ -119,13 +123,19 @@ impl Drop for Lease {
     }
 }
 fn pidfd(pid: u32) -> Result<File, SupervisorError> {
+    // SAFETY: pidfd_open takes (pid_t, unsigned flags) by value with no pointers;
+    // pid fits in pid_t-sized vararg and flags 0 is valid. Errors return -1.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
     if fd < 0 {
         return Err(error(std::io::Error::last_os_error()));
     }
+    // SAFETY: fd >= 0 is a fresh descriptor returned by pidfd_open that
+    // nothing else owns; File takes sole ownership and closes it on drop.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 fn signal(fd: &File, sig: i32) -> Result<(), SupervisorError> {
+    // SAFETY: fd borrows an open pidfd for the whole call; a null siginfo_t
+    // pointer and flags 0 are documented valid arguments to pidfd_send_signal.
     if unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,

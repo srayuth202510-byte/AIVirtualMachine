@@ -33,3 +33,6 @@ hardware = ["aivm-sandbox/hardware", "aivm-tools/hardware"]
 
 [dev-dependencies]
 proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

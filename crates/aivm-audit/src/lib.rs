@@ -4,6 +4,8 @@
 //! append-only ที่มี hash chaining (ตรวจจับการแก้ไขย้อนหลังได้)
 //! ความลับทุกอย่างถูก redact เป็นค่าเริ่มต้น
 
+#![forbid(unsafe_code)]
+
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
