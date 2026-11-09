@@ -47,9 +47,11 @@ AIVM คือ runtime สำหรับรัน open-weight models โดย�
 สถานะ Tier หมายถึงระดับการรองรับในโค้ด ไม่ใช่การรับรองความปลอดภัยของ host ทุกเครื่อง:
 Tier1 process เป็นค่าเริ่มต้น; Container และ MicroVM ต้องเตรียม host ตามคู่มือและ
 ตรวจผล probe/host validation สำหรับเครื่องเป้าหมาย; Hardware ยังเป็น experimental
-และ Generic QEMU ไม่ได้ยืนยัน TEE หรือ attestation. ดู [ผล host validation](./docs/archive/host-validation-2026-10-25.md)
-ซึ่งเป็น snapshot ณ 25 ตุลาคม 2026 ที่ baseline `16e00f3` พร้อม working-tree changes
-ทดสอบ pinned GGUF loader และ worker ทั้งสาม tier ไม่ใช่ผล probe แบบ live ของทุก host.
+และ Generic QEMU ไม่ได้ยืนยัน TEE หรือ attestation. ดู [ผล host validation](./docs/archive/model-host-validation-2026-11-10.md)
+ซึ่งเป็น snapshot ณ 10 พฤศจิกายน 2026 บน clean commit `f05f542`
+ทดสอบ pinned GGUF loader และ supervised worker ทั้งสาม tier รวม failure/recovery
+ผ่าน 11/11 stages ไม่ใช่ผล probe แบบ live ของทุก host; คะแนน model-only quality
+แยกจากผลระบบและอยู่ที่ 4/6 ทั้งแบบปิดและเปิด cache.
 
 รายละเอียดการบังคับใช้และพฤติกรรมที่เปลี่ยนหลัง security review: [`docs/security-hardening.md`](./docs/security-hardening.md)
 

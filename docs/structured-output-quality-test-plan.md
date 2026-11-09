@@ -1,6 +1,6 @@
 # แผน: Structured output, semantic verification และ staging recovery
 
-สถานะ: **ส่วน 1–3 เสร็จและตรวจแล้ว รวม Qwen รอบสด** — อัปเดต 9 พฤศจิกายน 2026
+สถานะ: **ส่วน 1–3 เสร็จและตรวจแล้ว รวม Qwen รอบสด และ host evaluation ครบสาม tier** — อัปเดต 10 พฤศจิกายน 2026
 ผลและข้อจำกัด: [structured output](archive/structured-output-validation-2026-10-27.md), [semantic verification](archive/semantic-validation-2026-10-27.md), [staging recovery](archive/staging-recovery-2026-11-09.md)
 Baseline: `aee1c18` พร้อมผล [coding validation](archive/coding-validation-2026-10-26.md)
 และ [model quality](archive/model-quality-2026-10-26.md)
@@ -152,8 +152,11 @@ nextest configuration, Makefile, CI และเอกสารทดสอบ
 - [x] `make verify` และ CI parity ผ่านบน source สุดท้าย
 - [x] Lint/tests ของ `llama` และ worker protocol ผ่าน
   เพิ่ม feature/host checks ตามเส้นทางที่เปลี่ยนจริง (`make check-llama`, `make test-llama`)
-- [ ] Model host evaluation มี complete structured evidence และไม่มี skipped test
-  ถูกนับเป็น host validation ผ่าน (แยกจาก §3; ต้องรันบน host ที่มี KVM/pins)
+- [x] Model host evaluation มี complete structured evidence และไม่มี skipped test
+  ถูกนับเป็น host validation ผ่าน (แยกจาก §3; รันบน host ที่มี KVM/pins)
+  [ผล 10 พฤศจิกายน 2026](archive/model-host-validation-2026-11-10.md): clean commit
+  `f05f542`, supervised control, 11/11 stages ผ่าน พร้อม failure/recovery ครบทั้งสาม tier
+  และ quality/cache evidence; คะแนนคำตอบแยกจาก infrastructure (4/6 ทั้งสองโหมด)
 - [x] รายงาน JSON format, semantic quality, latency/resource usage และ staging
   stability แยกกัน พร้อมข้อจำกัดและ failure logs
 - [x] แยก implementation เป็นสาม commits/PRs ตามส่วน 1–3

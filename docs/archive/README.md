@@ -16,6 +16,7 @@
 | [host-validation-2026-10-23.md](host-validation-2026-10-23.md) | Host validation และ dashboard load test — 23 ตุลาคม 2026 |
 | [host-validation-2026-10-25.md](host-validation-2026-10-25.md) | Worker control hardening — 25 ตุลาคม 2026 |
 | [model-host-validation-2026-11-04.md](model-host-validation-2026-11-04.md) | Model host validation — 4 พฤศจิกายน 2026 |
+| [model-host-validation-2026-11-10.md](model-host-validation-2026-11-10.md) | Supervised model host validation บน clean commit `f05f542` — 10 พฤศจิกายน 2026 |
 | [model-quality-2026-10-26.md](model-quality-2026-10-26.md) | Model quality comparison — 26 ตุลาคม 2026 |
 
 ## รายงานระบบ / รีวิว
