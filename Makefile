@@ -1,7 +1,7 @@
 # ทางลัดนักพัฒนา AIVM ดูรายการด้วย `make help`
 # ทุก target คือ cargo ธรรมดา ใช้ `rtk make <target>` ได้เหมือนกัน
 
-.PHONY: help build check test test-dashboard-http test-adv test-coding test-llama test-microvm test-hardware test-container check-llama check-microvm check-hardware check-ci demo e2e llama-smoke clippy fmt fmt-check verify ci clean bench setup-host pins audit-pack query path explain graph-update debug-test
+.PHONY: help build check test test-dashboard-http test-adv test-coding test-llama test-microvm test-hardware test-container test-nextest test-staging test-staging-stress strace-staging check-llama check-microvm check-hardware check-ci demo e2e llama-smoke clippy fmt fmt-check verify ci clean bench setup-host pins audit-pack query path explain graph-update debug-test
 
 help: ## แสดงวิธีใช้นี้
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS=":.*?## "} {printf "  %-10s %s\n", $$1, $$2}'
@@ -28,6 +28,20 @@ test-scripts: ## รันสคริปต์ Python ทั้งหมด (�
 
 test-adv: ## ชุด must-deny อย่างเดียว (สเปก §38)
 	cargo test -p aivm-adversarial
+
+test-nextest: ## รันเทสต์ทั้ง workspace ด้วย nextest process-per-test (pin 0.9.151)
+	cargo nextest run --workspace --profile ci
+
+test-staging: ## เทสต์ lease/recovery แบบ deterministic (ไม่มี sleep/retry)
+	cargo test -p aivm-model --lib worker::staging::tests -- --test-threads=8
+
+test-staging-stress: ## stress 1,000 รอบ/เคส (override ด้วย AIVM_STAGING_STRESS_*)
+	AIVM_STAGING_STRESS_ROUNDS=$${AIVM_STAGING_STRESS_ROUNDS:-1000} \
+	AIVM_STAGING_STRESS_THREADS=$${AIVM_STAGING_STRESS_THREADS:-8} \
+	cargo test -p aivm-model --lib worker::staging::tests::concurrent_recovery_stress -- --exact --ignored --nocapture
+
+strace-staging: ## เก็บ strace หลักฐาน fork/exec/open/close/flock/remove
+	sh scripts/staging-strace.sh
 
 test-coding: ## ทดสอบ agent อ่าน/แก้โค้ด + GCC/ld + test binary จริง พร้อม adversarial quotas
 	cargo test -p aivm-runtime --test coding_workflow
@@ -84,7 +98,7 @@ verify: fmt-check clippy test demo ## ด่านรวม: format + lint + tes
 test-dashboard-http: ## HTTP จริง: DB lock, slow clients, เพดาน concurrency และ graph cache (ต้องเปิด localhost ได้)
 	AIVM_DASHBOARD_HTTP_TESTS=1 python3 -m unittest discover -s scripts -p 'test_dashboard.py'
 
-ci: verify test-dashboard-http e2e check-llama test-llama check-microvm test-microvm check-hardware test-hardware ## เหมือน CI บน GitHub: verify + dashboard HTTP + วงจร CLI ครบ + llama + microvm + hardware
+ci: verify test-nextest test-dashboard-http e2e check-llama test-llama check-microvm test-microvm check-hardware test-hardware ## เหมือน CI บน GitHub: verify + nextest + dashboard HTTP + วงจร CLI ครบ + llama + microvm + hardware
 
 clean: ## ลบ build artifact กับบ้าน VM เดโม
 	cargo clean

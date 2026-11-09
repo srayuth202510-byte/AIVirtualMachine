@@ -21,7 +21,7 @@ def main():
     # 1. make ci ต้องมี gateครบ (verify + e2e + llama + microvm + hardware)
     m = re.search(r"^ci:(.*)$", mk, re.M)
     deps = m.group(1) if m else ""
-    for need in ["verify", "test-dashboard-http", "e2e", "check-llama", "test-llama", "check-microvm", "test-microvm", "check-hardware", "test-hardware"]:
+    for need in ["verify", "test-nextest", "test-dashboard-http", "e2e", "check-llama", "test-llama", "check-microvm", "test-microvm", "check-hardware", "test-hardware"]:
         if need not in deps:
             ok = fail(f"Makefile ci ขาด {need}") and False
 
@@ -30,6 +30,8 @@ def main():
         "cargo fmt --all -- --check",
         "cargo clippy --workspace --all-targets",
         "cargo test --workspace",
+        "nextest@0.9.151",
+        "make test-nextest",
         "make test-scripts",
         "make test-dashboard-http",
         "make check-llama",

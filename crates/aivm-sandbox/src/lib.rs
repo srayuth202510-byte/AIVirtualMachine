@@ -204,6 +204,12 @@ pub struct SandboxProbe {
     /// ไบนารี `swtpm` อยู่ใน PATH (vTPM สำหรับ Hardware Level 3)
     #[serde(default)]
     pub swtpm: bool,
+    /// ไบนารี OVMF firmware มีอยู่ (สำหรับ measured boot Level 3)
+    #[serde(default)]
+    pub ovmf: bool,
+    /// ไบนารี TPM device มีอยู่ (/dev/tpm0 หรือ /dev/tpmrm0)
+    #[serde(default)]
+    pub tpm_device: bool,
 }
 
 // ขีดจำกัดกันบัฟเฟอร์บวม/คำสั่งประหลาด (fail-closed)
@@ -1683,6 +1689,9 @@ pub fn probe() -> SandboxProbe {
         sev_snp: std::path::Path::new("/dev/sev").exists(),
         tdx: std::path::Path::new("/dev/tdx_guest").exists(),
         swtpm: probe_binary_in_path("swtpm"),
+        ovmf: std::path::Path::new("/usr/share/OVMF/OVMF_CODE_4M.fd").is_file(),
+        tpm_device: std::path::Path::new("/dev/tpm0").exists()
+            || std::path::Path::new("/dev/tpmrm0").exists(),
     }
 }
 

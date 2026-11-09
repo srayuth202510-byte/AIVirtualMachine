@@ -22,7 +22,11 @@ Regression tests สำหรับ response quota, RAG freshness และ cgro
 |---|---|---|
 | `make demo` | self-test 14 เคส ALLOW/DENY ใน temp dir (~1 วินาที) | ดีบักเส้น enforcement — เร็วสุด พิมพ์ decision/reason ต่อเคส |
 | `make verify` | `fmt-check` + `clippy(-D warnings)` + `cargo test --workspace` + `demo` | gate ก่อน commit ทุกครั้ง |
-| `make ci` | `verify` + `e2e` + `check/test-llama` + `check/test-microvm` + `check/test-hardware` | เท่า CI บน GitHub ทุกอย่าง |
+| `make ci` | `verify` + `nextest` + `e2e` + `check/test-llama` + `check/test-microvm` + `check/test-hardware` | เท่า CI บน GitHub ทุกอย่าง |
+| `make test-nextest` | `cargo nextest run --workspace --profile ci` (pin 0.9.151, process-per-test, ไม่มี retry) | ตรวจการแยก fd/lease ระหว่าง test และ CI parity |
+| `make test-staging` | lease/recovery แบบ deterministic (subprocess + pipe barrier, ไม่มี sleep/retry) | แตะ staging, cleanup หรือ recovery |
+| `make test-staging-stress` | 1,000 รอบ/เคส ขนาน 8 threads (override `AIVM_STAGING_STRESS_*`) | ตรวจ race ของ lease/recovery |
+| `make strace-staging` | `strace` fork/exec/open/close/flock/remove ของ staging tests | เก็บหลักฐานเมื่อสืบสาเหตุ test ไม่เสถียร |
 | `make e2e` | `scripts/smoke.sh` (create/inspect/run/agent/transition/logs/audit/kill + demo + adversarial) | ตรวจวงจร CLI ครบ |
 | `make test-coding` | agent loop + GCC/ld + test binary จริง และ quota/adversarial checks | แก้ build/output/agent observations |
 | `make test-adv` | `cargo test -p aivm-adversarial` (must-deny สเปก §38) | แตะ surface ด้าน security |
@@ -53,6 +57,8 @@ Regression tests สำหรับ response quota, RAG freshness และ cgro
 | `AIVM_MICROVM_KEEP_SCRATCH=1` | เก็บ scratch dir (รวม `serial.log`) ไว้ดีบัก ไม่ตั้ง = ลบทิ้ง |
 | `AIVM_HARDWARE_PINS=/path/pins.json` | เปิดเทสต์บูตจริงฝั่ง hardware (sandbox `real_boot…`) ไม่ตั้ง = skip |
 | `AIVM_HARDWARE_KEEP_SCRATCH=1` | เก็บ scratch dir ฝั่ง hardware ไว้ดีบัก ไม่ตั้ง = ลบทิ้ง |
+| `AIVM_STAGING_STRESS_ROUNDS` | จำนวนรอบ stress ของ `make test-staging-stress` (ค่าเริ่มต้น 1000) |
+| `AIVM_STAGING_STRESS_THREADS` | จำนวน thread ขนานของ stress (ค่าเริ่มต้น 8) |
 
 ## เพิ่ม surface ใหม่ต้องมีอะไรคุม
 
@@ -64,7 +70,7 @@ Regression tests สำหรับ response quota, RAG freshness และ cgro
 
 ## CI (`.github/workflows/ci.yml` = `make ci`)
 
-fmt → clippy strict → `cargo test --workspace` → Python tests → `make test-dashboard-http` → clippy/test หลังฟีเจอร์ llama → clippy หลังฟีเจอร์ microvm →
+fmt → clippy strict → `cargo test --workspace` → `cargo nextest` (0.9.151, process-per-test) → Python tests → `make test-dashboard-http` → clippy/test หลังฟีเจอร์ llama → clippy หลังฟีเจอร์ microvm →
 `make test-microvm` → clippy/test หลังฟีเจอร์ hardware → demo → smoke.sh
 runner ระบุรุ่นเป็น `ubuntu-24.04` (เทสต์บูตจริงข้ามเมื่อไม่มี KVM/pins — unit/plumbing
 ที่เหลือยังจับของพังได้)

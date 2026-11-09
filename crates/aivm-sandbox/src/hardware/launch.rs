@@ -246,15 +246,11 @@ fn spawn_swtpm(
     cfg: &HardwareConfig,
     scratch: &Path,
 ) -> Result<(KillOnDrop, PathBuf), (SandboxError, RunVerdict)> {
-    let swtpm_bin = if cfg.vtpm.swtpm_path.as_os_str().is_empty() {
-        which::which("swtpm").map_err(|_| {
-            clean_err(SandboxError::Spawn(
-                "swtpm binary not found in PATH (install swtpm or set vtpm.swtpm_path)".into(),
-            ))
-        })?
-    } else {
-        cfg.vtpm.swtpm_path.clone()
-    };
+    let swtpm_bin = super::resolve_swtpm(cfg).ok_or_else(|| {
+        clean_err(SandboxError::Spawn(
+            "swtpm binary not found in PATH (install swtpm or set vtpm.swtpm_path)".into(),
+        ))
+    })?;
     let state_dir = if cfg.vtpm.tpm_state_dir.as_os_str().is_empty() {
         scratch.join("tpmstate")
     } else {
@@ -393,7 +389,7 @@ fn build_qemu_cmd(
     // Measured boot ต้องการเฟิร์มแวร์ที่รองรับ — ถ้าไฟล์ไม่มี QEMU จะล้ม
     // แบบ fail-closed เอง (Spawn ดัง ไม่เงียบข้าม)
     if cfg.measured_boot.enabled {
-        cmd.arg("-bios").arg("/usr/share/OVMF/OVMF_CODE_4M.fd");
+        cmd.arg("-bios").arg(super::OVMF_CODE_PATH);
     }
 
     // GPU/NPU passthrough ยังไม่ implement (กันเงียบผ่าน: ถ้าเปิดไว้ต้องตาย

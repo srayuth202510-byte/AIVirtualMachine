@@ -23,6 +23,7 @@
 use super::{verify_artifact, ExecOutcome, ExecSpec, RunVerdict, SandboxError};
 use aivm_policy::Policy;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::path::PathBuf;
 
 /// เพดานขนาด artifact ตั้งต้น (kernel + initrd + image ไม่ควรเกินนี้)
@@ -34,6 +35,38 @@ const LAUNCH_TIMEOUT_DEFAULT_SECS: u64 = 120;
 /// ขอบเขตเส้นตายที่อนุญาต
 const LAUNCH_TIMEOUT_MIN_SECS: u64 = 10;
 const LAUNCH_TIMEOUT_MAX_SECS: u64 = 1800;
+
+/// ตรวจสอบและค้นหา swtpm binary
+///
+/// ถ้า operator ชี้ `vtpm.swtpm_path` → ตรวจ file มีจริง หรือ fail-closed
+/// ถาง → `which::which("swtpm")` เพื่อหาใน PATH (สำหรับ host readiness คืน Disabled ถ้าไม่เจอ)
+/// สำหรับ launch สปาเนอร์อีกชั้นจะ package-wrap ไปเป็น Spawn error ตามเดิม
+pub(crate) fn resolve_swtpm(cfg: &HardwareConfig) -> Option<PathBuf> {
+    if !cfg.vtpm.swtpm_path.as_os_str().is_empty() {
+        (cfg.vtpm.swtpm_path.is_file()).then_some(cfg.vtpm.swtpm_path.clone())
+    } else {
+        which::which("swtpm").ok()
+    }
+}
+
+/// ตรวจสอบว่า measured boot firmware พร้อมใช้งานบน host
+///
+/// เมื่อ measured_boot.enabled=True แต่ไฟล์ OVMF ไม่มี → fail-closed ด้วยข้อความชัดเจน
+pub(crate) fn check_measured_boot_host(
+    cfg: &HardwareConfig,
+    firmware: &Path,
+) -> Result<(), SandboxError> {
+    if cfg.measured_boot.enabled && !firmware.is_file() {
+        return Err(SandboxError::Disabled(format!(
+            "measured boot enabled but OVMF firmware not found at {} (fail-closed: guest ไม่ได้บูต)",
+            firmware.display()
+        )));
+    }
+    Ok(())
+}
+
+/// เส้นทางไบนารี OVMF ที่ใช้เมื่อ measured_boot.enabled (เพียงตัวเลือกที่รองรับ)
+pub(crate) const OVMF_CODE_PATH: &str = "/usr/share/OVMF/OVMF_CODE_4M.fd";
 
 /// ประเภท TEE ที่รองรับ
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -653,6 +686,19 @@ pub fn run_in_hardware(
                 SandboxError::Disabled(
                     "strict attestation needs a real TEE (SEV-SNP/TDX); generic is simulation-only"
                         .into(),
+                ),
+                RunVerdict::Clean,
+            ));
+        }
+
+        // 4b. measured boot host readiness: OVMF firmware
+        check_measured_boot_host(cfg, &OVMF_CODE_PATH).map_err(|e| (e, RunVerdict::Clean))?;
+
+        // 4c. vTPM emulator host readiness: swtpm
+        if cfg.vtpm.enabled && resolve_swtpm(cfg).is_none() {
+            return Err((
+                SandboxError::Disabled(
+                    "hardware vTPM needs swtpm in PATH or vtpm.swtpm_path".into(),
                 ),
                 RunVerdict::Clean,
             ));

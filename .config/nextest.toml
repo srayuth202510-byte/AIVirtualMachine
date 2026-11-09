@@ -1,0 +1,15 @@
+# nextest รันหนึ่ง process ต่อหนึ่ง test จึงแยก fd/lease ระหว่าง test ให้เอง
+# ห้ามเปิด retries: ผลล้มต้องไม่ถูกกลบด้วยการรันซ้ำ (แผน staging §3)
+[profile.default]
+retries = 0
+fail-fast = true
+slow-timeout = { period = "120s", terminate-after = 2 }
+status-level = "pass"
+final-status-level = "slow"
+
+[profile.ci]
+retries = 0
+fail-fast = true
+slow-timeout = { period = "60s", terminate-after = 2 }
+status-level = "pass"
+final-status-level = "slow"

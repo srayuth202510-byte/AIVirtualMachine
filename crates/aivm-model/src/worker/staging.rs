@@ -9,7 +9,12 @@ pub(super) struct StagedConfig {
 
 impl StagedConfig {
     pub(super) fn new() -> Result<Self, WorkerError> {
-        let root = std::env::temp_dir();
+        Self::new_in(std::env::temp_dir())
+    }
+
+    /// สร้าง staging ใต้ root ที่กำหนด เพื่อให้แต่ละ test แยกขอบเขต recovery
+    /// ไม่แชร์ `/tmp` ร่วมกันระหว่าง threads และไม่ต้องแก้ `TMPDIR` ของ process
+    pub(super) fn new_in(root: PathBuf) -> Result<Self, WorkerError> {
         Self::recover(&root)?;
         let directory = root.join(format!(
             "aivm-model-{}-{}",
@@ -366,11 +371,43 @@ pub(super) fn prepare_image(
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    const LEASE_CHILD_ENV: &str = "AIVM_STAGING_LEASE_CHILD";
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new() -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+            let path = std::env::temp_dir().join(format!(
+                "aivm-staging-test-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn pinned_worker_snapshot_survives_source_replacement_and_in_place_writes() {
         // exec ต้องใช้ bytes ที่ตรวจแล้ว แม้ source inode และ pathname เปลี่ยนหลังตรวจ
-        let mut stage = StagedConfig::new().unwrap();
+        let root = TestRoot::new();
+        let mut stage = StagedConfig::new_in(root.path().to_path_buf()).unwrap();
         let source = stage.directory().join("source");
         let approved = b"#!/bin/sh\nprintf approved";
         std::fs::write(&source, approved).unwrap();
@@ -395,37 +432,119 @@ mod tests {
     }
 
     #[test]
-    fn recovery_skips_active_leases_and_removes_abandoned_requests() {
-        // lock ถืออายุ request จริง; การปิด fd จำลอง process ตายโดยไม่ใช้ PID ที่ reuse ได้
-        let mut active = StagedConfig::new().unwrap();
+    fn recovery_keeps_owned_leases_and_removes_abandoned_requests() {
+        // lease ที่ยังมีเจ้าของต้องรอด; เมื่อปิด descriptor แล้วจึงกู้ได้ — ไม่มี sleep/retry
+        let root = TestRoot::new();
+        let mut active = StagedConfig::new_in(root.path().to_path_buf()).unwrap();
         let path = active.directory().to_path_buf();
-        StagedConfig::recover(&std::env::temp_dir()).unwrap();
-        assert!(path.exists());
-        active.lease.take();
-        // เทสต์อื่นที่ spawn child แบบขนานอาจ fork จังหวะที่ fd lease ยังเปิด
-        // (fd close-on-exec ตาม std อยู่แล้ว แต่ช่วง fork→exec ลูกยังถือ flock
-        // shared fd จาก parent) — scanner จึง skip ถูกต้องตาม fail-safe; รอระยะ
-        // สั้นแล้วค่อยยืนยันว่า reclaim สำเร็จเทียบกับ dir ค้างจริงที่ไม่เคยถูกลบ
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while path.exists() {
-            if std::time::Instant::now() >= deadline {
-                panic!(
-                    "recover ยังเหลือ staging directory ของ lease ที่ปล่อยแล้ว: {}",
-                    path.display()
-                );
+        StagedConfig::recover(root.path()).unwrap();
+        assert!(path.exists(), "recover ต้องไม่ลบ staging ที่ lease ยังถูกถือ");
+
+        drop(active.lease.take());
+        std::mem::forget(active);
+        StagedConfig::recover(root.path()).unwrap();
+        assert!(!path.exists(), "recover ต้องกู้ staging ที่ถูกทิ้งหลังปิด lease");
+    }
+
+    #[test]
+    fn recovery_respects_a_live_lease_holder_process() {
+        // process จริงถือ lease ข้าม barrier; recovery ต้องรอจน process ตายแล้วจึงกู้
+        let root = TestRoot::new();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worker::staging::tests::lease_holder_child",
+                "--nocapture",
+            ])
+            .env(LEASE_CHILD_ENV, root.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut lines = BufReader::new(stdout).lines();
+        let directory = loop {
+            let line = lines
+                .next()
+                .expect("lease holder exited before announcing its directory")
+                .unwrap();
+            if let Some(path) = line.strip_prefix("AIVM-LEASE-DIR ") {
+                break PathBuf::from(path);
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            StagedConfig::recover(&std::env::temp_dir()).unwrap();
-        }
+        };
+        assert!(directory.exists());
+
+        StagedConfig::recover(root.path()).unwrap();
+        assert!(
+            directory.exists(),
+            "recover ต้องไม่ลบ staging ที่ process เจ้าของ lease ยังมีชีวิต"
+        );
+
+        child.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+        assert!(child.wait().unwrap().success());
+
+        StagedConfig::recover(root.path()).unwrap();
+        assert!(
+            !directory.exists(),
+            "recover ต้องกู้ staging ได้หลัง process เจ้าของ lease ตาย"
+        );
+    }
+
+    #[test]
+    fn lease_holder_child() {
+        // helper ที่ test แม่เรียกซ้ำ; รันตามปกติจะ no-op
+        let Some(root) = std::env::var_os(LEASE_CHILD_ENV) else {
+            return;
+        };
+        let stage = StagedConfig::new_in(PathBuf::from(root)).unwrap();
+        println!("AIVM-LEASE-DIR {}", stage.directory().display());
+        let mut barrier = [0u8; 1];
+        let _ = std::io::stdin().read(&mut barrier);
+        // จบ process โดยไม่ cleanup: kernel ปิด descriptor และปล่อย flock เอง
+        std::mem::forget(stage);
     }
 
     #[test]
     fn checked_cleanup_reports_failure_instead_of_success() {
-        let mut stage = StagedConfig::new().unwrap();
+        let root = TestRoot::new();
+        let mut stage = StagedConfig::new_in(root.path().to_path_buf()).unwrap();
         let directory = stage.directory().to_path_buf();
         std::fs::remove_dir_all(&directory).unwrap();
         std::fs::write(&directory, b"blocked").unwrap();
         assert_eq!(stage.cleanup().unwrap_err().code(), "cleanup_failed");
         std::fs::remove_file(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "stress: make test-staging-stress"]
+    fn concurrent_recovery_stress() {
+        let rounds: usize = std::env::var("AIVM_STAGING_STRESS_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1000);
+        let threads: usize = std::env::var("AIVM_STAGING_STRESS_THREADS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8)
+            .max(1);
+        let per_thread = rounds.div_ceil(threads);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(move || {
+                    for _ in 0..per_thread {
+                        let root = TestRoot::new();
+                        let mut active = StagedConfig::new_in(root.path().to_path_buf()).unwrap();
+                        let path = active.directory().to_path_buf();
+                        StagedConfig::recover(root.path()).unwrap();
+                        assert!(path.exists());
+                        drop(active.lease.take());
+                        std::mem::forget(active);
+                        StagedConfig::recover(root.path()).unwrap();
+                        assert!(!path.exists());
+                    }
+                });
+            }
+        });
     }
 }

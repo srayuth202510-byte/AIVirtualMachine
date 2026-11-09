@@ -1,7 +1,7 @@
 # แผน: Structured output, semantic verification และ staging recovery
 
-สถานะ: **ส่วน 1–2 เสร็จและตรวจแล้ว รวม Qwen รอบสด; ส่วน 3 ยังไม่ได้ implement** — อัปเดต 27 ตุลาคม 2026
-ผลและข้อจำกัด: [structured output](archive/structured-output-validation-2026-10-27.md), [semantic verification](archive/semantic-validation-2026-10-27.md)
+สถานะ: **ส่วน 1–3 เสร็จและตรวจแล้ว รวม Qwen รอบสด** — อัปเดต 9 พฤศจิกายน 2026
+ผลและข้อจำกัด: [structured output](archive/structured-output-validation-2026-10-27.md), [semantic verification](archive/semantic-validation-2026-10-27.md), [staging recovery](archive/staging-recovery-2026-11-09.md)
 Baseline: `aee1c18` พร้อมผล [coding validation](archive/coding-validation-2026-10-26.md)
 และ [model quality](archive/model-quality-2026-10-26.md)
 
@@ -105,47 +105,59 @@ worker protocol/quality tests และ agent integration ที่ใช้ int
 
 ### งานที่จะทำ
 
-- [ ] ทำซ้ำ `recovery_skips_active_leases_and_removes_abandoned_requests`
+- [x] ทำซ้ำ `recovery_skips_active_leases_and_removes_abandoned_requests`
   ทั้งแบบเดี่ยวและขนาน เก็บ failure แรกพร้อม process/fd/lease metadata
-- [ ] ใช้ strace ติดตาม fork/exec, open/close, flock และ remove
+  แทนด้วย deterministic tests: `recovery_keeps_owned_leases_and_removes_abandoned_requests`
+  และ `recovery_respects_a_live_lease_holder_process` (subprocess + pipe barrier)
+  รันทั้ง `cargo test` และ nextest โดยไม่มี sleep/retry
+- [x] ใช้ strace ติดตาม fork/exec, open/close, flock และ remove
   เพื่อพิสูจน์สาเหตุ สมมติฐานเรื่อง fd ที่ถูกสืบทอดยังไม่ถือเป็นข้อสรุป
-- [ ] ให้ staging tests รับ temporary root ของตัวเองผ่าน argument/helper
+  หลักฐาน: `make strace-staging` → `flock(.lease) = -1 EAGAIN` ขณะ holder
+  มีชีวิต, holder `exit_group(0)`, แล้ว `flock = 0` + `unlinkat(.lease)` +
+  `unlinkat(AT_REMOVEDIR)`; `.lease-pending` เปิดด้วย `O_CLOEXEC`
+- [x] ให้ staging tests รับ temporary root ของตัวเองผ่าน argument/helper
   ไม่แก้ environment `TMPDIR` ร่วมกันระหว่าง threads
-- [ ] สร้าง regression ด้วย subprocess และ pipe/barrier ระบุจังหวะถือ lease,
+  (`StagedConfig::new_in(root)` + `TestRoot` ต่อ test)
+- [x] สร้าง regression ด้วย subprocess และ pipe/barrier ระบุจังหวะถือ lease,
   process exit และ recovery ไม่ใช้ fixed sleep หรือเพิ่ม retry เพื่อกลบ failure
-- [ ] แก้ production lifecycle เฉพาะเมื่อหลักฐานแสดงว่า implementation ผิด
+- [x] แก้ production lifecycle เฉพาะเมื่อหลักฐานแสดงว่า implementation ผิด
   ถ้าสัญญาของ test ผิด ให้แก้ test โดยยังพิสูจน์ ownership/lifetime จริง
-- [ ] เพิ่ม cargo-nextest แบบ pin รุ่นและระบุวิธีเตรียมเครื่อง/CI
+  (เพิ่มเฉพาะ test seam `new_in`; recovery/flock logic ไม่เปลี่ยน)
+- [x] เพิ่ม cargo-nextest แบบ pin รุ่นและระบุวิธีเตรียมเครื่อง/CI
   ใช้ process-per-test ช่วยแยกสภาพแวดล้อม พร้อมกำหนดกลุ่ม host tests ให้เหมาะสม
-- [ ] คงการตรวจด้วย `cargo test --workspace` แบบขนานด้วย
+  (`cargo-nextest 0.9.151`, `.config/nextest.toml`, `make test-nextest`)
+- [x] คงการตรวจด้วย `cargo test --workspace` แบบขนานด้วย
   nextest/serial run ต้องไม่กลายเป็นวิธีซ่อน production race
-- [ ] คง doctest gate แยกตามความสามารถของ runner และอัปเดต Makefile/CI parity
+- [x] คง doctest gate แยกตามความสามารถของ runner และอัปเดต Makefile/CI parity
+  (`cargo test` ยังรัน doctest; nextest รันเฉพาะ unit/integration)
 
 จุดแก้หลัก: `crates/aivm-model/src/worker/staging.rs`, process/helper tests,
 nextest configuration, Makefile, CI และเอกสารทดสอบ
 
 ### เกณฑ์ผ่าน
 
-- [ ] มี deterministic reproducer หรือหลักฐานที่อธิบาย failure เดิมได้
+- [x] มี deterministic reproducer หรือหลักฐานที่อธิบาย failure เดิมได้
   ไม่ปิดงานเพียงเพราะรันครั้งต่อมาผ่าน
-- [ ] Lease ที่ยังมีเจ้าของต้องไม่ถูก recovery ลบ; เมื่อ descriptors ปิดครบแล้ว
+- [x] Lease ที่ยังมีเจ้าของต้องไม่ถูก recovery ลบ; เมื่อ descriptors ปิดครบแล้ว
   abandoned staging ถูกกู้ได้โดยไม่กระทบ active requests
-- [ ] Stress แบบขนานเริ่มที่ 1,000 รอบต่อ test case บน host เดิม
+- [x] Stress แบบขนานเริ่มที่ 1,000 รอบต่อ test case บน host เดิม
   เก็บจำนวนรอบ, concurrency, failures และ residuals; จำนวนรอบอย่างเดียวไม่แทน proof
-- [ ] ผ่านทั้ง native Cargo runner และ nextest โดยไม่ต้อง serialize ทั้ง suite
+  (1,000 รอบ / 8 threads / 0 failures / 0 residual `aivm-staging-test-*` หรือ `aivm-model-*`)
+- [x] ผ่านทั้ง native Cargo runner และ nextest โดยไม่ต้อง serialize ทั้ง suite
   และไม่มี automatic retry เปลี่ยนผลล้มเหลวให้เป็นผลผ่านเงียบ ๆ
+  (`cargo test --workspace` และ nextest 518 passed / 14 skipped)
 
 ## Gate ปิดงานและผลส่งมอบ
 
-- [ ] `make verify` และ CI parity ผ่านบน source สุดท้าย
-- [ ] Lint/tests ของ `llama` และ worker protocol ผ่าน
-  เพิ่ม feature/host checks ตามเส้นทางที่เปลี่ยนจริง
+- [x] `make verify` และ CI parity ผ่านบน source สุดท้าย
+- [x] Lint/tests ของ `llama` และ worker protocol ผ่าน
+  เพิ่ม feature/host checks ตามเส้นทางที่เปลี่ยนจริง (`make check-llama`, `make test-llama`)
 - [ ] Model host evaluation มี complete structured evidence และไม่มี skipped test
-  ถูกนับเป็น host validation ผ่าน
-- [ ] รายงาน JSON format, semantic quality, latency/resource usage และ staging
+  ถูกนับเป็น host validation ผ่าน (แยกจาก §3; ต้องรันบน host ที่มี KVM/pins)
+- [x] รายงาน JSON format, semantic quality, latency/resource usage และ staging
   stability แยกกัน พร้อมข้อจำกัดและ failure logs
-- [ ] แยก implementation เป็นสาม commits/PRs ตามส่วน 1–3
-  แต่ละส่วนมี regression และหลักฐานก่อนปิดงาน
+- [x] แยก implementation เป็นสาม commits/PRs ตามส่วน 1–3
+  แต่ละส่วนมี regression และหลักฐานก่อนปิดงาน (§1–2 อยู่ในประวัติเดิม; §3 คือ commit นี้)
 
 ## แหล่งอ้างอิง
 

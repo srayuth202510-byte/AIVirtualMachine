@@ -36,6 +36,7 @@
 | [coding-validation-2026-10-26.md](coding-validation-2026-10-26.md) | Coding completion validation — 26 ตุลาคม 2026 |
 | [structured-output-validation-2026-10-27.md](structured-output-validation-2026-10-27.md) | Structured output validation — 27 ตุลาคม 2026 |
 | [semantic-validation-2026-10-27.md](semantic-validation-2026-10-27.md) | Semantic verification validation — 27 ตุลาคม 2026 |
+| [staging-recovery-2026-11-09.md](staging-recovery-2026-11-09.md) | Staging lease/recovery: deterministic tests, strace และ nextest — 9 พฤศจิกายน 2026 |
 
 ## รายงาน dashboard
 
