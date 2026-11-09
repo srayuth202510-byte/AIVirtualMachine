@@ -692,7 +692,8 @@ pub fn run_in_hardware(
         }
 
         // 4b. measured boot host readiness: OVMF firmware
-        check_measured_boot_host(cfg, &OVMF_CODE_PATH).map_err(|e| (e, RunVerdict::Clean))?;
+        check_measured_boot_host(cfg, Path::new(OVMF_CODE_PATH))
+            .map_err(|e| (e, RunVerdict::Clean))?;
 
         // 4c. vTPM emulator host readiness: swtpm
         if cfg.vtpm.enabled && resolve_swtpm(cfg).is_none() {
