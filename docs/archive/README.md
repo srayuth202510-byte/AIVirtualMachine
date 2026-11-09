@@ -38,6 +38,7 @@
 | [structured-output-validation-2026-10-27.md](structured-output-validation-2026-10-27.md) | Structured output validation — 27 ตุลาคม 2026 |
 | [semantic-validation-2026-10-27.md](semantic-validation-2026-10-27.md) | Semantic verification validation — 27 ตุลาคม 2026 |
 | [staging-recovery-2026-11-09.md](staging-recovery-2026-11-09.md) | Staging lease/recovery: deterministic tests, strace และ nextest — 9 พฤศจิกายน 2026 |
+| [staging-recovery-fork-2026-11-10.md](staging-recovery-fork-2026-11-10.md) | แก้ native parallel test ที่สืบทอด lease ข้าม fork พร้อม barrier regression — 10 พฤศจิกายน 2026 |
 
 ## รายงาน dashboard
 

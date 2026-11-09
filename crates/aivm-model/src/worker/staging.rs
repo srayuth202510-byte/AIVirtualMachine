@@ -374,6 +374,35 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
 
     const LEASE_CHILD_ENV: &str = "AIVM_STAGING_LEASE_CHILD";
+    const ISOLATED_TEST_ENV: &str = "AIVM_STAGING_ISOLATED_TEST";
+
+    fn run_in_isolated_process(name: &str) -> bool {
+        let test = format!("worker::staging::tests::{name}");
+        if std::env::var(ISOLATED_TEST_ENV).ok().as_deref() == Some(test.as_str()) {
+            return false;
+        }
+        // root แยกยังไม่กัน fd ที่ test thread อื่น fork ไปถือก่อน exec;
+        // สร้าง lease ใน process ที่รัน test นี้ตัวเดียว โดยไม่ serialize ทั้ง suite
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &test,
+                "--nocapture",
+                "--test-threads=1",
+                "--include-ignored",
+            ])
+            .env(ISOLATED_TEST_ENV, &test)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated test {test} failed: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
 
     struct TestRoot(PathBuf);
 
@@ -433,6 +462,9 @@ mod tests {
 
     #[test]
     fn recovery_keeps_owned_leases_and_removes_abandoned_requests() {
+        if run_in_isolated_process("recovery_keeps_owned_leases_and_removes_abandoned_requests") {
+            return;
+        }
         // lease ที่ยังมีเจ้าของต้องรอด; เมื่อปิด descriptor แล้วจึงกู้ได้ — ไม่มี sleep/retry
         let root = TestRoot::new();
         let mut active = StagedConfig::new_in(root.path().to_path_buf()).unwrap();
@@ -444,6 +476,73 @@ mod tests {
         std::mem::forget(active);
         StagedConfig::recover(root.path()).unwrap();
         assert!(!path.exists(), "recover ต้องกู้ staging ที่ถูกทิ้งหลังปิด lease");
+    }
+
+    #[test]
+    fn recovery_keeps_a_fork_inherited_lease_until_exec() {
+        use std::os::{fd::AsRawFd, unix::net::UnixStream, unix::process::CommandExt};
+
+        if run_in_isolated_process("recovery_keeps_a_fork_inherited_lease_until_exec") {
+            return;
+        }
+        let root = TestRoot::new();
+        let mut active = StagedConfig::new_in(root.path().to_path_buf()).unwrap();
+        let path = active.directory().to_path_buf();
+        let lease_fd = active.lease.as_ref().unwrap().as_raw_fd();
+        let (mut barrier, child_barrier) = UnixStream::pair().unwrap();
+        barrier
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let parent_fd = barrier.as_raw_fd();
+        let child_fd = child_barrier.as_raw_fd();
+
+        // ย้าย barrier เข้า scope เพื่อให้ panic ปิดปลาย parent ก่อน join;
+        // child จะเห็น EOF และไม่ค้างใน pre_exec หาก assertion ล้ม
+        std::thread::scope(move |scope| {
+            let child = scope.spawn(move || {
+                let mut command = Command::new("/bin/true");
+                // SAFETY: child ใช้เฉพาะ async-signal-safe syscalls ก่อน exec;
+                // fd มาจากไฟล์/socket ที่ยังมีเจ้าของใน parent ขณะ fork
+                unsafe {
+                    command.pre_exec(move || {
+                        libc::close(parent_fd);
+                        let flags = libc::fcntl(lease_fd, libc::F_GETFD);
+                        if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
+                            return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+                        }
+                        let mut byte = 1u8;
+                        if libc::write(child_fd, (&byte as *const u8).cast(), 1) != 1
+                            || libc::read(child_fd, (&mut byte as *mut u8).cast(), 1) != 1
+                        {
+                            return Err(std::io::Error::from_raw_os_error(libc::EPIPE));
+                        }
+                        Ok(())
+                    });
+                }
+                let status = command.status();
+                drop(child_barrier);
+                status.unwrap()
+            });
+
+            let mut ready = [0u8; 1];
+            barrier.read_exact(&mut ready).unwrap();
+            assert_eq!(ready, [1]);
+            drop(active.lease.take());
+            std::mem::forget(active);
+            StagedConfig::recover(root.path()).unwrap();
+            assert!(
+                path.exists(),
+                "child ก่อน exec ยังถือ lease แม้ parent ปิด descriptor แล้ว"
+            );
+
+            barrier.write_all(b"x").unwrap();
+            assert!(child.join().unwrap().success());
+            StagedConfig::recover(root.path()).unwrap();
+            assert!(
+                !path.exists(),
+                "exec ต้องปิด CLOEXEC lease แล้ว recovery จึงลบ staging ได้"
+            );
+        });
     }
 
     #[test]
@@ -519,6 +618,9 @@ mod tests {
     #[test]
     #[ignore = "stress: make test-staging-stress"]
     fn concurrent_recovery_stress() {
+        if run_in_isolated_process("concurrent_recovery_stress") {
+            return;
+        }
         let rounds: usize = std::env::var("AIVM_STAGING_STRESS_ROUNDS")
             .ok()
             .and_then(|value| value.parse().ok())

@@ -37,6 +37,12 @@ Regression tests สำหรับ response quota, RAG freshness และ cgro
 
 กฎ: แก้บั๊กโดยไม่มี regression test / demo case = ยังไม่เสร็จ
 
+Staging ownership และ stress tests สร้าง lease ใน subprocess ที่รันเฉพาะ test นั้น
+เพื่อกัน test thread อื่น fork ไปถือ descriptor ช่วงก่อน exec; `cargo test --workspace`
+ยังรันขนานตามเดิม Regression `recovery_keeps_a_fork_inherited_lease_until_exec`
+ใช้ barrier พิสูจน์ว่า parent ปิด fd แล้วยังห้ามกู้ขณะ child ถือสำเนา และกู้ได้หลัง exec
+โดยไม่มี sleep/retry ดู [ผล staging fork regression](archive/staging-recovery-fork-2026-11-10.md)
+
 ## Feature flags
 
 | ฟีเจอร์ | chain | ผล |

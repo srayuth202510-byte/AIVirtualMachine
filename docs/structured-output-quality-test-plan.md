@@ -110,6 +110,11 @@ worker protocol/quality tests และ agent integration ที่ใช้ int
   แทนด้วย deterministic tests: `recovery_keeps_owned_leases_and_removes_abandoned_requests`
   และ `recovery_respects_a_live_lease_holder_process` (subprocess + pipe barrier)
   รันทั้ง `cargo test` และ nextest โดยไม่มี sleep/retry
+  แก้เพิ่มเติม 10 พฤศจิกายน: test ที่ปิด lease ใน process เดียวและ stress สร้าง lease
+  ใน subprocess ที่รันเฉพาะ test นั้น เพราะ private root ไม่กัน descriptor ที่ test อื่น
+  fork ไปถือก่อน exec; suite หลักยังขนานตามเดิม และมี
+  `recovery_keeps_a_fork_inherited_lease_until_exec` บังคับจังหวะนี้ด้วย barrier
+  ดู [หลักฐานและผล regression](archive/staging-recovery-fork-2026-11-10.md)
 - [x] ใช้ strace ติดตาม fork/exec, open/close, flock และ remove
   เพื่อพิสูจน์สาเหตุ สมมติฐานเรื่อง fd ที่ถูกสืบทอดยังไม่ถือเป็นข้อสรุป
   หลักฐาน: `make strace-staging` → `flock(.lease) = -1 EAGAIN` ขณะ holder
@@ -143,6 +148,8 @@ nextest configuration, Makefile, CI และเอกสารทดสอบ
 - [x] Stress แบบขนานเริ่มที่ 1,000 รอบต่อ test case บน host เดิม
   เก็บจำนวนรอบ, concurrency, failures และ residuals; จำนวนรอบอย่างเดียวไม่แทน proof
   (1,000 รอบ / 8 threads / 0 failures / 0 residual `aivm-staging-test-*` หรือ `aivm-model-*`)
+  รอบแก้ fork inheritance วันที่ 10 พฤศจิกายนผ่าน stress 1,000 รอบ / 8 threads
+  และ native model suite 100 รอบ / 32 threads พร้อม forced fork/exec regression
 - [x] ผ่านทั้ง native Cargo runner และ nextest โดยไม่ต้อง serialize ทั้ง suite
   และไม่มี automatic retry เปลี่ยนผลล้มเหลวให้เป็นผลผ่านเงียบ ๆ
   (`cargo test --workspace` และ nextest 518 passed / 14 skipped)
