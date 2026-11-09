@@ -71,6 +71,15 @@ impl<'a> RequestControl<'a> {
         Ok(self.deadline.map_or(deadline, |total| total.min(deadline)))
     }
 
+    /// งบสั้น ๆ สำหรับเก็บ diagnostics หลัง worker ถูก terminate; ต้องไม่ยืด
+    /// เวลารอเกิน deadline ของ request แม้ลูกที่หลุด process group ยังถือ pipe อยู่
+    pub(super) fn diagnostics_budget(&self) -> Duration {
+        const CAP: Duration = Duration::from_millis(250);
+        self.deadline.map_or(CAP, |deadline| {
+            deadline.saturating_duration_since(Instant::now()).min(CAP)
+        })
+    }
+
     pub(super) fn remaining_ms(&self, maximum: u64) -> Result<u64, WorkerError> {
         self.check("sandbox setup")?;
         Ok(self.deadline.map_or(maximum, |deadline| {

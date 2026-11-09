@@ -53,3 +53,4 @@
 | [security-concerns-evaluation-2026-11-06.md](security-concerns-evaluation-2026-11-06.md) | Concern mode — 6 พฤศจิกายน 2026 |
 | [security-concern-claims-evaluation-2026-11-06.md](security-concern-claims-evaluation-2026-11-06.md) | Typed concern claims — 6 พฤศจิกายน 2026 |
 | [security-concern-availability-evaluation-2026-11-06.md](security-concern-availability-evaluation-2026-11-06.md) | Availability inventory experiment — 6 พฤศจิกายน 2026 |
+| [security-concern-availability-holdout-v2-2026-11-09.md](security-concern-availability-holdout-v2-2026-11-09.md) | Availability inventory holdout v2 — 9 พฤศจิกายน 2026 |

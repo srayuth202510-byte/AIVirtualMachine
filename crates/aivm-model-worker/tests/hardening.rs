@@ -198,6 +198,22 @@ fn watchdog_kills_worker_while_the_legacy_callback_is_blocked() {
 }
 
 #[test]
+fn detached_descendant_cannot_hold_stderr_past_the_deadline() {
+    // ลูกที่ setsid ออกไปถือ pipe ไว้ต้องไม่ทำให้ caller ค้างหลัง terminate
+    let fixture = Fixture::new("read request\nsetsid /bin/sleep 2 &\nexit 0");
+    let local = fixture.config.local.as_ref().unwrap();
+    let client = WorkerClient::new(local.worker_path.as_ref().unwrap());
+    let mut config = fixture.config.clone();
+    config.local.as_mut().unwrap().controller_path = None;
+    config.local.as_mut().unwrap().controller_sha256 = None;
+    let started = Instant::now();
+    let error = client
+        .infer_stream(&config, request(), &fixture.limits(150), &mut |_| Ok(()))
+        .unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(1), "{error}");
+}
+
+#[test]
 fn typed_remote_errors_and_stderr_do_not_disclose_request_data() {
     let mut fixture=Fixture::new("read request\nprintf '%s\\n' 'PROMPT_SECRET_SENTINEL' >&2\nprintf '%s\\n' '{\"protocol_version\":1,\"request_id\":\"req-1\",\"error\":\"PROMPT_SECRET_SENTINEL\",\"error_kind\":{\"LimitExceeded\":\"PROMPT_SECRET_SENTINEL\"}}'");
     let local = fixture.config.local.as_mut().unwrap();

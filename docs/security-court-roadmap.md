@@ -29,6 +29,13 @@ dev 4 คู่/8 views และ holdout ใหม่ 6 คู่/12 views ผ�
 holdout ไม่ได้เสนอ actor/count claims เพิ่ม จึงยืนยันเฉพาะงานถ่ายทอด availability
 และไม่อ้างว่าคุณภาพโมเดลผ่านทั่วไปหรือช่วยลด false containment; คง shadow/dry-run
 
+วัดซ้ำบน [holdout ชุดใหม่ v2](archive/security-concern-availability-holdout-v2-2026-11-09.md)
+เมื่อ 2026-11-09: audit shape ใหม่ 6 pairs/12 views ที่ไม่ซ้ำกับ dev/v1
+ผ่านทุก gate ตั้งแต่ attempt แรก รวม missing_evidence ครบ 12/12 และไม่มี
+fabricated facts (verified_claims=0) โดยไม่เปลี่ยน prompt; containment ตรง baseline
+12/12 (TP=4, FP=0, TN=2, FN=6 ของชุดนี้) นี่คือหลักฐาน generalization ของงาน
+ถ่ายทอด inventory เท่านั้น ไม่ได้ลด false containment และไม่เปลี่ยนสถานะ shadow/dry-run
+
 ระยะ 9 เรียก Qwen จริงครบ 114 รอบแล้ว:
 [สามบทบาทและเสียงข้างมาก](archive/security-court-qwen-evaluation-2026-11-05.md)
 เสนอ containment ทุก 38 เคส รวม benign 11 เคส จึงยังไม่ผ่าน improvement gate

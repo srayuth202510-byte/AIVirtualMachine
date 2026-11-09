@@ -916,7 +916,8 @@ impl WorkerClient {
                 .write_all(&payload)
                 .and_then(|_| stdin.write_all(b"\n"));
         });
-        let stderr_reader = std::thread::spawn(move || {
+        let (stderr_sender, stderr_receiver) = mpsc::channel();
+        std::thread::spawn(move || {
             let mut tail = Vec::new();
             let mut reader = BufReader::new(stderr);
             let mut buffer = [0; 4096];
@@ -929,7 +930,7 @@ impl WorkerClient {
                     tail.drain(..tail.len() - 16384);
                 }
             }
-            String::from_utf8_lossy(&tail).into_owned()
+            let _ = stderr_sender.send(String::from_utf8_lossy(&tail).into_owned());
         });
         let (sender, receiver) = mpsc::sync_channel(8);
         std::thread::spawn(move || {
@@ -1031,9 +1032,16 @@ impl WorkerClient {
             }
             Ok(response)
         })();
-        // A descendant cannot hold the response or diagnostics pipe open after exit.
+        // ลูกที่ setsid หลุด process group ยังถือ diagnostics pipe ไว้ได้; เก็บ detail
+        // แบบมีงบเท่านั้นและไม่ join thread เพื่อไม่ให้ caller ค้างเกิน deadline
         let exit = child.terminate_with_exit();
-        let detail = stderr_reader.join().unwrap_or_default();
+        let detail = if response_result.is_err() {
+            stderr_receiver
+                .recv_timeout(control.diagnostics_budget())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         response_result.map_err(|error| {
             let summary = safe_worker_diagnostic(&detail);
             let error = if matches!(error, WorkerError::Failed(_))

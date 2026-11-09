@@ -173,6 +173,9 @@ Runtime ปฏิเสธ total budget ที่ใช้กับ inline/remot
 I/O ใช้ cooperative cancellation: syscall ที่กำลังค้าง, host helper ระหว่าง sandbox
 setup และ cleanup ต้องรอคืนการควบคุมก่อนตรวจงบอีกครั้ง จึงยังไม่มี hard wall-clock
 deadline ครอบทุก syscall การตรวจงบหลัง execution/cleanup ปฏิเสธ completion ที่ช้าเกินงบ
+อย่างไรก็ดี path worker ตรงไม่ join diagnostics pipe แบบไม่มีขอบเขต: หลัง terminate
+จะเก็บ stderr ภายในงบสั้น ๆ ที่เหลือ (ไม่เกิน 250 ms) ลูกที่ `setsid` ออกไปจึงไม่สามารถ
+ตรึง caller เกิน deadline ได้
 
 Response มี `control_plane_usage` ซึ่ง client เขียนทับค่าที่ worker ส่งมาเสมอ:
 `preparation_ms`, `execution_ms`, `cleanup_ms`, `total_ms`
